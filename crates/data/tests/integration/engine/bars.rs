@@ -1005,3 +1005,164 @@ fn test_subscribe_range_bars_completes_forming_bar_at_default_boundary(
         ))
     );
 }
+
+#[rstest]
+fn test_subscribe_range_inclusive_bars_aggregates_trades(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+
+    let instrument_id = audusd_sim.id;
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        test_clock,
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+
+    // A range of 10 price increments
+    let bar_type =
+        BarType::from(format!("{instrument_id}-10-RANGE_INCLUSIVE-LAST-INTERNAL").as_str());
+    data_engine.execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+        SubscribeBars::new(
+            bar_type,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ),
+    )));
+
+    let make_trade = |price: &str, ts: u64, trade_id: &str| {
+        TradeTick::new(
+            instrument_id,
+            Price::from(price),
+            Quantity::from("1000"),
+            AggressorSide::Buy,
+            TradeId::new(trade_id),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        )
+    };
+
+    data_engine.process_data(Data::Trade(make_trade("0.65000", 1_000, "t1")));
+    data_engine.process_data(Data::Trade(make_trade("0.65009", 2_000, "t2")));
+    assert!(cache.borrow().bar(&bar_type).is_none());
+
+    // Range 0.00011 >= 0.00010: the completing trade and its overshoot are in the bar
+    data_engine.process_data(Data::Trade(make_trade("0.65011", 3_000, "t3")));
+
+    assert_eq!(
+        cache.borrow().bar(&bar_type).copied(),
+        Some(Bar::new(
+            bar_type,
+            Price::from("0.65000"),
+            Price::from("0.65011"),
+            Price::from("0.65000"),
+            Price::from("0.65011"),
+            Quantity::from("3000"),
+            UnixNanos::from(3_000),
+            UnixNanos::from(3_000),
+        ))
+    );
+}
+
+#[rstest]
+fn test_subscribe_range_inclusive_bars_discards_forming_bar_at_default_boundary(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+
+    let instrument_id = audusd_sim.id;
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        test_clock,
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+
+    let bar_type =
+        BarType::from(format!("{instrument_id}-10-RANGE_INCLUSIVE-LAST-INTERNAL").as_str());
+    data_engine.execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+        SubscribeBars::new(
+            bar_type,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ),
+    )));
+
+    let make_trade = |price: &str, ts: u64, trade_id: &str| {
+        TradeTick::new(
+            instrument_id,
+            Price::from(price),
+            Quantity::from("1000"),
+            AggressorSide::Buy,
+            TradeId::new(trade_id),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        )
+    };
+
+    // 18:00 America/New_York on 1970-01-01 (EST)
+    let boundary = 23 * 3_600 * 1_000_000_000_u64;
+    data_engine.process_data(Data::Trade(make_trade("0.65000", 1_000, "t1")));
+    data_engine.process_data(Data::Trade(make_trade("0.65009", 2_000, "t2")));
+
+    // The boundary discards the forming bar: a range measured across it would complete here
+    data_engine.process_data(Data::Trade(make_trade("0.65010", boundary, "t3")));
+    assert!(cache.borrow().bar(&bar_type).is_none());
+
+    data_engine.process_data(Data::Trade(make_trade("0.65020", boundary + 1_000, "t4")));
+
+    assert_eq!(
+        cache.borrow().bar(&bar_type).copied(),
+        Some(Bar::new(
+            bar_type,
+            Price::from("0.65010"),
+            Price::from("0.65020"),
+            Price::from("0.65010"),
+            Price::from("0.65020"),
+            Quantity::from("2000"),
+            UnixNanos::from(boundary + 1_000),
+            UnixNanos::from(boundary + 1_000),
+        ))
+    );
+}

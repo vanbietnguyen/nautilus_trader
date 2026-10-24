@@ -28,8 +28,8 @@ use super::{
     AggregationSource, BAR_AGGREGATOR_PRIORITY, BarAggregation, BarAggregator, BarBarHandler,
     BarQuoteHandler, BarTradeHandler, DataCommand, DataEngine, DataResponse,
     DeepChartsRangeBarAggregator, Instrument, InstrumentAny, PriceType, RANGE_BAR_DEFAULT_BOUNDARY,
-    RANGE_BAR_DEFAULT_TIME_ZONE, Rc, RefCell, RenkoBarAggregator, RequestBarAggregation,
-    RequestCommand, SubscribeQuotes, SubscribeTrades, TickBarAggregator,
+    RANGE_BAR_DEFAULT_TIME_ZONE, RangeInclusiveBarAggregator, Rc, RefCell, RenkoBarAggregator,
+    RequestBarAggregation, RequestCommand, SubscribeQuotes, SubscribeTrades, TickBarAggregator,
     TickImbalanceBarAggregator, TickRunsBarAggregator, TimeBarAggregator, UnsubscribeBars,
     UnsubscribeCommand, UnsubscribeQuotes, UnsubscribeTrades, ValueBarAggregator,
     ValueImbalanceBarAggregator, ValueRunsBarAggregator, VolumeBarAggregator,
@@ -525,6 +525,20 @@ impl DataEngine {
                         }),
                     handler,
                 )) as Box<dyn BarAggregator>,
+                BarAggregation::RangeInclusive => Box::new(RangeInclusiveBarAggregator::new(
+                    bar_type,
+                    price_precision,
+                    size_precision,
+                    instrument.price_increment(),
+                    time_zone,
+                    config
+                        .time_bars_origin_offset
+                        .get(&BarAggregation::RangeInclusive)
+                        .map_or(RANGE_BAR_DEFAULT_BOUNDARY, |duration| {
+                            jiff::SignedDuration::try_from(*duration).unwrap_or_default()
+                        }),
+                    handler,
+                )) as Box<dyn BarAggregator>,
                 other => unreachable!(
                     "Unsupported internal bar aggregation dispatch for {other:?}; update `create_bar_aggregator`"
                 ),
@@ -544,7 +558,10 @@ impl DataEngine {
         let time_zone = match time_zone {
             Some(zone) => zone,
             None => {
-                let default_zone = if bar_type.spec().aggregation == BarAggregation::Range {
+                let default_zone = if matches!(
+                    bar_type.spec().aggregation,
+                    BarAggregation::Range | BarAggregation::RangeInclusive
+                ) {
                     RANGE_BAR_DEFAULT_TIME_ZONE
                 } else {
                     "UTC"
