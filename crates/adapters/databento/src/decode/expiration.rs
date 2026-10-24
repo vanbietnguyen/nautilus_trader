@@ -79,21 +79,39 @@ impl OptionExpirationRule {
     }
 }
 
-/// Dataset-specific configuration applied while decoding Databento definitions.
+/// The Databento timestamp that decoded market data stamps as Nautilus `ts_event`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TsEventSource {
+    /// The capture-server receive time `ts_recv` (the default).
+    #[default]
+    Receive,
+    /// The record header `ts_event`, the matching-engine (exchange) time. Records whose header
+    /// `ts_event` is undefined keep `ts_recv`.
+    Exchange,
+}
+
+/// Configuration applied while decoding Databento records.
 ///
-/// The configuration is keyed by [`dbn::Dataset`] so per-dataset parsing rules scale without
-/// changing decode function signatures: adding behavior for another dataset is a new map entry.
+/// Option expiration rules apply to definitions and are keyed by [`dbn::Dataset`] so per-dataset
+/// parsing rules scale without changing decode function signatures: adding behavior for another
+/// dataset is a new map entry. [`TsEventSource`] applies to market data decoded through
+/// [`crate::decode::decode_record_with_config`]; `ts_init` is unaffected.
 #[derive(Clone, Debug)]
 pub struct DatabentoDecodeConfig {
     /// Per-dataset option expiration correction rules.
     pub option_expiration: AHashMap<dbn::Dataset, OptionExpirationRule>,
+    /// Which Databento timestamp market data records stamp as `ts_event`.
+    pub ts_event_source: TsEventSource,
 }
 
 impl Default for DatabentoDecodeConfig {
     fn default() -> Self {
         let mut option_expiration = AHashMap::new();
         option_expiration.insert(dbn::Dataset::OpraPillar, OptionExpirationRule::opra());
-        Self { option_expiration }
+        Self {
+            option_expiration,
+            ts_event_source: TsEventSource::default(),
+        }
     }
 }
 
@@ -252,6 +270,7 @@ mod tests {
         // A custom config that omits a rule for OPRA disables the correction for that dataset.
         let config = DatabentoDecodeConfig {
             option_expiration: ahash::AHashMap::new(),
+            ..DatabentoDecodeConfig::default()
         };
         let result = corrected_option_expiration(
             UnixNanos::from(EDT_MIDNIGHT_UTC),
