@@ -57,10 +57,12 @@ use nautilus_model::{
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 
 mod range;
+mod range_inclusive;
 
 pub use range::{
     DeepChartsRangeBarAggregator, RANGE_BAR_DEFAULT_BOUNDARY, RANGE_BAR_DEFAULT_TIME_ZONE,
 };
+pub use range_inclusive::RangeInclusiveBarAggregator;
 
 /// Type alias for bar handler to reduce type complexity.
 type BarHandler = Box<dyn FnMut(Bar)>;

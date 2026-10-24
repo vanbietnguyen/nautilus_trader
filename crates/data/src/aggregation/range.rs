@@ -45,6 +45,33 @@ pub const RANGE_BAR_DEFAULT_TIME_ZONE: &str = "America/New_York";
 /// The default daily range bar boundary, as an offset from local midnight (18:00).
 pub const RANGE_BAR_DEFAULT_BOUNDARY: SignedDuration = SignedDuration::from_hours(18);
 
+/// Returns the first daily boundary strictly after `ts`, where the boundary is `offset` from local
+/// midnight in `time_zone`.
+pub(super) fn next_daily_boundary_after(
+    time_zone: &TimeZone,
+    offset: SignedDuration,
+    ts: UnixNanos,
+) -> UnixNanos {
+    let now = ts.to_datetime_utc();
+    let mut date = time_zone.to_datetime(now).date();
+
+    loop {
+        let civil = date
+            .at(0, 0, 0, 0)
+            .checked_add(offset)
+            .expect("valid range bar boundary");
+        let boundary = time_zone
+            .to_timestamp(civil)
+            .expect("valid range bar boundary");
+
+        if boundary > now {
+            return UnixNanos::from(boundary);
+        }
+
+        date = date.tomorrow().expect("valid range bar boundary date");
+    }
+}
+
 /// Provides a means of building range bars, following the `DeepCharts` convention.
 ///
 /// The range is the bar specification step multiplied by the instrument price increment. An
@@ -131,25 +158,7 @@ impl DeepChartsRangeBarAggregator {
 
     /// Returns the first daily boundary strictly after `ts`.
     fn next_boundary_after(&self, ts: UnixNanos) -> UnixNanos {
-        let now = ts.to_datetime_utc();
-        let mut date = self.time_zone.to_datetime(now).date();
-
-        loop {
-            let civil = date
-                .at(0, 0, 0, 0)
-                .checked_add(self.boundary_offset)
-                .expect("valid range bar boundary");
-            let boundary = self
-                .time_zone
-                .to_timestamp(civil)
-                .expect("valid range bar boundary");
-
-            if boundary > now {
-                return UnixNanos::from(boundary);
-            }
-
-            date = date.tomorrow().expect("valid range bar boundary date");
-        }
+        next_daily_boundary_after(&self.time_zone, self.boundary_offset, ts)
     }
 
     /// Completes the forming bar at the pending boundary once `now` reaches it, then schedules
