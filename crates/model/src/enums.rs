@@ -362,6 +362,8 @@ pub enum BarAggregation {
     Renko = 18,
     /// Based on a fixed price range (high minus low) measured in ticks.
     Range = 19,
+    /// Based on a fixed price range (high minus low) measured in ticks, including the completing update.
+    RangeInclusive = 20,
 }
 
 /// The interval type for bar aggregation.
@@ -2751,6 +2753,7 @@ mod tests {
         "BarAggregation::Minute=MINUTE",
         "BarAggregation::Month=MONTH",
         "BarAggregation::Range=RANGE",
+        "BarAggregation::RangeInclusive=RANGE_INCLUSIVE",
         "BarAggregation::Renko=RENKO",
         "BarAggregation::Second=SECOND",
         "BarAggregation::Tick=TICK",
