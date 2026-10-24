@@ -250,6 +250,7 @@ impl sqlx::Encode<'_, sqlx::Postgres> for BarAggregationPg {
             BarAggregation::Year => "YEAR",
             BarAggregation::Renko => "RENKO",
             BarAggregation::Range => "RANGE",
+            BarAggregation::RangeInclusive => "RANGE_INCLUSIVE",
         };
         <&str as sqlx::Encode<sqlx::Postgres>>::encode(bar_aggregation_str, buf)
     }
@@ -418,6 +419,7 @@ mod tests {
     #[case(BarAggregation::Year, "YEAR")]
     #[case(BarAggregation::Renko, "RENKO")]
     #[case(BarAggregation::Range, "RANGE")]
+    #[case(BarAggregation::RangeInclusive, "RANGE_INCLUSIVE")]
     fn bar_aggregation_pg_encodes_postgres_labels(
         #[case] value: BarAggregation,
         #[case] expected: &str,

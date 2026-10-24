@@ -1515,6 +1515,7 @@ mod tests {
     #[case(BarAggregation::ValueRuns)]
     #[case(BarAggregation::Renko)]
     #[case(BarAggregation::Range)]
+    #[case(BarAggregation::RangeInclusive)]
     fn test_bar_specification_new_checked_allows_non_periodic_steps(
         #[case] aggregation: BarAggregation,
     ) {
@@ -1892,6 +1893,20 @@ mod tests {
         assert_eq!(
             bar_type.spec(),
             BarSpecification::new(40, BarAggregation::Range, PriceType::Last)
+        );
+        assert_eq!(bar_type.aggregation_source(), AggregationSource::Internal);
+        assert!(!bar_type.spec().is_time_aggregated());
+        assert_eq!(bar_type.to_string(), input);
+    }
+
+    #[rstest]
+    fn test_bar_type_parse_range_inclusive() {
+        let input = "MNQZ5.XCME-40-RANGE_INCLUSIVE-LAST-INTERNAL";
+        let bar_type = BarType::from(input);
+
+        assert_eq!(
+            bar_type.spec(),
+            BarSpecification::new(40, BarAggregation::RangeInclusive, PriceType::Last)
         );
         assert_eq!(bar_type.aggregation_source(), AggregationSource::Internal);
         assert!(!bar_type.spec().is_time_aggregated());
