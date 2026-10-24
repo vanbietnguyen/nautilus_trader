@@ -1085,6 +1085,56 @@ fn test_decode_tbbo_msg() {
 }
 
 #[rstest]
+fn test_decode_record_with_config_stamps_exchange_ts_event() {
+    let path = test_data_path().join("test_data.tbbo.dbn.zst");
+    let mut dbn_stream = Decoder::from_zstd_file(path)
+        .unwrap()
+        .decode_stream::<dbn::Mbp1Msg>();
+    let msg = dbn_stream.next().unwrap().unwrap();
+    assert_ne!(
+        msg.hd.ts_event, msg.ts_recv,
+        "fixture must carry distinct stamps"
+    );
+    let record_ref = dbn::RecordRef::from(msg);
+    let instrument_id = InstrumentId::from("ESM4.GLBX");
+    let exchange = DatabentoDecodeConfig {
+        ts_event_source: TsEventSource::Exchange,
+        ..DatabentoDecodeConfig::default()
+    };
+
+    let (quote, trade) = decode_record_with_config(
+        &record_ref,
+        instrument_id,
+        2,
+        None,
+        true,
+        true,
+        Some(&exchange),
+    )
+    .unwrap();
+    let (Some(Data::Quote(quote)), Some(Data::Trade(trade))) = (quote, trade) else {
+        panic!("expected a quote and a trade");
+    };
+    assert_eq!(quote.ts_event, msg.hd.ts_event);
+    assert_eq!(trade.ts_event, msg.hd.ts_event);
+    assert_eq!(quote.ts_init, msg.ts_recv);
+    assert_eq!(trade.ts_init, msg.ts_recv);
+
+    // The default config and no config keep the receive time
+    for config in [None, Some(&DatabentoDecodeConfig::default())] {
+        let (quote, trade) =
+            decode_record_with_config(&record_ref, instrument_id, 2, None, true, true, config)
+                .unwrap();
+        let (Some(Data::Quote(quote)), Some(Data::Trade(trade))) = (quote, trade) else {
+            panic!("expected a quote and a trade");
+        };
+        assert_eq!(quote.ts_event, msg.ts_recv);
+        assert_eq!(trade.ts_event, msg.ts_recv);
+        assert_eq!(trade.ts_init, msg.ts_recv);
+    }
+}
+
+#[rstest]
 fn test_decode_ohlcv_msg() {
     let path = test_data_path().join("test_data.ohlcv-1s.dbn.zst");
     let mut dbn_stream = Decoder::from_zstd_file(path)

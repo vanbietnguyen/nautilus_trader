@@ -28,9 +28,12 @@ use nautilus_model::{
     identifiers::{InstrumentId, TradeId},
 };
 
-use super::primitives::{
-    decode_price_or_undef, decode_quantity, parse_aggressor_side, parse_book_action,
-    parse_optional_bool, parse_order_side, parse_status_reason, parse_status_trading_event,
+use super::{
+    expiration::{DatabentoDecodeConfig, TsEventSource},
+    primitives::{
+        decode_price_or_undef, decode_quantity, parse_aggressor_side, parse_book_action,
+        parse_optional_bool, parse_order_side, parse_status_reason, parse_status_trading_event,
+    },
 };
 
 const STEP_ONE: NonZeroUsize = NonZeroUsize::new(1).unwrap();
@@ -870,6 +873,57 @@ pub fn decode_record(
     };
 
     Ok(result)
+}
+
+/// Decodes a market data record like [`decode_record`], applying `config`.
+///
+/// With [`TsEventSource::Exchange`] the decoded quotes, trades, book deltas and book depth carry the
+/// record header `ts_event` (exchange matching-engine time) as `ts_event` instead of `ts_recv`.
+/// `ts_init` is unchanged (the given `ts_init`, else `ts_recv`), and bars keep their bar-time
+/// stamping. A header `ts_event` of `UNDEF_TIMESTAMP` leaves the record on `ts_recv`.
+/// A `config` of `None` behaves as [`decode_record`].
+///
+/// # Errors
+///
+/// Returns an error if decoding the record type fails or encounters unsupported message.
+pub fn decode_record_with_config(
+    record: &dbn::RecordRef,
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    ts_init: Option<UnixNanos>,
+    include_trades: bool,
+    bars_timestamp_on_close: bool,
+    config: Option<&DatabentoDecodeConfig>,
+) -> anyhow::Result<(Option<Data>, Option<Data>)> {
+    let (first, second) = decode_record(
+        record,
+        instrument_id,
+        price_precision,
+        ts_init,
+        include_trades,
+        bars_timestamp_on_close,
+    )?;
+
+    let exchange_ts = config
+        .filter(|config| config.ts_event_source == TsEventSource::Exchange)
+        .map(|_| record.header().ts_event)
+        .filter(|ts| *ts != dbn::UNDEF_TIMESTAMP);
+    let Some(ts) = exchange_ts else {
+        return Ok((first, second));
+    };
+
+    let ts_event = UnixNanos::from(ts);
+    let restamp = |mut data: Data| {
+        match &mut data {
+            Data::Quote(quote) => quote.ts_event = ts_event,
+            Data::Trade(trade) => trade.ts_event = ts_event,
+            Data::BookDelta(delta) => delta.ts_event = ts_event,
+            Data::BookDepth(depth) => depth.ts_event = ts_event,
+            _ => {}
+        }
+        data
+    };
+    Ok((first.map(restamp), second.map(restamp)))
 }
 
 const fn determine_timestamp(ts_init: Option<UnixNanos>, msg_timestamp: UnixNanos) -> UnixNanos {

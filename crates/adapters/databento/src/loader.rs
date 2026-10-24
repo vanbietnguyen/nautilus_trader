@@ -35,8 +35,8 @@ use nautilus_model::{
 
 use super::{
     decode::{
-        MboDeltaBuffer, decode_imbalance_msg, decode_mbo_msg, decode_record, decode_statistics_msg,
-        decode_status_msg, is_supported_stat_type,
+        MboDeltaBuffer, decode_imbalance_msg, decode_mbo_msg, decode_record_with_config,
+        decode_statistics_msg, decode_status_msg, is_supported_stat_type,
     },
     symbology::decode_nautilus_instrument_id,
     types::{DatabentoImbalance, DatabentoPublisher, DatabentoStatistics, Dataset, PublisherId},
@@ -328,6 +328,35 @@ impl DatabentoDataLoader {
     where
         T: dbn::Record + dbn::HasRType + 'static,
     {
+        self.read_records_with_config::<T>(
+            filepath,
+            instrument_id,
+            price_precision,
+            include_trades,
+            bars_timestamp_on_close,
+            None,
+        )
+    }
+
+    /// Reads and decodes market data records from a DBN file, applying `decode_config`
+    /// (see [`decode_record_with_config`]). A `decode_config` of `None` behaves as
+    /// [`Self::read_records`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading records fails.
+    pub fn read_records_with_config<'a, T>(
+        &'a self,
+        filepath: &Path,
+        instrument_id: Option<InstrumentId>,
+        price_precision: Option<u8>,
+        include_trades: bool,
+        bars_timestamp_on_close: Option<bool>,
+        decode_config: Option<&'a DatabentoDecodeConfig>,
+    ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<(Option<Data>, Option<Data>)>> + 'a>
+    where
+        T: dbn::Record + dbn::HasRType + 'static,
+    {
         let decoder = Decoder::from_zstd_file(filepath)?;
         let mut metadata_cache = if instrument_id.is_none() {
             Some(MetadataCache::new(decoder.metadata().clone()))
@@ -354,13 +383,14 @@ impl DatabentoDataLoader {
                         fixed_instrument_id,
                         &mut fixed_price_precision,
                     )?;
-                    let (item1, item2) = decode_record(
+                    let (item1, item2) = decode_record_with_config(
                         &record,
                         instrument_id,
                         resolved_precision,
                         None,
                         include_trades,
                         bars_timestamp_on_close.unwrap_or(true),
+                        decode_config,
                     )?;
                     Ok(Some((item1, item2)))
                 } else {

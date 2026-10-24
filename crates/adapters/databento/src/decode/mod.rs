@@ -51,7 +51,9 @@ mod market_data;
 mod primitives;
 
 pub use custom::{decode_imbalance_msg, decode_statistics_msg, is_supported_stat_type};
-pub use expiration::{DatabentoDecodeConfig, OptionExpirationRule, corrected_option_expiration};
+pub use expiration::{
+    DatabentoDecodeConfig, OptionExpirationRule, TsEventSource, corrected_option_expiration,
+};
 pub use instruments::{
     decode_equity, decode_futures_contract, decode_futures_spread, decode_instrument_def_msg,
     decode_option_contract, decode_option_spread,
@@ -59,8 +61,9 @@ pub use instruments::{
 pub(crate) use market_data::MboDeltaBuffer;
 pub use market_data::{
     decode_bar_type, decode_bbo_msg, decode_cbbo_msg, decode_cmbp1_msg, decode_mbo_msg,
-    decode_mbp1_msg, decode_mbp10_msg, decode_ohlcv_msg, decode_record, decode_status_msg,
-    decode_tbbo_msg, decode_tcbbo_msg, decode_trade_msg, decode_ts_event_adjustment,
+    decode_mbp1_msg, decode_mbp10_msg, decode_ohlcv_msg, decode_record, decode_record_with_config,
+    decode_status_msg, decode_tbbo_msg, decode_tcbbo_msg, decode_trade_msg,
+    decode_ts_event_adjustment,
 };
 pub use primitives::{
     decode_lot_size, decode_multiplier, decode_optional_price, decode_optional_quantity,
