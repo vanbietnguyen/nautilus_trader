@@ -15,7 +15,7 @@
 
 //! Bar aggregation machinery.
 //!
-//! Defines the `BarAggregator` trait and core aggregation types (tick, volume, value, time),
+//! Defines the `BarAggregator` trait and core aggregation types (tick, volume, value, time, range),
 //! along with the `BarBuilder` and `BarAggregatorCore` components for constructing bars.
 
 use std::{
@@ -55,6 +55,12 @@ use nautilus_model::{
     },
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
+
+mod range;
+
+pub use range::{
+    DeepChartsRangeBarAggregator, RANGE_BAR_DEFAULT_BOUNDARY, RANGE_BAR_DEFAULT_TIME_ZONE,
+};
 
 /// Type alias for bar handler to reduce type complexity.
 type BarHandler = Box<dyn FnMut(Bar)>;
