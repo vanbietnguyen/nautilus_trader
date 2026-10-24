@@ -159,7 +159,8 @@ use crate::defi::engine as _;
 use crate::engine::pool::PoolUpdater;
 use crate::{
     aggregation::{
-        BarAggregator, RenkoBarAggregator, SpreadQuoteAggregator, TickBarAggregator,
+        BarAggregator, DeepChartsRangeBarAggregator, RANGE_BAR_DEFAULT_BOUNDARY,
+        RANGE_BAR_DEFAULT_TIME_ZONE, RenkoBarAggregator, SpreadQuoteAggregator, TickBarAggregator,
         TickImbalanceBarAggregator, TickRunsBarAggregator, TimeBarAggregator, ValueBarAggregator,
         ValueImbalanceBarAggregator, ValueRunsBarAggregator, VolumeBarAggregator,
         VolumeImbalanceBarAggregator, VolumeRunsBarAggregator,
@@ -466,7 +467,9 @@ impl DataEngine {
             // Request-scoped or historical aggregators run on private clocks;
             // re-arming them here would perturb an in-flight request's timer state
             let is_subscription = request_id.is_none() && !aggregator.borrow().is_historical();
-            if is_subscription && aggregator.borrow().bar_type().spec().is_time_aggregated() {
+            let spec = aggregator.borrow().bar_type().spec();
+            let has_timer = spec.is_time_aggregated() || spec.aggregation == BarAggregation::Range;
+            if is_subscription && has_timer {
                 aggregator
                     .borrow_mut()
                     .start_timer(Some(Rc::clone(aggregator)));

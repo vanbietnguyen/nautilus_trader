@@ -26,8 +26,9 @@ use nautilus_model::data::{Bar, BarType, QuoteTick, TradeTick};
 
 use super::{
     AggregationSource, BAR_AGGREGATOR_PRIORITY, BarAggregation, BarAggregator, BarBarHandler,
-    BarQuoteHandler, BarTradeHandler, DataCommand, DataEngine, DataResponse, Instrument,
-    InstrumentAny, PriceType, Rc, RefCell, RenkoBarAggregator, RequestBarAggregation,
+    BarQuoteHandler, BarTradeHandler, DataCommand, DataEngine, DataResponse,
+    DeepChartsRangeBarAggregator, Instrument, InstrumentAny, PriceType, RANGE_BAR_DEFAULT_BOUNDARY,
+    RANGE_BAR_DEFAULT_TIME_ZONE, Rc, RefCell, RenkoBarAggregator, RequestBarAggregation,
     RequestCommand, SubscribeQuotes, SubscribeTrades, TickBarAggregator,
     TickImbalanceBarAggregator, TickRunsBarAggregator, TimeBarAggregator, UnsubscribeBars,
     UnsubscribeCommand, UnsubscribeQuotes, UnsubscribeTrades, ValueBarAggregator,
@@ -510,6 +511,20 @@ impl DataEngine {
                     instrument.price_increment(),
                     handler,
                 )) as Box<dyn BarAggregator>,
+                BarAggregation::Range => Box::new(DeepChartsRangeBarAggregator::new(
+                    bar_type,
+                    price_precision,
+                    size_precision,
+                    instrument.price_increment(),
+                    time_zone,
+                    config
+                        .time_bars_origin_offset
+                        .get(&BarAggregation::Range)
+                        .map_or(RANGE_BAR_DEFAULT_BOUNDARY, |duration| {
+                            jiff::SignedDuration::try_from(*duration).unwrap_or_default()
+                        }),
+                    handler,
+                )) as Box<dyn BarAggregator>,
                 other => unreachable!(
                     "Unsupported internal bar aggregation dispatch for {other:?}; update `create_bar_aggregator`"
                 ),
@@ -528,8 +543,20 @@ impl DataEngine {
 
         let time_zone = match time_zone {
             Some(zone) => zone,
-            None => get_timezone(self.config.time_bars_time_zone.as_deref().unwrap_or("UTC"))
-                .context("invalid `time_bars_time_zone` configuration")?,
+            None => {
+                let default_zone = if bar_type.spec().aggregation == BarAggregation::Range {
+                    RANGE_BAR_DEFAULT_TIME_ZONE
+                } else {
+                    "UTC"
+                };
+                get_timezone(
+                    self.config
+                        .time_bars_time_zone
+                        .as_deref()
+                        .unwrap_or(default_zone),
+                )
+                .context("invalid `time_bars_time_zone` configuration")?
+            }
         };
 
         if let Some(aggregator) = self.bar_aggregators.get(&key) {
@@ -806,6 +833,12 @@ impl DataEngine {
                     .borrow_mut()
                     .start_timer(Some(Rc::clone(aggregator)));
             }
+        } else if bar_type.spec().aggregation == BarAggregation::Range && !historical {
+            // Range aggregators arm their completion alerts on the engine clock
+            aggregator.borrow_mut().set_clock(Rc::clone(&self.clock));
+            aggregator
+                .borrow_mut()
+                .start_timer(Some(Rc::clone(aggregator)));
         }
 
         Ok(())
