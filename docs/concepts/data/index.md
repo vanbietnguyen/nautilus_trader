@@ -109,6 +109,7 @@ NautilusTrader supports these aggregation methods:
 | `VALUE_IMBALANCE`  | Buy/sell imbalance of notional trade value.               | Threshold   |
 | `VALUE_RUNS`       | Sequential buy/sell runs of notional trade value.         | Information |
 | `RENKO`            | Fixed price movements, with brick size measured in ticks. | Price       |
+| `RANGE`            | Fixed price range (high minus low), measured in ticks.    | Price       |
 | `MILLISECOND`      | Time intervals with millisecond granularity.              | Time        |
 | `SECOND`           | Time intervals with second granularity.                   | Time        |
 | `MINUTE`           | Time intervals with minute granularity.                   | Time        |
@@ -119,8 +120,8 @@ NautilusTrader supports these aggregation methods:
 | `YEAR`             | Time intervals with year granularity.                     | Time        |
 
 The threshold, information, and time categories follow the `BarSpecification` predicates. `RENKO`
-is price-driven and has no matching predicate. The broader information-driven concept below
-includes both imbalance and runs bars.
+and `RANGE` are price-driven and have no matching predicate. The broader information-driven
+concept below includes both imbalance and runs bars.
 
 ### Information-driven bars
 

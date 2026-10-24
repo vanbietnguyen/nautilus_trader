@@ -360,6 +360,8 @@ pub enum BarAggregation {
     Year = 17,
     /// Based on fixed price movements (brick size).
     Renko = 18,
+    /// Based on a fixed price range (high minus low) measured in ticks.
+    Range = 19,
 }
 
 /// The interval type for bar aggregation.
@@ -2748,6 +2750,7 @@ mod tests {
         "BarAggregation::Millisecond=MILLISECOND",
         "BarAggregation::Minute=MINUTE",
         "BarAggregation::Month=MONTH",
+        "BarAggregation::Range=RANGE",
         "BarAggregation::Renko=RENKO",
         "BarAggregation::Second=SECOND",
         "BarAggregation::Tick=TICK",
