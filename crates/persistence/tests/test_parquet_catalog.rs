@@ -44,6 +44,7 @@ use nautilus_persistence::{
         paths::{make_object_store_path, timestamps_to_filename, urisafe_instrument_id},
     },
     catalog::{
+        session::DataBatchQueryResult,
         traits::{
             CatalogInstrumentQuery, CatalogQuery, CatalogReader, CatalogRecordQuery, CatalogWriter,
         },
@@ -7221,6 +7222,242 @@ fn typed_session_reports_decode_failure_instead_of_exhaustion() {
 
     assert_eq!(error.to_string(), "Missing metadata key: `instrument_id`");
     assert!(session.next_batch().unwrap().is_none());
+}
+
+fn per_file_quote_query() -> CatalogQuery {
+    CatalogQuery::new(NautilusDataType::QuoteTick).with_params(Some(Params::new(
+        [("optimize_file_loading".to_string(), false.into())].into(),
+    )))
+}
+
+fn next_quotes(session: &mut DataBatchQueryResult) -> anyhow::Result<Option<Vec<QuoteTick>>> {
+    match session.next_batch()? {
+        Some(DataBatch::Quote(rows)) => Ok(Some(rows.as_ref().to_vec())),
+        Some(_) => anyhow::bail!("expected quote batch"),
+        None => Ok(None),
+    }
+}
+
+fn quote_file_path(
+    directory: &TempDir,
+    catalog: &ParquetDataCatalog,
+    ts: u64,
+) -> std::path::PathBuf {
+    let files = catalog
+        .query_files(
+            &NautilusDataType::QuoteTick.into(),
+            None,
+            Some(UnixNanos::from(ts)),
+            Some(UnixNanos::from(ts)),
+        )
+        .unwrap();
+    directory.path().join(&files[0])
+}
+
+#[rstest]
+fn per_file_session_reads_many_files_in_order_and_chunk_boundaries() {
+    let (_directory, mut catalog) = create_temp_catalog();
+    let mut expected = Vec::new();
+
+    for session in 0..40_u64 {
+        let rows = [0, 1, 1].map(|offset| create_quote_tick(1_000 * (session + 1) + offset));
+        catalog.write_to_parquet(&rows, None, None, None).unwrap();
+        expected.extend(rows);
+    }
+
+    let mut session =
+        CatalogReader::query_batch_session(&mut catalog, &per_file_quote_query(), Some(2)).unwrap();
+    let mut batches = Vec::new();
+    while let Some(rows) = next_quotes(&mut session).unwrap() {
+        batches.push(rows);
+    }
+
+    // Each file's equal timestamps stay in one chunk: [t, t+1, t+1] splits as [t, t+1, t+1]
+    assert!(batches.iter().all(|rows| rows.len() == 3));
+    assert_eq!(batches.concat(), expected);
+}
+
+#[rstest]
+fn per_file_session_merges_identifiers_and_keeps_equal_timestamps_together() {
+    let (_directory, mut catalog) = create_temp_catalog();
+    let first = [10, 30, 30, 50].map(create_quote_tick).to_vec();
+    let second = [20_u64, 30, 40]
+        .map(|ts| {
+            QuoteTick::new(
+                InstrumentId::from("GBP/USD.SIM"),
+                Price::from("1.25001"),
+                Price::from("1.25003"),
+                Quantity::from("200"),
+                Quantity::from("300"),
+                UnixNanos::from(ts),
+                UnixNanos::from(ts),
+            )
+        })
+        .to_vec();
+    catalog.write_to_parquet(&first, None, None, None).unwrap();
+    catalog.write_to_parquet(&second, None, None, None).unwrap();
+
+    let mut session =
+        CatalogReader::query_batch_session(&mut catalog, &per_file_quote_query(), Some(2)).unwrap();
+
+    for rows in [
+        vec![first[0], second[0]],
+        vec![first[1], first[2], second[1]],
+        vec![second[2], first[3]],
+    ] {
+        assert_eq!(next_quotes(&mut session).unwrap().unwrap(), rows);
+    }
+    assert!(next_quotes(&mut session).unwrap().is_none());
+}
+
+#[rstest]
+fn per_file_session_rejects_rows_before_an_overridden_filename_start() {
+    let (_directory, mut catalog) = create_temp_catalog();
+    let rows = [10, 20].map(create_quote_tick);
+    catalog
+        .write_to_parquet(&rows, Some(UnixNanos::from(15)), None, None)
+        .unwrap();
+
+    let mut session =
+        CatalogReader::query_batch_session(&mut catalog, &per_file_quote_query(), None).unwrap();
+    let error = next_quotes(&mut session).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .ends_with("returned ts_init 10 before its declared start 15"),
+        "{error}"
+    );
+
+    // Directory tables declare no start, so the default query still reads the file
+    let query = CatalogQuery::new(NautilusDataType::QuoteTick);
+    let mut session = CatalogReader::query_batch_session(&mut catalog, &query, None).unwrap();
+    assert_eq!(next_quotes(&mut session).unwrap().unwrap(), rows.to_vec());
+}
+
+#[rstest]
+fn per_file_session_accepts_first_rows_after_the_filename_start() {
+    let (_directory, mut catalog) = create_temp_catalog();
+    let early = [10, 20].map(create_quote_tick);
+    let late = [30, 40].map(create_quote_tick);
+    catalog.write_to_parquet(&early, None, None, None).unwrap();
+    catalog
+        .write_to_parquet(&late, Some(UnixNanos::from(25)), None, None)
+        .unwrap();
+
+    let mut session =
+        CatalogReader::query_batch_session(&mut catalog, &per_file_quote_query(), None).unwrap();
+
+    assert_eq!(
+        next_quotes(&mut session).unwrap().unwrap(),
+        [early, late].concat()
+    );
+}
+
+#[rstest]
+fn per_file_session_drains_leading_and_inner_empty_files() {
+    let (directory, mut catalog) = create_temp_catalog();
+    let rows = [30, 40].map(create_quote_tick);
+    catalog.write_to_parquet(&rows, None, None, None).unwrap();
+    let parent = quote_file_path(&directory, &catalog, 30)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let schema_batch = QuoteTick::encode_batch(&QuoteTick::chunk_metadata(&rows), &rows).unwrap();
+
+    for (start, end) in [(10, 20), (32, 35)] {
+        let path = parent.join(timestamps_to_filename(
+            UnixNanos::from(start),
+            UnixNanos::from(end),
+        ));
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            fs::File::create(path).unwrap(),
+            schema_batch.schema(),
+            None,
+        )
+        .unwrap();
+        writer.write(&schema_batch.slice(0, 0)).unwrap();
+        writer.close().unwrap();
+    }
+
+    let mut session =
+        CatalogReader::query_batch_session(&mut catalog, &per_file_quote_query(), None).unwrap();
+
+    assert_eq!(next_quotes(&mut session).unwrap().unwrap(), rows.to_vec());
+    assert!(next_quotes(&mut session).unwrap().is_none());
+}
+
+#[rstest]
+#[case::corrupt_file(false)]
+#[case::removed_after_listing(true)]
+fn per_file_session_fails_on_the_pull_that_reaches_an_unreadable_file(#[case] remove: bool) {
+    let directory = TempDir::new().unwrap();
+    let mut catalog = ParquetDataCatalog::new(directory.path(), None, Some(1), None, None);
+    let first = [10, 11].map(create_quote_tick);
+    catalog.write_to_parquet(&first, None, None, None).unwrap();
+    for ts in [20, 30] {
+        catalog
+            .write_to_parquet(&[create_quote_tick(ts)], None, None, None)
+            .unwrap();
+    }
+    let unreadable = quote_file_path(&directory, &catalog, 20);
+    if !remove {
+        fs::write(&unreadable, b"not parquet").unwrap();
+    }
+
+    let mut session =
+        CatalogReader::query_batch_session(&mut catalog, &per_file_quote_query(), Some(1)).unwrap();
+    if remove {
+        fs::remove_file(&unreadable).unwrap();
+    }
+
+    assert_eq!(next_quotes(&mut session).unwrap().unwrap(), vec![first[0]]);
+    assert!(next_quotes(&mut session).is_err());
+    assert!(next_quotes(&mut session).unwrap().is_none());
+}
+
+#[rstest]
+fn per_file_session_survives_catalog_reset_and_drop() {
+    let directory = TempDir::new().unwrap();
+    let mut catalog = ParquetDataCatalog::new(directory.path(), None, Some(1), None, None);
+    let rows = [10, 20, 30].map(create_quote_tick);
+    for row in rows {
+        catalog.write_to_parquet(&[row], None, None, None).unwrap();
+    }
+
+    let mut session =
+        CatalogReader::query_batch_session(&mut catalog, &per_file_quote_query(), Some(1)).unwrap();
+    let mut read = next_quotes(&mut session).unwrap().unwrap();
+    CatalogReader::reset_session(&mut catalog);
+    read.extend(next_quotes(&mut session).unwrap().unwrap());
+    drop(catalog);
+
+    while let Some(rows) = next_quotes(&mut session).unwrap() {
+        read.extend(rows);
+    }
+
+    assert_eq!(read, rows.to_vec());
+}
+
+#[rstest]
+fn per_file_session_opens_files_without_timestamped_names_first() {
+    let (directory, mut catalog) = create_temp_catalog();
+    catalog
+        .write_to_parquet(&[create_quote_tick(10)], None, None, None)
+        .unwrap();
+    catalog
+        .write_to_parquet(&[create_quote_tick(20)], None, None, None)
+        .unwrap();
+    let later = quote_file_path(&directory, &catalog, 20);
+    fs::rename(&later, later.with_file_name("quote.parquet")).unwrap();
+
+    let mut session =
+        CatalogReader::query_batch_session(&mut catalog, &per_file_quote_query(), None).unwrap();
+
+    assert_eq!(
+        next_quotes(&mut session).unwrap().unwrap(),
+        [10, 20].map(create_quote_tick).to_vec()
+    );
 }
 
 #[rstest]

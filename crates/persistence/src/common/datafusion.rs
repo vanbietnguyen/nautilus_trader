@@ -217,20 +217,7 @@ impl DataBackendSession {
             return Ok(());
         }
 
-        // Catalog files are written in ascending ts_init order, declaring it lets files without
-        // sorting metadata skip a sort that can reorder rows with equal ts_init.
-        let parquet_options = ParquetReadOptions::<'_> {
-            skip_metadata: Some(false),
-            file_sort_order: vec![vec![col("ts_init").sort(true, false)]],
-            ..Default::default()
-        };
-
-        let dataframe =
-            block_on_nautilus_with(|| self.session_ctx.read_parquet(file_paths, parquet_options))?;
-
-        validate_catalog_schema(dataframe.schema().as_arrow())?;
-        self.session_ctx
-            .register_table(table_name, dataframe.into_view())?;
+        register_parquet_files(&self.session_ctx, table_name, file_paths)?;
         self.registered_tables.insert(table_name.to_string());
         Ok(())
     }
@@ -240,10 +227,7 @@ impl DataBackendSession {
         table_name: &str,
         sql_query: Option<&str>,
     ) -> Result<SendableRecordBatchStream> {
-        let default_query = format!("SELECT * FROM {table_name} ORDER BY ts_init");
-        let sql_query = sql_query.unwrap_or(&default_query);
-        let query = block_on_nautilus_with(|| self.session_ctx.sql(sql_query))?;
-        block_on_nautilus_with(|| query.execute_stream())
+        execute_table_query(&self.session_ctx, table_name, sql_query)
     }
 
     /// Clears all registered tables.
@@ -256,6 +240,118 @@ impl DataBackendSession {
         // Create a new session context to completely reset the DataFusion state
         self.session_ctx = SessionContext::new_with_config(session_config());
     }
+
+    /// Returns an opener that registers and streams tables on this session's current context
+    /// after the caller has moved on, such as after the session is reset.
+    pub(crate) fn table_opener(&self) -> TableOpener {
+        TableOpener {
+            session_ctx: self.session_ctx.clone(),
+            runtime: self.runtime.clone(),
+        }
+    }
+}
+
+/// Registers and streams one Parquet table at a time on a retained session context.
+#[derive(Clone)]
+pub(crate) struct TableOpener {
+    session_ctx: SessionContext,
+    runtime: tokio::runtime::Handle,
+}
+
+impl TableOpener {
+    /// Registers `file_paths` as `table_name` unless it is already registered, runs `sql_query`
+    /// over it and streams the decoded items from a prefetching task.
+    ///
+    /// The table is deregistered when the returned stream is dropped, or when opening fails.
+    pub(crate) fn open<S>(
+        &self,
+        table_name: &str,
+        file_paths: Vec<String>,
+        sql_query: &str,
+        decode: impl FnOnce(SendableRecordBatchStream) -> S,
+    ) -> anyhow::Result<TableBatchStream<S::Item>>
+    where
+        S: Stream + Send + 'static,
+        S::Item: Send + 'static,
+    {
+        if !self.session_ctx.table_exist(table_name)? {
+            register_parquet_files(&self.session_ctx, table_name, file_paths)?;
+        }
+
+        let registration = TableRegistration {
+            session_ctx: self.session_ctx.clone(),
+            table_name: table_name.to_string(),
+        };
+        let stream = execute_table_query(&self.session_ctx, table_name, Some(sql_query))?;
+
+        Ok(TableBatchStream {
+            stream: BlockingBatchStream::from_stream_with_runtime(decode(stream), &self.runtime),
+            _registration: registration,
+        })
+    }
+}
+
+/// A blocking stream over one registered table, deregistering the table when dropped.
+pub(crate) struct TableBatchStream<T> {
+    // Declared first so the producer stops before the table is deregistered
+    stream: BlockingBatchStream<T>,
+    _registration: TableRegistration,
+}
+
+impl<T: Send> Iterator for TableBatchStream<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.stream.next()
+    }
+}
+
+struct TableRegistration {
+    session_ctx: SessionContext,
+    table_name: String,
+}
+
+impl Drop for TableRegistration {
+    fn drop(&mut self) {
+        if let Err(e) = self.session_ctx.deregister_table(self.table_name.as_str()) {
+            log::warn!(
+                "Failed to deregister catalog table {}: {e}",
+                self.table_name
+            );
+        }
+    }
+}
+
+fn register_parquet_files(
+    session_ctx: &SessionContext,
+    table_name: &str,
+    file_paths: Vec<String>,
+) -> anyhow::Result<()> {
+    // Catalog files are written in ascending ts_init order, declaring it lets files without
+    // sorting metadata skip a sort that can reorder rows with equal ts_init.
+    let parquet_options = ParquetReadOptions::<'_> {
+        skip_metadata: Some(false),
+        file_sort_order: vec![vec![col("ts_init").sort(true, false)]],
+        ..Default::default()
+    };
+
+    let dataframe =
+        block_on_nautilus_with(|| session_ctx.read_parquet(file_paths, parquet_options))?;
+
+    validate_catalog_schema(dataframe.schema().as_arrow())?;
+    session_ctx.register_table(table_name, dataframe.into_view())?;
+    Ok(())
+}
+
+fn execute_table_query(
+    session_ctx: &SessionContext,
+    table_name: &str,
+    sql_query: Option<&str>,
+) -> Result<SendableRecordBatchStream> {
+    let default_query = format!("SELECT * FROM {table_name} ORDER BY ts_init");
+    let sql_query = sql_query.unwrap_or(&default_query);
+    let query = block_on_nautilus_with(|| session_ctx.sql(sql_query))?;
+    block_on_nautilus_with(|| query.execute_stream())
 }
 
 fn is_schema_merge_error(error: &anyhow::Error) -> bool {

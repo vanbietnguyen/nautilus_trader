@@ -2135,6 +2135,59 @@ fn test_run_streaming_ends_engine_when_a_later_chunk_fails_to_load(
 }
 
 #[rstest]
+fn test_run_streaming_fails_when_replay_reaches_an_unreadable_later_file(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+) {
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+
+    // The first file fills more than two default catalog pages, so the second file opens only
+    // after the first page has replayed
+    let (temp_dir, catalog_path) = create_catalog_with_quotes(&instrument, 20_001, 1_000_000_000);
+    let catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
+    let later = UnixNanos::from(31_000_000_000_000);
+    let quote = QuoteTick::new(
+        instrument_id,
+        Price::from("1000.00"),
+        Price::from("1000.10"),
+        Quantity::from("1.000"),
+        Quantity::from("1.000"),
+        later,
+        later,
+    );
+    catalog
+        .write_to_parquet(&[quote], None, None, None)
+        .unwrap();
+    let files = catalog
+        .query_files(
+            &NautilusDataType::QuoteTick.into(),
+            None,
+            Some(later),
+            Some(later),
+        )
+        .unwrap();
+    std::fs::write(temp_dir.path().join(&files[0]), b"not parquet").unwrap();
+
+    let config = BacktestRunConfig::builder()
+        .venues(vec![binance_venue_config()])
+        .data(vec![data_config(&catalog_path, instrument_id)])
+        .chunk_size(5_000)
+        .raise_exception(true)
+        .build()
+        .unwrap();
+    let config_id = config.id().to_string();
+    let mut node = BacktestNode::new(vec![config]).unwrap();
+
+    let result = node.run();
+
+    let engine = node.get_engine(&config_id).unwrap();
+    assert!(result.is_err());
+    assert_eq!(engine.iteration(), 10_000);
+    assert!(engine.kernel().trader.borrow().is_stopped());
+    assert!(engine.get_result().run_finished.is_some());
+}
+
+#[rstest]
 fn test_run_streaming_leaves_engine_unstarted_when_the_first_chunk_fails_to_load(
     crypto_perpetual_ethusdt: CryptoPerpetual,
 ) {
