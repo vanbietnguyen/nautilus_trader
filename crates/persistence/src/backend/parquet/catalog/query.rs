@@ -37,7 +37,7 @@ use super::{
     is_monotonically_increasing_by_init, make_object_store_path, make_sql_safe_identifier,
     parquet_data_path_prefix, parse_filename_timestamps, query_intersects_filename,
     read_parquet_from_object_store, read_parquet_schema_from_object_store,
-    session::{MergedPages, TypedPages, decode_typed_pages},
+    session::{MergedPages, PendingPages, TypedPages, decode_typed_pages},
     urisafe_instrument_id,
 };
 use crate::{
@@ -488,21 +488,22 @@ impl ParquetDataCatalog {
 
         let tables =
             self.resolve_tables_for_datafusion("parquet", &files, optimize_file_loading)?;
+        let opener = self.session.table_opener();
         let mut sources = Vec::with_capacity(tables.len());
         for table in tables {
+            // A file table opens when the merge reaches its filename start; a directory table
+            // (or a file without a timestamped name) opens before the first row
+            let first_ts =
+                parse_filename_timestamps(&table.path).map(|(ts, _)| UnixNanos::from(ts));
             let sql = build_query(&table.name, start, end, where_clause);
-            let stream = self.session.parquet_files_batch_stream(
-                &table.name,
-                vec![table.path],
-                Some(&sql),
-            )?;
-            let pages = decode_typed_pages::<T>(stream);
-            sources.push(
-                Box::new(datafusion::BlockingBatchStream::from_stream_with_runtime(
-                    pages,
-                    &self.session.runtime,
-                )) as TypedPages<T>,
-            );
+            let opener = opener.clone();
+            let label = table.path.clone();
+            let open = move || {
+                let pages =
+                    opener.open(&table.name, vec![table.path], &sql, decode_typed_pages::<T>)?;
+                Ok(Box::new(pages) as TypedPages<T>)
+            };
+            sources.push(PendingPages::new(label, first_ts, Box::new(open)));
         }
 
         Ok(Box::new(MergedPages::new(sources, self.batch_size)))
@@ -1272,5 +1273,86 @@ fn display_batch_identifier(
     } else {
         catalog_identifier_from_metadata(batch.schema().metadata())
             .or_else(|| path_identifier.map(str::to_string))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_model::data::{QuoteTick, stubs::quote_audusd};
+    use rstest::rstest;
+    use tempfile::TempDir;
+
+    use super::{ParquetDataCatalog, UnixNanos};
+
+    fn quote(ts: u64) -> QuoteTick {
+        QuoteTick {
+            ts_event: UnixNanos::from(ts),
+            ts_init: UnixNanos::from(ts),
+            ..quote_audusd()
+        }
+    }
+
+    #[rstest]
+    fn typed_pages_register_each_file_table_only_while_it_is_read() {
+        let directory = TempDir::new().unwrap();
+        let mut catalog = ParquetDataCatalog::new(directory.path(), None, Some(1), None, None);
+        for ts in [10, 20, 30] {
+            catalog
+                .write_to_parquet(&[quote(ts), quote(ts + 1)], None, None, None)
+                .unwrap();
+        }
+
+        let pages = catalog
+            .query_typed_pages::<QuoteTick>(None, None, None, None, None, false)
+            .unwrap();
+        let context = catalog.session.session_ctx.clone();
+        let registered = || {
+            (0..3)
+                .map(|index| context.table_exist(format!("parquet_{index}")).unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(registered(), [false, false, false]);
+        let mut timeline = Vec::new();
+
+        for page in pages {
+            let page = page.unwrap();
+            timeline.push((page[0].ts_init.as_u64(), registered()));
+        }
+
+        assert_eq!(
+            timeline,
+            vec![
+                (10, vec![true, false, false]),
+                (11, vec![false, false, false]),
+                (20, vec![false, true, false]),
+                (21, vec![false, false, false]),
+                (30, vec![false, false, true]),
+                (31, vec![false, false, false]),
+            ]
+        );
+    }
+
+    #[rstest]
+    fn typed_pages_release_registered_tables_when_dropped() {
+        let directory = TempDir::new().unwrap();
+        let mut catalog = ParquetDataCatalog::new(directory.path(), None, Some(1), None, None);
+        for ts in [10, 20] {
+            catalog
+                .write_to_parquet(&[quote(ts), quote(ts + 1)], None, None, None)
+                .unwrap();
+        }
+
+        let mut pages = catalog
+            .query_typed_pages::<QuoteTick>(None, None, None, None, None, false)
+            .unwrap();
+        let context = catalog.session.session_ctx.clone();
+        pages.next().unwrap().unwrap();
+        assert!(context.table_exist("parquet_0").unwrap());
+
+        drop(pages);
+
+        assert!(!context.table_exist("parquet_0").unwrap());
+        assert!(!context.table_exist("parquet_1").unwrap());
     }
 }
