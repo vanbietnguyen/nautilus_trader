@@ -28,6 +28,7 @@ pub mod wma;
 pub mod zscore;
 
 use nautilus_model::enums::PriceType;
+use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumIter, EnumString, FromRepr};
 
 use crate::{
@@ -53,6 +54,8 @@ use crate::{
     FromRepr,
     EnumIter,
     EnumString,
+    Serialize,
+    Deserialize,
 )]
 #[strum(ascii_case_insensitive)]
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]

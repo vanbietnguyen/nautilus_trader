@@ -17,12 +17,13 @@ use std::{collections::VecDeque, fmt::Display};
 
 use nautilus_core::correctness::FAILED;
 use nautilus_model::data::Bar;
+use serde::{Deserialize, Serialize};
 
 use crate::{indicator::Indicator, support::MAX_PERIOD};
 
 /// Donchian channel over rolling high and low prices.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.indicators")
@@ -248,5 +249,27 @@ mod tests {
         assert_eq!(dc_10.lower, 0.0);
         assert!(!dc_10.has_inputs);
         assert!(!dc_10.initialized);
+    }
+
+    #[rstest]
+    fn test_serde_round_trip_continues_identically(mut dc_10: DonchianChannel) {
+        for i in 0..15 {
+            let mid = 100.0 + f64::from(i % 7) * 1.3;
+            dc_10.update_raw(mid + 0.8, mid - 0.6);
+        }
+
+        let bytes = rmp_serde::to_vec(&dc_10).unwrap();
+        let mut restored: DonchianChannel = rmp_serde::from_slice(&bytes).unwrap();
+
+        for i in 0..10 {
+            let mid = 104.0 - f64::from(i) * 0.9;
+            dc_10.update_raw(mid + 0.4, mid - 1.1);
+            restored.update_raw(mid + 0.4, mid - 1.1);
+
+            assert_eq!(restored.upper.to_bits(), dc_10.upper.to_bits());
+            assert_eq!(restored.middle.to_bits(), dc_10.middle.to_bits());
+            assert_eq!(restored.lower.to_bits(), dc_10.lower.to_bits());
+            assert_eq!(restored.initialized, dc_10.initialized);
+        }
     }
 }

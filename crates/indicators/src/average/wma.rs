@@ -20,6 +20,7 @@ use nautilus_model::{
     data::{Bar, QuoteTick, TradeTick},
     enums::PriceType,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     indicator::{Indicator, MovingAverage},
@@ -28,7 +29,7 @@ use crate::{
 
 /// An indicator which calculates a weighted moving average across a rolling window.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.indicators")

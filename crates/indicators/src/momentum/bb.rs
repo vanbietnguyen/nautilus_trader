@@ -23,16 +23,20 @@ use nautilus_model::{
     data::{Bar, QuoteTick, TradeTick},
     enums::PriceType,
 };
+use serde::{Deserialize, Serialize};
 
 pub use crate::support::MAX_PERIOD;
 use crate::{
-    average::{MovingAverageFactory, MovingAverageType},
+    average::{
+        MovingAverageType, dema::DoubleExponentialMovingAverage, ema::ExponentialMovingAverage,
+        hma::HullMovingAverage, rma::WilderMovingAverage, sma::SimpleMovingAverage,
+    },
     indicator::{Indicator, MovingAverage},
 };
 
 /// Bollinger bands around a moving average.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.indicators", unsendable)
@@ -50,7 +54,7 @@ pub struct BollingerBands {
     pub lower: f64,
     pub stddev: f64,
     pub initialized: bool,
-    ma: Box<dyn MovingAverage + Send + 'static>,
+    ma: BandsMovingAverage,
     prices: VecDeque<f64>,
     has_inputs: bool,
 }
@@ -95,7 +99,7 @@ impl Indicator for BollingerBands {
     }
 
     fn reset(&mut self) {
-        self.ma.reset();
+        self.ma.as_mut().reset();
         self.prices.clear();
         self.upper = 0.0;
         self.middle = 0.0;
@@ -137,7 +141,7 @@ impl BollingerBands {
             period,
             k,
             ma_type: ma_type.unwrap_or(MovingAverageType::Simple),
-            ma: MovingAverageFactory::create(ma_type.unwrap_or(MovingAverageType::Simple), period),
+            ma: BandsMovingAverage::new(ma_type.unwrap_or(MovingAverageType::Simple), period),
             prices: VecDeque::with_capacity(period),
             has_inputs: false,
             initialized: false,
@@ -157,18 +161,71 @@ impl BollingerBands {
             let _ = self.prices.pop_front();
         }
         self.prices.push_back(value);
-        self.ma.update_raw(value);
+        self.ma.as_mut().update_raw(value);
         self.has_inputs = true;
 
-        if !self.ma.initialized() {
+        if !self.ma.as_ref().initialized() {
             return;
         }
 
-        self.middle = self.ma.value();
+        self.middle = self.ma.as_ref().value();
         self.stddev = fast_std_with_mean(self.prices.iter().copied(), self.middle);
         self.upper = self.k.mul_add(self.stddev, self.middle);
         self.lower = self.k.mul_add(-self.stddev, self.middle);
         self.initialized = true;
+    }
+}
+
+/// The moving average a [`BollingerBands`] centres on, held by concrete type so its state
+/// serializes with the bands. Built as `MovingAverageFactory::create` builds it.
+#[derive(Debug, Serialize, Deserialize)]
+enum BandsMovingAverage {
+    Simple(SimpleMovingAverage),
+    Exponential(ExponentialMovingAverage),
+    DoubleExponential(DoubleExponentialMovingAverage),
+    Wilder(WilderMovingAverage),
+    Hull(HullMovingAverage),
+}
+
+impl BandsMovingAverage {
+    fn new(ma_type: MovingAverageType, period: usize) -> Self {
+        let price_type = Some(PriceType::Last);
+
+        match ma_type {
+            MovingAverageType::Simple => Self::Simple(SimpleMovingAverage::new(period, price_type)),
+            MovingAverageType::Exponential => {
+                Self::Exponential(ExponentialMovingAverage::new(period, price_type))
+            }
+            MovingAverageType::DoubleExponential => {
+                Self::DoubleExponential(DoubleExponentialMovingAverage::new(period, price_type))
+            }
+            MovingAverageType::Wilder => Self::Wilder(WilderMovingAverage::new(period, price_type)),
+            MovingAverageType::Hull => Self::Hull(HullMovingAverage::new(period, price_type)),
+        }
+    }
+}
+
+impl AsRef<dyn MovingAverage> for BandsMovingAverage {
+    fn as_ref(&self) -> &(dyn MovingAverage + 'static) {
+        match self {
+            Self::Simple(ma) => ma,
+            Self::Exponential(ma) => ma,
+            Self::DoubleExponential(ma) => ma,
+            Self::Wilder(ma) => ma,
+            Self::Hull(ma) => ma,
+        }
+    }
+}
+
+impl AsMut<dyn MovingAverage> for BandsMovingAverage {
+    fn as_mut(&mut self) -> &mut (dyn MovingAverage + 'static) {
+        match self {
+            Self::Simple(ma) => ma,
+            Self::Exponential(ma) => ma,
+            Self::DoubleExponential(ma) => ma,
+            Self::Wilder(ma) => ma,
+            Self::Hull(ma) => ma,
+        }
     }
 }
 
@@ -303,5 +360,38 @@ mod tests {
         assert!((bb.middle - expected_mid).abs() < 1e-12);
         assert!((bb.upper - (expected_mid + expected_std)).abs() < 1e-12);
         assert!((bb.lower - (expected_mid - expected_std)).abs() < 1e-12);
+    }
+
+    #[rstest]
+    fn test_serde_round_trip_continues_identically(
+        #[values(
+            MovingAverageType::Simple,
+            MovingAverageType::Exponential,
+            MovingAverageType::DoubleExponential,
+            MovingAverageType::Wilder,
+            MovingAverageType::Hull
+        )]
+        ma_type: MovingAverageType,
+    ) {
+        let mut bb = BollingerBands::new(10, 2.0, Some(ma_type));
+        for i in 0..25 {
+            bb.update_raw(50.0 + f64::from(i % 9) * 0.71);
+        }
+
+        let bytes = rmp_serde::to_vec(&bb).unwrap();
+        let mut restored: BollingerBands = rmp_serde::from_slice(&bytes).unwrap();
+
+        assert_eq!(restored.ma_type, ma_type);
+        for i in 0..10 {
+            let value = 53.0 - f64::from(i) * 0.47;
+            bb.update_raw(value);
+            restored.update_raw(value);
+
+            assert_eq!(restored.upper.to_bits(), bb.upper.to_bits());
+            assert_eq!(restored.middle.to_bits(), bb.middle.to_bits());
+            assert_eq!(restored.lower.to_bits(), bb.lower.to_bits());
+            assert_eq!(restored.stddev.to_bits(), bb.stddev.to_bits());
+            assert_eq!(restored.initialized, bb.initialized);
+        }
     }
 }
