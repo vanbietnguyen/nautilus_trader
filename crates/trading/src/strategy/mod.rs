@@ -331,6 +331,8 @@ pub trait Strategy: DataActor {
 
     /// Modifies an order.
     ///
+    /// When `client_id` is `None`, the command is routed to the client cached for the order.
+    ///
     /// # Errors
     ///
     /// Returns an error if the strategy is not registered, no supplied value changes,
@@ -356,11 +358,15 @@ pub trait Strategy: DataActor {
         let params = params.filter(|params| !params.is_empty());
 
         // TODO: Snapshot the order from the cache. See `cancel_order` for the rationale.
-        let order = StrategyNative::strategy_core_mut(self)
-            .cache_rc()
-            .borrow()
-            .try_order_owned(&client_order_id)
-            .map_err(|e| anyhow::anyhow!("Cannot modify order: {e}"))?;
+        let (order, client_id) = {
+            let cache_rc = StrategyNative::strategy_core_mut(self).cache_rc();
+            let cache = cache_rc.borrow();
+            let order = cache
+                .try_order_owned(&client_order_id)
+                .map_err(|e| anyhow::anyhow!("Cannot modify order: {e}"))?;
+            let client_id = client_id.or_else(|| cache.client_id(&client_order_id).copied());
+            (order, client_id)
+        };
 
         let mut updating = false;
 
@@ -593,6 +599,8 @@ pub trait Strategy: DataActor {
 
     /// Cancels an order.
     ///
+    /// When `client_id` is `None`, the command is routed to the client cached for the order.
+    ///
     /// # Errors
     ///
     /// Returns an error if the strategy is not registered or order cancellation fails.
@@ -619,11 +627,15 @@ pub trait Strategy: DataActor {
         // TODO: Snapshot the order from the cache. Callers identify it by ID; we own the
         // snapshot so later calls (which take `&OrderAny` and may re-enter the cache)
         // run without holding a live cache borrow.
-        let order = StrategyNative::strategy_core_mut(self)
-            .cache_rc()
-            .borrow()
-            .try_order_owned(&client_order_id)
-            .map_err(|e| anyhow::anyhow!("Cannot cancel order: {e}"))?;
+        let (order, client_id) = {
+            let cache_rc = StrategyNative::strategy_core_mut(self).cache_rc();
+            let cache = cache_rc.borrow();
+            let order = cache
+                .try_order_owned(&client_order_id)
+                .map_err(|e| anyhow::anyhow!("Cannot cancel order: {e}"))?;
+            let client_id = client_id.or_else(|| cache.client_id(&client_order_id).copied());
+            (order, client_id)
+        };
 
         if !self.mark_order_pending_cancel(&order)? {
             return Ok(());
@@ -1119,6 +1131,9 @@ pub trait Strategy: DataActor {
 
     /// Closes a position by submitting a market order for the opposite side.
     ///
+    /// When `client_id` is `None`, the closing order is routed to the client cached for the
+    /// position's opening order.
+    ///
     /// # Errors
     ///
     /// Returns an error if the strategy is not registered or position closing fails.
@@ -1160,11 +1175,20 @@ pub trait Strategy: DataActor {
             tags,
             None,
         );
+        let client_id = client_id.or_else(|| {
+            StrategyNative::strategy_core(self)
+                .cache_ref()
+                .client_id(&position.opening_order_id)
+                .copied()
+        });
 
         self.submit_order(order, Some(position.id), client_id, params)
     }
 
     /// Closes all open positions for the given instrument.
+    ///
+    /// When `client_id` is `None`, the closing order is routed to the client cached for the
+    /// position's opening order.
     ///
     /// # Errors
     ///
@@ -1211,13 +1235,26 @@ pub trait Strategy: DataActor {
 
         let positions_data: Vec<_> = positions_open
             .iter()
-            .map(|p| (p.id, p.instrument_id, p.side, p.quantity, p.is_closed()))
+            .map(|p| {
+                let close_client_id =
+                    client_id.or_else(|| cache.client_id(&p.opening_order_id).copied());
+                (
+                    p.id,
+                    p.instrument_id,
+                    p.side,
+                    p.quantity,
+                    p.is_closed(),
+                    close_client_id,
+                )
+            })
             .collect();
         drop(positions_open);
 
         drop(cache);
 
-        for (pos_id, pos_instrument_id, pos_side, pos_quantity, is_closed) in positions_data {
+        for (pos_id, pos_instrument_id, pos_side, pos_quantity, is_closed, close_client_id) in
+            positions_data
+        {
             if is_closed {
                 continue;
             }
@@ -1239,7 +1276,7 @@ pub trait Strategy: DataActor {
                 None,
             );
 
-            self.submit_order(order, Some(pos_id), client_id, params.clone())?;
+            self.submit_order(order, Some(pos_id), close_client_id, params.clone())?;
         }
 
         Ok(())
@@ -1902,14 +1939,25 @@ pub trait Strategy: DataActor {
         let positions_data: Vec<_> = cache
             .positions_open(None, None, Some(&strategy_id), None, None)
             .iter()
-            .map(|p| (p.id, p.instrument_id, p.side, p.quantity, p.is_closed()))
+            .map(|p| {
+                (
+                    p.id,
+                    p.instrument_id,
+                    p.side,
+                    p.quantity,
+                    p.is_closed(),
+                    cache.client_id(&p.opening_order_id).copied(),
+                )
+            })
             .collect();
 
         if !positions_data.is_empty() {
             // If there are open positions but no orders, re-send close orders
             drop(cache);
 
-            for (pos_id, instrument_id, side, quantity, is_closed) in positions_data {
+            for (pos_id, instrument_id, side, quantity, is_closed, close_client_id) in
+                positions_data
+            {
                 if is_closed {
                     continue;
                 }
@@ -1934,7 +1982,7 @@ pub trait Strategy: DataActor {
                     None,
                 );
 
-                if let Err(e) = self.submit_order(order, Some(pos_id), None, None) {
+                if let Err(e) = self.submit_order(order, Some(pos_id), close_client_id, None) {
                     log::error!("Error re-submitting close order for position {pos_id}: {e}");
                 }
             }
@@ -2531,7 +2579,7 @@ mod tests {
     use nautilus_execution::engine::ExecutionEngine;
     use nautilus_model::{
         enums::{
-            ContingencyType, LiquiditySide, OrderSide, OrderStatus, OrderType,
+            ContingencyType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
             PositionAdjustmentType, PositionSide, TrailingOffsetType, TriggerType,
         },
         events::{
@@ -2546,6 +2594,7 @@ mod tests {
             AccountId, ActorId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId,
             TradeId, TraderId, VenueOrderId,
         },
+        instruments::{InstrumentAny, stubs::currency_pair_btcusdt},
         orderbook::own::OwnOrderBook,
         orders::{LimitOrder, MarketOrder, OrderTestBuilder, stubs::TestOrderEventStubs},
         stubs::TestDefault,
@@ -7646,5 +7695,276 @@ mod tests {
             cache.order(&third.client_order_id()).unwrap().status(),
             OrderStatus::PendingCancel
         );
+    }
+
+    fn add_order_to_cache_with_client(
+        strategy: &TestStrategy,
+        order: &OrderAny,
+        client_id: ClientId,
+    ) {
+        strategy
+            .core
+            .cache_rc()
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(client_id), true)
+            .unwrap();
+    }
+
+    fn register_command_recorder(
+        endpoint: msgbus::MStr<msgbus::Endpoint>,
+        name: &str,
+    ) -> TypedIntoMessageSavingHandler<TradingCommand> {
+        let (handler, messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from(name)));
+        msgbus::register_trading_command_endpoint(endpoint, handler);
+        messages
+    }
+
+    fn limit_order(
+        client_order_id: ClientOrderId,
+        side: OrderSide,
+        price: &str,
+        contingency: Option<(ContingencyType, Vec<ClientOrderId>)>,
+    ) -> OrderAny {
+        let mut builder = OrderTestBuilder::new(OrderType::Limit);
+        builder
+            .trader_id(TraderId::from("TRADER-001"))
+            .strategy_id(StrategyId::from("TEST-001"))
+            .instrument_id(InstrumentId::from("BTCUSDT.BINANCE"))
+            .client_order_id(client_order_id)
+            .side(side)
+            .price(Price::from(price))
+            .quantity(Quantity::from(100_000))
+            .submit(true);
+
+        if let Some((contingency_type, linked_order_ids)) = contingency {
+            builder
+                .contingency_type(contingency_type)
+                .linked_order_ids(linked_order_ids);
+        }
+        builder.build()
+    }
+
+    fn fill_event(order: &OrderAny, last_qty: Quantity, trade_id: &str) -> OrderEventAny {
+        OrderEventAny::Filled(
+            OrderFilledSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(order.client_order_id())
+                .venue_order_id(VenueOrderId::from("V-CACHED-CLIENT"))
+                .account_id(AccountId::from("ACCOUNT-001"))
+                .trade_id(TradeId::from(trade_id))
+                .order_side(order.order_side())
+                .order_type(order.order_type())
+                .last_qty(last_qty)
+                .last_px(order.price().unwrap())
+                .liquidity_side(LiquiditySide::Maker)
+                .build(),
+        )
+    }
+
+    fn create_contingent_managed_strategy() -> TestStrategy {
+        TestStrategy::new(StrategyConfig {
+            strategy_id: Some(StrategyId::from("TEST-001")),
+            order_id_tag: Some("001".to_string()),
+            manage_contingent_orders: true,
+            ..Default::default()
+        })
+    }
+
+    #[rstest]
+    fn test_contingent_cancel_routes_by_cached_client() {
+        let mut strategy = create_contingent_managed_strategy();
+        register_strategy(&mut strategy);
+        start_strategy(&mut strategy);
+        let exec_messages = register_command_recorder(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            "ExecEngine.queue_execute",
+        );
+        let broker = ClientId::from("BROKER-A");
+        let parent_id = ClientOrderId::from("O-OCO-PARENT");
+        let sibling_id = ClientOrderId::from("O-OCO-SIBLING");
+        let linked = vec![parent_id, sibling_id];
+        let parent = limit_order(
+            parent_id,
+            OrderSide::Buy,
+            "50000.0",
+            Some((ContingencyType::Oco, linked.clone())),
+        );
+        let sibling = limit_order(
+            sibling_id,
+            OrderSide::Sell,
+            "51000.0",
+            Some((ContingencyType::Oco, linked)),
+        );
+        add_order_to_cache_with_client(&strategy, &parent, broker);
+        add_order_to_cache_with_client(&strategy, &sibling, broker);
+        let event = fill_event(&parent, parent.quantity(), "T-OCO-PARENT");
+        strategy
+            .core
+            .cache_rc()
+            .borrow_mut()
+            .update_order(&event)
+            .unwrap();
+
+        strategy.handle_order_event(event);
+
+        assert!(matches!(
+            exec_messages.get_messages().as_slice(),
+            [TradingCommand::CancelOrder(command)]
+                if command.client_order_id == sibling_id && command.client_id == Some(broker)
+        ));
+    }
+
+    #[rstest]
+    fn test_contingent_modify_routes_by_cached_client() {
+        let mut strategy = create_contingent_managed_strategy();
+        register_strategy(&mut strategy);
+        start_strategy(&mut strategy);
+        let risk_messages = register_command_recorder(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            "RiskEngine.queue_execute",
+        );
+        let broker = ClientId::from("BROKER-A");
+        let take_profit_id = ClientOrderId::from("O-OUO-TP");
+        let stop_id = ClientOrderId::from("O-OUO-SL");
+        let linked = vec![take_profit_id, stop_id];
+        let take_profit = limit_order(
+            take_profit_id,
+            OrderSide::Sell,
+            "51000.0",
+            Some((ContingencyType::Ouo, linked.clone())),
+        );
+        let stop = limit_order(
+            stop_id,
+            OrderSide::Sell,
+            "52000.0",
+            Some((ContingencyType::Ouo, linked)),
+        );
+        add_order_to_cache_with_client(&strategy, &take_profit, broker);
+        add_order_to_cache_with_client(&strategy, &stop, broker);
+        let event = fill_event(&take_profit, Quantity::from(40_000), "T-OUO-TP");
+        strategy
+            .core
+            .cache_rc()
+            .borrow_mut()
+            .update_order(&event)
+            .unwrap();
+
+        strategy.handle_order_event(event);
+
+        assert!(matches!(
+            risk_messages.get_messages().as_slice(),
+            [TradingCommand::ModifyOrder(command)]
+                if command.client_order_id == stop_id
+                    && command.quantity == Some(Quantity::from(60_000))
+                    && command.client_id == Some(broker)
+        ));
+    }
+
+    #[rstest]
+    #[case::explicit_client_kept(Some("BROKER-B"), Some("BROKER-A"), Some("BROKER-B"))]
+    #[case::cached_client_used(None, Some("BROKER-A"), Some("BROKER-A"))]
+    #[case::no_cached_client(None, None, None)]
+    fn test_cancel_order_client_resolution(
+        #[case] requested: Option<&str>,
+        #[case] cached: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+        start_strategy(&mut strategy);
+        let exec_messages = register_command_recorder(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            "ExecEngine.queue_execute",
+        );
+        let order = limit_order(
+            ClientOrderId::from("O-CANCEL-ROUTE"),
+            OrderSide::Buy,
+            "50000.0",
+            None,
+        );
+        match cached {
+            Some(cached) => {
+                add_order_to_cache_with_client(&strategy, &order, ClientId::from(cached));
+            }
+            None => add_order_to_cache(&strategy, &order),
+        }
+
+        strategy
+            .cancel_order(order.client_order_id(), requested.map(ClientId::from), None)
+            .unwrap();
+
+        let expected = expected.map(ClientId::from);
+        assert!(matches!(
+            exec_messages.get_messages().as_slice(),
+            [TradingCommand::CancelOrder(command)] if command.client_id == expected
+        ));
+    }
+
+    #[rstest]
+    fn test_market_exit_close_order_routes_by_position_opening_client() {
+        let mut strategy = create_test_strategy();
+        let _clock = register_gtd_strategy(&mut strategy);
+        start_strategy(&mut strategy);
+        let risk_messages = register_command_recorder(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            "RiskEngine.queue_execute",
+        );
+        let broker = ClientId::from("BROKER-A");
+        let instrument = InstrumentAny::CurrencyPair(currency_pair_btcusdt());
+        let opening = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(TraderId::from("TRADER-001"))
+            .strategy_id(StrategyId::from("TEST-001"))
+            .instrument_id(InstrumentId::from("BTCUSDT.BINANCE"))
+            .client_order_id(ClientOrderId::from("O-OPENING"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000000"))
+            .submit(true)
+            .build();
+        add_order_to_cache_with_client(&strategy, &opening, broker);
+        let fill = TestOrderEventStubs::filled(
+            &opening,
+            &instrument,
+            None,
+            Some(PositionId::from("P-OPENING")),
+            Some(Price::from("50000.00")),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let position = {
+            let cache_rc = strategy.core.cache_rc();
+            let mut cache = cache_rc.borrow_mut();
+            cache.update_order(&fill).unwrap();
+            let OrderEventAny::Filled(fill) = fill else {
+                unreachable!("stub returns a fill");
+            };
+            let position = Position::new(&instrument, fill);
+            cache.add_position(&position, OmsType::Netting).unwrap();
+            position
+        };
+
+        strategy.market_exit().unwrap();
+        strategy.check_market_exit(TimeEvent::new(
+            Ustr::from("MARKET_EXIT_CHECK:TEST-001"),
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        ));
+
+        let messages = risk_messages.get_messages();
+        assert_eq!(messages.len(), 2, "market exit close then check re-submit");
+        for message in &messages {
+            assert!(matches!(
+                message,
+                TradingCommand::SubmitOrder(command)
+                    if command.position_id == Some(position.id)
+                        && command.client_id == Some(broker)
+            ));
+        }
     }
 }
