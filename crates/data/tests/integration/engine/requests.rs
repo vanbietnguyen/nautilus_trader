@@ -1718,3 +1718,181 @@ fn test_request_trades_with_bar_types_param_sets_up_aggregation_through_streamin
     );
     assert_eq!(data_engine.request_pipeline_count(), 0);
 }
+
+#[derive(Debug, PartialEq)]
+enum ResponsePart {
+    Trades(UUID4, Vec<TradeId>),
+    Bars(UUID4, BarType, Vec<UnixNanos>),
+}
+
+/// Registers a response handler for `request_id` that records every trades and bars part.
+fn record_response_parts(request_id: UUID4) -> Rc<RefCell<Vec<ResponsePart>>> {
+    let parts = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&parts);
+    let handler = msgbus::ShareableMessageHandler::from_any(move |message: &dyn Any| {
+        if let Some(resp) = message.downcast_ref::<TradesResponse>() {
+            let trade_ids = resp.data.iter().map(|trade| trade.trade_id).collect();
+            recorded
+                .borrow_mut()
+                .push(ResponsePart::Trades(resp.correlation_id, trade_ids));
+        } else if let Some(resp) = message.downcast_ref::<BarsResponse>() {
+            let bar_ts = resp.data.iter().map(|bar| bar.ts_event).collect();
+            recorded.borrow_mut().push(ResponsePart::Bars(
+                resp.correlation_id,
+                resp.bar_type,
+                bar_ts,
+            ));
+        }
+    });
+    msgbus::register_response_handler(&request_id, handler);
+    parts
+}
+
+/// Requests trades aggregated into a `RANGE_INCLUSIVE` and a `RANGE` bar type, answers with four
+/// trades (the third completes a bar of each type) and returns the recorded response parts.
+fn respond_to_range_aggregation_request(
+    audusd_sim: CurrencyPair,
+    client_id: ClientId,
+    venue: Venue,
+    interleave: Option<bool>,
+) -> (Vec<ResponsePart>, UUID4, [BarType; 2], Rc<RefCell<Cache>>) {
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+
+    let instrument_id = audusd_sim.id;
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        test_clock,
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+
+    let range_inclusive =
+        BarType::from(format!("{instrument_id}-10-RANGE_INCLUSIVE-LAST-INTERNAL").as_str());
+    let range = BarType::from(format!("{instrument_id}-10-RANGE-LAST-INTERNAL").as_str());
+    let mut params = json!({
+        "bar_types": [range_inclusive.to_string(), range.to_string()],
+        "update_subscriptions": false,
+    });
+    if let Some(interleave) = interleave {
+        params["interleave"] = json!(interleave);
+    }
+    let params: Params = serde_json::from_value(params).unwrap();
+
+    let request_id = UUID4::new();
+    let parts = record_response_parts(request_id);
+    data_engine.execute(DataCommand::Request(RequestCommand::Trades(
+        RequestTrades::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::default(),
+            Some(params.clone()),
+        ),
+    )));
+
+    let make_trade = |price: &str, ts: u64, trade_id: &str| {
+        TradeTick::new(
+            instrument_id,
+            Price::from(price),
+            Quantity::from("1000"),
+            AggressorSide::Buy,
+            TradeId::new(trade_id),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        )
+    };
+    data_engine.response(DataResponse::Trades(TradesResponse::new(
+        request_id,
+        client_id,
+        instrument_id,
+        vec![
+            make_trade("0.65000", 1_000, "t1"),
+            make_trade("0.65009", 2_000, "t2"),
+            make_trade("0.65011", 3_000, "t3"),
+            make_trade("0.65012", 4_000, "t4"),
+        ],
+        None,
+        None,
+        UnixNanos::from(4_000),
+        Some(params),
+    )));
+
+    let parts = parts.take();
+    (parts, request_id, [range_inclusive, range], cache)
+}
+
+fn trade_ids(ids: &[&str]) -> Vec<TradeId> {
+    ids.iter().map(|id| TradeId::new(*id)).collect()
+}
+
+#[rstest]
+fn test_interleaved_trades_request_orders_parts_by_bar_convention(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+
+    let (parts, request_id, [range_inclusive, range], cache) =
+        respond_to_range_aggregation_request(audusd_sim, client_id, venue, Some(true));
+
+    let completed = vec![UnixNanos::from(3_000)];
+    assert_eq!(
+        parts,
+        vec![
+            ResponsePart::Trades(request_id, trade_ids(&["t1", "t2"])),
+            ResponsePart::Bars(request_id, range, completed.clone()),
+            ResponsePart::Trades(request_id, trade_ids(&["t3"])),
+            ResponsePart::Bars(request_id, range_inclusive, completed),
+            ResponsePart::Trades(request_id, trade_ids(&["t4"])),
+        ]
+    );
+    assert_eq!(
+        cache.borrow().bar(&range_inclusive).map(|bar| bar.ts_event),
+        Some(UnixNanos::from(3_000))
+    );
+    assert_eq!(
+        cache.borrow().bar(&range).map(|bar| bar.ts_event),
+        Some(UnixNanos::from(3_000))
+    );
+}
+
+#[rstest]
+#[case::absent(None)]
+#[case::disabled(Some(false))]
+fn test_trades_request_without_interleave_sends_one_response(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] interleave: Option<bool>,
+) {
+    let _ = stub_msgbus;
+
+    let (parts, request_id, _, _) =
+        respond_to_range_aggregation_request(audusd_sim, client_id, venue, interleave);
+
+    assert_eq!(
+        parts,
+        vec![ResponsePart::Trades(
+            request_id,
+            trade_ids(&["t1", "t2", "t3", "t4"])
+        )]
+    );
+}

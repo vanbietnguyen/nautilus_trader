@@ -4540,6 +4540,73 @@ fn test_request_trades(
 }
 
 #[rstest]
+fn test_request_trades_handler_routes_interleaved_bars_parts(
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let request_id = actor
+        .request_trades(audusd_sim.id, None, None, None, None, None)
+        .unwrap();
+
+    let client_id = ClientId::new("TestClient");
+    let bar_type = BarType::from_str(&format!(
+        "{}-10-RANGE_INCLUSIVE-LAST-INTERNAL",
+        audusd_sim.id
+    ))
+    .unwrap();
+    let trade = TradeTick::default();
+    let bar = Bar::default();
+    let trades_part = |data: Vec<TradeTick>| {
+        DataResponse::Trades(TradesResponse::new(
+            request_id,
+            client_id,
+            audusd_sim.id,
+            data,
+            None,
+            None,
+            UnixNanos::default(),
+            None,
+        ))
+    };
+    let bars_part = DataResponse::Bars(BarsResponse::new(
+        request_id,
+        client_id,
+        bar_type,
+        vec![bar],
+        None,
+        None,
+        UnixNanos::default(),
+        None,
+    ));
+
+    msgbus::send_response_part(&request_id, &trades_part(vec![trade]));
+    msgbus::send_response_part(&request_id, &bars_part);
+    assert!(
+        get_message_bus()
+            .borrow()
+            .get_response_handler(&request_id)
+            .is_some()
+    );
+
+    msgbus::send_response(&request_id, &trades_part(Vec::new()));
+
+    assert_eq!(actor.received_trades, vec![trade]);
+    assert_eq!(actor.received_bars, vec![bar]);
+    assert!(
+        get_message_bus()
+            .borrow()
+            .get_response_handler(&request_id)
+            .is_none()
+    );
+}
+
+#[rstest]
 fn test_request_book_deltas(
     clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,

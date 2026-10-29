@@ -16,9 +16,10 @@
 use std::fmt::Debug;
 
 use anyhow::Context;
+use indexmap::IndexMap;
 use jiff::tz::TimeZone;
 use nautilus_common::{
-    messages::data::{SubscribeBars, SubscribeCommand},
+    messages::data::{BarsResponse, SubscribeBars, SubscribeCommand, TradesResponse},
     msgbus::{self, MStr, Topic, TypedHandler},
 };
 use nautilus_core::{UUID4, datetime::get_timezone};
@@ -147,11 +148,17 @@ impl DataEngine {
                 .collect();
 
             let cache = Rc::clone(&self.cache);
+            let interleaved_bars = state.interleave.then(|| Rc::clone(&self.interleaved_bars));
 
             let handler: Box<dyn FnMut(Bar)> = Box::new(move |bar: Bar| {
-                // Request-generated bars are delivered only through the cache.
+                // Request-generated bars are delivered only through the cache, or as response
+                // parts when the request interleaves.
                 if let Err(e) = cache.as_ref().borrow_mut().add_bar_historical(bar) {
                     log_error_on_cache_insert(&e);
+                }
+
+                if let Some(interleaved_bars) = &interleaved_bars {
+                    interleaved_bars.borrow_mut().push(bar);
                 }
 
                 for aggregator in &downstream {
@@ -230,6 +237,44 @@ impl DataEngine {
         }
 
         self.cleanup_request_bar_aggregators(&correlation_id);
+    }
+
+    /// Answers a trades request that set `interleave` with response parts in live order.
+    ///
+    /// Trades feed the request aggregators one at a time. A bar a trade completes is delivered
+    /// before that trade, except a `RANGE_INCLUSIVE` bar, which contains its completing trade and
+    /// is delivered after it (the live publication order). Each bar delivery first sends the
+    /// trades gathered since the previous one. The final part, the trades after the last
+    /// completed bar (possibly none), goes through `send_response` and ends the request.
+    pub(super) fn respond_interleaved_trades(
+        &mut self,
+        resp: &TradesResponse,
+        state: &RequestBarAggregation,
+    ) {
+        let request_id = resp.correlation_id;
+        let mut pending = Vec::new();
+
+        for trade in &resp.data {
+            self.update_request_bar_aggregators_from_trade(state, request_id, *trade);
+
+            let completed = std::mem::take(&mut *self.interleaved_bars.borrow_mut());
+            let (after, before): (Vec<Bar>, Vec<Bar>) = completed
+                .into_iter()
+                .partition(|bar| bar.bar_type.spec().aggregation == BarAggregation::RangeInclusive);
+
+            send_interleaved_bars(resp, &mut pending, before);
+            pending.push(*trade);
+            send_interleaved_bars(resp, &mut pending, after);
+        }
+
+        self.cleanup_request_bar_aggregators(&request_id);
+        let remaining = std::mem::take(&mut *self.interleaved_bars.borrow_mut());
+        send_interleaved_bars(resp, &mut pending, remaining);
+
+        msgbus::send_response(
+            &request_id,
+            &DataResponse::Trades(trades_part(resp, pending)),
+        );
     }
 
     pub(super) fn update_request_bar_aggregators_from_quote(
@@ -1013,6 +1058,52 @@ impl Debug for BarAggregatorSubscription {
                 .field("handler_id", &handler.id())
                 .finish(),
         }
+    }
+}
+
+/// Builds a trades part of an interleaved response, carrying the request's identity and window.
+fn trades_part(resp: &TradesResponse, data: Vec<TradeTick>) -> TradesResponse {
+    TradesResponse::new(
+        resp.correlation_id,
+        resp.client_id,
+        resp.instrument_id,
+        data,
+        resp.start,
+        resp.end,
+        resp.ts_init,
+        resp.params.clone(),
+    )
+}
+
+/// Sends the trades gathered in `pending`, then `bars` as one bars part per bar type in
+/// completion order. Sends nothing when `bars` is empty.
+fn send_interleaved_bars(resp: &TradesResponse, pending: &mut Vec<TradeTick>, bars: Vec<Bar>) {
+    if bars.is_empty() {
+        return;
+    }
+
+    if !pending.is_empty() {
+        let trades = trades_part(resp, std::mem::take(pending));
+        msgbus::send_response_part(&resp.correlation_id, &DataResponse::Trades(trades));
+    }
+
+    let mut bars_by_type: IndexMap<BarType, Vec<Bar>> = IndexMap::new();
+    for bar in bars {
+        bars_by_type.entry(bar.bar_type).or_default().push(bar);
+    }
+
+    for (bar_type, data) in bars_by_type {
+        let bars = BarsResponse::new(
+            resp.correlation_id,
+            resp.client_id,
+            bar_type,
+            data,
+            resp.start,
+            resp.end,
+            resp.ts_init,
+            resp.params.clone(),
+        );
+        msgbus::send_response_part(&resp.correlation_id, &DataResponse::Bars(bars));
     }
 }
 

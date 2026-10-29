@@ -216,6 +216,9 @@ pub struct DataEngine {
     /// `RANGE_INCLUSIVE` bars completed while their completing update is being delivered,
     /// published once that delivery returns.
     deferred_bars: Rc<RefCell<VecDeque<Bar>>>,
+    /// Bars completed by the request aggregators of an interleaving trades request, taken
+    /// after each trade to order the response parts.
+    interleaved_bars: Rc<RefCell<Vec<Bar>>>,
     option_chain_bootstrapper: Option<Rc<OptionChainBootstrapper>>,
     pending_option_chain_requests: AHashMap<UUID4, PendingOptionChainRequest>,
     option_chain_greeks_bootstraps: AHashMap<OptionSeriesId, OptionChainGreeksBootstrap>,
@@ -293,6 +296,7 @@ impl DataEngine {
             option_chain_instrument_index: AHashMap::new(),
             deferred_cmd_queue: Rc::new(RefCell::new(VecDeque::new())),
             deferred_bars: Rc::new(RefCell::new(VecDeque::new())),
+            interleaved_bars: Rc::new(RefCell::new(Vec::new())),
             option_chain_bootstrapper: None,
             pending_option_chain_requests: AHashMap::new(),
             option_chain_greeks_bootstraps: AHashMap::new(),
@@ -1829,6 +1833,17 @@ impl DataEngine {
                 return self.handle_option_chain_reference_price_response(&correlation_id, r);
             }
             DataResponse::Data(_) => {}
+        }
+
+        if let DataResponse::Trades(trades) = &resp
+            && let Some(state) = self
+                .request_bar_aggregations
+                .get(&correlation_id)
+                .filter(|state| state.interleave)
+                .cloned()
+        {
+            self.respond_interleaved_trades(trades, &state);
+            return;
         }
 
         self.process_request_bar_aggregation_response(&resp);

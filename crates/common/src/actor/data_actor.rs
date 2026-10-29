@@ -3094,11 +3094,20 @@ pub trait DataActor {
         Self: 'static + Debug + Sized,
     {
         let actor_id = self.core().actor_id().inner();
-        let handler = ShareableMessageHandler::from_typed(move |resp: &TradesResponse| {
-            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
-                actor.handle_trades_response(resp);
-            } else {
+        // A request with `bar_types` and `interleave` is answered in parts: trades parts and
+        // the aggregated bars parts between them, in live order
+        let handler = ShareableMessageHandler::from_any(move |message: &dyn Any| {
+            let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) else {
                 log::error!("Actor {actor_id} not found for trades response handling");
+                return;
+            };
+
+            if let Some(resp) = message.downcast_ref::<TradesResponse>() {
+                actor.handle_trades_response(resp);
+            } else if let Some(resp) = message.downcast_ref::<BarsResponse>() {
+                actor.handle_bars_response(resp);
+            } else {
+                log::error!("Actor {actor_id} received an unexpected trades response part");
             }
         });
 

@@ -1358,21 +1358,44 @@ pub fn send_response(correlation_id: &UUID4, message: &DataResponse) {
     };
 
     if let Some(handler) = handler {
-        match message {
-            DataResponse::Data(resp) => handler.0.handle(resp),
-            DataResponse::Instrument(resp) => handler.0.handle(resp.as_ref()),
-            DataResponse::Instruments(resp) => handler.0.handle(resp),
-            DataResponse::Book(resp) => handler.0.handle(resp),
-            DataResponse::BookDeltas(resp) => handler.0.handle(resp),
-            DataResponse::BookDepth(resp) => handler.0.handle(resp),
-            DataResponse::Quotes(resp) => handler.0.handle(resp),
-            DataResponse::Trades(resp) => handler.0.handle(resp),
-            DataResponse::FundingRates(resp) => handler.0.handle(resp),
-            DataResponse::OptionChainReferencePrice(resp) => handler.0.handle(resp),
-            DataResponse::Bars(resp) => handler.0.handle(resp),
-        }
+        handle_response(&handler, message);
     } else {
         log::error!("send_response: handler not found for correlation_id '{correlation_id}'");
+    }
+}
+
+/// Sends one part of a multi-part [`DataResponse`] to the registered correlation ID handler,
+/// leaving the handler registered for the parts that follow.
+///
+/// The last part is sent with [`send_response`], which removes the handler.
+pub fn send_response_part(correlation_id: &UUID4, message: &DataResponse) {
+    dispatch_tap_response(correlation_id, message);
+
+    let handler = get_message_bus()
+        .borrow()
+        .get_response_handler(correlation_id)
+        .cloned();
+
+    if let Some(handler) = handler {
+        handle_response(&handler, message);
+    } else {
+        log::error!("send_response_part: handler not found for correlation_id '{correlation_id}'");
+    }
+}
+
+fn handle_response(handler: &ShareableMessageHandler, message: &DataResponse) {
+    match message {
+        DataResponse::Data(resp) => handler.0.handle(resp),
+        DataResponse::Instrument(resp) => handler.0.handle(resp.as_ref()),
+        DataResponse::Instruments(resp) => handler.0.handle(resp),
+        DataResponse::Book(resp) => handler.0.handle(resp),
+        DataResponse::BookDeltas(resp) => handler.0.handle(resp),
+        DataResponse::BookDepth(resp) => handler.0.handle(resp),
+        DataResponse::Quotes(resp) => handler.0.handle(resp),
+        DataResponse::Trades(resp) => handler.0.handle(resp),
+        DataResponse::FundingRates(resp) => handler.0.handle(resp),
+        DataResponse::OptionChainReferencePrice(resp) => handler.0.handle(resp),
+        DataResponse::Bars(resp) => handler.0.handle(resp),
     }
 }
 

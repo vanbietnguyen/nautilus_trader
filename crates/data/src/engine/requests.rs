@@ -37,6 +37,7 @@ const CONTINUOUS_FUTURE_ADJUSTMENT_MODE: &str = "continuous_future_adjustment_mo
 const LAST_POST_INSTRUMENT_ID: &str = "last_post_instrument_id";
 const FIRST_PRE_INSTRUMENT_ID: &str = "first_pre_instrument_id";
 const BAR_TYPES: &str = "bar_types";
+const INTERLEAVE: &str = "interleave";
 
 #[derive(Debug, Clone)]
 pub(super) struct RequestBarAggregation {
@@ -45,6 +46,8 @@ pub(super) struct RequestBarAggregation {
     pub(super) disable_build_with_no_updates: bool,
     pub(super) skip_first_non_full_bar: Option<bool>,
     pub(super) time_zone: Option<TimeZone>,
+    /// Answer a trades request as trades and aggregated bars parts in live order.
+    pub(super) interleave: bool,
 }
 
 impl RequestBarAggregation {
@@ -316,6 +319,7 @@ pub(super) fn request_bar_aggregation_from_params(
 
     let update_subscriptions = params.get_bool("update_subscriptions").unwrap_or(false);
     let skip_first_non_full_bar = params.get_bool("skip_first_non_full_bar");
+    let interleave = params.get_bool(INTERLEAVE).unwrap_or(false);
 
     Ok(Some(RequestBarAggregation {
         bar_types: unique_bar_types,
@@ -323,6 +327,7 @@ pub(super) fn request_bar_aggregation_from_params(
         disable_build_with_no_updates: false,
         skip_first_non_full_bar,
         time_zone: time_zone_from_params(Some(params))?,
+        interleave,
     }))
 }
 
@@ -453,6 +458,7 @@ fn parse_continuous_future(
             disable_build_with_no_updates: true,
             skip_first_non_full_bar: None,
             time_zone: time_zone_from_params(Some(params))?,
+            interleave: false,
         },
         transitions,
         adjustment_mode,
