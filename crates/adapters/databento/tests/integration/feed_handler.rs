@@ -754,6 +754,48 @@ async fn test_reconnection_resubscribes() {
 
 #[rstest]
 #[tokio::test]
+async fn test_reconnect_command_resubscribes() {
+    let server = MockLsgServer::new(TEST_DATASET).await;
+    let (cmd_tx, mut msg_rx, mut handler) = create_test_handler(&server.addr(), TEST_DATASET);
+
+    server.authenticate();
+    server.expect_subscription();
+    server.start();
+    server.send_record(symbol_mapping_msg(INSTRUMENT_ID, RAW_SYMBOL));
+    server.send_record(trade_msg(INSTRUMENT_ID, 100_000_000_000, 50));
+
+    // Second session, reached only through the reconnect command (the gateway never drops)
+    server.authenticate();
+    server.expect_subscription();
+    server.start();
+    server.send_record(symbol_mapping_msg(INSTRUMENT_ID, RAW_SYMBOL));
+    server.send_record(trade_msg(INSTRUMENT_ID, 101_000_000_000, 25));
+
+    let handle = tokio::spawn(async move { handler.run().await });
+
+    cmd_tx
+        .send(HandlerCommand::Subscribe(subscription(dbn::Schema::Trades)))
+        .unwrap();
+    cmd_tx.send(HandlerCommand::Start).unwrap();
+
+    let first = recv_msg(&mut msg_rx).await;
+    assert!(matches!(first, DatabentoMessage::Data(Data::Trade(_))));
+
+    cmd_tx.send(HandlerCommand::Reconnect).unwrap();
+
+    let second = recv_msg(&mut msg_rx).await;
+    let DatabentoMessage::Data(Data::Trade(trade)) = second else {
+        panic!("expected a trade from the second session, was {second:?}");
+    };
+    assert_eq!(trade.size, Quantity::from(25));
+
+    cmd_tx.send(HandlerCommand::Close).unwrap();
+    let _ = handle.await;
+    server.stop().await;
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_system_msg_subscription_ack() {
     let server = MockLsgServer::new(TEST_DATASET).await;
     let (cmd_tx, mut msg_rx, mut handler) = create_test_handler(&server.addr(), TEST_DATASET);
