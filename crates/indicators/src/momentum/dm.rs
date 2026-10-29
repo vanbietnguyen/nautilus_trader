@@ -17,6 +17,7 @@ use std::fmt::{Debug, Display};
 
 use nautilus_core::correctness::FAILED;
 use nautilus_model::data::Bar;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     indicator::Indicator,
@@ -33,7 +34,7 @@ use crate::{
 /// on the scale of a `period`-bar sum of movements. The first complete output
 /// arrives after `period + 1` bars.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.indicators")
@@ -285,5 +286,26 @@ mod tests {
         assert_eq!(dm_10.neg, 0.0);
         assert_eq!(dm_10.previous, None);
         assert_eq!(dm_10.seed_count, 0);
+    }
+
+    #[rstest]
+    fn test_serde_round_trip_continues_identically(mut dm_10: DirectionalMovement) {
+        for i in 0..15 {
+            let mid = 100.0 + f64::from(i % 6) * 1.7;
+            dm_10.update_raw(mid + 0.9, mid - 0.5);
+        }
+
+        let bytes = rmp_serde::to_vec(&dm_10).unwrap();
+        let mut restored: DirectionalMovement = rmp_serde::from_slice(&bytes).unwrap();
+
+        for i in 0..10 {
+            let mid = 103.0 - f64::from(i) * 0.8;
+            dm_10.update_raw(mid + 1.2, mid - 0.7);
+            restored.update_raw(mid + 1.2, mid - 0.7);
+
+            assert_eq!(restored.pos.to_bits(), dm_10.pos.to_bits());
+            assert_eq!(restored.neg.to_bits(), dm_10.neg.to_bits());
+            assert_eq!(restored.initialized, dm_10.initialized);
+        }
     }
 }
