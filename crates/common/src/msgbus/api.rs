@@ -1381,6 +1381,17 @@ pub fn send_response_envelope(message: &DataResponseEnvelope) {
     }
 }
 
+/// Sends one part of a multi-part [`DataResponse`] to the registered correlation ID handler,
+/// leaving the handler registered for the parts that follow.
+///
+/// The last part is sent with [`send_response`], which removes the handler.
+pub fn send_response_part(correlation_id: &UUID4, message: &DataResponse) {
+    let source = (correlation_id != message.correlation_id()).then_some(*message.correlation_id());
+    let envelope = DataResponseEnvelope::new(message.clone(), false, source)
+        .with_correlation_id(*correlation_id);
+    send_response_envelope(&envelope);
+}
+
 /// Sends a quote tick to an endpoint handler.
 pub fn send_quote(endpoint: MStr<Endpoint>, quote: &QuoteTick) {
     send_endpoint_ref(
