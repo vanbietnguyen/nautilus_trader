@@ -54,7 +54,9 @@ use nautilus_core::{
     datetime::datetime_to_unix_nanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
-use nautilus_live::task::TaskGroup;
+use nautilus_live::{
+    SocketControl, SocketControlFactory, SocketReconnectRequestOutcome, task::TaskGroup,
+};
 use nautilus_model::{
     data::{BarSpecification, BarType, CustomData, Data, DataType, custom::CustomDataTrait},
     enums::{BarAggregation, PriceType},
@@ -196,6 +198,7 @@ pub struct DatabentoDataClient {
     publisher_venue_map: Arc<IndexMap<PublisherId, Venue>>,
     symbol_venue_map: Arc<AtomicMap<Symbol, Venue>>,
     data_sender: EventSender<DataEvent>,
+    socket_controls: SocketControlFactory,
 }
 
 impl DatabentoDataClient {
@@ -250,6 +253,10 @@ impl DatabentoDataClient {
 
         let task_handles = TaskGroup::new();
 
+        // Built here, inside the node's client factory scope, so the controls it makes later
+        // (one per dataset feed handler) are owned by the node's socket registry
+        let socket_controls = SocketControlFactory::new(client_id, None);
+
         Ok(Self {
             client_id,
             config,
@@ -262,6 +269,7 @@ impl DatabentoDataClient {
             publisher_venue_map: Arc::new(publisher_venue_map),
             symbol_venue_map: Arc::new(AtomicMap::new()),
             data_sender,
+            socket_controls,
         })
     }
 
@@ -426,10 +434,15 @@ impl DatabentoDataClient {
             feed_handler = feed_handler.with_gateway_addr(addr.clone());
         }
 
+        let socket_control = self.socket_controls.control(&feed_dataset);
+        register_feed_reconnect(&socket_control, &cmd_tx);
+
         let feed_future = async move {
             // run() logs its terminal error and forwards it as `DatabentoMessage::Error`
             let _ = feed_handler.run().await;
             feed_channels.lock().remove(&feed_dataset);
+            // Deregisters the dataset endpoint once its feed handler has stopped
+            drop(socket_control);
         };
 
         let cancellation_token = self.cancellation_token.clone();
@@ -1742,6 +1755,31 @@ fn send_subscription_commands(
     Ok(())
 }
 
+/// Registers an operator reconnect for one dataset feed handler.
+///
+/// The `databento` TCP client reports no transport state to a sink, so the sink is created
+/// only to arm the control's generation, which `SocketControl::register` requires. A request
+/// sends `HandlerCommand::Reconnect` through a weak sender so the registry never keeps the
+/// feed's command channel open.
+fn register_feed_reconnect(
+    control: &SocketControl,
+    cmd_tx: &tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+) {
+    let _state_sink = control.sink();
+    let cmd_tx = cmd_tx.downgrade();
+
+    control.register(move || {
+        let Some(cmd_tx) = cmd_tx.upgrade() else {
+            return SocketReconnectRequestOutcome::Closed;
+        };
+
+        match cmd_tx.send(HandlerCommand::Reconnect) {
+            Ok(()) => SocketReconnectRequestOutcome::Accepted,
+            Err(_) => SocketReconnectRequestOutcome::Closed,
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use std::{num::NonZeroUsize, path::PathBuf};
@@ -1756,6 +1794,7 @@ mod tests {
         msgbus::{self, switchboard::get_custom_topic},
     };
     use nautilus_core::UUID4;
+    use nautilus_live::{SocketReconnectLookup, SocketReconnectRegistry};
     use nautilus_model::{
         data::{BatchView, NautilusDataType, OrderBookDelta, QuoteTick},
         enums::BookType,
@@ -1769,7 +1808,9 @@ mod tests {
     use tokio::{
         io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
         net::TcpListener,
+        sync::mpsc::error::TryRecvError,
     };
+    use ustr::Ustr;
 
     use super::*;
     use crate::enums::{DatabentoStatisticType, DatabentoStatisticUpdateAction};
@@ -2216,6 +2257,46 @@ mod tests {
         assert_eq!(
             receiver.try_recv().unwrap_err(),
             tokio::sync::mpsc::error::TryRecvError::Empty
+        );
+    }
+
+    #[rstest]
+    fn test_client_built_in_registry_scope_declares_reconnect_support() {
+        let registry = SocketReconnectRegistry::default();
+
+        let client = registry.scope(test_data_client);
+
+        assert!(matches!(
+            registry.get(client.client_id, Ustr::from("GLBX.MDP3")),
+            SocketReconnectLookup::EndpointNotFound
+        ));
+    }
+
+    #[rstest]
+    fn test_feed_reconnect_request_reaches_handler() {
+        let registry = SocketReconnectRegistry::default();
+        let client_id = ClientId::from("DATABENTO-TEST");
+        let endpoint = Ustr::from("GLBX.MDP3");
+        let control = SocketControl::with_registry(client_id, None, endpoint, &registry);
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        register_feed_reconnect(&control, &cmd_tx);
+
+        let SocketReconnectLookup::Handle(handle) = registry.get(client_id, endpoint) else {
+            panic!("dataset endpoint should be registered");
+        };
+        assert_eq!(
+            handle.request_reconnect(),
+            SocketReconnectRequestOutcome::Accepted
+        );
+        assert!(matches!(cmd_rx.try_recv(), Ok(HandlerCommand::Reconnect)));
+
+        // The registry holds no sender, so the feed's channel closes with its last sender
+        drop(cmd_tx);
+        assert!(matches!(cmd_rx.try_recv(), Err(TryRecvError::Disconnected)));
+        assert_eq!(
+            handle.request_reconnect(),
+            SocketReconnectRequestOutcome::Closed
         );
     }
 
