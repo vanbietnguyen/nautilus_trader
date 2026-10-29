@@ -610,7 +610,31 @@ async fn drain_buffer(
     pipe.query_async(conn).await.map_err(anyhow::Error::from)
 }
 
+/// Where a Redis stream read starts: each stream delivers the entries after this position.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum StreamStart {
+    /// Entries written from the current time on.
+    #[default]
+    Now,
+    /// Every entry still held in the stream, then new entries.
+    Beginning,
+    /// Entries after the given stream entry ID (for example `1700000000000-0`).
+    After(String),
+}
+
+/// Returns the stream entry ID a read starting at `start` begins after.
+fn initial_stream_id(start: &StreamStart) -> String {
+    match start {
+        StreamStart::Now => get_atomic_clock_realtime().get_time_ms().to_string(),
+        StreamStart::Beginning => "0".to_string(),
+        StreamStart::After(id) => id.clone(),
+    }
+}
+
 /// Streams messages from Redis streams and sends them over the provided `tx` channel.
+///
+/// Reads start from the current time; see [`stream_messages_from`] to read entries already
+/// held in the streams.
 ///
 /// # Errors
 ///
@@ -621,6 +645,27 @@ pub async fn stream_messages(
     tx: tokio::sync::mpsc::Sender<BusMessage>,
     config: RedisMessageBusConfig,
     stream_keys: Vec<String>,
+    stream_signal: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    stream_messages_from(tx, config, stream_keys, StreamStart::Now, stream_signal).await
+}
+
+/// Streams messages from Redis streams, starting after `start`, and sends them over the
+/// provided `tx` channel.
+///
+/// One read loop delivers the entries already held after `start` and then tails new entries,
+/// so the hand-over from history to live loses and repeats nothing.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Establishing the Redis connection fails before the terminate signal is received.
+/// - A Redis read operation returns a non-retryable error.
+pub async fn stream_messages_from(
+    tx: tokio::sync::mpsc::Sender<BusMessage>,
+    config: RedisMessageBusConfig,
+    stream_keys: Vec<String>,
+    start: StreamStart,
     stream_signal: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     log_task_started(MSGBUS_STREAM);
@@ -639,10 +684,7 @@ pub async fn stream_messages(
 
     log::debug!("Listening to streams: [{}]", stream_keys.join(", "));
 
-    // Start streaming from current timestamp
-    let clock = get_atomic_clock_realtime();
-    let timestamp_ms = clock.get_time_ms();
-    let initial_id = timestamp_ms.to_string();
+    let initial_id = initial_stream_id(&start);
 
     let mut last_ids: HashMap<String, String> = stream_keys
         .iter()
@@ -1426,6 +1468,23 @@ mod tests {
         assert!(!is_retryable_stream_error(&client));
     }
 
+    #[rstest]
+    #[case::beginning(StreamStart::Beginning, "0")]
+    #[case::after_entry(StreamStart::After("5-1".to_string()), "5-1")]
+    fn test_stream_start_initial_id(#[case] start: StreamStart, #[case] expected: &str) {
+        assert_eq!(initial_stream_id(&start), expected);
+    }
+
+    #[rstest]
+    fn test_stream_start_now_initial_id_is_current_time() {
+        let clock = get_atomic_clock_realtime();
+        let before = clock.get_time_ms();
+
+        let initial_id: u64 = initial_stream_id(&StreamStart::Now).parse().unwrap();
+
+        assert!((before..=clock.get_time_ms()).contains(&initial_id));
+    }
+
     #[tokio::test]
     async fn test_wait_for_retry_delay_returns_false_when_signaled() {
         let stream_signal = Arc::new(AtomicBool::new(true));
@@ -1734,6 +1793,98 @@ mod serial_tests {
 
         assert_eq!(msg.topic, "live");
         assert_eq!(msg.payload, Bytes::from("new"));
+    }
+
+    async fn read_backlog_then_live(
+        con: &mut ConnectionManager,
+        start: StreamStart,
+    ) -> Vec<(String, Bytes)> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BusMessage>(100);
+        let stream_key = format!("test:stream:start:{}", UUID4::new());
+        let external_streams = vec![stream_key.clone()];
+        let stream_signal = Arc::new(AtomicBool::new(false));
+        let stream_signal_clone = Arc::clone(&stream_signal);
+
+        for (id, payload) in [("1-0", "first"), ("2-0", "second")] {
+            let _: () = con
+                .xadd(
+                    &stream_key,
+                    id,
+                    &[("topic", "backlog"), ("payload", payload)],
+                )
+                .await
+                .unwrap();
+        }
+
+        let handle = tokio::spawn(async move {
+            stream_messages_from(
+                tx,
+                RedisMessageBusConfig::default(),
+                external_streams,
+                start,
+                stream_signal_clone,
+            )
+            .await
+            .unwrap();
+        });
+
+        let future_id = (get_atomic_clock_realtime().get_time_ms() + 1_000_000).to_string();
+        let _: () = con
+            .xadd(
+                &stream_key,
+                future_id,
+                &[("topic", "live"), ("payload", "new")],
+            )
+            .await
+            .unwrap();
+
+        let mut received = Vec::new();
+        loop {
+            let msg = receive_bus_message(&mut rx, Duration::from_secs(2)).await;
+            let is_live = msg.topic == "live";
+            received.push((msg.topic.to_string(), msg.payload));
+            if is_live {
+                break;
+            }
+        }
+
+        rx.close();
+        stream_signal.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+        let _: usize = con.del(stream_key).await.unwrap();
+
+        received
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stream_messages_from_beginning_replays_backlog_then_tails(
+        #[future] redis_connection: ConnectionManager,
+    ) {
+        let mut con = redis_connection.await;
+
+        let received = read_backlog_then_live(&mut con, StreamStart::Beginning).await;
+
+        assert_eq!(
+            received,
+            vec![
+                ("backlog".to_string(), Bytes::from("first")),
+                ("backlog".to_string(), Bytes::from("second")),
+                ("live".to_string(), Bytes::from("new")),
+            ]
+        );
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stream_messages_from_now_skips_backlog(
+        #[future] redis_connection: ConnectionManager,
+    ) {
+        let mut con = redis_connection.await;
+
+        let received = read_backlog_then_live(&mut con, StreamStart::Now).await;
+
+        assert_eq!(received, vec![("live".to_string(), Bytes::from("new"))]);
     }
 
     #[rstest]
