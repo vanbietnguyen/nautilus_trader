@@ -6245,7 +6245,9 @@ dependencies = [
  "proptest",
  "pyo3",
  "pyo3-stub-gen",
+ "rmp-serde",
  "rstest",
+ "serde",
  "strum 0.28.0",
 ]
 

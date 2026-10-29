@@ -20,6 +20,7 @@ use nautilus_model::{
     data::{Bar, QuoteTick, TradeTick},
     enums::PriceType,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     average::ema::ExponentialMovingAverage,
@@ -30,7 +31,7 @@ use crate::{
 /// The Double Exponential Moving Average attempts to a smoother average with less
 /// lag than the normal Exponential Moving Average (EMA)
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.indicators")

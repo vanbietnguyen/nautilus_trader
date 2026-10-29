@@ -20,6 +20,7 @@ use nautilus_model::{
     data::{Bar, QuoteTick, TradeTick},
     enums::PriceType,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     indicator::{Indicator, MovingAverage},
@@ -28,7 +29,7 @@ use crate::{
 
 /// Exponential moving average.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.indicators")
@@ -354,5 +355,25 @@ mod tests {
             ema.value() > 0.0,
             "Underflow: EMA value collapsed to zero for sub-normal inputs"
         );
+    }
+
+    #[rstest]
+    fn test_serde_round_trip_continues_identically(mut indicator_ema_10: ExponentialMovingAverage) {
+        for i in 0..15 {
+            indicator_ema_10.update_raw(1.0 + f64::from(i) * 0.37);
+        }
+
+        let bytes = rmp_serde::to_vec(&indicator_ema_10).unwrap();
+        let mut restored: ExponentialMovingAverage = rmp_serde::from_slice(&bytes).unwrap();
+
+        for i in 0..10 {
+            let value = 7.0 - f64::from(i) * 0.53;
+            indicator_ema_10.update_raw(value);
+            restored.update_raw(value);
+
+            assert_eq!(restored.value.to_bits(), indicator_ema_10.value.to_bits());
+            assert_eq!(restored.count, indicator_ema_10.count);
+            assert_eq!(restored.initialized, indicator_ema_10.initialized);
+        }
     }
 }

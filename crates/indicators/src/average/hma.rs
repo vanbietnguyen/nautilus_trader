@@ -20,6 +20,7 @@ use nautilus_model::{
     data::{Bar, QuoteTick, TradeTick},
     enums::PriceType,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     average::wma::WeightedMovingAverage,
@@ -31,7 +32,7 @@ use crate::{
 /// window. The HMA, developed by Alan Hull, is an extremely fast and smooth
 /// moving average.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.indicators")
