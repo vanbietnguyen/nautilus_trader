@@ -217,6 +217,9 @@ pub struct DataEngine {
     option_chain_managers: AHashMap<OptionSeriesId, Rc<RefCell<OptionChainManager>>>,
     option_chain_instrument_index: AHashMap<InstrumentId, OptionSeriesId>,
     deferred_cmd_queue: DeferredCommandQueue,
+    /// `RANGE_INCLUSIVE` bars completed while their completing update is being delivered,
+    /// published once that delivery returns.
+    deferred_bars: Rc<RefCell<VecDeque<Bar>>>,
     option_chain_bootstrapper: Option<Rc<OptionChainBootstrapper>>,
     pending_option_chain_requests: AHashMap<UUID4, PendingOptionChainRequest>,
     option_chain_greeks_bootstraps: AHashMap<OptionSeriesId, OptionChainGreeksBootstrap>,
@@ -297,6 +300,7 @@ impl DataEngine {
             option_chain_managers: AHashMap::new(),
             option_chain_instrument_index: AHashMap::new(),
             deferred_cmd_queue: Rc::new(RefCell::new(VecDeque::new())),
+            deferred_bars: Rc::new(RefCell::new(VecDeque::new())),
             option_chain_bootstrapper: None,
             pending_option_chain_requests: AHashMap::new(),
             option_chain_greeks_bootstraps: AHashMap::new(),
@@ -1864,6 +1868,8 @@ impl DataEngine {
             )]
             other => log_defi_data_dropped(other),
         }
+
+        self.publish_deferred_bars();
     }
 
     /// Processes a `Data` instance through the pipeline bus path.
