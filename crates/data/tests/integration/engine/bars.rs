@@ -1166,3 +1166,330 @@ fn test_subscribe_range_inclusive_bars_discards_forming_bar_at_default_boundary(
         ))
     );
 }
+
+#[derive(Debug, PartialEq)]
+enum Delivery {
+    Trade {
+        trade_id: TradeId,
+        cached_bar_ts: Option<UnixNanos>,
+    },
+    Bar(UnixNanos),
+}
+
+/// Subscribes trades and bars at the default priority, as an actor does, and records the order
+/// in which they are delivered with the cached bar seen by each trade.
+fn record_deliveries(
+    cache: &Rc<RefCell<Cache>>,
+    instrument_id: InstrumentId,
+    bar_type: BarType,
+) -> Rc<RefCell<Vec<Delivery>>> {
+    let deliveries = Rc::new(RefCell::new(Vec::new()));
+
+    let trade_deliveries = Rc::clone(&deliveries);
+    let trade_cache = Rc::clone(cache);
+    let trade_handler = TypedHandler::from(move |trade: &TradeTick| {
+        let cached_bar_ts = trade_cache.borrow().bar(&bar_type).map(|bar| bar.ts_event);
+        trade_deliveries.borrow_mut().push(Delivery::Trade {
+            trade_id: trade.trade_id,
+            cached_bar_ts,
+        });
+    });
+    let trades_topic = switchboard::get_trades_topic(instrument_id);
+    msgbus::subscribe_trades(trades_topic.into(), trade_handler, None);
+
+    let bar_deliveries = Rc::clone(&deliveries);
+    let bar_handler = TypedHandler::from(move |bar: &Bar| {
+        bar_deliveries
+            .borrow_mut()
+            .push(Delivery::Bar(bar.ts_event));
+    });
+    let bars_topic = switchboard::get_bars_topic(bar_type);
+    msgbus::subscribe_bars(bars_topic.into(), bar_handler, None);
+
+    deliveries
+}
+
+fn range_bar_engine(
+    audusd_sim: CurrencyPair,
+    client_id: ClientId,
+    venue: Venue,
+) -> (DataEngine, Rc<RefCell<Cache>>) {
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        test_clock,
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+    (data_engine, cache)
+}
+
+fn subscribe_bars(
+    data_engine: &mut DataEngine,
+    bar_type: BarType,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    data_engine.execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+        SubscribeBars::new(
+            bar_type,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ),
+    )));
+}
+
+fn audusd_trade(instrument_id: InstrumentId, price: &str, ts: u64, trade_id: &str) -> TradeTick {
+    TradeTick::new(
+        instrument_id,
+        Price::from(price),
+        Quantity::from("1000"),
+        AggressorSide::Buy,
+        TradeId::new(trade_id),
+        UnixNanos::from(ts),
+        UnixNanos::from(ts),
+    )
+}
+
+fn delivered_trade(trade_id: &str, cached_bar_ts: Option<u64>) -> Delivery {
+    Delivery::Trade {
+        trade_id: TradeId::new(trade_id),
+        cached_bar_ts: cached_bar_ts.map(UnixNanos::from),
+    }
+}
+
+#[rstest]
+fn test_range_inclusive_bar_publishes_after_its_completing_trade(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let instrument_id = audusd_sim.id;
+    let (mut data_engine, cache) = range_bar_engine(audusd_sim, client_id, venue);
+    let bar_type =
+        BarType::from(format!("{instrument_id}-10-RANGE_INCLUSIVE-LAST-INTERNAL").as_str());
+    subscribe_bars(&mut data_engine, bar_type, client_id, venue);
+    let deliveries = record_deliveries(&cache, instrument_id, bar_type);
+
+    data_engine.process_data(Data::Trade(audusd_trade(
+        instrument_id,
+        "0.65000",
+        1_000,
+        "t1",
+    )));
+    data_engine.process_data(Data::Trade(audusd_trade(
+        instrument_id,
+        "0.65009",
+        2_000,
+        "t2",
+    )));
+    data_engine.process_data(Data::Trade(audusd_trade(
+        instrument_id,
+        "0.65011",
+        3_000,
+        "t3",
+    )));
+
+    assert_eq!(
+        *deliveries.borrow(),
+        vec![
+            delivered_trade("t1", None),
+            delivered_trade("t2", None),
+            delivered_trade("t3", None),
+            Delivery::Bar(UnixNanos::from(3_000)),
+        ]
+    );
+    assert_eq!(
+        cache.borrow().bar(&bar_type).copied(),
+        Some(Bar::new(
+            bar_type,
+            Price::from("0.65000"),
+            Price::from("0.65011"),
+            Price::from("0.65000"),
+            Price::from("0.65011"),
+            Quantity::from("3000"),
+            UnixNanos::from(3_000),
+            UnixNanos::from(3_000),
+        ))
+    );
+}
+
+#[rstest]
+fn test_range_bar_publishes_before_its_completing_trade(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let instrument_id = audusd_sim.id;
+    let (mut data_engine, cache) = range_bar_engine(audusd_sim, client_id, venue);
+    let bar_type = BarType::from(format!("{instrument_id}-10-RANGE-LAST-INTERNAL").as_str());
+    subscribe_bars(&mut data_engine, bar_type, client_id, venue);
+    let deliveries = record_deliveries(&cache, instrument_id, bar_type);
+
+    data_engine.process_data(Data::Trade(audusd_trade(
+        instrument_id,
+        "0.65000",
+        1_000,
+        "t1",
+    )));
+    data_engine.process_data(Data::Trade(audusd_trade(
+        instrument_id,
+        "0.65010",
+        2_000,
+        "t2",
+    )));
+    data_engine.process_data(Data::Trade(audusd_trade(
+        instrument_id,
+        "0.65011",
+        3_000,
+        "t3",
+    )));
+
+    assert_eq!(
+        *deliveries.borrow(),
+        vec![
+            delivered_trade("t1", None),
+            delivered_trade("t2", None),
+            Delivery::Bar(UnixNanos::from(3_000)),
+            delivered_trade("t3", Some(3_000)),
+        ]
+    );
+}
+
+#[rstest]
+fn test_range_inclusive_request_aggregation_unchanged(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let instrument_id = audusd_sim.id;
+    let (mut data_engine, cache) = range_bar_engine(audusd_sim, client_id, venue);
+    let bar_type =
+        BarType::from(format!("{instrument_id}-10-RANGE_INCLUSIVE-LAST-INTERNAL").as_str());
+    let (handler, saver) = get_typed_message_saving_handler::<Bar>(None);
+    msgbus::subscribe_bars(switchboard::get_bars_topic(bar_type).into(), handler, None);
+
+    let request_id = UUID4::new();
+    let params: Params = serde_json::from_value(json!({
+        "bar_types": [bar_type.to_string()],
+        "update_subscriptions": false,
+    }))
+    .unwrap();
+    data_engine.execute(DataCommand::Request(RequestCommand::Trades(
+        RequestTrades::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::default(),
+            Some(params.clone()),
+        ),
+    )));
+    data_engine.response(DataResponse::Trades(TradesResponse::new(
+        request_id,
+        client_id,
+        instrument_id,
+        vec![
+            audusd_trade(instrument_id, "0.65000", 1_000, "historical-1"),
+            audusd_trade(instrument_id, "0.65009", 2_000, "historical-2"),
+            audusd_trade(instrument_id, "0.65011", 3_000, "historical-3"),
+        ],
+        None,
+        None,
+        UnixNanos::from(3_000),
+        Some(params),
+    )));
+
+    assert_eq!(
+        cache.borrow().bar(&bar_type).copied(),
+        Some(Bar::new(
+            bar_type,
+            Price::from("0.65000"),
+            Price::from("0.65011"),
+            Price::from("0.65000"),
+            Price::from("0.65011"),
+            Quantity::from("3000"),
+            UnixNanos::from(3_000),
+            UnixNanos::from(3_000),
+        ))
+    );
+    assert!(saver.get_messages().is_empty());
+}
+
+#[rstest]
+fn test_range_inclusive_boundary_discard_publishes_nothing(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let instrument_id = audusd_sim.id;
+    let (mut data_engine, cache) = range_bar_engine(audusd_sim, client_id, venue);
+    let bar_type =
+        BarType::from(format!("{instrument_id}-10-RANGE_INCLUSIVE-LAST-INTERNAL").as_str());
+    subscribe_bars(&mut data_engine, bar_type, client_id, venue);
+    let deliveries = record_deliveries(&cache, instrument_id, bar_type);
+
+    // 18:00 America/New_York on 1970-01-01 (EST)
+    let boundary = 23 * 3_600 * 1_000_000_000_u64;
+    data_engine.process_data(Data::Trade(audusd_trade(
+        instrument_id,
+        "0.65000",
+        1_000,
+        "t1",
+    )));
+    data_engine.process_data(Data::Trade(audusd_trade(
+        instrument_id,
+        "0.65009",
+        2_000,
+        "t2",
+    )));
+    data_engine.process_data(Data::Trade(audusd_trade(
+        instrument_id,
+        "0.65010",
+        boundary,
+        "t3",
+    )));
+    data_engine.process_data(Data::Trade(audusd_trade(
+        instrument_id,
+        "0.65020",
+        boundary + 1_000,
+        "t4",
+    )));
+
+    assert_eq!(
+        *deliveries.borrow(),
+        vec![
+            delivered_trade("t1", None),
+            delivered_trade("t2", None),
+            delivered_trade("t3", None),
+            delivered_trade("t4", None),
+            Delivery::Bar(UnixNanos::from(boundary + 1_000)),
+        ]
+    );
+}

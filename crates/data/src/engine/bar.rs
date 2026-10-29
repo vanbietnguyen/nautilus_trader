@@ -824,9 +824,20 @@ impl DataEngine {
         let validate_sequence = self.config.validate_data_sequence;
         let publish = !historical;
 
-        let handler: Box<dyn FnMut(Bar)> = Box::new(move |bar: Bar| {
-            process_engine_bar(&cache, validate_sequence, publish, bar);
-        });
+        // A live update-fed RANGE_INCLUSIVE bar contains its completing update, so it is
+        // published after that update has reached every subscriber (see `publish_deferred_bars`)
+        let defer_until_update_delivered = publish
+            && bar_type.spec().aggregation == BarAggregation::RangeInclusive
+            && !bar_type.is_composite();
+
+        let handler: Box<dyn FnMut(Bar)> = if defer_until_update_delivered {
+            let deferred_bars = Rc::clone(&self.deferred_bars);
+            Box::new(move |bar: Bar| deferred_bars.borrow_mut().push_back(bar))
+        } else {
+            Box::new(move |bar: Bar| {
+                process_engine_bar(&cache, validate_sequence, publish, bar);
+            })
+        };
 
         aggregator
             .borrow_mut()

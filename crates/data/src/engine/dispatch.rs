@@ -128,6 +128,20 @@ impl DataEngine {
         msgbus::publish_trade(topic, &trade);
     }
 
+    /// Caches and publishes the bars deferred until their completing update was delivered,
+    /// in completion order.
+    ///
+    /// Pops one bar at a time so no borrow of the queue is held while subscribers run; a bar
+    /// completed by a handler of a published bar is published in the same drain.
+    pub(super) fn publish_deferred_bars(&self) {
+        loop {
+            let Some(bar) = self.deferred_bars.borrow_mut().pop_front() else {
+                return;
+            };
+            process_engine_bar(&self.cache, self.config.validate_data_sequence, true, bar);
+        }
+    }
+
     pub(super) fn handle_bar(&self, bar: Bar) {
         process_engine_bar(&self.cache, self.config.validate_data_sequence, true, bar);
     }
