@@ -5961,7 +5961,8 @@ impl OrderMatchingEngine {
         position: Option<&Position>,
     ) -> anyhow::Result<Option<Quantity>> {
         if self.config.use_reduce_only && order.is_reduce_only() {
-            return Ok(Some(self.position_quantity_remaining(order, position)?));
+            let remaining = self.position_quantity_remaining(order, position)?;
+            return Ok(Some(self.parent_capped_leaves(order, remaining)));
         }
 
         Ok(None)
@@ -6425,7 +6426,23 @@ impl OrderMatchingEngine {
             let child = self
                 .order_snapshot(*id)
                 .ok_or_else(|| anyhow::anyhow!("Order {id} not found in cache"))?;
-            self.update_ouo_child_after_fill(&child, leaves_qty, &excluded);
+            let quantity = if self.config.use_reduce_only
+                && order.is_reduce_only()
+                && child.is_reduce_only()
+                && order.parent_order_id().is_some()
+                && order.parent_order_id() == child.parent_order_id()
+                && order.instrument_id() == child.instrument_id()
+                && order.strategy_id() == child.strategy_id()
+                && order.order_side() == child.order_side()
+            {
+                // OUO updates take total quantity; a partially filled peer still owns its fills.
+                self.engine_filled_qty(&child)
+                    .checked_add(self.parent_capped_leaves(&child, leaves_qty))
+                    .ok_or_else(|| anyhow::anyhow!("OUO quantity overflow for order {id}"))?
+            } else {
+                leaves_qty
+            };
+            self.update_ouo_child_after_fill(&child, quantity, &excluded);
         }
 
         Ok(())
@@ -6617,10 +6634,40 @@ impl OrderMatchingEngine {
         };
 
         parent.map_or(leaves, |parent| {
-            min(
-                leaves,
-                parent.filled_qty().saturating_sub(order.filled_qty()),
-            )
+            let mut remaining = self
+                .engine_filled_qty(&parent)
+                .saturating_sub(self.engine_filled_qty(order));
+
+            if parent.instrument_id() == order.instrument_id()
+                && parent.strategy_id() == order.strategy_id()
+                && parent.order_side() != order.order_side()
+            {
+                let cache = self.cache.borrow();
+                for id in cache.iter_client_order_ids(
+                    None,
+                    Some(&order.instrument_id()),
+                    Some(&order.strategy_id()),
+                    None,
+                ) {
+                    if id == order.client_order_id() {
+                        continue;
+                    }
+
+                    let Some(child) = cache.order_ref(&id) else {
+                        continue;
+                    };
+
+                    if child.parent_order_id() == Some(parent.client_order_id())
+                        && child.order_side() == order.order_side()
+                    {
+                        // Include terminal and MARKET children, using native cumulative fills
+                        // even when their fill events have not reached the cache yet.
+                        remaining = remaining.saturating_sub(self.engine_filled_qty(&child));
+                    }
+                }
+            }
+
+            min(leaves, remaining)
         })
     }
 

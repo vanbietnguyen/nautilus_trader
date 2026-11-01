@@ -18,6 +18,486 @@ use nautilus_model::orders::stubs::TestOrderEventStubs;
 use super::*;
 
 #[rstest]
+fn test_parent_residual_partial_target_then_stop(
+    #[values(false, true)] with_b: bool,
+    #[values(false, true)] deferred: bool,
+) {
+    let instrument =
+        InstrumentAny::FuturesContract(futures_contract_es(Some(UnixNanos::default()), None));
+    let a = residual_bracket(&instrument, "A", "2", "95.00", "110.00");
+    let account_id = a[0].account_id().unwrap();
+    let (mut engine, cache, handler) = bracket_margin_engine(
+        &instrument,
+        account_id,
+        OmsType::Netting,
+        BookType::L1_MBP,
+        engine_config(),
+    );
+    residual_quote(&mut engine, &instrument, "100.00", "10", 1);
+    submit_orders(&mut engine, account_id, a.to_vec());
+
+    if with_b {
+        let b = residual_bracket(&instrument, "B", "1", "90.00", "120.00");
+        submit_orders(&mut engine, account_id, b.to_vec());
+    }
+
+    {
+        let cache = cache.borrow();
+        let entry = cache.order(&ClientOrderId::from("A-ENTRY")).unwrap();
+        assert_eq!(entry.filled_qty(), Quantity::from("2"));
+        let position_id = cache.position_id(&entry.client_order_id()).unwrap();
+        assert_eq!(
+            cache.position(position_id).unwrap().quantity,
+            Quantity::from(if with_b { "3" } else { "2" })
+        );
+    }
+
+    run_with_dispatch(&mut engine, deferred, |engine| {
+        residual_quote(engine, &instrument, "110.00", "1", 2);
+    });
+    let stop_leaves = cache
+        .borrow()
+        .order(&ClientOrderId::from("A-STOP"))
+        .unwrap()
+        .leaves_qty();
+    {
+        let cache = cache.borrow();
+        let target = cache.order(&ClientOrderId::from("A-TARGET")).unwrap();
+        assert_eq!(target.status(), OrderStatus::PartiallyFilled);
+        assert_eq!(target.filled_qty(), Quantity::from("1"));
+        assert_eq!(target.leaves_qty(), Quantity::from("1"));
+    }
+    clear_order_event_handler_messages(&handler);
+    run_with_dispatch(&mut engine, deferred, |engine| {
+        residual_quote(engine, &instrument, "94.75", "10", 3);
+    });
+
+    let fills: Vec<_> = get_order_event_handler_messages(&handler)
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some((fill.client_order_id, fill.last_qty)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fills,
+        vec![(ClientOrderId::from("A-STOP"), Quantity::from("1"))]
+    );
+    assert_eq!(stop_leaves, Quantity::from("1"));
+    let cache = cache.borrow();
+    let position_id = cache.position_id(&ClientOrderId::from("A-ENTRY")).unwrap();
+    assert_eq!(
+        cache.position(position_id).unwrap().quantity,
+        Quantity::from(if with_b { "1" } else { "0" })
+    );
+    assert_eq!(
+        cache
+            .order(&ClientOrderId::from("A-TARGET"))
+            .unwrap()
+            .status(),
+        OrderStatus::Canceled
+    );
+
+    if with_b {
+        for id in ["B-STOP", "B-TARGET"] {
+            let order = cache.order(&ClientOrderId::from(id)).unwrap();
+            assert_eq!(order.status(), OrderStatus::Accepted);
+            assert_eq!(order.leaves_qty(), Quantity::from("1"));
+            assert!(engine.order_exists(order.client_order_id()));
+        }
+    }
+}
+
+#[rstest]
+#[case::linked_market(true, false)]
+#[case::canceled_target(true, true)]
+#[case::unparented_market(false, false)]
+fn test_parent_residual_market_exit(
+    #[case] parented: bool,
+    #[case] cancel_target: bool,
+    #[values(false, true)] deferred: bool,
+) {
+    let instrument =
+        InstrumentAny::FuturesContract(futures_contract_es(Some(UnixNanos::default()), None));
+    let a = residual_bracket(&instrument, "A", "2", "95.00", "110.00");
+    let account_id = a[0].account_id().unwrap();
+    let (mut engine, cache, handler) = bracket_margin_engine(
+        &instrument,
+        account_id,
+        OmsType::Netting,
+        BookType::L1_MBP,
+        engine_config(),
+    );
+    residual_quote(&mut engine, &instrument, "100.00", "10", 1);
+    let b = residual_bracket(&instrument, "B", "1", "90.00", "120.00");
+    submit_orders(&mut engine, account_id, a.into_iter().chain(b).collect());
+    clear_order_event_handler_messages(&handler);
+
+    run_with_dispatch(&mut engine, deferred, |engine| {
+        residual_quote(engine, &instrument, "110.00", "1", 2);
+
+        if cancel_target {
+            engine.process_cancel(
+                &CancelOrder::new(
+                    TraderId::test_default(),
+                    None,
+                    StrategyId::test_default(),
+                    instrument.id(),
+                    ClientOrderId::from("A-TARGET"),
+                    None,
+                    UUID4::new(),
+                    UnixNanos::from(2),
+                    None,
+                    None,
+                ),
+                account_id,
+            );
+        }
+
+        let mut builder = OrderTestBuilder::new(OrderType::Market);
+        builder
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("RULE"))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("2"))
+            .reduce_only(true)
+            .submit(true);
+
+        if parented {
+            builder.parent_order_id(ClientOrderId::from("A-ENTRY"));
+
+            if !cancel_target {
+                builder
+                    .contingency_type(ContingencyType::Ouo)
+                    .linked_order_ids(vec![
+                        ClientOrderId::from("A-STOP"),
+                        ClientOrderId::from("A-TARGET"),
+                    ]);
+            }
+        }
+
+        // The declared quantity is stale; execution must cap it even before the target fill
+        // reaches the order and position cache. An unparented exit remains a net reduction.
+        engine.process_order(&mut builder.build(), account_id);
+    });
+
+    let fills: Vec<_> = get_order_event_handler_messages(&handler)
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some((fill.client_order_id, fill.last_qty)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fills.first(),
+        Some(&(ClientOrderId::from("A-TARGET"), Quantity::from("1")))
+    );
+    assert!(
+        fills[1..]
+            .iter()
+            .all(|(id, _)| *id == ClientOrderId::from("RULE"))
+    );
+    let rule_filled = fills[1..]
+        .iter()
+        .fold(Quantity::zero(0), |filled, (_, quantity)| {
+            filled + *quantity
+        });
+    assert_eq!(
+        rule_filled,
+        Quantity::from(if parented { "1" } else { "2" })
+    );
+    let cache = cache.borrow();
+    let position_id = cache.position_id(&ClientOrderId::from("A-ENTRY")).unwrap();
+    assert_eq!(
+        cache.position(position_id).unwrap().quantity,
+        Quantity::from(if parented { "1" } else { "0" })
+    );
+
+    for id in ["B-STOP", "B-TARGET"] {
+        let order = cache.order(&ClientOrderId::from(id)).unwrap();
+        assert_eq!(
+            order.status(),
+            if parented {
+                OrderStatus::Accepted
+            } else {
+                OrderStatus::Canceled
+            }
+        );
+        assert_eq!(engine.order_exists(order.client_order_id()), parented);
+    }
+
+    if cancel_target {
+        let target = cache.order(&ClientOrderId::from("A-TARGET")).unwrap();
+        assert_eq!(target.status(), OrderStatus::Canceled);
+        assert_eq!(target.filled_qty(), Quantity::from("1"));
+        assert_eq!(target.leaves_qty(), Quantity::from("1"));
+        assert!(!engine.order_exists(target.client_order_id()));
+    }
+}
+
+#[rstest]
+fn test_parent_residual_grows_only_with_additional_entry_fills(
+    #[values(false, true)] deferred: bool,
+) {
+    let instrument =
+        InstrumentAny::FuturesContract(futures_contract_es(Some(UnixNanos::default()), None));
+    let mut a = residual_bracket(&instrument, "A", "3", "95.00", "110.00");
+    a[0] = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(a[0].client_order_id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("3"))
+        .price(Price::from("100.01"))
+        .contingency_type(ContingencyType::Oto)
+        .linked_order_ids(a[0].linked_order_ids().unwrap().to_vec())
+        .submit(true)
+        .build();
+    let account_id = a[0].account_id().unwrap();
+    let (mut engine, cache, handler) = bracket_margin_engine(
+        &instrument,
+        account_id,
+        OmsType::Netting,
+        BookType::L1_MBP,
+        engine_config(),
+    );
+    residual_quote(&mut engine, &instrument, "100.00", "2", 1);
+    run_with_dispatch(&mut engine, deferred, |engine| {
+        submit_orders(engine, account_id, a.to_vec());
+    });
+    assert_eq!(
+        cache
+            .borrow()
+            .order(&ClientOrderId::from("A-ENTRY"))
+            .unwrap()
+            .filled_qty(),
+        Quantity::from("2")
+    );
+    let b = residual_bracket(&instrument, "B", "1", "90.00", "120.00");
+    run_with_dispatch(&mut engine, deferred, |engine| {
+        submit_orders(engine, account_id, b.to_vec());
+    });
+    run_with_dispatch(&mut engine, deferred, |engine| {
+        residual_quote(engine, &instrument, "110.00", "1", 2);
+    });
+    assert_eq!(
+        cache
+            .borrow()
+            .order(&ClientOrderId::from("A-STOP"))
+            .unwrap()
+            .leaves_qty(),
+        Quantity::from("1")
+    );
+
+    run_with_dispatch(&mut engine, deferred, |engine| {
+        residual_quote(engine, &instrument, "100.00", "1", 3);
+    });
+    {
+        let cache = cache.borrow();
+        let entry = cache.order(&ClientOrderId::from("A-ENTRY")).unwrap();
+        assert_eq!(entry.status(), OrderStatus::Filled);
+        assert_eq!(entry.filled_qty(), Quantity::from("3"));
+        let stop = cache.order(&ClientOrderId::from("A-STOP")).unwrap();
+        let target = cache.order(&ClientOrderId::from("A-TARGET")).unwrap();
+        assert_eq!(stop.leaves_qty(), Quantity::from("2"));
+        assert_eq!(target.filled_qty(), Quantity::from("1"));
+        assert_eq!(target.leaves_qty(), Quantity::from("2"));
+    }
+
+    clear_order_event_handler_messages(&handler);
+    run_with_dispatch(&mut engine, deferred, |engine| {
+        residual_quote(engine, &instrument, "94.75", "10", 4);
+    });
+    let fills: Vec<_> = get_order_event_handler_messages(&handler)
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some((fill.client_order_id, fill.last_qty)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fills,
+        vec![(ClientOrderId::from("A-STOP"), Quantity::from("2"))]
+    );
+    let cache = cache.borrow();
+    let position_id = cache.position_id(&ClientOrderId::from("A-ENTRY")).unwrap();
+    assert_eq!(
+        cache.position(position_id).unwrap().quantity,
+        Quantity::from("1")
+    );
+
+    for id in ["B-STOP", "B-TARGET"] {
+        assert!(engine.order_exists(ClientOrderId::from(id)));
+        assert_eq!(
+            cache.order(&ClientOrderId::from(id)).unwrap().status(),
+            OrderStatus::Accepted
+        );
+    }
+}
+
+#[rstest]
+fn test_parent_residual_counts_both_partially_filled_children_once(
+    #[values(false, true)] deferred: bool,
+) {
+    let instrument =
+        InstrumentAny::FuturesContract(futures_contract_es(Some(UnixNanos::default()), None));
+    let mut a = residual_bracket(&instrument, "A", "3", "95.00", "110.00");
+    a[1] = OrderTestBuilder::new(OrderType::StopLimit)
+        .instrument_id(instrument.id())
+        .client_order_id(a[1].client_order_id())
+        .parent_order_id(a[0].client_order_id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("3"))
+        .trigger_price(Price::from("95.00"))
+        .price(Price::from("95.00"))
+        .reduce_only(true)
+        .contingency_type(ContingencyType::Ouo)
+        .linked_order_ids(vec![a[2].client_order_id()])
+        .submit(true)
+        .build();
+    let account_id = a[0].account_id().unwrap();
+    let (mut engine, cache, handler) = bracket_margin_engine(
+        &instrument,
+        account_id,
+        OmsType::Netting,
+        BookType::L1_MBP,
+        engine_config(),
+    );
+    residual_quote(&mut engine, &instrument, "100.00", "10", 1);
+    let b = residual_bracket(&instrument, "B", "1", "90.00", "130.00");
+    submit_orders(&mut engine, account_id, a.into_iter().chain(b).collect());
+    run_with_dispatch(&mut engine, deferred, |engine| {
+        residual_quote(engine, &instrument, "95.00", "1", 2);
+    });
+    assert_eq!(
+        cache
+            .borrow()
+            .order(&ClientOrderId::from("A-STOP"))
+            .unwrap()
+            .filled_qty(),
+        Quantity::from("1")
+    );
+
+    // Move the triggered stop-limit above the target so the next quote fills only the target
+    let modify = ModifyOrder::new(
+        TraderId::test_default(),
+        None,
+        StrategyId::test_default(),
+        instrument.id(),
+        ClientOrderId::from("A-STOP"),
+        None,
+        None,
+        Some(Price::from("120.00")),
+        None,
+        UUID4::new(),
+        UnixNanos::from(2),
+        None,
+        None,
+    );
+    run_with_dispatch(&mut engine, deferred, |engine| {
+        engine.process_modify(&modify, account_id);
+    });
+    clear_order_event_handler_messages(&handler);
+    run_with_dispatch(&mut engine, deferred, |engine| {
+        residual_quote(engine, &instrument, "110.00", "1", 3);
+    });
+    let fills: Vec<_> = get_order_event_handler_messages(&handler)
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some((fill.client_order_id, fill.last_qty)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fills,
+        vec![(ClientOrderId::from("A-TARGET"), Quantity::from("1"))]
+    );
+    let cache = cache.borrow();
+
+    for id in ["A-STOP", "A-TARGET"] {
+        let order = cache.order(&ClientOrderId::from(id)).unwrap();
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+        assert_eq!(order.filled_qty(), Quantity::from("1"));
+        assert_eq!(order.quantity(), Quantity::from("2"));
+        assert_eq!(order.leaves_qty(), Quantity::from("1"));
+        assert!(engine.order_exists(order.client_order_id()));
+    }
+
+    let position_id = cache.position_id(&ClientOrderId::from("A-ENTRY")).unwrap();
+    assert_eq!(
+        cache.position(position_id).unwrap().quantity,
+        Quantity::from("2")
+    );
+    assert!(engine.order_exists(ClientOrderId::from("B-STOP")));
+    assert!(engine.order_exists(ClientOrderId::from("B-TARGET")));
+}
+
+fn residual_bracket(
+    instrument: &InstrumentAny,
+    prefix: &str,
+    quantity: &str,
+    stop: &str,
+    target: &str,
+) -> [OrderAny; 3] {
+    let entry_id = ClientOrderId::new(format!("{prefix}-ENTRY"));
+    let stop_id = ClientOrderId::new(format!("{prefix}-STOP"));
+    let target_id = ClientOrderId::new(format!("{prefix}-TARGET"));
+    let quantity = Quantity::from(quantity);
+    let entry = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .client_order_id(entry_id)
+        .side(OrderSide::Buy)
+        .quantity(quantity)
+        .contingency_type(ContingencyType::Oto)
+        .linked_order_ids(vec![stop_id, target_id])
+        .submit(true)
+        .build();
+    let stop = OrderTestBuilder::new(OrderType::StopMarket)
+        .instrument_id(instrument.id())
+        .client_order_id(stop_id)
+        .parent_order_id(entry_id)
+        .side(OrderSide::Sell)
+        .quantity(quantity)
+        .trigger_price(Price::from(stop))
+        .reduce_only(true)
+        .contingency_type(ContingencyType::Ouo)
+        .linked_order_ids(vec![target_id])
+        .submit(true)
+        .build();
+    let target = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(target_id)
+        .parent_order_id(entry_id)
+        .side(OrderSide::Sell)
+        .quantity(quantity)
+        .price(Price::from(target))
+        .reduce_only(true)
+        .contingency_type(ContingencyType::Ouo)
+        .linked_order_ids(vec![stop_id])
+        .submit(true)
+        .build();
+    [entry, stop, target]
+}
+
+fn residual_quote(
+    engine: &mut CachingEngine,
+    instrument: &InstrumentAny,
+    bid: &str,
+    size: &str,
+    ts: u64,
+) {
+    let bid = Price::from(bid);
+    engine.process_quote_tick(&QuoteTick::new(
+        instrument.id(),
+        bid,
+        bid + instrument.price_increment(),
+        Quantity::from(size),
+        Quantity::from(size),
+        UnixNanos::from(ts),
+        UnixNanos::from(ts),
+    ));
+}
+
+#[rstest]
 fn test_hedging_restart_preserves_independent_positions() {
     let account_id = AccountId::from("ACCOUNT-001");
     let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
