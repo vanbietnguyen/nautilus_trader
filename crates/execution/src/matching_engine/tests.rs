@@ -8640,3 +8640,137 @@ fn test_mark_price_limit_if_touched_rests_as_maker(
     assert_eq!(order.filled_qty(), Quantity::from("1.000"));
     assert_eq!(order.avg_px(), Some(Price::from(limit).as_decimal()));
 }
+
+// Builds an L1 engine whose events are recorded and applied to its cache, as the execution engine does
+fn l1_engine_recording_events() -> (OrderMatchingEngine, Rc<RefCell<Vec<OrderEventAny>>>) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let mut engine = OrderMatchingEngine::new(
+        InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt()),
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into(),
+        BookType::L1_MBP,
+        OmsType::Netting,
+        AccountType::Margin,
+        Rc::new(RefCell::new(VirtualClock::new())),
+        cache.clone(),
+        OrderMatchingEngineConfig::default(),
+    );
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&events);
+    engine.set_event_handler(Rc::new(move |event: OrderEventAny| {
+        if let Ok(mut cache) = cache.try_borrow_mut() {
+            let _ = cache.update_order(&event);
+        }
+        recorded.borrow_mut().push(event);
+    }));
+    (engine, events)
+}
+
+// An L1 engine with no order work skips matching on market data. A market order submitted after
+// such ticks must fill exactly as on an engine whose resting order kept every tick on the full path.
+#[rstest]
+fn test_idle_l1_fast_path_leaves_state_of_full_path(
+    #[values(OrderSide::Buy, OrderSide::Sell)] side: OrderSide,
+    #[values(false, true)] with_quote: bool,
+) {
+    let account_id = AccountId::from("ACCOUNT-001");
+    let (mut idle, idle_events) = l1_engine_recording_events();
+    let (mut busy, busy_events) = l1_engine_recording_events();
+    let instrument_id = idle.instrument.id();
+    let trade = |price: &str, size: &str, aggressor: AggressorSide, ts: u64| {
+        TradeTick::new(
+            instrument_id,
+            Price::from(price),
+            Quantity::from(size),
+            aggressor,
+            TradeId::new(ts.to_string()),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        )
+    };
+
+    let opening = trade("1000.00", "1.000", AggressorSide::Buy, 1);
+    idle.process_trade_tick(&opening);
+    busy.process_trade_tick(&opening);
+
+    // A sell limit far above the market rests on the busy engine and never matches
+    let mut resting = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_id)
+        .side(OrderSide::Sell)
+        .price(Price::from("9000.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
+        .submit(true)
+        .build();
+    process_cached_order(&mut busy, &mut resting, account_id);
+    assert!(busy.core.order_exists(resting.client_order_id()));
+    assert!(!busy.is_idle_l1(UnixNanos::from(2)));
+    busy_events.borrow_mut().clear();
+
+    if with_quote {
+        let quote = QuoteTick::new(
+            instrument_id,
+            Price::from("999.50"),
+            Price::from("1000.50"),
+            Quantity::from("4.000"),
+            Quantity::from("6.000"),
+            UnixNanos::from(2),
+            UnixNanos::from(2),
+        );
+        idle.process_quote_tick(&quote);
+        busy.process_quote_tick(&quote);
+    }
+
+    for tick in [
+        trade("1000.50", "2.000", AggressorSide::Buy, 3),
+        trade("1000.00", "3.000", AggressorSide::Sell, 4),
+        trade("1000.25", "1.000", AggressorSide::NoAggressor, 5),
+        trade("1000.75", "2.000", AggressorSide::Sell, 6),
+    ] {
+        assert!(idle.is_idle_l1(tick.ts_init));
+        idle.process_trade_tick(&tick);
+        busy.process_trade_tick(&tick);
+    }
+
+    assert!(idle_events.borrow().is_empty());
+    assert!(busy_events.borrow().is_empty());
+    let state = |engine: &OrderMatchingEngine| {
+        (
+            engine.core.bid,
+            engine.core.ask,
+            engine.core.last,
+            engine.book.best_bid_price(),
+            engine.book.best_ask_price(),
+            engine.last_trade_size,
+            engine.l1_trade_size,
+            engine.trade_consumption,
+        )
+    };
+    assert_eq!(state(&idle), state(&busy));
+
+    let fills = |engine: &mut OrderMatchingEngine, events: &Rc<RefCell<Vec<OrderEventAny>>>| {
+        let mut market = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument_id)
+            .side(side)
+            .quantity(Quantity::from("5.000"))
+            .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-2"))
+            .submit(true)
+            .build();
+        process_cached_order(engine, &mut market, account_id);
+        events
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                OrderEventAny::Filled(fill) => {
+                    Some((fill.last_px, fill.last_qty, fill.liquidity_side))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let idle_fills = fills(&mut idle, &idle_events);
+    let busy_fills = fills(&mut busy, &busy_events);
+    assert!(!idle_fills.is_empty());
+    assert_eq!(idle_fills, busy_fills);
+}
