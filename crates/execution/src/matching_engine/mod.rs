@@ -1848,6 +1848,9 @@ impl OrderMatchingEngine {
     }
 
     /// Processes a quote tick to update the market state.
+    ///
+    /// An L1 tick with no order work (see `is_idle_l1`) updates the book and the core's
+    /// prices and skips matching: the resulting state is the full path's.
     pub fn process_quote_tick(&mut self, quote: &QuoteTick) {
         log::debug!("Processing {quote}");
 
@@ -1904,6 +1907,12 @@ impl OrderMatchingEngine {
 
             self.last_quote_bid = Some(quote.bid_price);
             self.last_quote_ask = Some(quote.ask_price);
+
+            // Fast path: with no order work, iterating only resets the core from the book
+            if self.is_idle_l1(quote.ts_init) {
+                self.sync_idle_l1_core();
+                return;
+            }
         }
 
         self.iterate(quote.ts_init, AggressorSide::NoAggressor);
@@ -2399,6 +2408,9 @@ impl OrderMatchingEngine {
     /// can trigger `LastPrice` stop orders, which fill against book liquidity. The trade
     /// tick does not match resting limit orders or trigger stops that use other trigger
     /// types.
+    ///
+    /// An L1 tick with no order work (see `is_idle_l1`) updates the book and the core's
+    /// prices and skips matching: the resulting state is the full path's.
     pub fn process_trade_tick(&mut self, trade: &TradeTick) {
         log::debug!("Processing {trade}");
 
@@ -2457,6 +2469,17 @@ impl OrderMatchingEngine {
         }
 
         let aggressor_side = trade.aggressor_side;
+
+        // Fast path: with no order work, matching and maintenance are no-ops. Leave the
+        // trade-iteration state and the core as the full path below leaves them.
+        if self.is_idle_l1(trade.ts_init) {
+            self.last_trade_size = None;
+            self.l1_trade_size = None;
+            self.trade_consumption = 0;
+            self.sync_idle_l1_core();
+            self.restore_l1_quote_side(aggressor_side);
+            return;
+        }
 
         match aggressor_side {
             AggressorSide::Buy => {
@@ -2536,19 +2559,7 @@ impl OrderMatchingEngine {
         // polluted by iterate's L1 book sync). Without quotes, skip the restore
         // so the core tracks the latest trade price.
         if self.book_type == BookType::L1_MBP {
-            match aggressor_side {
-                AggressorSide::Sell => {
-                    if let Some(ask) = self.last_quote_ask {
-                        self.core.ask = Some(ask);
-                    }
-                }
-                AggressorSide::Buy => {
-                    if let Some(bid) = self.last_quote_bid {
-                        self.core.bid = Some(bid);
-                    }
-                }
-                AggressorSide::NoAggressor => {}
-            }
+            self.restore_l1_quote_side(aggressor_side);
         } else {
             match aggressor_side {
                 AggressorSide::Sell => {
@@ -2568,6 +2579,58 @@ impl OrderMatchingEngine {
                 AggressorSide::NoAggressor => {}
             }
         }
+    }
+
+    /// Restores the non-aggressor side of an L1 core from the last quote after a trade tick.
+    fn restore_l1_quote_side(&mut self, aggressor_side: AggressorSide) {
+        match aggressor_side {
+            AggressorSide::Sell => {
+                if let Some(ask) = self.last_quote_ask {
+                    self.core.ask = Some(ask);
+                }
+            }
+            AggressorSide::Buy => {
+                if let Some(bid) = self.last_quote_bid {
+                    self.core.bid = Some(bid);
+                }
+            }
+            AggressorSide::NoAggressor => {}
+        }
+    }
+
+    /// Returns whether an L1 market data update at `timestamp_ns` has no order work: the book is
+    /// `L1_MBP` without liquidity consumption, the core holds no order, no submitted order is in
+    /// flight, and no fill, update, queue position, contingent command, trigger override or
+    /// instrument expiration awaits processing.
+    ///
+    /// For such an update, [`Self::iterate`] matches nothing and its maintenance finds nothing to
+    /// purge, so only its final step changes state: the core's bid and ask are reset from the
+    /// book. The update paths take that step directly (see [`Self::sync_idle_l1_core`]). The book
+    /// itself is still updated, because order admission fills against it
+    /// (`determine_market_price_and_volume`).
+    fn is_idle_l1(&self, timestamp_ns: UnixNanos) -> bool {
+        self.book_type == BookType::L1_MBP
+            && !self.config.liquidity_consumption
+            && self.core.iter_orders().next().is_none()
+            && self.inflight_orders.is_empty()
+            && self.pending_fills.is_empty()
+            && self.post_match_order_ids.is_empty()
+            && self.queue_pending.is_empty()
+            && self.queue_ahead_total.is_empty()
+            && self.queue_ids_by_price.is_empty()
+            && self.queue_excess.is_empty()
+            && self.target_bid.is_none()
+            && self.target_ask.is_none()
+            && self.target_last.is_none()
+            && self.orders.is_idle()
+            && !self.instrument_expiration_due(timestamp_ns)
+    }
+
+    /// The state [`Self::iterate`] leaves after an idle L1 update: the core's bid and ask equal
+    /// the book's best prices.
+    fn sync_idle_l1_core(&mut self) {
+        self.core.bid = self.book.best_bid_price();
+        self.core.ask = self.book.best_ask_price();
     }
 
     fn start_trade_iteration(&mut self, size: Quantity) {
@@ -2743,13 +2806,24 @@ impl OrderMatchingEngine {
         );
     }
 
+    /// Returns whether [`Self::check_instrument_expiration`] has work at `timestamp_ns`: the
+    /// instrument has expired or received an instrument close, and is not yet settled.
+    fn instrument_expiration_due(&self, timestamp_ns: UnixNanos) -> bool {
+        !(self.expiration_processed || self.option_settlement_failed)
+            && (self.instrument_close.is_some()
+                || self
+                    .instrument
+                    .expiration_ns()
+                    .is_some_and(|ns| ns != UnixNanos::default() && timestamp_ns >= ns))
+    }
+
     fn check_instrument_expiration(
         &mut self,
         timestamp_ns: UnixNanos,
         defer_settlement: bool,
         excluded: &[ClientOrderId],
     ) {
-        if self.expiration_processed || self.option_settlement_failed {
+        if !self.instrument_expiration_due(timestamp_ns) {
             return;
         }
 
@@ -2757,10 +2831,6 @@ impl OrderMatchingEngine {
             .instrument
             .expiration_ns()
             .is_some_and(|ns| ns != UnixNanos::default() && timestamp_ns >= ns);
-
-        if !timestamp_triggered && self.instrument_close.is_none() {
-            return;
-        }
 
         if self.instrument_close.is_none()
             && timestamp_triggered

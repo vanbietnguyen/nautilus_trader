@@ -97,6 +97,17 @@ impl MatchingOrders {
         self.commands.borrow_mut().pop_front()
     }
 
+    /// Returns whether no order holds work here that an engine's iteration would purge or a
+    /// venue would drain: no unapplied update, cached fill quantity, rejected OTO parent or
+    /// closed OTO order, and no queued contingent command.
+    pub(super) fn is_idle(&self) -> bool {
+        self.pending_updates.borrow().is_empty()
+            && self.cached_filled_qty.borrow().is_empty()
+            && self.rejected_oto_parent_ids.borrow().is_empty()
+            && self.closed_oto_order_ids.borrow().is_empty()
+            && self.commands.borrow().is_empty()
+    }
+
     pub(super) fn reset(&self, instrument_id: InstrumentId, cache: &Cache) {
         let keep = |id: &ClientOrderId| {
             cache

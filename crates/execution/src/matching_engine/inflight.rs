@@ -51,6 +51,11 @@ impl InflightOrders {
         self.orders.borrow().contains(&id)
     }
 
+    /// Returns whether no order is awaiting venue receipt.
+    pub fn is_empty(&self) -> bool {
+        self.orders.borrow().is_empty()
+    }
+
     /// Clears receipt state when the venue discards its queues.
     pub fn clear(&self) {
         self.orders.borrow_mut().clear();
