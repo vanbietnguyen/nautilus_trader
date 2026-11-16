@@ -72,7 +72,7 @@ use crate::{
     common::{Credential, DATABENTO_VENUE, ohlcv_schema_from_aggregation},
     historical::{DatabentoHistoricalClient, RangeQueryParams},
     live::{
-        DatabentoFeedHandler, DatabentoMessage, HandlerCommand, LiveSessionSpec, ReplayEnd,
+        DatabentoFeedHandler, DatabentoMessage, HandlerCommand, LiveSessionSpec, ReplaySummary,
         replay_trades,
     },
     loader::DatabentoDataLoader,
@@ -90,6 +90,10 @@ const SCHEMA_PARAM: &str = "schema";
 /// received from `replay_start` on (the lag bound). The value is a placeholder, to be set from
 /// measured evidence.
 pub(crate) const REPLAY_LAG_BOUND: DurationNanos = DurationNanos::from_secs(1);
+/// How long a trades replay waits for a data record before it ends as complete (the idle time).
+const REPLAY_IDLE: Duration = Duration::from_millis(5000);
+/// The wall-clock bound over a whole trades replay when `replay_bound_secs` is not configured.
+const DEFAULT_REPLAY_BOUND_SECS: u64 = 120;
 const MBP10_DEPTH: usize = 10;
 const QUOTE_SCHEMAS: &[dbn::Schema] = &[
     dbn::Schema::Mbp1,
@@ -138,6 +142,12 @@ pub struct DatabentoDataClientConfig {
     pub reconnect_timeout_mins: Option<u64>,
     /// Year digits in futures IDs: 2 by default, or 1 for existing catalogs and caches.
     pub futures_year_digits: FuturesYearDigits,
+    /// Wall-clock bound in seconds over a whole `replay_start` trades replay, from the
+    /// connection attempt to the end of draining (None for the default of 120). On expiry the
+    /// private gateway session is dropped and the request fails with a reason naming the
+    /// bound; the caller has then seen any partial responses already sent, followed by the
+    /// failure, and trades decoded but not yet sent are lost.
+    pub replay_bound_secs: Option<u64>,
 }
 
 #[cfg(feature = "python")]
@@ -169,6 +179,7 @@ impl DatabentoDataClientConfig {
             reconnect_timeout_mins: Some(10), // Default: 10 minutes
             historical_base_url: None,
             live_gateway_addr: None,
+            replay_bound_secs: None,
         }
     }
 
@@ -421,7 +432,12 @@ impl DatabentoDataClient {
     ///
     /// The replay runs on a private gateway session from `replay_start` less
     /// [`REPLAY_LAG_BOUND`] and keeps the trades received at or after `replay_start`. Each batch
-    /// is sent as a partial response, then one empty response completes the request. The
+    /// is sent as a partial response. The replay ends on the gateway's `ReplayCompleted`, after
+    /// [`REPLAY_IDLE`] without a data record, or at the first record whose event time reaches
+    /// the clock's time when the request arrives (discarded); one empty response then
+    /// completes the request. The whole replay is bounded by `replay_bound_secs`; on expiry,
+    /// or when the replay fails, the request fails after any partial responses already sent.
+    /// One `info` line with the replay's counts and timings is logged at every end. The
     /// historical client is never called.
     fn request_trades_replay(
         &self,
@@ -468,6 +484,12 @@ impl DatabentoDataClient {
         let start = datetime_to_unix_nanos(request.start);
         let params = request.params;
         let replay_from = replay_start.saturating_sub(REPLAY_LAG_BOUND);
+        let until = get_atomic_clock_realtime().get_time_ns();
+        let replay_bound = Duration::from_secs(
+            self.config
+                .replay_bound_secs
+                .unwrap_or(DEFAULT_REPLAY_BOUND_SECS),
+        );
 
         self.spawn_task(async move {
             let response = |trades: Vec<TradeTick>| {
@@ -489,29 +511,47 @@ impl DatabentoDataClient {
                     .map_err(|e| anyhow::anyhow!("Failed to send replay response: {e}"))
             };
             let mut batch = Vec::new();
-            let result = replay_trades(
-                session,
-                replay_from,
-                replay_start,
-                None,
-                &mut batch,
-                |trades| send(trades, false),
+            let mut summary = ReplaySummary::new();
+            let result = tokio::time::timeout(
+                replay_bound,
+                replay_trades(
+                    session,
+                    replay_from,
+                    replay_start,
+                    until,
+                    REPLAY_IDLE,
+                    None,
+                    &mut batch,
+                    &mut summary,
+                    |trades| send(trades, false),
+                ),
             )
-            .await;
+            .await
+            .unwrap_or_else(|_| {
+                summary.end("replay_bound");
+                Err(anyhow::anyhow!(
+                    "exceeded the replay bound of {} s (`replay_bound_secs`)",
+                    replay_bound.as_secs()
+                ))
+            });
 
             match result {
-                Ok(ReplayEnd::Completed) => {
+                Ok(_) => {
                     if let Err(e) = send(Vec::new(), true) {
                         log::error!("{e}");
                     }
                 }
-                Err(e) => send_request_result(
-                    &data_sender,
-                    request_id,
-                    None,
-                    &[format!("Replay of {instrument_id}: {e}")],
-                ),
+                Err(e) => {
+                    summary.end("error");
+                    send_request_result(
+                        &data_sender,
+                        request_id,
+                        None,
+                        &[format!("Replay of {instrument_id}: {e}")],
+                    );
+                }
             }
+            log::info!("Replay of {instrument_id} ended: {summary}");
         });
 
         Ok(())

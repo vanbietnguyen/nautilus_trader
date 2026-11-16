@@ -1151,6 +1151,137 @@ pub(crate) struct LiveSessionSpec {
 pub(crate) enum ReplayEnd {
     /// The gateway sent `ReplayCompleted`: the replay reached real time.
     Completed,
+    /// No data record arrived for the idle time. Heartbeats and other non-data records do not
+    /// re-arm the idle timer.
+    Idle,
+    /// A data record's event time reached `until`. That record is discarded.
+    Bound,
+}
+
+impl ReplayEnd {
+    /// Returns the end's name in a [`ReplaySummary`] line.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Idle => "idle",
+            Self::Bound => "bound",
+        }
+    }
+}
+
+/// Counts and timings of one [`replay_trades`] session, logged once at its end.
+///
+/// It holds no price, size or row. Timings are milliseconds from the creation of the summary
+/// (the connection attempt). Record counts cover data (`tbbo`) records only. Its text is a
+/// list of `key=value` fields whose names are stable; an absent value reads `none`.
+#[derive(Debug)]
+pub(crate) struct ReplaySummary {
+    started: tokio::time::Instant,
+    end: Option<&'static str>,
+    connected: Option<Duration>,
+    first_record: Option<Duration>,
+    ended: Option<Duration>,
+    records: u64,
+    kept: u64,
+    discarded_below_keep_from: u64,
+    ts_event_below_start: u64,
+    ts_recv_below_start: u64,
+    ts_recv_decreases: u64,
+    max_recv_minus_event_ns: Option<u64>,
+    replay_completed: Option<Duration>,
+    first_kept_offset_ms: Option<u64>,
+    last_kept_offset_ms: Option<u64>,
+}
+
+impl ReplaySummary {
+    /// Creates an empty summary whose timings start now.
+    pub(crate) fn new() -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            end: None,
+            connected: None,
+            first_record: None,
+            ended: None,
+            records: 0,
+            kept: 0,
+            discarded_below_keep_from: 0,
+            ts_event_below_start: 0,
+            ts_recv_below_start: 0,
+            ts_recv_decreases: 0,
+            max_recv_minus_event_ns: None,
+            replay_completed: None,
+            first_kept_offset_ms: None,
+            last_kept_offset_ms: None,
+        }
+    }
+
+    /// Records how the replay ended, with its time. Only the first end is kept.
+    pub(crate) fn end(&mut self, kind: &'static str) {
+        if self.end.is_none() {
+            self.end = Some(kind);
+            self.ended = Some(self.started.elapsed());
+        }
+    }
+
+    fn count_record(&mut self, ts_event: u64, ts_recv: u64, start: UnixNanos) {
+        self.records += 1;
+        self.first_record
+            .get_or_insert_with(|| self.started.elapsed());
+
+        if ts_event != dbn::UNDEF_TIMESTAMP {
+            if ts_event < start.as_u64() {
+                self.ts_event_below_start += 1;
+            }
+            let lag = ts_recv.saturating_sub(ts_event);
+            self.max_recv_minus_event_ns =
+                Some(self.max_recv_minus_event_ns.map_or(lag, |max| max.max(lag)));
+        }
+
+        if ts_recv < start.as_u64() {
+            self.ts_recv_below_start += 1;
+        }
+    }
+
+    fn count_kept(&mut self, ts_recv: u64, keep_from: UnixNanos) {
+        let offset_ms = ts_recv.saturating_sub(keep_from.as_u64()) / 1_000_000;
+        self.kept += 1;
+        self.first_kept_offset_ms.get_or_insert(offset_ms);
+        self.last_kept_offset_ms = Some(offset_ms);
+    }
+}
+
+impl Display for ReplaySummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn ms(duration: Option<Duration>) -> String {
+            duration.map_or_else(|| "none".to_owned(), |d| d.as_millis().to_string())
+        }
+        fn value(value: Option<u64>) -> String {
+            value.map_or_else(|| "none".to_owned(), |v| v.to_string())
+        }
+
+        write!(
+            f,
+            "end={} connect_ms={} first_record_ms={} end_ms={} records={} kept={} \
+             discarded_below_keep_from={} ts_event_below_start={} ts_recv_below_start={} \
+             ts_recv_decreases={} max_recv_minus_event_ns={} replay_completed={} \
+             replay_completed_ms={} first_kept_offset_ms={} last_kept_offset_ms={}",
+            self.end.unwrap_or("none"),
+            ms(self.connected),
+            ms(self.first_record),
+            ms(self.ended),
+            self.records,
+            self.kept,
+            self.discarded_below_keep_from,
+            self.ts_event_below_start,
+            self.ts_recv_below_start,
+            self.ts_recv_decreases,
+            value(self.max_recv_minus_event_ns),
+            self.replay_completed.is_some(),
+            ms(self.replay_completed),
+            value(self.first_kept_offset_ms),
+            value(self.last_kept_offset_ms),
+        )
+    }
 }
 
 /// Replays the trades of one instrument from `start` through a private live gateway session.
@@ -1158,19 +1289,33 @@ pub(crate) enum ReplayEnd {
 /// Subscribes the `tbbo` schema with `start`, then starts the session. Each trade is decoded
 /// with `ts_init` taken from the record's `ts_recv`; a trade whose `ts_recv` is below
 /// `keep_from` is discarded. Decoded trades collect in `batch` and are handed to `deliver`
-/// every [`REPLAY_BATCH_SIZE`] trades. When the gateway reports `ReplayCompleted`, the
-/// remaining batch is delivered and the replay ends.
+/// every [`REPLAY_BATCH_SIZE`] trades. The replay ends, delivering the remaining batch, at
+/// the first of:
+/// - the gateway's `ReplayCompleted` ([`ReplayEnd::Completed`]);
+/// - no data record for `idle` after the session starts or after the last data record
+///   ([`ReplayEnd::Idle`]); heartbeats and other non-data records do not re-arm it;
+/// - a data record whose header `ts_event` (its `ts_recv` when undefined) is at or after
+///   `until` ([`ReplayEnd::Bound`]); that record is discarded.
+///
+/// `summary` collects counts and timings and records the end. The caller bounds the whole
+/// replay in time: dropping the future drops the session, and `batch` keeps what was decoded.
 ///
 /// # Errors
 ///
 /// Returns an error if the connection, subscription, session start, record decoding or
-/// `deliver` fails, or if the gateway ends the session before the replay completes.
+/// `deliver` fails, if a data record's `ts_recv` is below the previous one's, if the gateway
+/// sends an error message (its code name in the error), or if the gateway ends the session
+/// before the replay ends.
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn replay_trades(
     session: LiveSessionSpec,
     start: UnixNanos,
     keep_from: UnixNanos,
+    until: UnixNanos,
+    idle: Duration,
     decode_config: Option<&DatabentoDecodeConfig>,
     batch: &mut Vec<TradeTick>,
+    summary: &mut ReplaySummary,
     mut deliver: impl FnMut(Vec<TradeTick>) -> anyhow::Result<()>,
 ) -> anyhow::Result<ReplayEnd> {
     let LiveSessionSpec {
@@ -1209,6 +1354,7 @@ pub(crate) async fn replay_trades(
     })
     .await?
     .map_err(|e| anyhow::anyhow!("Failed to connect to Databento LSG: {e}"))?;
+    summary.connected = Some(summary.started.elapsed());
 
     let subscription = Subscription::builder()
         .schema(dbn::Schema::Tbbo)
@@ -1227,14 +1373,54 @@ pub(crate) async fn replay_trades(
     let mut subscription_price_precision_map: AHashMap<u32, u8> = AHashMap::new();
     // The session subscribes no definitions, so precision comes from overrides or the default
     let instrument_def_price_precision_map: AHashMap<u32, u8> = AHashMap::new();
+    let mut previous_recv: Option<u64> = None;
+    let mut idle_deadline = tokio::time::Instant::now() + idle;
 
     loop {
-        let Some(record) = client.next_record().await? else {
+        let Ok(next) = tokio::time::timeout_at(idle_deadline, client.next_record()).await else {
+            if !batch.is_empty() {
+                deliver(std::mem::take(batch))?;
+            }
+            summary.end(ReplayEnd::Idle.name());
+            return Ok(ReplayEnd::Idle);
+        };
+        let Some(record) = next? else {
+            summary.end("gateway_closed");
             anyhow::bail!("Gateway ended the {instrument_id} replay session before it completed");
         };
 
         if let Some(msg) = record.get::<dbn::TbboMsg>() {
-            if msg.ts_recv < keep_from.as_u64() {
+            let ts_recv = msg.ts_recv;
+            let ts_event = msg.hd.ts_event;
+            summary.count_record(ts_event, ts_recv, start);
+
+            if previous_recv.is_some_and(|previous| ts_recv < previous) {
+                summary.ts_recv_decreases += 1;
+                summary.end("out_of_order");
+                anyhow::bail!(
+                    "Replay of {instrument_id} received a record whose ts_recv is below the \
+                     previous record's"
+                );
+            }
+            previous_recv = Some(ts_recv);
+            idle_deadline = tokio::time::Instant::now() + idle;
+
+            // A record at or after `until` ends the replay and is discarded
+            let event_time = if ts_event == dbn::UNDEF_TIMESTAMP {
+                ts_recv
+            } else {
+                ts_event
+            };
+            if event_time >= until.as_u64() {
+                if !batch.is_empty() {
+                    deliver(std::mem::take(batch))?;
+                }
+                summary.end(ReplayEnd::Bound.name());
+                return Ok(ReplayEnd::Bound);
+            }
+
+            if ts_recv < keep_from.as_u64() {
+                summary.discarded_below_keep_from += 1;
                 continue;
             }
 
@@ -1265,6 +1451,7 @@ pub(crate) async fn replay_trades(
 
             if let Some(Data::Trade(trade)) = trade {
                 batch.push(trade);
+                summary.count_kept(ts_recv, keep_from);
             }
 
             if batch.len() >= REPLAY_BATCH_SIZE {
@@ -1284,13 +1471,23 @@ pub(crate) async fn replay_trades(
             )?;
         } else if let Some(msg) = record.get::<dbn::SystemMsg>() {
             if matches!(msg.code(), Ok(dbn::SystemCode::ReplayCompleted)) {
+                summary.replay_completed = Some(summary.started.elapsed());
                 if !batch.is_empty() {
                     deliver(std::mem::take(batch))?;
                 }
+                summary.end(ReplayEnd::Completed.name());
                 return Ok(ReplayEnd::Completed);
             }
         } else if let Some(msg) = record.get::<dbn::ErrorMsg>() {
             handle_error_msg(msg);
+            summary.end("gateway_error");
+            let text = msg.err().unwrap_or("<invalid utf-8>");
+            match msg.code() {
+                Ok(code) if code != dbn::ErrorCode::Unset => {
+                    anyhow::bail!("Gateway error {code:?} in the {instrument_id} replay: {text}")
+                }
+                _ => anyhow::bail!("Gateway error in the {instrument_id} replay: {text}"),
+            }
         }
     }
 }
@@ -2609,5 +2806,57 @@ mod tests {
         assert_eq!(trade.ts_event, msg.hd.ts_event);
         assert_eq!(trade.ts_init, 1_766_102_400_000_000_001);
         assert!(extra.is_none());
+    }
+
+    #[rstest]
+    fn test_replay_summary_line_lists_counts_and_timings() {
+        let summary = ReplaySummary {
+            started: tokio::time::Instant::now(),
+            end: Some("idle"),
+            connected: Some(Duration::from_millis(12)),
+            first_record: Some(Duration::from_micros(40_900)),
+            ended: Some(Duration::from_millis(5_041)),
+            records: 7,
+            kept: 4,
+            discarded_below_keep_from: 2,
+            ts_event_below_start: 1,
+            ts_recv_below_start: 0,
+            ts_recv_decreases: 0,
+            max_recv_minus_event_ns: Some(1_500),
+            replay_completed: None,
+            first_kept_offset_ms: Some(0),
+            last_kept_offset_ms: Some(500),
+        };
+
+        assert_eq!(
+            summary.to_string(),
+            "end=idle connect_ms=12 first_record_ms=40 end_ms=5041 records=7 kept=4 \
+             discarded_below_keep_from=2 ts_event_below_start=1 ts_recv_below_start=0 \
+             ts_recv_decreases=0 max_recv_minus_event_ns=1500 replay_completed=false \
+             replay_completed_ms=none first_kept_offset_ms=0 last_kept_offset_ms=500"
+        );
+    }
+
+    #[rstest]
+    fn test_replay_summary_line_marks_absent_values_none() {
+        let mut summary = ReplaySummary::new();
+        summary.replay_completed = Some(Duration::from_millis(3));
+        summary.end("replay_bound");
+        summary.end("error");
+
+        let line = summary.to_string();
+
+        assert!(line.starts_with("end=replay_bound connect_ms=none first_record_ms=none end_ms="));
+        assert!(line.contains(" records=0 kept=0 "), "{line}");
+        assert!(
+            line.contains(
+                " max_recv_minus_event_ns=none replay_completed=true replay_completed_ms=3 "
+            ),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(" first_kept_offset_ms=none last_kept_offset_ms=none"),
+            "{line}"
+        );
     }
 }

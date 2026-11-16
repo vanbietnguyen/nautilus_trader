@@ -18,7 +18,10 @@
 //! Drives `DataClient::request_trades` with the `replay_start` param against the mock LSG
 //! (Live Streaming Gateway) server.
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use databento::dbn;
 use nautilus_common::{
@@ -26,7 +29,7 @@ use nautilus_common::{
     live::runner::replace_data_event_sender,
     messages::{
         DataEvent, DataResponse,
-        data::{DataResponseEnvelope, RequestTrades},
+        data::{DataRequestFailed, DataResponseEnvelope, RequestTrades},
     },
 };
 use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
@@ -49,10 +52,24 @@ const REQUEST_INSTRUMENT_ID: &str = "ESM4.GLBX";
 const REPLAY_START: u64 = 1_717_423_200_000_000_000;
 // The adapter's lag bound, one second
 const LAG_BOUND_NS: u64 = 1_000_000_000;
+// The adapter's idle time, 5000 ms
+const IDLE: Duration = Duration::from_millis(5_000);
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
+// An idle end must arrive by then; one re-armed by a heartbeat a second before it would not
+const IDLE_END_WITHIN: Duration = Duration::from_millis(7_000);
 
 fn replay_client(
     gateway_addr: String,
+) -> (
+    DatabentoDataClient,
+    tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+) {
+    replay_client_with_bound(gateway_addr, None)
+}
+
+fn replay_client_with_bound(
+    gateway_addr: String,
+    replay_bound_secs: Option<u64>,
 ) -> (
     DatabentoDataClient,
     tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
@@ -68,6 +85,7 @@ fn replay_client(
     );
     config.live_gateway_addr = Some(gateway_addr);
     config.futures_year_digits = FuturesYearDigits::One;
+    config.replay_bound_secs = replay_bound_secs;
     let client = DatabentoDataClient::new(
         ClientId::from("DATABENTO-REPLAY"),
         config,
@@ -112,8 +130,18 @@ fn replay_completed_msg() -> dbn::SystemMsg {
     system_msg("Replay completed", dbn::SystemCode::ReplayCompleted as u8)
 }
 
-/// Queues one replay session: the subscription, the start, then `records` and `ReplayCompleted`.
-fn serve_replay(server: &MockLsgServer, records: impl IntoIterator<Item = dbn::Mbp1Msg>) {
+fn heartbeat_msg() -> dbn::SystemMsg {
+    system_msg("Heartbeat", dbn::SystemCode::Heartbeat as u8)
+}
+
+/// Returns a time an hour from now, past the clock's time when a request arrives.
+fn an_hour_from_now() -> u64 {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    u64::try_from((now + Duration::from_secs(3_600)).as_nanos()).unwrap()
+}
+
+/// Queues one replay session: the subscription, the start, then `records`, and then goes quiet.
+fn serve_session(server: &MockLsgServer, records: impl IntoIterator<Item = dbn::Mbp1Msg>) {
     server.authenticate();
     server.expect_subscription();
     server.start();
@@ -122,6 +150,11 @@ fn serve_replay(server: &MockLsgServer, records: impl IntoIterator<Item = dbn::M
     for record in records {
         server.send_record(record);
     }
+}
+
+/// Queues one replay session: the subscription, the start, then `records` and `ReplayCompleted`.
+fn serve_replay(server: &MockLsgServer, records: impl IntoIterator<Item = dbn::Mbp1Msg>) {
+    serve_session(server, records);
     server.send_record(replay_completed_msg());
 }
 
@@ -129,10 +162,18 @@ fn serve_replay(server: &MockLsgServer, records: impl IntoIterator<Item = dbn::M
 async fn recv_until_completed(
     receiver: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
 ) -> Vec<DataResponseEnvelope> {
+    recv_until_completed_by(receiver, tokio::time::Instant::now() + RECV_TIMEOUT).await
+}
+
+/// Receives response envelopes until the completed one, which must arrive by `deadline`.
+async fn recv_until_completed_by(
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    deadline: tokio::time::Instant,
+) -> Vec<DataResponseEnvelope> {
     let mut envelopes = Vec::new();
 
     loop {
-        let event = tokio::time::timeout(RECV_TIMEOUT, receiver.recv())
+        let event = tokio::time::timeout_at(deadline, receiver.recv())
             .await
             .expect("timed out waiting for a response envelope")
             .expect("channel closed");
@@ -146,6 +187,29 @@ async fn recv_until_completed(
             return envelopes;
         }
     }
+}
+
+/// Receives the request's failure, which must be its next event and arrive within `within`.
+async fn recv_failure(
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    within: Duration,
+) -> DataRequestFailed {
+    let event = tokio::time::timeout(within, receiver.recv())
+        .await
+        .expect("timed out waiting for the request failure")
+        .expect("channel closed");
+    let DataEvent::RequestFailed(failed) = event else {
+        panic!("expected a request failure, was {event:?}");
+    };
+    failed
+}
+
+fn trade_sizes(envelopes: &[DataResponseEnvelope]) -> Vec<Quantity> {
+    envelopes
+        .iter()
+        .flat_map(envelope_trades)
+        .map(|trade| trade.size)
+        .collect()
 }
 
 fn envelope_trades(envelope: &DataResponseEnvelope) -> Vec<TradeTick> {
@@ -262,6 +326,174 @@ async fn test_replay_completed_sends_one_completed_envelope_after_partials() {
     assert!(
         after.is_err(),
         "expected no event after completion, was {after:?}"
+    );
+
+    server.stop().await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_replay_ends_idle_when_the_gateway_goes_quiet() {
+    let server = MockLsgServer::new(TEST_DATASET).await;
+    let (client, mut receiver) = replay_client(server.addr());
+    serve_session(
+        &server,
+        [tbbo_trade(REPLAY_START, 1), tbbo_trade(REPLAY_START + 1, 2)],
+    );
+    let sent = tokio::time::Instant::now();
+
+    client.request_trades(replay_request()).unwrap();
+    let envelopes = recv_until_completed_by(&mut receiver, sent + IDLE_END_WITHIN).await;
+
+    assert!(
+        sent.elapsed() >= IDLE,
+        "the idle end came before the idle time"
+    );
+    assert_eq!(trade_sizes(&envelopes), [1, 2].map(Quantity::from).to_vec());
+    let (completed, _) = envelopes.split_last().unwrap();
+    assert!(envelope_trades(completed).is_empty());
+    assert!(
+        envelopes
+            .iter()
+            .all(|envelope| envelope.failure_reason().is_none())
+    );
+
+    server.stop().await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_replay_heartbeats_do_not_rearm_the_idle_end() {
+    let server = MockLsgServer::new(TEST_DATASET).await;
+    let (client, mut receiver) = replay_client(server.addr());
+    serve_session(
+        &server,
+        [tbbo_trade(REPLAY_START, 1), tbbo_trade(REPLAY_START + 1, 2)],
+    );
+    let sent = tokio::time::Instant::now();
+
+    client.request_trades(replay_request()).unwrap();
+    // Heartbeats one to four seconds into the quiet: re-armed, the idle end would come at nine
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        server.send_record(heartbeat_msg());
+    }
+    let envelopes = recv_until_completed_by(&mut receiver, sent + IDLE_END_WITHIN).await;
+
+    assert!(
+        sent.elapsed() >= IDLE,
+        "the idle end came before the idle time"
+    );
+    assert_eq!(trade_sizes(&envelopes), [1, 2].map(Quantity::from).to_vec());
+
+    server.stop().await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_replay_ends_at_bound_and_discards_the_crossing_record() {
+    let server = MockLsgServer::new(TEST_DATASET).await;
+    let (client, mut receiver) = replay_client(server.addr());
+    let crossing = an_hour_from_now();
+    serve_session(
+        &server,
+        [
+            tbbo_trade(REPLAY_START, 1),
+            tbbo_trade(REPLAY_START + 1, 2),
+            tbbo_trade(crossing, 3),
+            tbbo_trade(crossing + 1, 4),
+        ],
+    );
+    let sent = tokio::time::Instant::now();
+
+    client.request_trades(replay_request()).unwrap();
+    // Before the idle time, so the end is the bound's
+    let envelopes = recv_until_completed_by(&mut receiver, sent + IDLE / 2).await;
+
+    assert_eq!(
+        trade_sizes(&envelopes),
+        [1, 2].map(Quantity::from).to_vec(),
+        "the record at or after the bound and those after it must be absent"
+    );
+    let (completed, _) = envelopes.split_last().unwrap();
+    assert!(envelope_trades(completed).is_empty());
+
+    server.stop().await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_replay_bound_drops_a_session_that_never_authenticates() {
+    let server = MockLsgServer::new(TEST_DATASET).await;
+    let (client, mut receiver) = replay_client_with_bound(server.addr(), Some(1));
+    let closed = server.accept_until_closed();
+
+    client.request_trades(replay_request()).unwrap();
+    let failed = recv_failure(&mut receiver, Duration::from_secs(3)).await;
+
+    assert!(
+        failed.reason.contains("replay bound of 1 s"),
+        "{}",
+        failed.reason
+    );
+    assert!(
+        failed.reason.contains("replay_bound_secs"),
+        "{}",
+        failed.reason
+    );
+    tokio::time::timeout(Duration::from_secs(2), closed)
+        .await
+        .expect("the gateway did not see the session dropped")
+        .unwrap();
+
+    server.stop().await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_replay_fails_on_a_record_received_before_the_previous() {
+    let server = MockLsgServer::new(TEST_DATASET).await;
+    let (client, mut receiver) = replay_client(server.addr());
+    serve_replay(
+        &server,
+        [
+            tbbo_trade(REPLAY_START + 10, 1),
+            tbbo_trade(REPLAY_START + 5, 2),
+        ],
+    );
+
+    client.request_trades(replay_request()).unwrap();
+    let failed = recv_failure(&mut receiver, RECV_TIMEOUT).await;
+
+    assert!(
+        failed.reason.contains("ts_recv is below the previous"),
+        "{}",
+        failed.reason
+    );
+
+    server.stop().await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_replay_gateway_error_fails_with_its_code_name() {
+    let server = MockLsgServer::new(TEST_DATASET).await;
+    let (client, mut receiver) = replay_client(server.addr());
+    serve_session(&server, [tbbo_trade(REPLAY_START, 1)]);
+    server.send_record(dbn::ErrorMsg::new(
+        1_000_000_000,
+        Some(dbn::ErrorCode::ReplayDataAgedOut),
+        "Replay data aged out",
+        true,
+    ));
+
+    client.request_trades(replay_request()).unwrap();
+    let failed = recv_failure(&mut receiver, RECV_TIMEOUT).await;
+
+    assert!(
+        failed.reason.contains("ReplayDataAgedOut"),
+        "{}",
+        failed.reason
     );
 
     server.stop().await;
