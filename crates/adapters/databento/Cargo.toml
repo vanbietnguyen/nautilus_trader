@@ -93,6 +93,7 @@ nautilus-testkit = { workspace = true, default-features = false, features = [
   "testers",
 ] }
 
+clap = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
 rstest = { workspace = true }
@@ -117,5 +118,12 @@ required-features = ["live"]
 [[example]]
 name = "databento-data-tester"
 path = "examples/node_data_tester.rs"
+required-features = ["live"]
+doc = false
+
+# Run with `cargo run --example databento-replay-trades --package nautilus-databento -- --help`.
+[[example]]
+name = "databento-replay-trades"
+path = "examples/replay_trades.rs"
 required-features = ["live"]
 doc = false
