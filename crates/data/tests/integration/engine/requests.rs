@@ -2261,7 +2261,7 @@ const JOIN_DEADLINE_AFTER_NS: u64 = 120 * NANOSECONDS_IN_SECOND;
 const CUT_WARMUP_REFUSED: &str = "Cannot admit a `cut_warmup` request";
 
 struct JoinFixture {
-    engine: DataEngine,
+    engine: Rc<RefCell<DataEngine>>,
     recorder: Rc<RefCell<Vec<DataCommand>>>,
     instrument_id: InstrumentId,
     bar_type: BarType,
@@ -2286,7 +2286,12 @@ fn join_fixture(
         .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
         .unwrap();
 
-    let mut engine = DataEngine::new(clock, Rc::clone(&cache), None);
+    let engine = Rc::new(RefCell::new(DataEngine::new(
+        clock,
+        Rc::clone(&cache),
+        None,
+    )));
+    DataEngine::register_msgbus_handlers(&engine);
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         Rc::new(RefCell::new(VirtualClock::new())),
@@ -2295,7 +2300,7 @@ fn join_fixture(
         venue,
         None,
         &recorder,
-        &mut engine,
+        &mut engine.borrow_mut(),
     );
 
     JoinFixture {
@@ -2359,8 +2364,8 @@ fn execute_recording_failures(
 
 /// Asserts `request` is refused on the command with a reason containing `reason`, the requester
 /// receives that reason in one terminal, and no client is asked anything.
-fn assert_cut_warmup_refused(fixture: &mut JoinFixture, request: RequestCommand, reason: &str) {
-    let (result, failures) = execute_recording_failures(&mut fixture.engine, request);
+fn assert_cut_warmup_refused(fixture: &JoinFixture, request: RequestCommand, reason: &str) {
+    let (result, failures) = execute_recording_failures(&mut fixture.engine.borrow_mut(), request);
     let error = result
         .expect_err("a `cut_warmup` request failing a condition must be refused")
         .to_string();
@@ -2377,9 +2382,9 @@ fn assert_cut_warmup_refused(fixture: &mut JoinFixture, request: RequestCommand,
 /// Asserts `request` was admitted and its plan dispatched: the client received exactly one
 /// command, the replay tail, open-ended from the current trading day's open.
 #[cfg(feature = "streaming")]
-fn assert_reaches_join_dispatcher(fixture: &mut JoinFixture, request: RequestCommand) {
+fn assert_reaches_join_dispatcher(fixture: &JoinFixture, request: RequestCommand) {
     let current_open = joined_current_open(&request);
-    let (result, failures) = execute_recording_failures(&mut fixture.engine, request);
+    let (result, failures) = execute_recording_failures(&mut fixture.engine.borrow_mut(), request);
     result.unwrap();
     assert!(failures.is_empty(), "{failures:?}");
     assert_replay_tail(fixture, current_open);
@@ -2388,8 +2393,8 @@ fn assert_reaches_join_dispatcher(fixture: &mut JoinFixture, request: RequestCom
 /// Asserts `request` was admitted and reached the join's dispatcher, which refuses it without
 /// the `streaming` feature; no client was asked anything.
 #[cfg(not(feature = "streaming"))]
-fn assert_reaches_join_dispatcher(fixture: &mut JoinFixture, request: RequestCommand) {
-    let (result, failures) = execute_recording_failures(&mut fixture.engine, request);
+fn assert_reaches_join_dispatcher(fixture: &JoinFixture, request: RequestCommand) {
+    let (result, failures) = execute_recording_failures(&mut fixture.engine.borrow_mut(), request);
     let error = result.unwrap_err().to_string();
     assert!(
         error.contains("the join's plan needs the `streaming` feature"),
@@ -2450,7 +2455,7 @@ fn test_admitted_cut_warmup_request_reaches_the_join_dispatcher(
     #[case] session_opens: [u64; 2],
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, now_ns);
+    let fixture = join_fixture(audusd_sim, client_id, venue, now_ns);
     let request = trades_request(
         vec![fixture.instrument_id],
         None,
@@ -2458,7 +2463,7 @@ fn test_admitted_cut_warmup_request_reaches_the_join_dispatcher(
         joined_params(fixture.bar_type, now_ns, &session_opens),
     );
 
-    assert_reaches_join_dispatcher(&mut fixture, request);
+    assert_reaches_join_dispatcher(&fixture, request);
 }
 
 #[cfg(feature = "streaming")]
@@ -2470,9 +2475,9 @@ fn test_admitted_cut_warmup_request_reaches_the_join_dispatcher_with_a_catalog(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
     let _catalog_dir = register_trade_catalog_with_trades(
-        &mut fixture.engine,
+        &mut fixture.engine.borrow_mut(),
         "join-admission",
         &[split_trade(fixture.instrument_id, 2_000, "catalog-1")],
         Some((1_000, 2_000)),
@@ -2489,7 +2494,7 @@ fn test_admitted_cut_warmup_request_reaches_the_join_dispatcher_with_a_catalog(
     );
 
     // The schema bypass of the catalog path would send this request to the client
-    assert_reaches_join_dispatcher(&mut fixture, request);
+    assert_reaches_join_dispatcher(&fixture, request);
 }
 
 #[rstest]
@@ -2500,7 +2505,7 @@ fn test_cut_warmup_refused_for_a_request_other_than_trades(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
     let params = joined_params(
         fixture.bar_type,
         NY_2026_11_10_2000,
@@ -2518,7 +2523,7 @@ fn test_cut_warmup_refused_for_a_request_other_than_trades(
     ));
 
     assert_cut_warmup_refused(
-        &mut fixture,
+        &fixture,
         request,
         "only a trades request can set `cut_warmup`",
     );
@@ -2532,7 +2537,7 @@ fn test_cut_warmup_refused_for_a_batch(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
     let request = trades_request(
         vec![fixture.instrument_id, InstrumentId::from("EUR/USD.SIM")],
         None,
@@ -2545,7 +2550,7 @@ fn test_cut_warmup_refused_for_a_batch(
     );
 
     assert_cut_warmup_refused(
-        &mut fixture,
+        &fixture,
         request,
         "it must name exactly one instrument (batches are refused), received 2",
     );
@@ -2566,7 +2571,7 @@ fn test_cut_warmup_refused_without_internal_last_bar_types(
     #[case] reason: &str,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
     let mut params = joined_params(
         fixture.bar_type,
         NY_2026_11_10_2000,
@@ -2588,7 +2593,7 @@ fn test_cut_warmup_refused_without_internal_last_bar_types(
     }
     let request = trades_request(vec![instrument_id], None, client_id, params);
 
-    assert_cut_warmup_refused(&mut fixture, request, reason);
+    assert_cut_warmup_refused(&fixture, request, reason);
 }
 
 #[rstest]
@@ -2602,7 +2607,7 @@ fn test_cut_warmup_refused_without_update_subscriptions(
     #[case] update_subscriptions: Option<bool>,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
     let mut params = joined_params(
         fixture.bar_type,
         NY_2026_11_10_2000,
@@ -2619,7 +2624,7 @@ fn test_cut_warmup_refused_without_update_subscriptions(
     }
     let request = trades_request(vec![fixture.instrument_id], None, client_id, params);
 
-    assert_cut_warmup_refused(&mut fixture, request, "it must set `update_subscriptions`");
+    assert_cut_warmup_refused(&fixture, request, "it must set `update_subscriptions`");
 }
 
 #[rstest]
@@ -2634,7 +2639,7 @@ fn test_cut_warmup_refused_without_a_valid_deadline(
     #[case] reason: &str,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
     let mut params = joined_params(
         fixture.bar_type,
         NY_2026_11_10_2000,
@@ -2648,7 +2653,7 @@ fn test_cut_warmup_refused_without_a_valid_deadline(
     }
     let request = trades_request(vec![fixture.instrument_id], None, client_id, params);
 
-    assert_cut_warmup_refused(&mut fixture, request, reason);
+    assert_cut_warmup_refused(&fixture, request, reason);
 }
 
 #[rstest]
@@ -2659,7 +2664,7 @@ fn test_cut_warmup_refused_with_an_end(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
     let request = trades_request(
         vec![fixture.instrument_id],
         Some(NY_2026_11_10_2000),
@@ -2671,7 +2676,7 @@ fn test_cut_warmup_refused_with_an_end(
         ),
     );
 
-    assert_cut_warmup_refused(&mut fixture, request, "it must be open-ended (no end)");
+    assert_cut_warmup_refused(&fixture, request, "it must be open-ended (no end)");
 }
 
 #[rstest]
@@ -2685,7 +2690,7 @@ fn test_cut_warmup_refused_without_the_tbbo_schema(
     #[case] schema: Option<&str>,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
     let mut params = joined_params(
         fixture.bar_type,
         NY_2026_11_10_2000,
@@ -2699,7 +2704,7 @@ fn test_cut_warmup_refused_without_the_tbbo_schema(
     }
     let request = trades_request(vec![fixture.instrument_id], None, client_id, params);
 
-    assert_cut_warmup_refused(&mut fixture, request, "it must set `schema` to `tbbo`");
+    assert_cut_warmup_refused(&fixture, request, "it must set `schema` to `tbbo`");
 }
 
 #[rstest]
@@ -2749,14 +2754,14 @@ fn test_cut_warmup_refused_without_verified_session_opens(
     #[case] reason: &str,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, now_ns);
+    let fixture = join_fixture(audusd_sim, client_id, venue, now_ns);
     let mut params = joined_params(fixture.bar_type, now_ns, session_opens.unwrap_or_default());
     if session_opens.is_none() {
         params.as_object_mut().unwrap().remove("session_opens");
     }
     let request = trades_request(vec![fixture.instrument_id], None, client_id, params);
 
-    assert_cut_warmup_refused(&mut fixture, request, reason);
+    assert_cut_warmup_refused(&fixture, request, reason);
 }
 
 #[rstest]
@@ -2767,7 +2772,7 @@ fn test_cut_warmup_refused_when_not_a_boolean(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
     let mut params = joined_params(
         fixture.bar_type,
         NY_2026_11_10_2000,
@@ -2776,7 +2781,7 @@ fn test_cut_warmup_refused_when_not_a_boolean(
     params["cut_warmup"] = json!("true");
     let request = trades_request(vec![fixture.instrument_id], None, client_id, params);
 
-    assert_cut_warmup_refused(&mut fixture, request, "`cut_warmup` must be a boolean");
+    assert_cut_warmup_refused(&fixture, request, "`cut_warmup` must be a boolean");
 }
 
 #[rstest]
@@ -2791,9 +2796,10 @@ fn test_cut_warmup_refused_before_request_aggregators(
     #[case] reason: &str,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
     fixture
         .engine
+        .borrow_mut()
         .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
             SubscribeBars::new(
                 fixture.bar_type,
@@ -2824,7 +2830,7 @@ fn test_cut_warmup_refused_before_request_aggregators(
 
     // Preparing the request aggregators first would fail on the running live aggregator, or,
     // without `bar_types`, take the ordinary path to the client
-    assert_cut_warmup_refused(&mut fixture, request, reason);
+    assert_cut_warmup_refused(&fixture, request, reason);
 }
 
 #[rstest]
@@ -2835,7 +2841,7 @@ fn test_trades_request_with_cut_warmup_false_takes_the_ordinary_path(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
     let request = trades_request(
         vec![fixture.instrument_id],
         None,
@@ -2843,7 +2849,11 @@ fn test_trades_request_with_cut_warmup_false_takes_the_ordinary_path(
         json!({ "cut_warmup": false, "bar_types": [fixture.bar_type.to_string()] }),
     );
 
-    fixture.engine.execute_request(request.clone()).unwrap();
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request.clone())
+        .unwrap();
 
     assert_eq!(
         fixture.recorder.borrow().last(),
@@ -2905,7 +2915,7 @@ fn record_join_answers(request_id: UUID4) -> Rc<RefCell<Vec<JoinAnswer>>> {
 /// Registers a made-up trades catalog holding `rows` (`ts_init`, trade ID).
 #[cfg(feature = "streaming")]
 fn register_join_catalog(
-    fixture: &mut JoinFixture,
+    fixture: &JoinFixture,
     label: &str,
     rows: &[(u64, &str)],
 ) -> CatalogTempDir {
@@ -2916,7 +2926,12 @@ fn register_join_catalog(
     trades.sort_by_key(|trade| trade.ts_init);
     let first = trades.first().unwrap().ts_init.as_u64();
     let last = trades.last().unwrap().ts_init.as_u64();
-    register_trade_catalog_with_trades(&mut fixture.engine, label, &trades, Some((first, last)))
+    register_trade_catalog_with_trades(
+        &mut fixture.engine.borrow_mut(),
+        label,
+        &trades,
+        Some((first, last)),
+    )
 }
 
 /// Executes a joined request over `session_opens` at `now_ns` with the parent's `start`, checks
@@ -2924,7 +2939,7 @@ fn register_join_catalog(
 /// every answer the requester received.
 #[cfg(feature = "streaming")]
 fn run_join(
-    fixture: &mut JoinFixture,
+    fixture: &JoinFixture,
     now_ns: u64,
     session_opens: &[u64],
     start: Option<u64>,
@@ -2945,7 +2960,11 @@ fn run_join(
     let answers = record_join_answers(request_id);
     let current_open = *session_opens.last().unwrap();
 
-    fixture.engine.execute_request(request).unwrap();
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
     let tail_id = assert_replay_tail(fixture, current_open);
     assert!(
         answers.borrow().is_empty(),
@@ -2973,9 +2992,15 @@ fn run_join(
         .iter()
         .map(|(ts, id)| split_trade(fixture.instrument_id, *ts, id))
         .collect();
-    fixture.engine.response_envelope(part(tail, false));
+    fixture
+        .engine
+        .borrow_mut()
+        .response_envelope(part(tail, false));
     assert!(answers.borrow().is_empty(), "{:?}", answers.borrow());
-    fixture.engine.response_envelope(part(Vec::new(), true));
+    fixture
+        .engine
+        .borrow_mut()
+        .response_envelope(part(Vec::new(), true));
 
     answers.take()
 }
@@ -3007,9 +3032,9 @@ fn test_join_answers_catalog_rows_then_the_replay_tail(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let _catalog_dir = register_join_catalog(
-        &mut fixture,
+        &fixture,
         "join-catalog-then-tail",
         &[
             (NY_2026_11_09_1800 - 1, "before-the-depth"),
@@ -3020,7 +3045,7 @@ fn test_join_answers_catalog_rows_then_the_replay_tail(
     );
 
     let answers = run_join(
-        &mut fixture,
+        &fixture,
         NY_2026_11_12_2000,
         &[
             NY_2026_11_09_1800,
@@ -3045,9 +3070,9 @@ fn test_join_keeps_current_day_catalog_rows_outside_the_catalog_leg(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let _catalog_dir = register_join_catalog(
-        &mut fixture,
+        &fixture,
         "join-current-day",
         &[
             (NY_2026_11_11_1800 + ONE_HOUR_NS, "c1"),
@@ -3058,7 +3083,7 @@ fn test_join_keeps_current_day_catalog_rows_outside_the_catalog_leg(
 
     // The tail runs although the catalog holds some of the current day
     let answers = run_join(
-        &mut fixture,
+        &fixture,
         NY_2026_11_12_2000,
         &[NY_2026_11_11_1800, NY_2026_11_12_1800],
         None,
@@ -3098,10 +3123,10 @@ fn test_join_seams_serve_listed_days_and_name_missing_ones(
     #[case] missing: Option<&str>,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     // Each day's first and last nanosecond, as a restamped session's rows can reach them
     let _catalog_dir = register_join_catalog(
-        &mut fixture,
+        &fixture,
         "join-seams",
         &[
             (NY_2026_11_08_1800 - 1, "before-the-depth"),
@@ -3119,7 +3144,7 @@ fn test_join_seams_serve_listed_days_and_name_missing_ones(
     session_opens.push(NY_2026_11_12_1800);
 
     let answers = run_join(
-        &mut fixture,
+        &fixture,
         NY_2026_11_12_2000,
         &session_opens,
         None,
@@ -3144,10 +3169,10 @@ fn test_join_without_a_catalog_requests_the_replay_tail_alone(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
 
     let answers = run_join(
-        &mut fixture,
+        &fixture,
         NY_2026_11_12_2000,
         &[NY_2026_11_10_1800, NY_2026_11_11_1800, NY_2026_11_12_1800],
         None,
@@ -3174,10 +3199,10 @@ fn test_join_days_follow_civil_boundaries_across_daylight_saving_end(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_01_2000_EST);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_01_2000_EST);
     // The 2026-10-31 day lasts 25 hours: to 2026-11-01 18:00 EST, not 17:00 EST
     let _catalog_dir = register_join_catalog(
-        &mut fixture,
+        &fixture,
         "join-daylight-saving",
         &[
             (NY_2026_10_30_1800_EDT, "d30-open"),
@@ -3188,7 +3213,7 @@ fn test_join_days_follow_civil_boundaries_across_daylight_saving_end(
     );
 
     let answers = run_join(
-        &mut fixture,
+        &fixture,
         NY_2026_11_01_2000_EST,
         &[NY_2026_10_30_1800_EDT, NY_2026_11_01_1800_EST],
         None,
@@ -3213,16 +3238,16 @@ fn test_join_answer_keeps_the_open_end_when_trimmed_to_its_start(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let _catalog_dir = register_join_catalog(
-        &mut fixture,
+        &fixture,
         "join-open-end",
         &[(NY_2026_11_11_1800 + ONE_HOUR_NS, "c1")],
     );
 
     // With a start the rebuilt answer is trimmed: to its start only, never to the catalog's end
     let answers = run_join(
-        &mut fixture,
+        &fixture,
         NY_2026_11_12_2000,
         &[NY_2026_11_11_1800, NY_2026_11_12_1800],
         Some(NY_2026_11_11_1800),
@@ -3262,7 +3287,7 @@ fn release_trade(
 /// completes it.
 #[cfg(feature = "streaming")]
 fn run_joined_release(
-    fixture: &mut JoinFixture,
+    fixture: &JoinFixture,
     bar_types: &[BarType],
     interleave: bool,
     held: &[TradeTick],
@@ -3277,12 +3302,17 @@ fn run_joined_release(
     );
     params["interleave"] = json!(interleave);
     let request = trades_request(vec![fixture.instrument_id], None, fixture.client_id, params);
-    fixture.engine.execute_request(request).unwrap();
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
     let tail_id = assert_replay_tail(fixture, NY_2026_11_12_1800);
 
     for bar_type in bar_types {
         fixture
             .engine
+            .borrow_mut()
             .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
                 SubscribeBars::new(
                     *bar_type,
@@ -3297,28 +3327,35 @@ fn run_joined_release(
     }
 
     for trade in held {
-        fixture.engine.process_data(Data::Trade(*trade));
+        fixture
+            .engine
+            .borrow_mut()
+            .process_data(Data::Trade(*trade));
     }
 
-    fixture.engine.response_envelope(DataResponseEnvelope::new(
-        DataResponse::Trades(TradesResponse::new(
-            tail_id,
-            fixture.client_id,
-            fixture.instrument_id,
-            answered,
-            Some(UnixNanos::from(NY_2026_11_12_1800)),
+    fixture
+        .engine
+        .borrow_mut()
+        .response_envelope(DataResponseEnvelope::new(
+            DataResponse::Trades(TradesResponse::new(
+                tail_id,
+                fixture.client_id,
+                fixture.instrument_id,
+                answered,
+                Some(UnixNanos::from(NY_2026_11_12_1800)),
+                None,
+                UnixNanos::from(NY_2026_11_12_2000),
+                None,
+            )),
+            true,
             None,
-            UnixNanos::from(NY_2026_11_12_2000),
-            None,
-        )),
-        true,
-        None,
-    ));
+        ));
 }
 
 /// The bars of `bar_type` in the cache, oldest first, as (close, `ts_init`).
 fn built_bars(fixture: &JoinFixture, bar_type: BarType) -> Vec<(Price, UnixNanos)> {
-    let cache = fixture.engine.cache().borrow();
+    let engine = fixture.engine.borrow();
+    let cache = engine.cache().borrow();
     let mut bars: Vec<_> = cache
         .bars(&bar_type)
         .unwrap_or_default()
@@ -3346,12 +3383,12 @@ fn test_joined_release_counts_a_trade_in_both_the_answer_and_the_held_stream_onc
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let id = fixture.instrument_id;
     let bar_type = fixture.bar_type;
 
     run_joined_release(
-        &mut fixture,
+        &fixture,
         &[bar_type],
         false,
         &[
@@ -3384,13 +3421,13 @@ fn test_joined_release_drops_live_trades_in_the_cut_millisecond(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let id = fixture.instrument_id;
     let bar_type = fixture.bar_type;
 
     // The cut is the answer's millisecond, 100 ms, though its trade is at its first nanosecond
     run_joined_release(
-        &mut fixture,
+        &fixture,
         &[bar_type],
         false,
         &[release_trade(
@@ -3403,20 +3440,26 @@ fn test_joined_release_drops_live_trades_in_the_cut_millisecond(
         vec![release_trade(id, 100 * MS_NS, 150 * MS_NS, "0.65000", "a1")],
     );
     // After the release: a late trade of the same millisecond, then one after it
-    fixture.engine.process_data(Data::Trade(release_trade(
-        id,
-        100 * MS_NS + 999_999,
-        175 * MS_NS,
-        "0.65020",
-        "live-late",
-    )));
-    fixture.engine.process_data(Data::Trade(release_trade(
-        id,
-        101 * MS_NS,
-        180 * MS_NS,
-        "0.65030",
-        "after",
-    )));
+    fixture
+        .engine
+        .borrow_mut()
+        .process_data(Data::Trade(release_trade(
+            id,
+            100 * MS_NS + 999_999,
+            175 * MS_NS,
+            "0.65020",
+            "live-late",
+        )));
+    fixture
+        .engine
+        .borrow_mut()
+        .process_data(Data::Trade(release_trade(
+            id,
+            101 * MS_NS,
+            180 * MS_NS,
+            "0.65030",
+            "after",
+        )));
 
     assert_eq!(
         built_bars(&fixture, bar_type),
@@ -3433,13 +3476,13 @@ fn test_joined_release_builds_a_held_trade_below_the_answer_at_the_floor(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let id = fixture.instrument_id;
     let bar_type = fixture.bar_type;
 
     // Answered (100 ms, 200), held (101 ms, 199): past the cut, below the builder's last input
     run_joined_release(
-        &mut fixture,
+        &fixture,
         &[bar_type],
         false,
         &[release_trade(
@@ -3467,12 +3510,12 @@ fn test_interleaved_joined_release_cuts_and_floors_the_held_trades(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let id = fixture.instrument_id;
     let bar_type = fixture.bar_type;
 
     run_joined_release(
-        &mut fixture,
+        &fixture,
         &[bar_type],
         true,
         &[
@@ -3497,12 +3540,12 @@ fn test_joined_release_floor_rolls_with_each_admitted_trade(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let id = fixture.instrument_id;
     let bar_type = fixture.bar_type;
 
     run_joined_release(
-        &mut fixture,
+        &fixture,
         &[bar_type],
         false,
         &[
@@ -3513,13 +3556,16 @@ fn test_joined_release_floor_rolls_with_each_admitted_trade(
         vec![release_trade(id, 100 * MS_NS, 200 * MS_NS, "0.65000", "a1")],
     );
     // After the release the floor keeps rolling
-    fixture.engine.process_data(Data::Trade(release_trade(
-        id,
-        103 * MS_NS,
-        260 * MS_NS,
-        "0.65030",
-        "live",
-    )));
+    fixture
+        .engine
+        .borrow_mut()
+        .process_data(Data::Trade(release_trade(
+            id,
+            103 * MS_NS,
+            260 * MS_NS,
+            "0.65030",
+            "live",
+        )));
 
     assert_eq!(
         built_bars(&fixture, bar_type),
@@ -3541,13 +3587,13 @@ fn test_joined_release_puts_a_floored_trade_on_a_time_bar_boundary_in_the_later_
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let id = fixture.instrument_id;
     let bar_type = BarType::from(format!("{id}-1-SECOND-LAST-INTERNAL").as_str());
     let second = NANOSECONDS_IN_SECOND;
 
     run_joined_release(
-        &mut fixture,
+        &fixture,
         &[bar_type],
         false,
         &[
@@ -3561,7 +3607,8 @@ fn test_joined_release_puts_a_floored_trade_on_a_time_bar_boundary_in_the_later_
         ],
     );
 
-    let cache = fixture.engine.cache().borrow();
+    let engine = fixture.engine.borrow();
+    let cache = engine.cache().borrow();
     let mut bars = cache.bars(&bar_type).unwrap_or_default();
     bars.reverse();
     let bars: Vec<_> = bars
@@ -3594,13 +3641,13 @@ fn test_joined_release_gives_each_bar_type_its_own_floor(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let id = fixture.instrument_id;
     let tick = fixture.bar_type;
     let volume = BarType::from(format!("{id}-1000-VOLUME-LAST-INTERNAL").as_str());
 
     run_joined_release(
-        &mut fixture,
+        &fixture,
         &[tick, volume],
         false,
         &[
@@ -3629,7 +3676,7 @@ fn test_joined_release_leaves_the_original_trades_to_an_ordinary_subscriber(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let id = fixture.instrument_id;
     let bar_type = fixture.bar_type;
     let (handler, saver) = get_typed_message_saving_handler::<TradeTick>(None);
@@ -3638,13 +3685,13 @@ fn test_joined_release_leaves_the_original_trades_to_an_ordinary_subscriber(
     let live = release_trade(id, 102 * MS_NS, 198 * MS_NS, "0.65020", "live");
 
     run_joined_release(
-        &mut fixture,
+        &fixture,
         &[bar_type],
         false,
         &[held],
         vec![release_trade(id, 100 * MS_NS, 200 * MS_NS, "0.65000", "a1")],
     );
-    fixture.engine.process_data(Data::Trade(live));
+    fixture.engine.borrow_mut().process_data(Data::Trade(live));
 
     assert_eq!(saver.get_messages(), vec![held, live]);
     assert_eq!(
@@ -3665,7 +3712,7 @@ fn test_update_subscriptions_request_without_cut_warmup_releases_without_the_cut
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
     let id = fixture.instrument_id;
     let bar_type = fixture.bar_type;
     let trade = |ts_event: u64, ts_init: u64, price: &str, trade_id: &str| {
@@ -3682,9 +3729,14 @@ fn test_update_subscriptions_request_without_cut_warmup_releases_without_the_cut
     let params = json!({ "bar_types": [bar_type.to_string()], "update_subscriptions": true });
     let request = trades_request(vec![id], None, client_id, params.clone());
     let request_id = *request.request_id();
-    fixture.engine.execute_request(request).unwrap();
     fixture
         .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+    fixture
+        .engine
+        .borrow_mut()
         .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
             SubscribeBars::new(
                 bar_type,
@@ -3698,14 +3750,21 @@ fn test_update_subscriptions_request_without_cut_warmup_releases_without_the_cut
         )));
 
     // In the answer's millisecond, then below its last `ts_init`
+    fixture.engine.borrow_mut().process_data(Data::Trade(trade(
+        100_000_001,
+        250,
+        "0.65010",
+        "same-ms",
+    )));
+    fixture.engine.borrow_mut().process_data(Data::Trade(trade(
+        101_000_000,
+        199,
+        "0.65020",
+        "below",
+    )));
     fixture
         .engine
-        .process_data(Data::Trade(trade(100_000_001, 250, "0.65010", "same-ms")));
-    fixture
-        .engine
-        .process_data(Data::Trade(trade(101_000_000, 199, "0.65020", "below")));
-    fixture
-        .engine
+        .borrow_mut()
         .response(DataResponse::Trades(TradesResponse::new(
             request_id,
             client_id,
@@ -3823,7 +3882,7 @@ fn second_bars(instrument_id: InstrumentId) -> BarType {
 
 /// Executes an interleaved trades request for `instrument_id` aggregated into `bar_types`.
 fn execute_interleaved(
-    fixture: &mut JoinFixture,
+    fixture: &JoinFixture,
     instrument_id: InstrumentId,
     bar_types: &[BarType],
     update_subscriptions: bool,
@@ -3835,7 +3894,11 @@ fn execute_interleaved(
     });
     let request = trades_request(vec![instrument_id], None, fixture.client_id, params);
     let request_id = *request.request_id();
-    fixture.engine.execute_request(request).unwrap();
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
     request_id
 }
 
@@ -3879,15 +3942,15 @@ fn test_interleaved_answer_keeps_its_failure_reason_on_its_one_terminal(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let id = fixture.instrument_id;
     let tick = fixture.bar_type;
     let tap = TappedResponses::install();
 
-    let request_id = execute_interleaved(&mut fixture, id, &[tick], false);
+    let request_id = execute_interleaved(&fixture, id, &[tick], false);
     let failed = answer_trades(&fixture, request_id, id, &[(1, "t1"), (2, "t2")], true)
         .with_failure("the source stopped".to_owned());
-    fixture.engine.response_envelope(failed);
+    fixture.engine.borrow_mut().response_envelope(failed);
 
     assert_eq!(
         tap.take(request_id),
@@ -3911,13 +3974,13 @@ fn test_interleaved_failure_after_a_part_delivers_its_bars_once_and_none_to_the_
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let id = fixture.instrument_id;
     let seconds = second_bars(id);
     let tick = fixture.bar_type;
     let tap = TappedResponses::install();
 
-    let first = execute_interleaved(&mut fixture, id, &[seconds], false);
+    let first = execute_interleaved(&fixture, id, &[seconds], false);
     let answer = answer_trades(
         &fixture,
         first,
@@ -3925,17 +3988,18 @@ fn test_interleaved_failure_after_a_part_delivers_its_bars_once_and_none_to_the_
         &[(SECOND_NS / 5, "a1"), (SECOND_NS + SECOND_NS / 5, "a2")],
         false,
     );
-    fixture.engine.response_envelope(answer);
+    fixture.engine.borrow_mut().response_envelope(answer);
     fixture
         .engine
+        .borrow_mut()
         .response_envelope(DataResponseEnvelope::terminal(
             first,
             Some("the source stopped".to_owned()),
         ));
 
-    let second = execute_interleaved(&mut fixture, id, &[tick], false);
+    let second = execute_interleaved(&fixture, id, &[tick], false);
     let answer = answer_trades(&fixture, second, id, &[(5 * SECOND_NS, "b1")], true);
-    fixture.engine.response_envelope(answer);
+    fixture.engine.borrow_mut().response_envelope(answer);
 
     assert_eq!(
         tap.take(second),
@@ -3967,12 +4031,12 @@ fn test_interleaved_completion_delivers_its_clean_up_bars_then_one_terminal(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let id = fixture.instrument_id;
     let seconds = second_bars(id);
     let tap = TappedResponses::install();
 
-    let request_id = execute_interleaved(&mut fixture, id, &[seconds], false);
+    let request_id = execute_interleaved(&fixture, id, &[seconds], false);
     let answer = answer_trades(
         &fixture,
         request_id,
@@ -3980,7 +4044,7 @@ fn test_interleaved_completion_delivers_its_clean_up_bars_then_one_terminal(
         &[(SECOND_NS / 5, "a1"), (SECOND_NS + SECOND_NS / 5, "a2")],
         true,
     );
-    fixture.engine.response_envelope(answer);
+    fixture.engine.borrow_mut().response_envelope(answer);
 
     // The bar a2 completed is pending until the clean-up flushes it
     assert_eq!(
@@ -4005,14 +4069,15 @@ fn test_interleaved_failure_before_any_part_delivers_held_trades_bars_through_th
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let id = fixture.instrument_id;
     let tick = fixture.bar_type;
     let tap = TappedResponses::install();
 
-    let request_id = execute_interleaved(&mut fixture, id, &[tick], true);
+    let request_id = execute_interleaved(&fixture, id, &[tick], true);
     fixture
         .engine
+        .borrow_mut()
         .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
             SubscribeBars::new(
                 tick,
@@ -4027,10 +4092,12 @@ fn test_interleaved_failure_before_any_part_delivers_held_trades_bars_through_th
     for (ts, trade_id) in [(10, "live-1"), (20, "live-2")] {
         fixture
             .engine
+            .borrow_mut()
             .process_data(Data::Trade(make_trade(id, "1.0000", 1, trade_id, ts)));
     }
     fixture
         .engine
+        .borrow_mut()
         .response_envelope(DataResponseEnvelope::terminal(
             request_id,
             Some("the source stopped".to_owned()),
@@ -4083,12 +4150,12 @@ fn test_two_interleaved_requests_one_after_the_other_each_get_their_own_bars(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let id = fixture.instrument_id;
     let seconds = second_bars(id);
     let tap = TappedResponses::install();
 
-    let first = execute_interleaved(&mut fixture, id, &[seconds], false);
+    let first = execute_interleaved(&fixture, id, &[seconds], false);
     let answer = answer_trades(
         &fixture,
         first,
@@ -4096,9 +4163,9 @@ fn test_two_interleaved_requests_one_after_the_other_each_get_their_own_bars(
         &[(SECOND_NS / 5, "a1"), (SECOND_NS + SECOND_NS / 5, "a2")],
         true,
     );
-    fixture.engine.response_envelope(answer);
+    fixture.engine.borrow_mut().response_envelope(answer);
     // The same trades again: each request's aggregators are its own
-    let second = execute_interleaved(&mut fixture, id, &[seconds], false);
+    let second = execute_interleaved(&fixture, id, &[seconds], false);
     let answer = answer_trades(
         &fixture,
         second,
@@ -4106,7 +4173,7 @@ fn test_two_interleaved_requests_one_after_the_other_each_get_their_own_bars(
         &[(SECOND_NS / 5, "b1"), (SECOND_NS + SECOND_NS / 5, "b2")],
         true,
     );
-    fixture.engine.response_envelope(answer);
+    fixture.engine.borrow_mut().response_envelope(answer);
 
     assert_eq!(
         tap.take(first),
@@ -4142,11 +4209,12 @@ fn test_two_interleaved_requests_at_the_same_time_for_different_instruments_each
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let gbpusd = gbpusd_sim();
     let (aud, gbp) = (fixture.instrument_id, gbpusd.id);
     fixture
         .engine
+        .borrow()
         .cache()
         .borrow_mut()
         .add_instrument(InstrumentAny::CurrencyPair(gbpusd))
@@ -4154,8 +4222,8 @@ fn test_two_interleaved_requests_at_the_same_time_for_different_instruments_each
     let (aud_seconds, gbp_seconds) = (second_bars(aud), second_bars(gbp));
     let tap = TappedResponses::install();
 
-    let first = execute_interleaved(&mut fixture, aud, &[aud_seconds], false);
-    let second = execute_interleaved(&mut fixture, gbp, &[gbp_seconds], false);
+    let first = execute_interleaved(&fixture, aud, &[aud_seconds], false);
+    let second = execute_interleaved(&fixture, gbp, &[gbp_seconds], false);
     let (a1, a2) = (SECOND_NS / 5, SECOND_NS + SECOND_NS / 5);
     let (b1, b2, b3) = (
         SECOND_NS / 4,
@@ -4163,17 +4231,18 @@ fn test_two_interleaved_requests_at_the_same_time_for_different_instruments_each
         2 * SECOND_NS + SECOND_NS / 4,
     );
     let answer = answer_trades(&fixture, first, aud, &[(a1, "a1"), (a2, "a2")], false);
-    fixture.engine.response_envelope(answer);
+    fixture.engine.borrow_mut().response_envelope(answer);
     let answer = answer_trades(&fixture, second, gbp, &[(b1, "b1"), (b2, "b2")], false);
-    fixture.engine.response_envelope(answer);
+    fixture.engine.borrow_mut().response_envelope(answer);
     fixture
         .engine
+        .borrow_mut()
         .response_envelope(DataResponseEnvelope::terminal(
             first,
             Some("the source stopped".to_owned()),
         ));
     let answer = answer_trades(&fixture, second, gbp, &[(b3, "b3")], true);
-    fixture.engine.response_envelope(answer);
+    fixture.engine.borrow_mut().response_envelope(answer);
 
     // A completed time bar is pending until the next one completes or the clean-up flushes it
     assert_eq!(
@@ -4204,19 +4273,19 @@ fn test_interleaved_request_routes_three_partial_envelopes_to_its_entry_until_th
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let id = fixture.instrument_id;
     let seconds = second_bars(id);
     let tap = TappedResponses::install();
 
-    let request_id = execute_interleaved(&mut fixture, id, &[seconds], false);
+    let request_id = execute_interleaved(&fixture, id, &[seconds], false);
     for (index, trade_id) in ["a1", "a2", "a3"].into_iter().enumerate() {
         let ts = index as u64 * SECOND_NS + SECOND_NS / 5;
         let answer = answer_trades(&fixture, request_id, id, &[(ts, trade_id)], false);
-        fixture.engine.response_envelope(answer);
+        fixture.engine.borrow_mut().response_envelope(answer);
     }
     let answer = answer_trades(&fixture, request_id, id, &[], true);
-    fixture.engine.response_envelope(answer);
+    fixture.engine.borrow_mut().response_envelope(answer);
 
     // A completed time bar is pending until the next one completes or the clean-up flushes it
     let bars = |ts: u64| part(ResponsePart::Bars(request_id, seconds, at_ns(&[ts])));
@@ -4243,7 +4312,7 @@ fn test_joined_interleaved_request_answers_once_after_three_partial_envelopes_wi
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let id = fixture.instrument_id;
     let tick = fixture.bar_type;
     let tap = TappedResponses::install();
@@ -4252,7 +4321,11 @@ fn test_joined_interleaved_request_answers_once_after_three_partial_envelopes_wi
     let request = trades_request(vec![id], None, client_id, params);
     let request_id = *request.request_id();
 
-    fixture.engine.execute_request(request).unwrap();
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
     let tail_id = assert_replay_tail(&fixture, NY_2026_11_12_1800);
     let tail_part = |trades: Vec<TradeTick>, completed: bool| {
         DataResponseEnvelope::new(
@@ -4274,11 +4347,13 @@ fn test_joined_interleaved_request_answers_once_after_three_partial_envelopes_wi
         let trade = split_trade(id, NY_2026_11_12_1800 + offset, trade_id);
         fixture
             .engine
+            .borrow_mut()
             .response_envelope(tail_part(vec![trade], false));
         assert!(tap.take(request_id).is_empty(), "the join answers once");
     }
     fixture
         .engine
+        .borrow_mut()
         .response_envelope(tail_part(Vec::new(), true));
 
     let delivered = tap.take(request_id);
@@ -4326,7 +4401,8 @@ fn test_joined_interleaved_request_without_a_client_ends_with_one_terminal_and_i
         .borrow_mut()
         .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
         .unwrap();
-    let mut engine = DataEngine::new(clock, cache, None);
+    let engine = Rc::new(RefCell::new(DataEngine::new(clock, cache, None)));
+    DataEngine::register_msgbus_handlers(&engine);
     let tick = BarType::from(format!("{id}-1-TICK-LAST-INTERNAL").as_str());
     let tap = TappedResponses::install();
     let mut params = joined_params(tick, NY_2026_11_12_2000, &[NY_2026_11_12_1800]);
@@ -4334,7 +4410,7 @@ fn test_joined_interleaved_request_without_a_client_ends_with_one_terminal_and_i
     let request = trades_request(vec![id], None, client_id, params);
     let request_id = *request.request_id();
 
-    engine.execute_request(request).unwrap();
+    engine.borrow_mut().execute_request(request).unwrap();
 
     let delivered = tap.take(request_id);
     let [only] = &delivered[..] else {
@@ -4344,4 +4420,440 @@ fn test_joined_interleaved_request_without_a_client_ends_with_one_terminal_and_i
     let reason = only.failure.as_deref().unwrap_or_default();
     assert!(reason.contains("no client found"), "{reason:?}");
     assert!(reason.contains("no catalog is registered"), "{reason:?}");
+}
+
+// The join's deadline: the engine's outer bound over all its legs, armed at dispatch
+#[cfg(feature = "streaming")]
+const JOIN_DEADLINE: u64 = NY_2026_11_12_2000 + JOIN_DEADLINE_AFTER_NS;
+
+/// Moves the engine clock of `fixture` to `to_ns` and returns the timer handlers that fell due,
+/// not yet run: the node's event loop runs them after the envelopes queued ahead of them.
+#[cfg(feature = "streaming")]
+fn move_join_clock(
+    fixture: &JoinFixture,
+    to_ns: u64,
+) -> Vec<nautilus_common::timer::TimeEventHandler> {
+    let clock = Rc::clone(fixture.engine.borrow().clock());
+    let mut clock = clock.borrow_mut();
+    let clock = clock.as_any_mut().downcast_mut::<VirtualClock>().unwrap();
+    let events = clock.advance_time(UnixNanos::from(to_ns), true);
+    clock.match_handlers(events)
+}
+
+#[cfg(feature = "streaming")]
+fn run_timers(handlers: Vec<nautilus_common::timer::TimeEventHandler>) {
+    for handler in handlers {
+        handler.callback.call(handler.event);
+    }
+}
+
+/// The time the engine clock's one timer is armed for, if any.
+#[cfg(feature = "streaming")]
+fn join_timer(fixture: &JoinFixture) -> Option<UnixNanos> {
+    let engine = fixture.engine.borrow();
+    let clock = engine.clock().borrow();
+    let names = clock.timer_names();
+    assert!(names.len() <= 1, "one deadline timer at most: {names:?}");
+    names.first().and_then(|name| clock.next_time_ns(name))
+}
+
+/// Executes a joined request of `fixture`'s instrument at 2026-11-12 20:00 New York over
+/// `session_opens`, interleaved or not; returns its request ID and its replay tail's.
+#[cfg(feature = "streaming")]
+fn execute_join(fixture: &JoinFixture, session_opens: &[u64], interleave: bool) -> (UUID4, UUID4) {
+    let mut params = joined_params(fixture.bar_type, NY_2026_11_12_2000, session_opens);
+    params["interleave"] = json!(interleave);
+    let request = trades_request(vec![fixture.instrument_id], None, fixture.client_id, params);
+    let request_id = *request.request_id();
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+    let tail_id = assert_replay_tail(fixture, NY_2026_11_12_1800);
+    (request_id, tail_id)
+}
+
+/// An envelope of the replay tail `tail_id` with trades (`ts`, trade ID).
+#[cfg(feature = "streaming")]
+fn tail_envelope(
+    fixture: &JoinFixture,
+    tail_id: UUID4,
+    trades: &[(u64, &str)],
+    completed: bool,
+) -> DataResponseEnvelope {
+    let trades: Vec<_> = trades
+        .iter()
+        .map(|(ts, id)| split_trade(fixture.instrument_id, *ts, id))
+        .collect();
+    DataResponseEnvelope::new(
+        DataResponse::Trades(TradesResponse::new(
+            tail_id,
+            fixture.client_id,
+            fixture.instrument_id,
+            trades,
+            Some(UnixNanos::from(NY_2026_11_12_1800)),
+            None,
+            UnixNanos::from(NY_2026_11_12_2000),
+            None,
+        )),
+        completed,
+        None,
+    )
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+#[case::ordinary(false)]
+#[case::interleaved(true)]
+fn test_joined_request_expires_with_its_answered_part_rebuilt_open_and_one_terminal(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] interleave: bool,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let catalog_ts = NY_2026_11_11_1800 + ONE_HOUR_NS;
+    let _catalog = register_join_catalog(&fixture, "deadline", &[(catalog_ts, "c1")]);
+    let tap = TappedResponses::install();
+    let (request_id, tail_id) = execute_join(
+        &fixture,
+        &[NY_2026_11_11_1800, NY_2026_11_12_1800],
+        interleave,
+    );
+    let answers = record_join_answers(request_id);
+    let tail_ts = NY_2026_11_12_1800 + MS_NS;
+    fixture.engine.borrow_mut().response_envelope(tail_envelope(
+        &fixture,
+        tail_id,
+        &[(tail_ts, "r1")],
+        false,
+    ));
+    assert_eq!(join_timer(&fixture), Some(UnixNanos::from(JOIN_DEADLINE)));
+
+    run_timers(move_join_clock(&fixture, JOIN_DEADLINE));
+
+    let delivered = tap.take(request_id);
+    let tick = fixture.bar_type;
+    if interleave {
+        let bars = |ts: u64| part(ResponsePart::Bars(request_id, tick, at_ns(&[ts])));
+        assert_eq!(
+            delivered,
+            vec![
+                bars(catalog_ts),
+                part(ResponsePart::Trades(request_id, trade_ids(&["c1"]))),
+                bars(tail_ts),
+                terminal(
+                    Some(ResponsePart::Trades(request_id, trade_ids(&["r1"]))),
+                    Some("deadline"),
+                ),
+            ]
+        );
+        let answers = answers.take();
+        assert!(
+            answers.iter().all(|answer| answer.end.is_none()),
+            "{answers:?}"
+        );
+    } else {
+        assert_eq!(
+            delivered,
+            vec![terminal(
+                Some(ResponsePart::Trades(request_id, trade_ids(&["c1", "r1"]))),
+                Some("deadline"),
+            )]
+        );
+        assert_one_answer(&answers.take(), &["c1", "r1"], Some(&["deadline"]));
+        let built: Vec<_> = built_bars(&fixture, tick)
+            .into_iter()
+            .map(|(_, ts_init)| ts_init)
+            .collect();
+        assert_eq!(built, at_ns(&[catalog_ts, tail_ts]));
+    }
+    assert_eq!(join_timer(&fixture), None);
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+#[case::ordinary(false)]
+#[case::interleaved(true)]
+fn test_late_envelopes_after_expiry_are_dropped_and_counted_until_the_legs_terminal(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] interleave: bool,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let tap = TappedResponses::install();
+    let (request_id, tail_id) = execute_join(&fixture, &[NY_2026_11_12_1800], interleave);
+
+    run_timers(move_join_clock(&fixture, JOIN_DEADLINE));
+
+    let [only] = &tap.take(request_id)[..] else {
+        panic!("one terminal at the deadline");
+    };
+    assert_eq!((&only.part, only.completed), (&None, true));
+    let reason = only.failure.as_deref().unwrap_or_default();
+    assert!(reason.starts_with("deadline; "), "{reason:?}");
+
+    let late_ts = NY_2026_11_12_1800 + MS_NS;
+    let late = tail_envelope(&fixture, tail_id, &[(late_ts, "late")], false);
+    fixture.engine.borrow_mut().response_envelope(late);
+    assert_eq!(fixture.engine.borrow().late_envelopes(), 1);
+    let leg_terminal = DataResponseEnvelope::terminal(tail_id, None);
+    fixture.engine.borrow_mut().response_envelope(leg_terminal);
+    assert_eq!(fixture.engine.borrow().late_envelopes(), 2);
+    assert!(tap.take(tail_id).is_empty(), "late envelopes are dropped");
+
+    // The leg's own terminal ended its suppression: a later envelope is no longer the join's
+    let after = DataResponseEnvelope::terminal(tail_id, None);
+    fixture.engine.borrow_mut().response_envelope(after);
+    assert_eq!(fixture.engine.borrow().late_envelopes(), 2);
+    assert_eq!(tap.take(tail_id).len(), 1);
+    assert!(tap.take(request_id).is_empty());
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_envelope_queued_behind_the_deadline_is_dropped_and_counted(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let tap = TappedResponses::install();
+    let (request_id, tail_id) = execute_join(&fixture, &[NY_2026_11_12_1800], false);
+    let answered = tail_envelope(&fixture, tail_id, &[(NY_2026_11_12_1800 + 1, "r1")], false);
+    fixture.engine.borrow_mut().response_envelope(answered);
+
+    // The clock passed the deadline; its timer event is still queued behind an envelope
+    let timers = move_join_clock(&fixture, JOIN_DEADLINE);
+    let queued = tail_envelope(&fixture, tail_id, &[(NY_2026_11_12_1800 + 2, "r2")], true);
+    fixture.engine.borrow_mut().response_envelope(queued);
+
+    let [only] = &tap.take(request_id)[..] else {
+        panic!("one terminal at the deadline");
+    };
+    assert_eq!(
+        (&only.part, only.completed),
+        (
+            &Some(ResponsePart::Trades(request_id, trade_ids(&["r1"]))),
+            true
+        )
+    );
+    let reason = only.failure.as_deref().unwrap_or_default();
+    assert!(reason.starts_with("deadline; "), "{reason:?}");
+    assert_eq!(fixture.engine.borrow().late_envelopes(), 1);
+
+    run_timers(timers);
+
+    assert!(tap.take(request_id).is_empty(), "no second terminal");
+    assert_eq!(join_timer(&fixture), None);
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_joined_completion_just_before_its_deadline_cancels_the_timer(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let catalog_ts = NY_2026_11_11_1800 + ONE_HOUR_NS;
+    let _catalog = register_join_catalog(&fixture, "deadline", &[(catalog_ts, "c1")]);
+    let tap = TappedResponses::install();
+    let (request_id, tail_id) =
+        execute_join(&fixture, &[NY_2026_11_11_1800, NY_2026_11_12_1800], false);
+    let answers = record_join_answers(request_id);
+    run_timers(move_join_clock(&fixture, JOIN_DEADLINE - 1));
+
+    let completed = tail_envelope(&fixture, tail_id, &[(NY_2026_11_12_1800 + 1, "r1")], true);
+    fixture.engine.borrow_mut().response_envelope(completed);
+
+    assert_one_answer(&answers.take(), &["c1", "r1"], None);
+    assert_eq!(join_timer(&fixture), None, "completion cancels the timer");
+    assert_eq!(tap.take(request_id).len(), 1);
+
+    run_timers(move_join_clock(&fixture, JOIN_DEADLINE + 1));
+
+    assert!(tap.take(request_id).is_empty(), "no second terminal");
+    assert_eq!(fixture.engine.borrow().late_envelopes(), 0);
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_joined_request_is_refused_when_its_deadline_timer_cannot_be_registered(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut virtual_clock = VirtualClock::new();
+    let _ = virtual_clock.advance_time(UnixNanos::from(NY_2026_11_12_2000), true);
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(virtual_clock));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    let id = audusd_sim.id;
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+    // Not registered on the message bus: the engine holds no handle for a timer's callback
+    let mut engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), None);
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        cache,
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut engine,
+    );
+    let tick = BarType::from(format!("{id}-1-TICK-LAST-INTERNAL").as_str());
+    let params = joined_params(tick, NY_2026_11_12_2000, &[NY_2026_11_12_1800]);
+    let request = trades_request(vec![id], None, client_id, params);
+
+    let (result, failures) = execute_recording_failures(&mut engine, request);
+
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("could not be armed"), "{error}");
+    assert_eq!(failures, vec![Some(error)]);
+    assert!(recorder.borrow().is_empty(), "{:?}", recorder.borrow());
+    assert_eq!(engine.request_pipeline_count(), 0);
+    assert_eq!(clock.borrow().timer_count(), 0);
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_two_joined_requests_expire_each_at_its_own_deadline(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let gbpusd = gbpusd_sim();
+    let (aud, gbp) = (fixture.instrument_id, gbpusd.id);
+    fixture
+        .engine
+        .borrow()
+        .cache()
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(gbpusd))
+        .unwrap();
+    let tap = TappedResponses::install();
+    let (earlier, later) = (JOIN_DEADLINE - 60 * SECOND_NS, JOIN_DEADLINE);
+    let execute = |instrument_id: InstrumentId, deadline: u64| {
+        let tick = BarType::from(format!("{instrument_id}-1-TICK-LAST-INTERNAL").as_str());
+        let mut params = joined_params(tick, NY_2026_11_12_2000, &[NY_2026_11_12_1800]);
+        params["deadline"] = json!(deadline);
+        let request = trades_request(vec![instrument_id], None, client_id, params);
+        let request_id = *request.request_id();
+        fixture
+            .engine
+            .borrow_mut()
+            .execute_request(request)
+            .unwrap();
+        request_id
+    };
+    let (first, second) = (execute(gbp, later), execute(aud, earlier));
+    assert_eq!(join_timer(&fixture), Some(UnixNanos::from(earlier)));
+    let expired_once = |request_id: UUID4| {
+        let delivered = tap.take(request_id);
+        let [only] = &delivered[..] else {
+            panic!("one terminal: {delivered:?}");
+        };
+        let reason = only.failure.as_deref().unwrap_or_default();
+        assert!(
+            only.completed && reason.starts_with("deadline; "),
+            "{only:?}"
+        );
+    };
+
+    run_timers(move_join_clock(&fixture, earlier));
+
+    expired_once(second);
+    assert!(tap.take(first).is_empty());
+    assert_eq!(join_timer(&fixture), Some(UnixNanos::from(later)));
+
+    run_timers(move_join_clock(&fixture, later));
+
+    expired_once(first);
+    assert!(tap.take(second).is_empty());
+    assert_eq!(join_timer(&fixture), None);
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_engine_reset_ends_join_deadlines_and_leg_suppressions(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let gbpusd = gbpusd_sim();
+    let (aud, gbp) = (fixture.instrument_id, gbpusd.id);
+    fixture
+        .engine
+        .borrow()
+        .cache()
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(gbpusd))
+        .unwrap();
+    let tap = TappedResponses::install();
+    let (earlier, later) = (JOIN_DEADLINE - 60 * SECOND_NS, JOIN_DEADLINE);
+    let execute = |instrument_id: InstrumentId, deadline: u64| {
+        let tick = BarType::from(format!("{instrument_id}-1-TICK-LAST-INTERNAL").as_str());
+        let mut params = joined_params(tick, NY_2026_11_12_2000, &[NY_2026_11_12_1800]);
+        params["deadline"] = json!(deadline);
+        let request = trades_request(vec![instrument_id], None, client_id, params);
+        let request_id = *request.request_id();
+        fixture
+            .engine
+            .borrow_mut()
+            .execute_request(request)
+            .unwrap();
+        request_id
+    };
+    let (_expired, pending) = (execute(aud, earlier), execute(gbp, later));
+    let aud_tail = fixture
+        .recorder
+        .borrow()
+        .iter()
+        .find_map(|command| match command {
+            DataCommand::Request(RequestCommand::Trades(tail)) if tail.instrument_ids == [aud] => {
+                Some(tail.request_id)
+            }
+            _ => None,
+        })
+        .unwrap();
+    run_timers(move_join_clock(&fixture, earlier));
+
+    fixture.engine.borrow_mut().reset();
+    run_timers(move_join_clock(&fixture, later));
+    let leg_terminal = DataResponseEnvelope::terminal(aud_tail, None);
+    fixture.engine.borrow_mut().response_envelope(leg_terminal);
+
+    assert_eq!(
+        fixture.engine.borrow().late_envelopes(),
+        0,
+        "no leg is suppressed"
+    );
+    assert!(
+        tap.take(pending).is_empty(),
+        "no deadline survives the reset"
+    );
+    assert_eq!(join_timer(&fixture), None);
 }

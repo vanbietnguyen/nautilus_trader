@@ -33,6 +33,7 @@ pub mod book;
 pub mod config;
 
 mod commands;
+mod deadline;
 mod dispatch;
 mod futures;
 mod handlers;
@@ -75,6 +76,7 @@ use book::{
 };
 pub(crate) use commands::{DeferredCommand, DeferredCommandQueue};
 use config::DataEngineConfig;
+use deadline::JoinDeadlineTimer;
 use dispatch::{log_error_on_cache_insert, process_engine_bar};
 use futures::{ContinuousFutureRoller, ContinuousFutureSubscriptionState, datetime_to_unix_nanos};
 use handlers::{
@@ -226,6 +228,14 @@ pub struct DataEngine {
     deferred_bars: Rc<RefCell<VecDeque<Bar>>>,
     /// Each interleaving request's own state, until its bars and its one terminal are out.
     interleaved_requests: AHashMap<UUID4, InterleavedRequest>,
+    /// Each joined request's deadline, from its dispatch until its completion or its expiry
+    /// claims it.
+    request_deadlines: AHashMap<UUID4, UnixNanos>,
+    /// The unfinished legs of expired joined requests, each until its own terminal arrives.
+    suppressed_legs: AHashSet<UUID4>,
+    /// Envelopes of suppressed legs dropped after their request's expiry.
+    late_envelopes: u64,
+    join_deadline_timer: Option<Rc<JoinDeadlineTimer>>,
     option_chain_bootstrapper: Option<Rc<OptionChainBootstrapper>>,
     pending_option_chain_requests: AHashMap<UUID4, PendingOptionChainRequest>,
     option_chain_greeks_bootstraps: AHashMap<OptionSeriesId, OptionChainGreeksBootstrap>,
@@ -308,6 +318,10 @@ impl DataEngine {
             deferred_cmd_queue: Rc::new(RefCell::new(VecDeque::new())),
             deferred_bars: Rc::new(RefCell::new(VecDeque::new())),
             interleaved_requests: AHashMap::new(),
+            request_deadlines: AHashMap::new(),
+            suppressed_legs: AHashSet::new(),
+            late_envelopes: 0,
+            join_deadline_timer: None,
             option_chain_bootstrapper: None,
             pending_option_chain_requests: AHashMap::new(),
             option_chain_greeks_bootstraps: AHashMap::new(),
@@ -365,6 +379,7 @@ impl DataEngine {
             Some(Rc::new(ContinuousFutureRoller::new(engine)));
         engine.borrow_mut().option_chain_bootstrapper =
             Some(Rc::new(OptionChainBootstrapper::new(engine)));
+        engine.borrow_mut().join_deadline_timer = Some(Rc::new(JoinDeadlineTimer::new(engine)));
 
         let weak1 = weak.clone();
         msgbus::register_data_command_endpoint(
@@ -561,6 +576,8 @@ impl DataEngine {
         self.request_bar_aggregations.clear();
         self.interleaved_requests.clear();
         self.inflight_requests.clear();
+        self.request_deadlines.clear();
+        self.suppressed_legs.clear();
         self.request_pipeline_parent_request.clear();
         self.request_pipeline_n_components.clear();
         self.request_pipeline_parent_request_id.clear();
@@ -639,6 +656,7 @@ impl DataEngine {
         self.data_count = 0;
         self.request_count = 0;
         self.response_count = 0;
+        self.late_envelopes = 0;
     }
 
     /// Disposes the engine, stopping all clients and canceling any timers.
@@ -1703,7 +1721,6 @@ impl DataEngine {
         not(feature = "streaming"),
         expect(
             clippy::needless_pass_by_value,
-            clippy::needless_pass_by_ref_mut,
             reason = "only the streaming build plans the join"
         )
     )]
@@ -1712,28 +1729,30 @@ impl DataEngine {
         req: RequestCommand,
         join: &AdmittedJoin,
     ) -> anyhow::Result<()> {
+        let request_id = *req.request_id();
         log::debug!(
-            "Dispatching the `cut_warmup` request {} for {} ({} session opens, deadline {})",
-            req.request_id(),
+            "Dispatching the `cut_warmup` request {request_id} for {} ({} session opens, deadline {})",
             join.instrument_id,
             join.session_opens.len(),
             join.deadline,
         );
 
+        self.arm_join_deadline(request_id, join.deadline)?;
+
         #[cfg(feature = "streaming")]
-        {
-            self.dispatch_join_plan(req, &join.session_opens)
-        }
+        let result = self.dispatch_join_plan(req, &join.session_opens);
 
         #[cfg(not(feature = "streaming"))]
-        {
-            anyhow::bail!(
-                "Cannot handle the `cut_warmup` request {} for {}: the join's plan needs the \
-                 `streaming` feature",
-                req.request_id(),
-                join.instrument_id,
-            )
+        let result = Err(anyhow::anyhow!(
+            "Cannot handle the `cut_warmup` request {request_id} for {}: the join's plan needs \
+             the `streaming` feature",
+            join.instrument_id,
+        ));
+
+        if result.is_err() {
+            self.claim_join_deadline(&request_id);
         }
+        result
     }
 
     fn validate_request(req: &RequestCommand) -> anyhow::Result<()> {
@@ -2037,6 +2056,12 @@ impl DataEngine {
     }
 
     fn process_response_envelope(&mut self, mut envelope: DataResponseEnvelope) {
+        // A joined request's deadline is checked before any payload effect
+        self.expire_overdue_joins();
+        if self.drop_late_envelope(&envelope) {
+            return;
+        }
+
         let accepted = match envelope.response() {
             Some(DataResponse::Instrument(response)) => self.cache_instrument(&response.data),
             Some(DataResponse::Instruments(response)) => {
@@ -2295,12 +2320,29 @@ impl DataEngine {
         let slots = self.request_pipeline_responses.remove(&parent_id)?;
         self.request_pipeline_n_components.remove(&parent_id);
         let parent = self.request_pipeline_parent_request.remove(&parent_id);
-        let failures = slots
-            .iter()
-            .flatten()
-            .flatten()
-            .filter_map(|value| value.failure_reason())
-            .collect::<Vec<_>>();
+        // Completion claims a joined request's deadline (an expiry would have taken the slots)
+        self.claim_join_deadline(&parent_id);
+        Some(self.finish_request_pipeline(parent_id, parent.as_ref(), slots, None))
+    }
+
+    /// Rebuilds a pipeline's answer from the envelopes its legs' slots hold, into one completed
+    /// envelope; shared by the pipeline's completion and a joined request's expiry. Its reason
+    /// is `first_reason`, if any, followed by the reasons the legs carry.
+    fn finish_request_pipeline(
+        &mut self,
+        parent_id: UUID4,
+        parent: Option<&RequestCommand>,
+        slots: Vec<Option<Vec<DataResponseEnvelope>>>,
+        first_reason: Option<&str>,
+    ) -> DataResponseEnvelope {
+        let mut failures = first_reason.into_iter().collect::<Vec<_>>();
+        failures.extend(
+            slots
+                .iter()
+                .flatten()
+                .flatten()
+                .filter_map(|value| value.failure_reason()),
+        );
         let failure_reason = (!failures.is_empty()).then(|| failures.join("; "));
         let legs = slots
             .into_iter()
@@ -2310,28 +2352,28 @@ impl DataEngine {
             .collect::<Vec<_>>();
 
         if legs.is_empty() {
-            return Some(DataResponseEnvelope::terminal(parent_id, failure_reason));
+            return DataResponseEnvelope::terminal(parent_id, failure_reason);
         }
 
-        let (parent_start, parent_end) = parent_request_window(parent.as_ref());
-        if self.emit_partitioned_book_responses(parent_id, parent.as_ref(), &legs) {
-            return Some(DataResponseEnvelope::terminal(parent_id, failure_reason));
+        let (parent_start, parent_end) = parent_request_window(parent);
+        if self.emit_partitioned_book_responses(parent_id, parent, &legs) {
+            return DataResponseEnvelope::terminal(parent_id, failure_reason);
         }
 
-        let rebuilt = rebuild_pipeline_response(parent_id, parent.as_ref(), legs);
+        let rebuilt = rebuild_pipeline_response(parent_id, parent, legs);
 
         let Some(mut rebuilt) = rebuilt else {
             let reason = failure_reason
                 .unwrap_or_else(|| "Request pipeline could not rebuild its response".to_owned());
 
-            return Some(DataResponseEnvelope::terminal(parent_id, Some(reason)));
+            return DataResponseEnvelope::terminal(parent_id, Some(reason));
         };
 
         if let DataResponse::BookDeltas(r) = &mut rebuilt {
             self.book_deltas_snapshot_replay(r);
         }
 
-        if parent.as_ref().is_some_and(sets_cut_warmup) {
+        if parent.is_some_and(sets_cut_warmup) {
             keep_open_end(&mut rebuilt);
         }
 
@@ -2343,11 +2385,11 @@ impl DataEngine {
         }
 
         let result = DataResponseEnvelope::new(rebuilt, true, None);
-        Some(if let Some(reason) = failure_reason {
+        if let Some(reason) = failure_reason {
             result.with_failure(reason)
         } else {
             result
-        })
+        }
     }
 
     fn emit_partitioned_book_responses(
