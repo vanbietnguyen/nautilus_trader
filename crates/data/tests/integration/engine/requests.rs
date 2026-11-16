@@ -3231,3 +3231,497 @@ fn test_join_answer_keeps_the_open_end_when_trimmed_to_its_start(
 
     assert_one_answer(&answers, &["c1", "t1"], None);
 }
+
+#[cfg(feature = "streaming")]
+const MS_NS: u64 = 1_000_000;
+
+/// A trade of the release tests, its stamps `ts_event` and `ts_init` as nanoseconds after the
+/// current trading day's open (2026-11-12 18:00 New York); its price identifies it in a bar.
+#[cfg(feature = "streaming")]
+fn release_trade(
+    instrument_id: InstrumentId,
+    ts_event: u64,
+    ts_init: u64,
+    price: &str,
+    trade_id: &str,
+) -> TradeTick {
+    TradeTick::new(
+        instrument_id,
+        Price::from(price),
+        Quantity::from("1000"),
+        AggressorSide::Buy,
+        TradeId::new(trade_id),
+        UnixNanos::from(NY_2026_11_12_1800 + ts_event),
+        UnixNanos::from(NY_2026_11_12_1800 + ts_init),
+    )
+}
+
+/// Executes a joined request for `bar_types` at 2026-11-12 20:00 New York, interleaved or not,
+/// subscribes each bar type live (its builder holds the live trades while the answer is in
+/// flight), publishes `held` as live trades, then answers the replay tail with `answered` and
+/// completes it.
+#[cfg(feature = "streaming")]
+fn run_joined_release(
+    fixture: &mut JoinFixture,
+    bar_types: &[BarType],
+    interleave: bool,
+    held: &[TradeTick],
+    answered: Vec<TradeTick>,
+) {
+    let mut params = joined_params(fixture.bar_type, NY_2026_11_12_2000, &[NY_2026_11_12_1800]);
+    params["bar_types"] = json!(
+        bar_types
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+    params["interleave"] = json!(interleave);
+    let request = trades_request(vec![fixture.instrument_id], None, fixture.client_id, params);
+    fixture.engine.execute_request(request).unwrap();
+    let tail_id = assert_replay_tail(fixture, NY_2026_11_12_1800);
+
+    for bar_type in bar_types {
+        fixture
+            .engine
+            .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+                SubscribeBars::new(
+                    *bar_type,
+                    Some(fixture.client_id),
+                    None,
+                    UUID4::new(),
+                    UnixNanos::default(),
+                    None,
+                    None,
+                ),
+            )));
+    }
+
+    for trade in held {
+        fixture.engine.process_data(Data::Trade(*trade));
+    }
+
+    fixture.engine.response_envelope(DataResponseEnvelope::new(
+        DataResponse::Trades(TradesResponse::new(
+            tail_id,
+            fixture.client_id,
+            fixture.instrument_id,
+            answered,
+            Some(UnixNanos::from(NY_2026_11_12_1800)),
+            None,
+            UnixNanos::from(NY_2026_11_12_2000),
+            None,
+        )),
+        true,
+        None,
+    ));
+}
+
+/// The bars of `bar_type` in the cache, oldest first, as (close, `ts_init`).
+fn built_bars(fixture: &JoinFixture, bar_type: BarType) -> Vec<(Price, UnixNanos)> {
+    let cache = fixture.engine.cache().borrow();
+    let mut bars: Vec<_> = cache
+        .bars(&bar_type)
+        .unwrap_or_default()
+        .iter()
+        .map(|bar| (bar.close, bar.ts_init))
+        .collect();
+    bars.reverse();
+    bars
+}
+
+#[cfg(feature = "streaming")]
+fn at(price: &str, ts_init: u64) -> (Price, UnixNanos) {
+    (
+        Price::from(price),
+        UnixNanos::from(NY_2026_11_12_1800 + ts_init),
+    )
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_joined_release_counts_a_trade_in_both_the_answer_and_the_held_stream_once(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let bar_type = fixture.bar_type;
+
+    run_joined_release(
+        &mut fixture,
+        &[bar_type],
+        false,
+        &[
+            // The answer's second trade, received live later
+            release_trade(id, 110 * MS_NS, 170 * MS_NS, "0.65010", "a2"),
+            release_trade(id, 120 * MS_NS, 180 * MS_NS, "0.65020", "h3"),
+        ],
+        vec![
+            release_trade(id, 100 * MS_NS, 150 * MS_NS, "0.65000", "a1"),
+            release_trade(id, 110 * MS_NS, 160 * MS_NS, "0.65010", "a2"),
+        ],
+    );
+
+    assert_eq!(
+        built_bars(&fixture, bar_type),
+        vec![
+            at("0.65000", 150 * MS_NS),
+            at("0.65010", 160 * MS_NS),
+            at("0.65020", 180 * MS_NS),
+        ]
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_joined_release_drops_live_trades_in_the_cut_millisecond(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let bar_type = fixture.bar_type;
+
+    // The cut is the answer's millisecond, 100 ms, though its trade is at its first nanosecond
+    run_joined_release(
+        &mut fixture,
+        &[bar_type],
+        false,
+        &[release_trade(
+            id,
+            100 * MS_NS + 500_000,
+            170 * MS_NS,
+            "0.65010",
+            "held-late",
+        )],
+        vec![release_trade(id, 100 * MS_NS, 150 * MS_NS, "0.65000", "a1")],
+    );
+    // After the release: a late trade of the same millisecond, then one after it
+    fixture.engine.process_data(Data::Trade(release_trade(
+        id,
+        100 * MS_NS + 999_999,
+        175 * MS_NS,
+        "0.65020",
+        "live-late",
+    )));
+    fixture.engine.process_data(Data::Trade(release_trade(
+        id,
+        101 * MS_NS,
+        180 * MS_NS,
+        "0.65030",
+        "after",
+    )));
+
+    assert_eq!(
+        built_bars(&fixture, bar_type),
+        vec![at("0.65000", 150 * MS_NS), at("0.65030", 180 * MS_NS)]
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_joined_release_builds_a_held_trade_below_the_answer_at_the_floor(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let bar_type = fixture.bar_type;
+
+    // Answered (100 ms, 200), held (101 ms, 199): past the cut, below the builder's last input
+    run_joined_release(
+        &mut fixture,
+        &[bar_type],
+        false,
+        &[release_trade(
+            id,
+            101 * MS_NS,
+            199 * MS_NS,
+            "0.65010",
+            "held",
+        )],
+        vec![release_trade(id, 100 * MS_NS, 200 * MS_NS, "0.65000", "a1")],
+    );
+
+    assert_eq!(
+        built_bars(&fixture, bar_type),
+        vec![at("0.65000", 200 * MS_NS), at("0.65010", 200 * MS_NS)]
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_interleaved_joined_release_cuts_and_floors_the_held_trades(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let bar_type = fixture.bar_type;
+
+    run_joined_release(
+        &mut fixture,
+        &[bar_type],
+        true,
+        &[
+            release_trade(id, 100 * MS_NS + 500_000, 210 * MS_NS, "0.65010", "same-ms"),
+            release_trade(id, 101 * MS_NS, 199 * MS_NS, "0.65020", "below-the-floor"),
+        ],
+        vec![release_trade(id, 100 * MS_NS, 200 * MS_NS, "0.65000", "a1")],
+    );
+
+    assert_eq!(
+        built_bars(&fixture, bar_type),
+        vec![at("0.65000", 200 * MS_NS), at("0.65020", 200 * MS_NS)]
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_joined_release_floor_rolls_with_each_admitted_trade(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let bar_type = fixture.bar_type;
+
+    run_joined_release(
+        &mut fixture,
+        &[bar_type],
+        false,
+        &[
+            release_trade(id, 101 * MS_NS, 300 * MS_NS, "0.65010", "h1"),
+            // Above the answer's floor, below the trade the builder took before it
+            release_trade(id, 102 * MS_NS, 250 * MS_NS, "0.65020", "h2"),
+        ],
+        vec![release_trade(id, 100 * MS_NS, 200 * MS_NS, "0.65000", "a1")],
+    );
+    // After the release the floor keeps rolling
+    fixture.engine.process_data(Data::Trade(release_trade(
+        id,
+        103 * MS_NS,
+        260 * MS_NS,
+        "0.65030",
+        "live",
+    )));
+
+    assert_eq!(
+        built_bars(&fixture, bar_type),
+        vec![
+            at("0.65000", 200 * MS_NS),
+            at("0.65010", 300 * MS_NS),
+            at("0.65020", 300 * MS_NS),
+            at("0.65030", 300 * MS_NS),
+        ]
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_joined_release_puts_a_floored_trade_on_a_time_bar_boundary_in_the_later_interval(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let bar_type = BarType::from(format!("{id}-1-SECOND-LAST-INTERNAL").as_str());
+    let second = NANOSECONDS_IN_SECOND;
+
+    run_joined_release(
+        &mut fixture,
+        &[bar_type],
+        false,
+        &[
+            // Its own stamp is in the first second, the floor is past that second's close
+            release_trade(id, 1_000 * MS_NS, second - 1_000, "0.65090", "h1"),
+            release_trade(id, 2_500 * MS_NS, 2_500 * MS_NS, "0.65020", "h2"),
+        ],
+        vec![
+            release_trade(id, 400 * MS_NS, 500 * MS_NS, "0.65000", "a1"),
+            release_trade(id, 999 * MS_NS, second + 1_000, "0.65010", "a2"),
+        ],
+    );
+
+    let cache = fixture.engine.cache().borrow();
+    let mut bars = cache.bars(&bar_type).unwrap_or_default();
+    bars.reverse();
+    let bars: Vec<_> = bars
+        .iter()
+        .map(|bar| (bar.ts_event, bar.high, bar.close))
+        .collect();
+    assert_eq!(
+        bars,
+        vec![
+            (
+                UnixNanos::from(NY_2026_11_12_1800 + second),
+                Price::from("0.65000"),
+                Price::from("0.65000"),
+            ),
+            (
+                UnixNanos::from(NY_2026_11_12_1800 + 2 * second),
+                Price::from("0.65090"),
+                Price::from("0.65090"),
+            ),
+        ]
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_joined_release_gives_each_bar_type_its_own_floor(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let tick = fixture.bar_type;
+    let volume = BarType::from(format!("{id}-1000-VOLUME-LAST-INTERNAL").as_str());
+
+    run_joined_release(
+        &mut fixture,
+        &[tick, volume],
+        false,
+        &[
+            release_trade(id, 101 * MS_NS, 199 * MS_NS, "0.65010", "h1"),
+            release_trade(id, 102 * MS_NS, 400 * MS_NS, "0.65020", "h2"),
+        ],
+        vec![release_trade(id, 100 * MS_NS, 200 * MS_NS, "0.65000", "a1")],
+    );
+
+    // Each builder starts from the answer's floor, not from the other builder's rolled one
+    let expected = vec![
+        at("0.65000", 200 * MS_NS),
+        at("0.65010", 200 * MS_NS),
+        at("0.65020", 400 * MS_NS),
+    ];
+    assert_eq!(built_bars(&fixture, tick), expected);
+    assert_eq!(built_bars(&fixture, volume), expected);
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_joined_release_leaves_the_original_trades_to_an_ordinary_subscriber(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let bar_type = fixture.bar_type;
+    let (handler, saver) = get_typed_message_saving_handler::<TradeTick>(None);
+    msgbus::subscribe_trades(switchboard::get_trades_topic(id).into(), handler, None);
+    let held = release_trade(id, 101 * MS_NS, 199 * MS_NS, "0.65010", "held");
+    let live = release_trade(id, 102 * MS_NS, 198 * MS_NS, "0.65020", "live");
+
+    run_joined_release(
+        &mut fixture,
+        &[bar_type],
+        false,
+        &[held],
+        vec![release_trade(id, 100 * MS_NS, 200 * MS_NS, "0.65000", "a1")],
+    );
+    fixture.engine.process_data(Data::Trade(live));
+
+    assert_eq!(saver.get_messages(), vec![held, live]);
+    assert_eq!(
+        built_bars(&fixture, bar_type),
+        vec![
+            at("0.65000", 200 * MS_NS),
+            at("0.65010", 200 * MS_NS),
+            at("0.65020", 200 * MS_NS),
+        ]
+    );
+}
+
+#[rstest]
+fn test_update_subscriptions_request_without_cut_warmup_releases_without_the_cut_or_the_floor(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let id = fixture.instrument_id;
+    let bar_type = fixture.bar_type;
+    let trade = |ts_event: u64, ts_init: u64, price: &str, trade_id: &str| {
+        TradeTick::new(
+            id,
+            Price::from(price),
+            Quantity::from("1000"),
+            AggressorSide::Buy,
+            TradeId::new(trade_id),
+            UnixNanos::from(ts_event),
+            UnixNanos::from(ts_init),
+        )
+    };
+    let params = json!({ "bar_types": [bar_type.to_string()], "update_subscriptions": true });
+    let request = trades_request(vec![id], None, client_id, params.clone());
+    let request_id = *request.request_id();
+    fixture.engine.execute_request(request).unwrap();
+    fixture
+        .engine
+        .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+            SubscribeBars::new(
+                bar_type,
+                Some(client_id),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )));
+
+    // In the answer's millisecond, then below its last `ts_init`
+    fixture
+        .engine
+        .process_data(Data::Trade(trade(100_000_001, 250, "0.65010", "same-ms")));
+    fixture
+        .engine
+        .process_data(Data::Trade(trade(101_000_000, 199, "0.65020", "below")));
+    fixture
+        .engine
+        .response(DataResponse::Trades(TradesResponse::new(
+            request_id,
+            client_id,
+            id,
+            vec![trade(100_000_000, 200, "0.65000", "a1")],
+            None,
+            None,
+            UnixNanos::from(300),
+            Some(serde_json::from_value(params).unwrap()),
+        )));
+
+    assert_eq!(
+        built_bars(&fixture, bar_type),
+        vec![
+            (Price::from("0.65000"), UnixNanos::from(200)),
+            (Price::from("0.65010"), UnixNanos::from(250)),
+        ]
+    );
+}

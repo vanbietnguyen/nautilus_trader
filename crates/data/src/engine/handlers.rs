@@ -16,7 +16,7 @@
 use std::{cell::RefCell, rc::Rc};
 
 use nautilus_common::msgbus::Handler;
-use nautilus_core::WeakCell;
+use nautilus_core::{UnixNanos, WeakCell, datetime::NANOSECONDS_IN_MILLISECOND};
 use nautilus_model::{
     data::{Bar, BarType, QuoteTick, TradeTick},
     identifiers::InstrumentId,
@@ -60,6 +60,144 @@ impl<T: Copy> WarmupBuffer<T> {
     /// Ends the warm-up and returns the data held in arrival order.
     pub(super) fn release(&self) -> Vec<T> {
         self.0.borrow_mut().take().unwrap_or_default()
+    }
+}
+
+/// What the release of one joined warm-up did with the live trades it held (the history/live join).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct WarmupCounts {
+    /// Live trades held while the answer was in flight.
+    pub(super) held: u64,
+    /// Trades past the cut, fed to the builder.
+    pub(super) flushed: u64,
+    /// Trades in or before the cut's millisecond: the answer holds them already.
+    pub(super) dropped: u64,
+    /// Fed trades whose `ts_init` was raised to the floor.
+    pub(super) floored: u64,
+    /// Answered trades without an exchange time: their receive time stands in and can over-cut.
+    pub(super) fallback_rows: u64,
+}
+
+/// The cut and the rolling floor through which one joined builder takes live trades after its
+/// answer completes (the history/live join).
+///
+/// The cut is the largest answered `ts_event` at whole milliseconds: a live trade in or before
+/// that millisecond is in the answer already and is dropped. The floor starts at the largest
+/// answered `ts_init` and rolls to each admitted trade's: a builder silently refuses a `ts_init`
+/// below the last it took, so the builder gets a private copy with `ts_init` raised to the floor.
+///
+/// Invariant: every live trade admitted after the cut reaches the builder with a `ts_init` no
+/// lower than any input that builder already took.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct JoinedRelease {
+    pub(super) cut_ms: Option<u64>,
+    pub(super) floor: Option<UnixNanos>,
+    pub(super) counts: WarmupCounts,
+}
+
+impl JoinedRelease {
+    /// The cut and the floor of a complete `answered` set of trades.
+    pub(super) fn from_answer(answered: &[TradeTick]) -> Self {
+        Self {
+            cut_ms: answered
+                .iter()
+                .map(|trade| trade.ts_event.as_u64() / NANOSECONDS_IN_MILLISECOND)
+                .max(),
+            floor: answered.iter().map(|trade| trade.ts_init).max(),
+            counts: WarmupCounts {
+                // A replayed or restamp-free row decoded without an exchange time carries its
+                // receive time as both stamps
+                fallback_rows: answered
+                    .iter()
+                    .filter(|trade| trade.ts_event == trade.ts_init)
+                    .count() as u64,
+                ..WarmupCounts::default()
+            },
+        }
+    }
+
+    /// Whether `trade` falls in or before the cut's millisecond.
+    fn is_cut(&self, trade: &TradeTick) -> bool {
+        self.cut_ms
+            .is_some_and(|cut_ms| trade.ts_event.as_u64() / NANOSECONDS_IN_MILLISECOND <= cut_ms)
+    }
+
+    /// Returns the builder's copy of a live `trade`: `None` when the cut drops it, otherwise the
+    /// trade with its `ts_init` raised to the floor, which then rolls to the copy's.
+    fn admit(&mut self, trade: &TradeTick) -> Option<TradeTick> {
+        if self.is_cut(trade) {
+            self.counts.dropped += 1;
+            return None;
+        }
+
+        let mut copy = *trade;
+        if let Some(floor) = self.floor
+            && copy.ts_init < floor
+        {
+            copy.ts_init = floor;
+            self.counts.floored += 1;
+        }
+        self.floor = Some(copy.ts_init);
+        self.counts.flushed += 1;
+        Some(copy)
+    }
+}
+
+/// The release of a joined warm-up, shared by the engine, which sets it when the answer is
+/// complete, and the trade handler of the joined builder, which takes every later live trade
+/// through it until the aggregator stops. Stays empty for every other warm-up.
+#[derive(Clone, Debug, Default)]
+pub(super) struct JoinedSlot(Rc<RefCell<Option<JoinedRelease>>>);
+
+impl JoinedSlot {
+    /// Returns the builder's copy of a live `trade`: the trade itself while the slot is empty.
+    fn admit(&self, trade: &TradeTick) -> Option<TradeTick> {
+        match self.0.borrow_mut().as_mut() {
+            Some(release) => release.admit(trade),
+            None => Some(*trade),
+        }
+    }
+}
+
+impl WarmupBuffer<TradeTick> {
+    /// Ends a joined warm-up: feeds the held trades to `aggregator` in arrival order through
+    /// `release`'s cut and floor, logs the counts, and leaves the release in `joined` for the
+    /// live trades after.
+    pub(super) fn release_joined(
+        &self,
+        joined: &JoinedSlot,
+        mut release: JoinedRelease,
+        aggregator: &mut dyn BarAggregator,
+        bar_type: BarType,
+    ) {
+        let held = self.release();
+        release.counts.held = held.len() as u64;
+
+        if held.first().is_some_and(|trade| !release.is_cut(trade)) {
+            log::warn!(
+                "Joined warm-up of {bar_type}: no overlap observed, the first held live trade is \
+                 after the answer's cut (a gap is possible)"
+            );
+        }
+
+        for trade in &held {
+            if let Some(copy) = release.admit(trade) {
+                aggregator.handle_trade(copy);
+            }
+        }
+
+        let counts = release.counts;
+        log::info!(
+            "Released the joined warm-up of {bar_type}: held={}, flushed={}, dropped={}, \
+             floored={}, fallback_rows={}",
+            counts.held,
+            counts.flushed,
+            counts.dropped,
+            counts.floored,
+            counts.fallback_rows,
+        );
+
+        *joined.0.borrow_mut() = Some(release);
     }
 }
 
@@ -121,6 +259,7 @@ pub(super) struct BarTradeHandler {
     aggregator: WeakCell<Box<dyn BarAggregator>>,
     bar_type: BarType,
     warmup: Option<WarmupBuffer<TradeTick>>,
+    joined: Option<JoinedSlot>,
 }
 
 impl BarTradeHandler {
@@ -129,12 +268,19 @@ impl BarTradeHandler {
             aggregator: WeakCell::from(Rc::downgrade(aggregator)),
             bar_type,
             warmup: None,
+            joined: None,
         }
     }
 
     /// Holds incoming data in `warmup` until the buffer is released.
     pub(super) fn with_warmup(mut self, warmup: Option<WarmupBuffer<TradeTick>>) -> Self {
         self.warmup = warmup;
+        self
+    }
+
+    /// Takes the live trades after the warm-up through the release `joined` receives, if any.
+    pub(super) fn with_joined(mut self, joined: Option<JoinedSlot>) -> Self {
+        self.joined = joined;
         self
     }
 }
@@ -153,8 +299,18 @@ impl Handler<TradeTick> for BarTradeHandler {
             return;
         }
 
-        if let Some(agg) = self.aggregator.upgrade() {
-            agg.borrow_mut().handle_trade(*trade);
+        let Some(agg) = self.aggregator.upgrade() else {
+            return;
+        };
+
+        // A joined builder takes a private copy; every other subscriber keeps the original
+        match &self.joined {
+            Some(joined) => {
+                if let Some(copy) = joined.admit(trade) {
+                    agg.borrow_mut().handle_trade(copy);
+                }
+            }
+            None => agg.borrow_mut().handle_trade(*trade),
         }
     }
 }
@@ -238,5 +394,259 @@ impl Handler<QuoteTick> for SpreadQuoteHandler {
         if let Some(agg) = self.aggregator.upgrade() {
             agg.borrow_mut().handle_quote_tick(*quote);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc, sync::Once};
+
+    use log::{Level, LevelFilter, Log, Metadata, Record};
+    use nautilus_common::msgbus::Handler;
+    use nautilus_core::{UnixNanos, datetime::NANOSECONDS_IN_MILLISECOND};
+    use nautilus_model::{
+        data::{Bar, BarType, TradeTick},
+        enums::AggressorSide,
+        identifiers::{InstrumentId, TradeId},
+        types::{Price, Quantity},
+    };
+    use rstest::rstest;
+
+    use super::{BarTradeHandler, JoinedRelease, JoinedSlot, WarmupBuffer, WarmupCounts};
+    use crate::aggregation::{BarAggregator, TickBarAggregator};
+
+    const MS: u64 = NANOSECONDS_IN_MILLISECOND;
+
+    thread_local! {
+        static RELEASE_LOGS: RefCell<Vec<(Level, String)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    struct ReleaseLogCapture;
+
+    impl Log for ReleaseLogCapture {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.target() == module_path!().trim_end_matches("::tests")
+        }
+
+        fn log(&self, record: &Record<'_>) {
+            if self.enabled(record.metadata()) {
+                RELEASE_LOGS.with_borrow_mut(|logs| {
+                    logs.push((record.level(), record.args().to_string()));
+                });
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn capture_release_logs() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            log::set_logger(&ReleaseLogCapture).expect("test logger already installed");
+            log::set_max_level(LevelFilter::Info);
+        });
+        RELEASE_LOGS.with_borrow_mut(Vec::clear);
+    }
+
+    fn take_release_logs() -> Vec<(Level, String)> {
+        RELEASE_LOGS.with_borrow_mut(std::mem::take)
+    }
+
+    fn trade(ts_event: u64, ts_init: u64, id: &str) -> TradeTick {
+        TradeTick::new(
+            InstrumentId::from("AUD/USD.SIM"),
+            Price::from("0.65000"),
+            Quantity::from("1000"),
+            AggressorSide::Buy,
+            TradeId::new(id),
+            UnixNanos::from(ts_event),
+            UnixNanos::from(ts_init),
+        )
+    }
+
+    /// A one-tick builder that has taken `answered`, its trade handler holding a joined warm-up,
+    /// and the bars it builds.
+    struct HeldBuilder {
+        bar_type: BarType,
+        aggregator: Rc<RefCell<Box<dyn BarAggregator>>>,
+        handler: BarTradeHandler,
+        buffer: WarmupBuffer<TradeTick>,
+        joined: JoinedSlot,
+        bars: Rc<RefCell<Vec<Bar>>>,
+    }
+
+    fn held_builder(answered: &[TradeTick], held: &[TradeTick]) -> HeldBuilder {
+        let bar_type = BarType::from("AUD/USD.SIM-1-TICK-LAST-INTERNAL");
+        let bars = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&bars);
+        let aggregator: Rc<RefCell<Box<dyn BarAggregator>>> = Rc::new(RefCell::new(Box::new(
+            TickBarAggregator::new(bar_type, 5, 0, move |bar| sink.borrow_mut().push(bar)),
+        )));
+        for trade in answered {
+            aggregator.borrow_mut().handle_trade(*trade);
+        }
+
+        let buffer = WarmupBuffer::new();
+        let joined = JoinedSlot::default();
+        let handler = BarTradeHandler::new(&aggregator, bar_type)
+            .with_warmup(Some(buffer.clone()))
+            .with_joined(Some(joined.clone()));
+        for trade in held {
+            handler.handle(trade);
+        }
+
+        HeldBuilder {
+            bar_type,
+            aggregator,
+            handler,
+            buffer,
+            joined,
+            bars,
+        }
+    }
+
+    impl HeldBuilder {
+        fn release(&self, answered: &[TradeTick]) {
+            self.buffer.release_joined(
+                &self.joined,
+                JoinedRelease::from_answer(answered),
+                self.aggregator.borrow_mut().as_mut(),
+                self.bar_type,
+            );
+        }
+
+        /// The `ts_init` of each bar built, in order: a one-tick bar carries its trade's.
+        fn built(&self) -> Vec<UnixNanos> {
+            self.bars.borrow().iter().map(|bar| bar.ts_init).collect()
+        }
+    }
+
+    #[rstest]
+    fn test_joined_release_counts_what_it_held() {
+        // The answer's cut is 160 ms; its second row has no exchange time (both stamps equal)
+        let answered = [
+            trade(100 * MS, 150 * MS, "a1"),
+            trade(160 * MS, 160 * MS, "a2"),
+        ];
+        let held = [
+            trade(150 * MS, 170 * MS, "in-the-answer"),
+            trade(160 * MS + MS / 2, 175 * MS, "same-millisecond"),
+            trade(161 * MS, 158 * MS, "below-the-floor"),
+            trade(170 * MS, 180 * MS, "after"),
+        ];
+        let builder = held_builder(&answered, &held);
+        capture_release_logs();
+
+        builder.release(&answered);
+
+        let release = (*builder.joined.0.borrow()).unwrap();
+        assert_eq!(
+            release.counts,
+            WarmupCounts {
+                held: 4,
+                flushed: 2,
+                dropped: 2,
+                floored: 1,
+                fallback_rows: 1,
+            }
+        );
+        assert_eq!(
+            take_release_logs(),
+            vec![(
+                Level::Info,
+                format!(
+                    "Released the joined warm-up of {}: held=4, flushed=2, dropped=2, floored=1, \
+                     fallback_rows=1",
+                    builder.bar_type
+                ),
+            )]
+        );
+        // The answer's two bars, then the floored copy at the floor and the trade after
+        assert_eq!(
+            builder.built(),
+            [150 * MS, 160 * MS, 160 * MS, 180 * MS].map(UnixNanos::from)
+        );
+    }
+
+    #[rstest]
+    fn test_joined_release_floors_a_held_trade_below_the_answer() {
+        // Answered (100 ms, 200), held (101 ms, 199): past the cut, below the builder's last input
+        let answered = [trade(100 * MS, 200 * MS, "a1")];
+        let builder = held_builder(&answered, &[trade(101 * MS, 199 * MS, "held")]);
+
+        builder.release(&answered);
+
+        assert_eq!(builder.built(), [200 * MS, 200 * MS].map(UnixNanos::from));
+        let release = (*builder.joined.0.borrow()).unwrap();
+        assert_eq!(release.counts.floored, 1);
+        assert_eq!(release.counts.flushed, 1);
+    }
+
+    #[rstest]
+    fn test_joined_release_logs_no_overlap_observed_when_the_first_held_trade_is_after_the_cut() {
+        let answered = [trade(100 * MS, 150 * MS, "a1")];
+        let builder = held_builder(&answered, &[trade(101 * MS, 160 * MS, "after")]);
+        capture_release_logs();
+
+        builder.release(&answered);
+
+        let logs = take_release_logs();
+        assert_eq!(logs.len(), 2, "{logs:?}");
+        assert_eq!(logs[0].0, Level::Warn);
+        assert!(logs[0].1.contains("no overlap observed"), "{logs:?}");
+        assert_eq!(
+            logs[1].1,
+            format!(
+                "Released the joined warm-up of {}: held=1, flushed=1, dropped=0, floored=0, \
+                 fallback_rows=0",
+                builder.bar_type
+            )
+        );
+    }
+
+    #[rstest]
+    fn test_joined_release_logs_counts_only_when_the_first_held_trade_is_in_the_answer() {
+        let answered = [trade(100 * MS, 150 * MS, "a1")];
+        let held = [
+            trade(100 * MS, 155 * MS, "a1-live"),
+            trade(101 * MS, 160 * MS, "after"),
+        ];
+        let builder = held_builder(&answered, &held);
+        capture_release_logs();
+
+        builder.release(&answered);
+
+        let logs = take_release_logs();
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        assert_eq!(logs[0].0, Level::Info);
+    }
+
+    #[rstest]
+    fn test_joined_handler_takes_later_live_trades_through_the_cut_and_the_floor() {
+        let answered = [trade(100 * MS, 200 * MS, "a1")];
+        let builder = held_builder(&answered, &[]);
+        builder.release(&answered);
+
+        // After the release: a late trade of the cut's millisecond, then one below the floor
+        builder
+            .handler
+            .handle(&trade(100 * MS + 1, 210 * MS, "late"));
+        builder
+            .handler
+            .handle(&trade(101 * MS, 199 * MS, "below-the-floor"));
+
+        assert_eq!(builder.built(), [200 * MS, 200 * MS].map(UnixNanos::from));
+        let release = (*builder.joined.0.borrow()).unwrap();
+        assert_eq!(release.counts.dropped, 1);
+        assert_eq!(release.counts.floored, 1);
+    }
+
+    #[rstest]
+    fn test_joined_release_of_an_empty_answer_cuts_nothing() {
+        let release = JoinedRelease::from_answer(&[]);
+
+        assert_eq!(release.cut_ms, None);
+        assert_eq!(release.floor, None);
+        assert_eq!(release.counts, WarmupCounts::default());
     }
 }

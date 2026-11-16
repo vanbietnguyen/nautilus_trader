@@ -57,6 +57,9 @@ pub(super) struct RequestBarAggregation {
     pub(super) time_zone: Option<TimeZone>,
     /// Answer a trades request as trades and aggregated bars parts in live order.
     pub(super) interleave: bool,
+    /// Release the held live trades through the join's cut and floor (an admitted `cut_warmup`
+    /// request, the history/live join).
+    pub(super) cut_warmup: bool,
 }
 
 impl RequestBarAggregation {
@@ -319,6 +322,8 @@ pub(super) fn request_bar_aggregation_from_params(
     let update_subscriptions = params.get_bool(UPDATE_SUBSCRIPTIONS).unwrap_or(false);
     let skip_first_non_full_bar = params.get_bool("skip_first_non_full_bar");
     let interleave = params.get_bool(INTERLEAVE).unwrap_or(false);
+    // Only an admitted request reaches here with `cut_warmup` set: admission refuses the others
+    let cut_warmup = params.get_bool(CUT_WARMUP) == Some(true);
 
     Ok(Some(RequestBarAggregation {
         bar_types: unique_bar_types,
@@ -327,6 +332,7 @@ pub(super) fn request_bar_aggregation_from_params(
         skip_first_non_full_bar,
         time_zone: time_zone_from_params(Some(params))?,
         interleave,
+        cut_warmup,
     }))
 }
 
@@ -692,6 +698,7 @@ fn parse_continuous_future(
             skip_first_non_full_bar: None,
             time_zone: time_zone_from_params(Some(params))?,
             interleave: false,
+            cut_warmup: false,
         },
         transitions,
         adjustment_mode,

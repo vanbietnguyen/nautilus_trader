@@ -36,9 +36,12 @@ use super::{
     TickImbalanceBarAggregator, TickRunsBarAggregator, TimeBarAggregator, UnsubscribeBars,
     UnsubscribeCommand, UnsubscribeQuotes, UnsubscribeTrades, ValueBarAggregator,
     ValueImbalanceBarAggregator, ValueRunsBarAggregator, VolumeBarAggregator,
-    VolumeImbalanceBarAggregator, VolumeRunsBarAggregator, handlers::WarmupBuffer,
+    VolumeImbalanceBarAggregator, VolumeRunsBarAggregator,
+    handlers::{JoinedRelease, JoinedSlot, WarmupBuffer},
     log_error_on_cache_insert, process_engine_bar, request_bar_aggregation_from_params,
-    request_params, requests::time_zone_from_params, switchboard,
+    request_params,
+    requests::time_zone_from_params,
+    switchboard,
 };
 
 impl DataEngine {
@@ -173,6 +176,16 @@ impl DataEngine {
     }
 
     pub(super) fn cleanup_request_bar_aggregators(&mut self, request_id: &UUID4) -> bool {
+        self.release_request_bar_aggregators(request_id, None)
+    }
+
+    /// Cleans up the request's aggregators like [`Self::cleanup_request_bar_aggregators`], each
+    /// joined builder releasing its held live trades through its own copy of `joined`.
+    fn release_request_bar_aggregators(
+        &mut self,
+        request_id: &UUID4,
+        joined: Option<JoinedRelease>,
+    ) -> bool {
         let Some(state) = self.request_bar_aggregations.remove(request_id) else {
             return false;
         };
@@ -188,7 +201,7 @@ impl DataEngine {
             let has_live_handlers =
                 state.update_subscriptions && self.bar_aggregator_handlers.contains_key(&key);
 
-            self.finish_historical_bar_aggregator(&key, has_live_handlers);
+            self.finish_historical_bar_aggregator(&key, has_live_handlers, joined);
 
             let keep_running = if has_live_handlers {
                 match self.setup_bar_aggregator(bar_type, false, aggregator_request_id) {
@@ -222,13 +235,18 @@ impl DataEngine {
         &mut self,
         key: &BarAggregatorKey,
         has_live_handlers: bool,
+        joined: Option<JoinedRelease>,
     ) {
         // Replay buffered updates before closing their last historical interval
         if has_live_handlers
             && let Some(warmup) = self.bar_aggregator_warmups.remove(key)
             && let Some(aggregator) = self.bar_aggregators.get(key)
         {
-            warmup.release(aggregator.borrow_mut().as_mut());
+            let mut aggregator = aggregator.borrow_mut();
+            match joined {
+                Some(release) => warmup.release_joined(aggregator.as_mut(), release, key.0),
+                None => warmup.release(aggregator.as_mut()),
+            }
         }
 
         if let Some(aggregator) = self.bar_aggregators.get(key) {
@@ -271,7 +289,8 @@ impl DataEngine {
         }
 
         if completed {
-            self.cleanup_request_bar_aggregators(&correlation_id);
+            let joined = joined_release(&state, resp);
+            self.release_request_bar_aggregators(&correlation_id, joined);
         }
     }
 
@@ -306,7 +325,10 @@ impl DataEngine {
         }
 
         if envelope.completed() {
-            self.cleanup_request_bar_aggregators(&request_id);
+            let joined = state
+                .cut_warmup
+                .then(|| JoinedRelease::from_answer(&resp.data));
+            self.release_request_bar_aggregators(&request_id, joined);
             let remaining = std::mem::take(&mut *self.interleaved_bars.borrow_mut());
             send_interleaved_bars(resp, &mut pending, remaining);
         }
@@ -796,10 +818,15 @@ impl DataEngine {
             } else if bar_type.spec().price_type == PriceType::Last {
                 let topic = switchboard::get_trades_topic(bar_type.instrument_id());
                 let buffer = defer.then(WarmupBuffer::new);
+                let joined = defer.then(JoinedSlot::default);
                 let handler = TypedHandler::new(
-                    BarTradeHandler::new(&aggregator, bar_type_std).with_warmup(buffer.clone()),
+                    BarTradeHandler::new(&aggregator, bar_type_std)
+                        .with_warmup(buffer.clone())
+                        .with_joined(joined.clone()),
                 );
-                warmup = buffer.map(BarAggregatorWarmup::Trade);
+                warmup = buffer
+                    .zip(joined)
+                    .map(|(buffer, joined)| BarAggregatorWarmup::Trade(buffer, joined));
                 msgbus::subscribe_trades(
                     topic.into(),
                     handler.clone(),
@@ -1165,7 +1192,9 @@ fn sources_before_dependents(bar_types: &[BarType]) -> Vec<BarType> {
 #[derive(Debug)]
 pub(super) enum BarAggregatorWarmup {
     Bar(WarmupBuffer<Bar>),
-    Trade(WarmupBuffer<TradeTick>),
+    /// Held trades, and the slot through which the handler takes later trades once a joined
+    /// warm-up is released.
+    Trade(WarmupBuffer<TradeTick>, JoinedSlot),
     Quote(WarmupBuffer<QuoteTick>),
 }
 
@@ -1177,7 +1206,7 @@ impl BarAggregatorWarmup {
                 .release()
                 .into_iter()
                 .for_each(|bar| aggregator.handle_bar(bar)),
-            Self::Trade(buffer) => buffer
+            Self::Trade(buffer, _) => buffer
                 .release()
                 .into_iter()
                 .for_each(|trade| aggregator.handle_trade(trade)),
@@ -1186,6 +1215,32 @@ impl BarAggregatorWarmup {
                 .into_iter()
                 .for_each(|quote| aggregator.handle_quote(quote)),
         }
+    }
+
+    /// Ends a joined warm-up: the held trades reach `aggregator` through `release`'s cut and
+    /// floor (see [`JoinedRelease`]). Joined bar types aggregate trades; any other warm-up is
+    /// released as usual.
+    pub(super) fn release_joined(
+        &self,
+        aggregator: &mut dyn BarAggregator,
+        release: JoinedRelease,
+        bar_type: BarType,
+    ) {
+        match self {
+            Self::Trade(buffer, joined) => {
+                buffer.release_joined(joined, release, aggregator, bar_type);
+            }
+            Self::Bar(_) | Self::Quote(_) => self.release(aggregator),
+        }
+    }
+}
+
+/// The cut and the floor that release the held live trades of a joined request's builders, from
+/// its complete answer; `None` for every other request.
+fn joined_release(state: &RequestBarAggregation, resp: &DataResponse) -> Option<JoinedRelease> {
+    match resp {
+        DataResponse::Trades(r) if state.cut_warmup => Some(JoinedRelease::from_answer(&r.data)),
+        _ => None,
     }
 }
 
