@@ -558,3 +558,120 @@ async fn test_replay_stamps_ts_event_by_the_client_decode_config(
 
     server.stop().await;
 }
+
+/// A stamp of a made-up record in the Bound cases, resolved against the crossing time.
+#[derive(Debug, Clone, Copy)]
+enum Stamp {
+    /// This many nanoseconds after `REPLAY_START`, before the request's time.
+    AfterReplayStart(u64),
+    /// The crossing time, after the request's time.
+    Crossing,
+    /// `UNDEF_TIMESTAMP`.
+    Undefined,
+}
+
+impl Stamp {
+    fn at(self, crossing: u64) -> u64 {
+        match self {
+            Self::AfterReplayStart(offset) => REPLAY_START + offset,
+            Self::Crossing => crossing,
+            Self::Undefined => dbn::UNDEF_TIMESTAMP,
+        }
+    }
+}
+
+#[rstest]
+#[case::header_before_receive_crosses(
+    Stamp::AfterReplayStart(2),
+    Stamp::Crossing,
+    [1, 2].map(Quantity::from).to_vec()
+)]
+#[case::header_crosses_receive_before(
+    Stamp::Crossing,
+    Stamp::AfterReplayStart(2),
+    [1].map(Quantity::from).to_vec()
+)]
+#[case::header_undefined_receive_crosses(
+    Stamp::Undefined,
+    Stamp::Crossing,
+    [1].map(Quantity::from).to_vec()
+)]
+#[tokio::test]
+async fn test_replay_bound_end_reads_the_header_exchange_time_else_the_receive_time(
+    #[case] header_ts_event: Stamp,
+    #[case] ts_recv: Stamp,
+    #[case] expected_sizes: Vec<Quantity>,
+) {
+    let server = MockLsgServer::new(TEST_DATASET).await;
+    let (client, mut receiver) = replay_client(server.addr());
+    let crossing = an_hour_from_now();
+    let mut second = tbbo_trade(ts_recv.at(crossing), 2);
+    second.hd.ts_event = header_ts_event.at(crossing);
+    // Crosses on both clocks, so a replay the second record does not end ends here
+    let third = tbbo_trade(crossing + 1, 3);
+    serve_session(&server, [tbbo_trade(REPLAY_START, 1), second, third]);
+    let sent = tokio::time::Instant::now();
+
+    client.request_trades(replay_request()).unwrap();
+    // Before the idle time, so the end is the bound's
+    let envelopes = recv_until_completed_by(&mut receiver, sent + IDLE / 2).await;
+
+    assert_eq!(trade_sizes(&envelopes), expected_sizes);
+
+    server.stop().await;
+}
+
+// The adapter's batch size, 10,000 trades
+const BATCH_SIZE: u64 = 10_000;
+
+#[rstest]
+#[tokio::test]
+async fn test_replay_bound_fails_an_established_session_and_keeps_its_delivered_batch() {
+    let server = MockLsgServer::new(TEST_DATASET).await;
+    let (client, mut receiver) = replay_client_with_bound(server.addr(), Some(2));
+    serve_session(&server, std::iter::empty::<dbn::Mbp1Msg>());
+    // One full batch, then one trade more that is decoded but never delivered; then quiet
+    // for longer than the bound and shorter than the idle time
+    let records: Vec<u8> = (0..=BATCH_SIZE)
+        .flat_map(|offset| tbbo_trade(REPLAY_START + offset, 1).as_ref().to_vec())
+        .collect();
+    server.send_bytes(records.into());
+    let request = replay_request();
+    let request_id = request.request_id;
+    let sent = tokio::time::Instant::now();
+
+    client.request_trades(request).unwrap();
+    let event = tokio::time::timeout(RECV_TIMEOUT, receiver.recv())
+        .await
+        .expect("timed out waiting for the batch")
+        .expect("channel closed");
+    let DataEvent::ResponseEnvelope(batch) = event else {
+        panic!("expected the batch's partial envelope, was {event:?}");
+    };
+    let failed = recv_failure(&mut receiver, Duration::from_secs(4)).await;
+
+    assert!(!batch.completed());
+    assert_eq!(batch.correlation_id(), &request_id);
+    assert_eq!(batch.failure_reason(), None);
+    assert_eq!(
+        envelope_trades(&batch).len(),
+        usize::try_from(BATCH_SIZE).unwrap()
+    );
+    assert!(
+        sent.elapsed() >= Duration::from_secs(2),
+        "failed before the bound"
+    );
+    assert_eq!(failed.request_id, request_id);
+    assert!(
+        failed.reason.contains("replay bound of 2 s"),
+        "{}",
+        failed.reason
+    );
+    let after = tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await;
+    assert!(
+        after.is_err(),
+        "expected no event after the failure, was {after:?}"
+    );
+
+    server.stop().await;
+}

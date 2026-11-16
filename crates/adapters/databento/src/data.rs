@@ -88,8 +88,14 @@ const PRICE_PRECISION_PARAM: &str = "price_precision";
 const REPLAY_START_PARAM: &str = "replay_start";
 const SCHEMA_PARAM: &str = "schema";
 /// How far before `replay_start` a trades replay begins, so the gateway still sends every trade
-/// received from `replay_start` on (the lag bound). The value is a placeholder, to be set from
-/// measured evidence.
+/// received from `replay_start` on (the lag bound).
+///
+/// It assumes no trade received at or after `replay_start` has an exchange time more than this
+/// before it. The assumption is unverified: the only measurement is one Sunday open, whose
+/// largest receive-minus-exchange time was 88.7 ms, and which clock the gateway filters the
+/// replay's start by is not known. If it filters by exchange time, a trade past the bound is
+/// never sent and the replay still completes, so exact completeness is not claimed until that
+/// filter is known.
 pub(crate) const REPLAY_LAG_BOUND: DurationNanos = DurationNanos::from_secs(1);
 /// How long a trades replay waits for a data record before it ends as complete (the idle time).
 const REPLAY_IDLE: Duration = Duration::from_millis(5000);
@@ -148,6 +154,12 @@ pub struct DatabentoDataClientConfig {
     /// private gateway session is dropped and the request fails with a reason naming the
     /// bound; the caller has then seen any partial responses already sent, followed by the
     /// failure, and trades decoded but not yet sent are lost.
+    ///
+    /// A replay starts one second before `replay_start`, assuming no trade received at or after
+    /// `replay_start` has an exchange time more than one second before it. That is unverified
+    /// (one Sunday open measured at most 88.7 ms between receive and exchange time, and which
+    /// clock the gateway filters the start by is not known), so a completed replay is not
+    /// claimed to hold every such trade until the gateway's start filter is known.
     pub replay_bound_secs: Option<u64>,
     /// Decode configuration for `replay_start` trades replays (None decodes as the default
     /// configuration does, `ts_event` from `ts_recv`). With [`TsEventSource::Exchange`] a
@@ -1221,7 +1233,7 @@ impl DataClient for DatabentoDataClient {
     }
 
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
-        if let Some(replay_start) = replay_start_from_params(request.params.as_ref()) {
+        if let Some(replay_start) = replay_start_from_params(request.params.as_ref())? {
             return self.request_trades_replay(request, replay_start);
         }
 
@@ -1801,10 +1813,18 @@ fn requested_instrument(
         .cloned()
 }
 
-fn replay_start_from_params(params: Option<&Params>) -> Option<UnixNanos> {
+/// Reads `replay_start`: `None` when absent, an error when present but not an unsigned
+/// nanosecond count (a string, a negative, a null), so a malformed opt-in is refused rather
+/// than served by the historical client.
+fn replay_start_from_params(params: Option<&Params>) -> anyhow::Result<Option<UnixNanos>> {
     params
-        .and_then(|params| params.get_u64(REPLAY_START_PARAM))
-        .map(UnixNanos::from)
+        .and_then(|params| params.get(REPLAY_START_PARAM))
+        .map(|value| {
+            value.as_u64().map(UnixNanos::from).ok_or_else(|| {
+                anyhow::anyhow!("`{REPLAY_START_PARAM}` must be an unsigned count of nanoseconds")
+            })
+        })
+        .transpose()
 }
 
 fn price_precision_from_params(params: Option<&Params>) -> anyhow::Result<Option<u8>> {
@@ -1974,7 +1994,7 @@ mod tests {
         types::{Currency, Price, Quantity},
     };
     use rstest::rstest;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use time::macros::date;
     use tokio::{
         io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -3070,6 +3090,59 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.to_string(), expected);
+    }
+
+    #[rstest]
+    #[case::string(json!("1717423200000000000"))]
+    #[case::negative(json!(-1_717_423_200_000_000_000_i64))]
+    #[case::null(json!(null))]
+    fn test_request_trades_refuses_a_present_but_invalid_replay_start(#[case] value: Value) {
+        let client = test_data_client();
+        let start = UnixNanos::from(1_717_423_200_000_000_000);
+        let params = Params::new(
+            [
+                (REPLAY_START_PARAM.to_owned(), value),
+                (SCHEMA_PARAM.to_owned(), json!("tbbo")),
+            ]
+            .into(),
+        );
+
+        let error = client
+            .request_trades(RequestTrades::new(
+                InstrumentId::from("ESM4.GLBX"),
+                Some(start.to_datetime_utc()),
+                None,
+                None,
+                None,
+                UUID4::new(),
+                UnixNanos::from(37),
+                Some(params),
+            ))
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "`replay_start` must be an unsigned count of nanoseconds"
+        );
+    }
+
+    #[rstest]
+    #[case::absent(None, None)]
+    #[case::valid(Some(json!(1_717_423_200_000_000_000_u64)), Some(1_717_423_200_000_000_000))]
+    fn test_replay_start_from_params_reads_absent_and_valid(
+        #[case] value: Option<Value>,
+        #[case] expected: Option<u64>,
+    ) {
+        let params = Params::new(
+            value
+                .map(|value| (REPLAY_START_PARAM.to_owned(), value))
+                .into_iter()
+                .collect(),
+        );
+
+        let replay_start = replay_start_from_params(Some(&params)).unwrap();
+
+        assert_eq!(replay_start, expected.map(UnixNanos::from));
     }
 
     #[rstest]

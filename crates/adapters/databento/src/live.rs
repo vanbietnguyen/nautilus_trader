@@ -65,7 +65,8 @@ use super::{
 use crate::{
     common::{Credential, build_publisher_venue_map, load_publishers},
     decode::{
-        DatabentoDecodeConfig, decode_instrument_def_msg, decode_record, decode_record_with_config,
+        DatabentoDecodeConfig, TsEventSource, decode_instrument_def_msg, decode_record,
+        decode_record_with_config,
     },
     symbology::{
         check_consistent_symbology, dataset_uses_futures_symbology, infer_symbology_type,
@@ -1187,6 +1188,10 @@ pub(crate) struct ReplaySummary {
     ts_event_below_start: u64,
     ts_recv_below_start: u64,
     ts_recv_decreases: u64,
+    /// Kept trades decoded with [`TsEventSource::Exchange`] whose header `ts_event` is
+    /// undefined, so their `ts_event` fell back to `ts_recv`. Zero when the decode takes
+    /// `ts_event` from `ts_recv` for every trade.
+    ts_event_fallbacks: u64,
     max_recv_minus_event_ns: Option<u64>,
     replay_completed: Option<Duration>,
     first_kept_offset_ms: Option<u64>,
@@ -1208,6 +1213,7 @@ impl ReplaySummary {
             ts_event_below_start: 0,
             ts_recv_below_start: 0,
             ts_recv_decreases: 0,
+            ts_event_fallbacks: 0,
             max_recv_minus_event_ns: None,
             replay_completed: None,
             first_kept_offset_ms: None,
@@ -1263,8 +1269,9 @@ impl Display for ReplaySummary {
             f,
             "end={} connect_ms={} first_record_ms={} end_ms={} records={} kept={} \
              discarded_below_keep_from={} ts_event_below_start={} ts_recv_below_start={} \
-             ts_recv_decreases={} max_recv_minus_event_ns={} replay_completed={} \
-             replay_completed_ms={} first_kept_offset_ms={} last_kept_offset_ms={}",
+             ts_recv_decreases={} ts_event_fallbacks={} max_recv_minus_event_ns={} \
+             replay_completed={} replay_completed_ms={} first_kept_offset_ms={} \
+             last_kept_offset_ms={}",
             self.end.unwrap_or("none"),
             ms(self.connected),
             ms(self.first_record),
@@ -1275,6 +1282,7 @@ impl Display for ReplaySummary {
             self.ts_event_below_start,
             self.ts_recv_below_start,
             self.ts_recv_decreases,
+            self.ts_event_fallbacks,
             value(self.max_recv_minus_event_ns),
             self.replay_completed.is_some(),
             ms(self.replay_completed),
@@ -1299,6 +1307,15 @@ impl Display for ReplaySummary {
 ///
 /// `summary` collects counts and timings and records the end. The caller bounds the whole
 /// replay in time: dropping the future drops the session, and `batch` keeps what was decoded.
+///
+/// Completeness is not claimed. The caller passes a `start` some lag before `keep_from` (the
+/// data client's `REPLAY_LAG_BOUND`, one second), assuming every trade received at or after
+/// `keep_from` has an exchange time no more than that lag before it. That bound is unverified:
+/// the only measurement is one Sunday open, whose largest receive-minus-exchange time was
+/// 88.7 ms, and which clock the gateway filters `start` by is not known. If it filters by
+/// exchange time, a trade whose exchange time is more than the lag before `keep_from` but whose
+/// receive time is at or after it is never sent, and the replay still ends successfully
+/// without it.
 ///
 /// # Errors
 ///
@@ -1375,6 +1392,8 @@ pub(crate) async fn replay_trades(
     let instrument_def_price_precision_map: AHashMap<u32, u8> = AHashMap::new();
     let mut previous_recv: Option<u64> = None;
     let mut idle_deadline = tokio::time::Instant::now() + idle;
+    let stamps_exchange_time =
+        decode_config.is_some_and(|config| config.ts_event_source == TsEventSource::Exchange);
 
     loop {
         let Ok(next) = tokio::time::timeout_at(idle_deadline, client.next_record()).await else {
@@ -1452,6 +1471,10 @@ pub(crate) async fn replay_trades(
             if let Some(Data::Trade(trade)) = trade {
                 batch.push(trade);
                 summary.count_kept(ts_recv, keep_from);
+                // The decode stamps an undefined exchange time with `ts_recv`
+                if stamps_exchange_time && ts_event == dbn::UNDEF_TIMESTAMP {
+                    summary.ts_event_fallbacks += 1;
+                }
             }
 
             if batch.len() >= REPLAY_BATCH_SIZE {
@@ -1991,6 +2014,12 @@ fn flush_mbo_event_boundary(
     let deltas = OrderBookDeltas::new(instrument_id, buffer);
     Some(deltas)
 }
+
+// The integration tests' mock gateway, so a replay test here can read its summary directly
+#[cfg(test)]
+#[allow(dead_code, reason = "the replay test uses part of the mock gateway")]
+#[path = "../tests/common/mock_server.rs"]
+mod mock_server;
 
 #[cfg(test)]
 mod tests {
@@ -2822,6 +2851,7 @@ mod tests {
             ts_event_below_start: 1,
             ts_recv_below_start: 0,
             ts_recv_decreases: 0,
+            ts_event_fallbacks: 3,
             max_recv_minus_event_ns: Some(1_500),
             replay_completed: None,
             first_kept_offset_ms: Some(0),
@@ -2832,9 +2862,122 @@ mod tests {
             summary.to_string(),
             "end=idle connect_ms=12 first_record_ms=40 end_ms=5041 records=7 kept=4 \
              discarded_below_keep_from=2 ts_event_below_start=1 ts_recv_below_start=0 \
-             ts_recv_decreases=0 max_recv_minus_event_ns=1500 replay_completed=false \
-             replay_completed_ms=none first_kept_offset_ms=0 last_kept_offset_ms=500"
+             ts_recv_decreases=0 ts_event_fallbacks=3 max_recv_minus_event_ns=1500 \
+             replay_completed=false replay_completed_ms=none first_kept_offset_ms=0 \
+             last_kept_offset_ms=500"
         );
+    }
+
+    /// A made-up `tbbo` trade of instrument 1 with its header `ts_event` and its `ts_recv`.
+    fn replay_tbbo_trade(ts_event: u64, ts_recv: u64) -> dbn::Mbp1Msg {
+        dbn::Mbp1Msg {
+            hd: dbn::RecordHeader::new::<dbn::Mbp1Msg>(rtype::MBP_1, 1, 1, ts_event),
+            price: 100_250_000_000,
+            size: 1,
+            action: b'T' as std::ffi::c_char,
+            side: b'N' as std::ffi::c_char,
+            flags: dbn::FlagSet::new(128),
+            depth: 0,
+            ts_recv,
+            ts_in_delta: 0,
+            sequence: 1,
+            levels: [dbn::BidAskPair {
+                bid_px: 100_000_000_000,
+                ask_px: 100_250_000_000,
+                bid_sz: 100,
+                ask_sz: 50,
+                bid_ct: 5,
+                ask_ct: 3,
+            }],
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_replay_counts_only_undefined_exchange_times_as_ts_event_fallbacks() {
+        let replay_start: u64 = 1_717_423_200_000_000_000;
+        let server = mock_server::MockLsgServer::new("GLBX.MDP3").await;
+        server.authenticate();
+        server.expect_subscription();
+        server.start();
+        server.send_record(
+            dbn::SymbolMappingMsg::new(
+                1,
+                1_000_000_000,
+                dbn::SType::InstrumentId,
+                "1",
+                dbn::SType::RawSymbol,
+                "ESM4",
+                1_000_000_000,
+                u64::MAX,
+            )
+            .unwrap(),
+        );
+        // Undefined exchange time: the decode falls back to the receive time
+        server.send_record(replay_tbbo_trade(dbn::UNDEF_TIMESTAMP, replay_start + 1));
+        // Defined exchange time, equal to the receive time: no fallback
+        server.send_record(replay_tbbo_trade(replay_start + 2, replay_start + 2));
+        server.send_record(
+            dbn::SystemMsg::new(
+                1_000_000_000,
+                Some(dbn::SystemCode::ReplayCompleted),
+                "Replay completed",
+            )
+            .unwrap(),
+        );
+        let session = LiveSessionSpec {
+            credential: Credential::new("32-character-with-lots-of-filler"),
+            dataset: "GLBX.MDP3".to_owned(),
+            gateway_addr: Some(server.addr()),
+            instrument_id: InstrumentId::from("ESM4.GLBX"),
+            publisher_venue_map: Arc::new(IndexMap::from([(1, Venue::from("GLBX"))])),
+            futures_year_digits: FuturesYearDigits::One,
+            price_precision: Some(2),
+        };
+        let decode_config = DatabentoDecodeConfig {
+            ts_event_source: TsEventSource::Exchange,
+            ..DatabentoDecodeConfig::default()
+        };
+        let mut batch = Vec::new();
+        let mut summary = ReplaySummary::new();
+        let mut delivered = Vec::new();
+
+        let end = replay_trades(
+            session,
+            UnixNanos::from(replay_start - 1_000_000_000),
+            UnixNanos::from(replay_start),
+            UnixNanos::from(u64::MAX),
+            Duration::from_secs(5),
+            Some(&decode_config),
+            &mut batch,
+            &mut summary,
+            |trades| {
+                delivered.extend(trades);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(end, ReplayEnd::Completed);
+        let times: Vec<(u64, u64)> = delivered
+            .iter()
+            .map(|trade| (trade.ts_event.as_u64(), trade.ts_init.as_u64()))
+            .collect();
+        assert_eq!(
+            times,
+            [
+                (replay_start + 1, replay_start + 1),
+                (replay_start + 2, replay_start + 2)
+            ],
+            "both trades carry equal stamps"
+        );
+        assert_eq!(summary.kept, 2);
+        assert_eq!(summary.ts_event_fallbacks, 1);
+        let line = summary.to_string();
+        assert!(line.contains(" ts_event_fallbacks=1 "), "{line}");
+
+        server.stop().await;
     }
 
     #[rstest]
