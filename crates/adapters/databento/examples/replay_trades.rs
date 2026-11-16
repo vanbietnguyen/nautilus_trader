@@ -77,7 +77,6 @@ use nautilus_model::{
     identifiers::{ClientId, InstrumentId, TraderId, futures::FuturesYearDigits},
 };
 use serde_json::json;
-use tokio::{sync::mpsc::UnboundedReceiver, time::Instant};
 use zeroize::Zeroize;
 
 const CLIENT_ID: &str = "DATABENTO-REPLAY";
@@ -346,7 +345,10 @@ fn price_precision_params() -> Params {
 /// Builds the client on its own data event channel, then connects and subscribes.
 async fn set_up(
     args: &Args,
-) -> anyhow::Result<(DatabentoDataClient, UnboundedReceiver<DataEvent>)> {
+) -> anyhow::Result<(
+    DatabentoDataClient,
+    tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+)> {
     let key = read_key(&args.key_file)?;
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     replace_data_event_sender(sender);
@@ -374,9 +376,9 @@ async fn set_up(
 
 /// Reads events until the request's completed response, its failure, or `deadline`.
 async fn read_until_end(
-    receiver: &mut UnboundedReceiver<DataEvent>,
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
     request_id: UUID4,
-    deadline: Instant,
+    deadline: tokio::time::Instant,
     tally: &mut ReplayTally,
 ) -> Outcome {
     loop {
@@ -428,7 +430,7 @@ async fn run(args: &Args, tally: &mut ReplayTally) -> (Outcome, Option<u128>) {
         get_atomic_clock_realtime().get_time_ns(),
         Some(replay_params(args.start_ns)),
     );
-    let sent = Instant::now();
+    let sent = tokio::time::Instant::now();
     let outcome = match client.request_trades(request) {
         Ok(()) => {
             let deadline = sent + Duration::from_secs(args.bound_secs);
@@ -570,9 +572,13 @@ mod tests {
 
     #[rstest]
     #[case::no_key_file(&["--instrument", "MNQZ6.GLBX", "--start-ns", "1"][..])]
-    #[case::negative_start(&["--key-file", "k", "--instrument", "MNQZ6.GLBX", "--start-ns", "-1"][..])]
+    #[case::negative_start(
+        &["--key-file", "k", "--instrument", "MNQZ6.GLBX", "--start-ns", "-1"][..]
+    )]
     #[case::no_venue(&["--key-file", "k", "--instrument", "MNQZ6", "--start-ns", "1"][..])]
-    #[case::key_value_flag(&["--key", "abc", "--key-file", "k", "--instrument", "MNQZ6.GLBX", "--start-ns", "1"][..])]
+    #[case::key_value_flag(
+        &["--key", "abc", "--key-file", "k", "--instrument", "MNQZ6.GLBX", "--start-ns", "1"][..]
+    )]
     fn test_refuses_bad_flags(#[case] flags: &[&str]) {
         let argv = std::iter::once("databento-replay-trades").chain(flags.iter().copied());
 
@@ -692,7 +698,8 @@ mod tests {
         assert!(line.starts_with("outcome=failed envelopes=0 "), "{line}");
         assert!(
             line.ends_with(
-                " quotes=0 wall_ms=120004 failure=\"Replay of MNQZ6.GLBX: exceeded the replay bound\""
+                " quotes=0 wall_ms=120004 failure=\"Replay of MNQZ6.GLBX: exceeded the replay \
+                 bound\""
             ),
             "{line}"
         );

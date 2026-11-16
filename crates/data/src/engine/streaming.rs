@@ -660,8 +660,8 @@ impl DataEngine {
         self.dispatch_request_plan(req, plan.legs)
     }
 
-    /// The plan of an admitted join over `session_opens` (strictly increasing trading-day opens,
-    /// the last the current one, `H`).
+    /// Returns the plan of an admitted join over `session_opens` (strictly increasing trading-day
+    /// opens, the last the current one, `H`).
     ///
     /// Past sessions come from one catalog leg over `[first open, H)`, asked up to `H - 1 ns`
     /// (the catalog's upper bound is inclusive), only when a catalog is registered. Rows own
@@ -729,7 +729,7 @@ impl DataEngine {
 
         let mut tail =
             with_dates_for_pipeline(req, Some(current_open.to_datetime_utc()), None, now);
-        with_replay_start(&mut tail, current_open);
+        set_replay_start(&mut tail, current_open);
         legs.push(RequestLeg::Client(tail));
 
         if !missing_sessions.is_empty() {
@@ -1335,7 +1335,7 @@ fn drop_rows_of_unavailable_days(
 }
 
 /// Sets the trades request's `replay_start` parameter: the client serves it by its replay.
-fn with_replay_start(request: &mut RequestCommand, replay_start: UnixNanos) {
+fn set_replay_start(request: &mut RequestCommand, replay_start: UnixNanos) {
     if let RequestCommand::Trades(cmd) = request {
         let mut params = cmd.params.as_deref().cloned().unwrap_or_default();
         params.insert(

@@ -1147,7 +1147,10 @@ pub(crate) struct LiveSessionSpec {
     pub(crate) price_precision: Option<u8>,
 }
 
-/// How a [`replay_trades`] session ended.
+/// How a [`replay_trades`] session ended, failures included.
+///
+/// A replay that succeeds ends `Completed`, `Idle` or `Bound`, the only ends [`replay_trades`]
+/// returns; every other end is a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplayEnd {
     /// The gateway sent `ReplayCompleted`: the replay reached real time.
@@ -1157,6 +1160,18 @@ pub(crate) enum ReplayEnd {
     Idle,
     /// A data record's event time reached `until`. That record is discarded.
     Bound,
+    /// The gateway session was not established within [`CONNECT_TIMEOUT`].
+    ConnectTimeout,
+    /// The gateway ended the session before the replay ended.
+    GatewayClosed,
+    /// A data record's `ts_recv` was below the previous one's.
+    OutOfOrder,
+    /// The gateway sent an error message.
+    GatewayError,
+    /// The whole replay exceeded the data client's replay bound.
+    ReplayBound,
+    /// The replay failed for any other reason.
+    Error,
 }
 
 impl ReplayEnd {
@@ -1166,6 +1181,12 @@ impl ReplayEnd {
             Self::Completed => "completed",
             Self::Idle => "idle",
             Self::Bound => "bound",
+            Self::ConnectTimeout => "connect_timeout",
+            Self::GatewayClosed => "gateway_closed",
+            Self::OutOfOrder => "out_of_order",
+            Self::GatewayError => "gateway_error",
+            Self::ReplayBound => "replay_bound",
+            Self::Error => "error",
         }
     }
 }
@@ -1178,7 +1199,7 @@ impl ReplayEnd {
 #[derive(Debug)]
 pub(crate) struct ReplaySummary {
     started: tokio::time::Instant,
-    end: Option<&'static str>,
+    end: Option<ReplayEnd>,
     connected: Option<Duration>,
     first_record: Option<Duration>,
     ended: Option<Duration>,
@@ -1200,6 +1221,7 @@ pub(crate) struct ReplaySummary {
 
 impl ReplaySummary {
     /// Creates an empty summary whose timings start now.
+    #[must_use]
     pub(crate) fn new() -> Self {
         Self {
             started: tokio::time::Instant::now(),
@@ -1222,9 +1244,9 @@ impl ReplaySummary {
     }
 
     /// Records how the replay ended, with its time. Only the first end is kept.
-    pub(crate) fn end(&mut self, kind: &'static str) {
+    pub(crate) fn end(&mut self, end: ReplayEnd) {
         if self.end.is_none() {
-            self.end = Some(kind);
+            self.end = Some(end);
             self.ended = Some(self.started.elapsed());
         }
     }
@@ -1272,7 +1294,7 @@ impl Display for ReplaySummary {
              ts_recv_decreases={} ts_event_fallbacks={} max_recv_minus_event_ns={} \
              replay_completed={} replay_completed_ms={} first_kept_offset_ms={} \
              last_kept_offset_ms={}",
-            self.end.unwrap_or("none"),
+            self.end.map_or("none", ReplayEnd::name),
             ms(self.connected),
             ms(self.first_record),
             ms(self.ended),
@@ -1319,10 +1341,10 @@ impl Display for ReplaySummary {
 ///
 /// # Errors
 ///
-/// Returns an error if the connection, subscription, session start, record decoding or
-/// `deliver` fails, if a data record's `ts_recv` is below the previous one's, if the gateway
-/// sends an error message (its code name in the error), or if the gateway ends the session
-/// before the replay ends.
+/// Returns an error if the gateway session is not established within [`CONNECT_TIMEOUT`], if
+/// the connection, subscription, session start, record decoding or `deliver` fails, if a data
+/// record's `ts_recv` is below the previous one's, if the gateway sends an error message (its
+/// code name in the error), or if the gateway ends the session before the replay ends.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn replay_trades(
     session: LiveSessionSpec,
@@ -1356,7 +1378,7 @@ pub(crate) async fn replay_trades(
 
     let api_key = SecretString::from(credential.api_key().to_owned());
     let connect_dataset = dataset.clone();
-    let mut client = tokio::time::timeout(CONNECT_TIMEOUT, async move {
+    let connected = tokio::time::timeout(CONNECT_TIMEOUT, async move {
         let base = databento::LiveClient::builder();
         let base = if let Some(addr) = gateway_addr {
             base.addr(addr).await?
@@ -1369,8 +1391,16 @@ pub(crate) async fn replay_trades(
             .build()
             .await
     })
-    .await?
-    .map_err(|e| anyhow::anyhow!("Failed to connect to Databento LSG: {e}"))?;
+    .await;
+    let Ok(connected) = connected else {
+        summary.end(ReplayEnd::ConnectTimeout);
+        anyhow::bail!(
+            "Failed to connect to Databento LSG within the connection limit of {} s",
+            CONNECT_TIMEOUT.as_secs()
+        );
+    };
+    let mut client =
+        connected.map_err(|e| anyhow::anyhow!("Failed to connect to Databento LSG: {e}"))?;
     summary.connected = Some(summary.started.elapsed());
 
     let subscription = Subscription::builder()
@@ -1400,11 +1430,11 @@ pub(crate) async fn replay_trades(
             if !batch.is_empty() {
                 deliver(std::mem::take(batch))?;
             }
-            summary.end(ReplayEnd::Idle.name());
+            summary.end(ReplayEnd::Idle);
             return Ok(ReplayEnd::Idle);
         };
         let Some(record) = next? else {
-            summary.end("gateway_closed");
+            summary.end(ReplayEnd::GatewayClosed);
             anyhow::bail!("Gateway ended the {instrument_id} replay session before it completed");
         };
 
@@ -1415,7 +1445,7 @@ pub(crate) async fn replay_trades(
 
             if previous_recv.is_some_and(|previous| ts_recv < previous) {
                 summary.ts_recv_decreases += 1;
-                summary.end("out_of_order");
+                summary.end(ReplayEnd::OutOfOrder);
                 anyhow::bail!(
                     "Replay of {instrument_id} received a record whose ts_recv is below the \
                      previous record's"
@@ -1434,7 +1464,7 @@ pub(crate) async fn replay_trades(
                 if !batch.is_empty() {
                     deliver(std::mem::take(batch))?;
                 }
-                summary.end(ReplayEnd::Bound.name());
+                summary.end(ReplayEnd::Bound);
                 return Ok(ReplayEnd::Bound);
             }
 
@@ -1498,12 +1528,11 @@ pub(crate) async fn replay_trades(
                 if !batch.is_empty() {
                     deliver(std::mem::take(batch))?;
                 }
-                summary.end(ReplayEnd::Completed.name());
+                summary.end(ReplayEnd::Completed);
                 return Ok(ReplayEnd::Completed);
             }
         } else if let Some(msg) = record.get::<dbn::ErrorMsg>() {
-            handle_error_msg(msg);
-            summary.end("gateway_error");
+            summary.end(ReplayEnd::GatewayError);
             let text = msg.err().unwrap_or("<invalid utf-8>");
             match msg.code() {
                 Ok(code) if code != dbn::ErrorCode::Unset => {
@@ -2841,7 +2870,7 @@ mod tests {
     fn test_replay_summary_line_lists_counts_and_timings() {
         let summary = ReplaySummary {
             started: tokio::time::Instant::now(),
-            end: Some("idle"),
+            end: Some(ReplayEnd::Idle),
             connected: Some(Duration::from_millis(12)),
             first_record: Some(Duration::from_micros(40_900)),
             ended: Some(Duration::from_millis(5_041)),
@@ -2980,12 +3009,58 @@ mod tests {
         server.stop().await;
     }
 
+    // Paused time: the clock advances to the connection limit once the client only waits on the
+    // gateway, which accepts the connection and never authenticates it
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_replay_fails_on_the_connection_limit_when_the_gateway_never_authenticates() {
+        let server = mock_server::MockLsgServer::new("GLBX.MDP3").await;
+        let session = LiveSessionSpec {
+            credential: Credential::new("32-character-with-lots-of-filler"),
+            dataset: "GLBX.MDP3".to_owned(),
+            gateway_addr: Some(server.addr()),
+            instrument_id: InstrumentId::from("ESM4.GLBX"),
+            publisher_venue_map: Arc::new(IndexMap::from([(1, Venue::from("GLBX"))])),
+            futures_year_digits: FuturesYearDigits::One,
+            price_precision: Some(2),
+        };
+        let mut batch = Vec::new();
+        let mut summary = ReplaySummary::new();
+
+        let error = replay_trades(
+            session,
+            UnixNanos::from(1_717_423_199_000_000_000),
+            UnixNanos::from(1_717_423_200_000_000_000),
+            UnixNanos::from(u64::MAX),
+            Duration::from_secs(5),
+            None,
+            &mut batch,
+            &mut summary,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Failed to connect to Databento LSG within the connection limit of 5 s"
+        );
+        assert_eq!(summary.end, Some(ReplayEnd::ConnectTimeout));
+        let line = summary.to_string();
+        assert!(
+            line.starts_with("end=connect_timeout connect_ms=none "),
+            "{line}"
+        );
+
+        server.stop().await;
+    }
+
     #[rstest]
     fn test_replay_summary_line_marks_absent_values_none() {
         let mut summary = ReplaySummary::new();
         summary.replay_completed = Some(Duration::from_millis(3));
-        summary.end("replay_bound");
-        summary.end("error");
+        summary.end(ReplayEnd::ReplayBound);
+        summary.end(ReplayEnd::Error);
 
         let line = summary.to_string();
 

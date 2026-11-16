@@ -127,3 +127,5 @@ name = "databento-replay-trades"
 path = "examples/replay_trades.rs"
 required-features = ["live"]
 doc = false
+# Its embedded unit tests run with the crate's `--tests` targets.
+test = true

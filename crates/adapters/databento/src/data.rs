@@ -73,8 +73,8 @@ use crate::{
     decode::DatabentoDecodeConfig,
     historical::{DatabentoHistoricalClient, RangeQueryParams},
     live::{
-        DatabentoFeedHandler, DatabentoMessage, HandlerCommand, LiveSessionSpec, ReplaySummary,
-        replay_trades,
+        DatabentoFeedHandler, DatabentoMessage, HandlerCommand, LiveSessionSpec, ReplayEnd,
+        ReplaySummary, replay_trades,
     },
     loader::DatabentoDataLoader,
     symbology::{
@@ -87,6 +87,7 @@ use crate::{
 const PRICE_PRECISION_PARAM: &str = "price_precision";
 const REPLAY_START_PARAM: &str = "replay_start";
 const SCHEMA_PARAM: &str = "schema";
+
 /// How far before `replay_start` a trades replay begins, so the gateway still sends every trade
 /// received from `replay_start` on (the lag bound).
 ///
@@ -97,8 +98,10 @@ const SCHEMA_PARAM: &str = "schema";
 /// never sent and the replay still completes, so exact completeness is not claimed until that
 /// filter is known.
 pub(crate) const REPLAY_LAG_BOUND: DurationNanos = DurationNanos::from_secs(1);
+
 /// How long a trades replay waits for a data record before it ends as complete (the idle time).
 const REPLAY_IDLE: Duration = Duration::from_millis(5000);
+
 /// The wall-clock bound over a whole trades replay when `replay_bound_secs` is not configured.
 const DEFAULT_REPLAY_BOUND_SECS: u64 = 120;
 const MBP10_DEPTH: usize = 10;
@@ -551,7 +554,7 @@ impl DatabentoDataClient {
             )
             .await
             .unwrap_or_else(|_| {
-                summary.end("replay_bound");
+                summary.end(ReplayEnd::ReplayBound);
                 Err(anyhow::anyhow!(
                     "exceeded the replay bound of {} s (`replay_bound_secs`)",
                     replay_bound.as_secs()
@@ -565,7 +568,7 @@ impl DatabentoDataClient {
                     }
                 }
                 Err(e) => {
-                    summary.end("error");
+                    summary.end(ReplayEnd::Error);
                     send_request_result(
                         &data_sender,
                         request_id,

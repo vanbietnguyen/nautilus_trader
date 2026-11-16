@@ -42,21 +42,21 @@ impl DataEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error, refusing the request, when the deadline timer cannot be registered.
+    /// Returns an error if the deadline timer cannot be registered; the request is then refused.
     pub(super) fn arm_join_deadline(
         &mut self,
         request_id: UUID4,
         deadline: UnixNanos,
     ) -> anyhow::Result<()> {
         self.request_deadlines.insert(request_id, deadline);
-        if self.schedule_join_deadline_timer() {
+        let Err(e) = self.schedule_join_deadline_timer() else {
             return Ok(());
-        }
+        };
 
         self.claim_join_deadline(&request_id);
         anyhow::bail!(
             "Cannot handle the `cut_warmup` request {request_id}: its deadline {deadline} could \
-             not be armed, the engine's timer did not register"
+             not be armed, the engine's timer did not register: {e}"
         )
     }
 
@@ -64,25 +64,33 @@ impl DataEngine {
     /// expiry cannot finish it too; the timer moves to the next deadline or is cancelled.
     pub(super) fn claim_join_deadline(&mut self, request_id: &UUID4) {
         if self.request_deadlines.remove(request_id).is_some() {
-            self.schedule_join_deadline_timer();
+            self.reschedule_join_deadline_timer();
         }
     }
 
-    fn schedule_join_deadline_timer(&self) -> bool {
+    /// Moves the timer to the earliest remaining deadline. A failure is logged here, as nothing
+    /// propagates it: the requests already armed keep their entries in `request_deadlines`.
+    fn reschedule_join_deadline_timer(&self) {
+        if let Err(e) = self.schedule_join_deadline_timer() {
+            log::error!("{e}");
+        }
+    }
+
+    fn schedule_join_deadline_timer(&self) -> anyhow::Result<()> {
         let Some(deadline) = self.request_deadlines.values().copied().min() else {
             self.clock.borrow_mut().cancel_timer(JOIN_DEADLINE_TIMER);
-            return true;
+            return Ok(());
         };
 
         if self.clock.borrow().next_time_ns(JOIN_DEADLINE_TIMER) == Some(deadline) {
-            return true;
+            return Ok(());
         }
 
         let Some(timer) = self.join_deadline_timer.clone() else {
-            log::error!(
-                "Cannot schedule the join deadline: data engine message bus handlers are not registered"
+            anyhow::bail!(
+                "Cannot schedule the join deadline: data engine message bus handlers are not \
+                 registered"
             );
-            return false;
         };
 
         let callback_fn: Rc<dyn Fn(TimeEvent)> = Rc::new(move |_| {
@@ -95,16 +103,15 @@ impl DataEngine {
             Some(TimeEventCallback::from(callback_fn)),
             Some(true),
         ) {
-            log::error!("Failed to schedule the join deadline: {e}");
-            return false;
+            anyhow::bail!("Failed to schedule the join deadline: {e}");
         }
 
-        true
+        Ok(())
     }
 
     fn handle_join_deadline_timeout(&mut self) {
         self.expire_overdue_joins();
-        self.schedule_join_deadline_timer();
+        self.reschedule_join_deadline_timer();
     }
 
     /// Expires every joined request whose deadline the clock has reached.
@@ -138,7 +145,7 @@ impl DataEngine {
             self.expire_joined_request(request_id, deadline);
         }
 
-        self.schedule_join_deadline_timer();
+        self.reschedule_join_deadline_timer();
     }
 
     /// Expires the joined request `parent_id` at its `deadline`.

@@ -97,7 +97,8 @@ pub(super) struct JoinedRelease {
 }
 
 impl JoinedRelease {
-    /// The cut and the floor of a complete `answered` set of trades.
+    /// Returns the cut and the floor of a complete `answered` set of trades.
+    #[must_use]
     pub(super) fn from_answer(answered: &[TradeTick]) -> Self {
         Self {
             cut_ms: answered
@@ -115,7 +116,7 @@ impl JoinedRelease {
         }
     }
 
-    /// Whether `trade` falls in or before the cut's millisecond.
+    /// Returns whether `trade` falls in or before the cut's millisecond.
     fn is_cut(&self, trade: &TradeTick) -> bool {
         self.cut_ms
             .is_some_and(|cut_ms| trade.ts_event.as_u64() / NANOSECONDS_IN_MILLISECOND <= cut_ms)
@@ -186,6 +187,7 @@ impl WarmupBuffer<TradeTick> {
         }
 
         let counts = release.counts;
+
         log::info!(
             "Released the joined warm-up of {bar_type}: held={}, flushed={}, dropped={}, \
              floored={}, equal_stamp_rows={}",

@@ -375,8 +375,8 @@ pub(super) struct AdmittedJoin {
 ///
 /// # Errors
 ///
-/// Returns an error naming the failed condition when the request sets `cut_warmup` and is not
-/// admitted.
+/// Returns an error if the request sets `cut_warmup` and is not admitted; the error names the
+/// failed condition.
 pub(super) fn admit_cut_warmup(
     req: &RequestCommand,
     now: impl FnOnce() -> UnixNanos,
@@ -398,7 +398,8 @@ pub(super) fn admit_cut_warmup(
     };
     let [instrument_id] = cmd.instrument_ids[..] else {
         anyhow::bail!(
-            "{CUT_WARMUP_REFUSED}: it must name exactly one instrument (batches are refused), received {}",
+            "{CUT_WARMUP_REFUSED}: it must name exactly one instrument (batches are refused), \
+             received {}",
             cmd.instrument_ids.len(),
         );
     };
@@ -457,9 +458,9 @@ pub(super) fn admit_cut_warmup(
     }))
 }
 
-/// The `session_opens` parameter, verified: strictly increasing instants, each at civil 18:00
-/// `America/New_York` of its day (read through the time zone, so a daylight-saving change moves
-/// the UTC instant), the last one the current trading day's open by `now`.
+/// Returns the `session_opens` parameter, verified: strictly increasing instants, each at civil
+/// 18:00 `America/New_York` of its day (read through the time zone, so a daylight-saving change
+/// moves the UTC instant), the last one the current trading day's open by `now`.
 fn verified_session_opens(params: &Params, now: UnixNanos) -> anyhow::Result<Vec<UnixNanos>> {
     let values = params
         .get(SESSION_OPENS)
@@ -477,13 +478,15 @@ fn verified_session_opens(params: &Params, now: UnixNanos) -> anyhow::Result<Vec
         if let Some(previous) = opens.last() {
             anyhow::ensure!(
                 open > *previous,
-                "{CUT_WARMUP_REFUSED}: `session_opens` must be strictly increasing, {open} follows {previous}"
+                "{CUT_WARMUP_REFUSED}: `session_opens` must be strictly increasing, {open} follows \
+                 {previous}"
             );
         }
         let civil = jiff::Timestamp::from(open).to_zoned(time_zone.clone());
         anyhow::ensure!(
             civil.time() == SESSION_OPEN_TIME,
-            "{CUT_WARMUP_REFUSED}: `session_opens` {open} is at {civil}, not at 18:00 {SESSION_TIME_ZONE}"
+            "{CUT_WARMUP_REFUSED}: `session_opens` {open} is at {civil}, not at 18:00 \
+             {SESSION_TIME_ZONE}"
         );
         opens.push(open);
     }
@@ -496,13 +499,14 @@ fn verified_session_opens(params: &Params, now: UnixNanos) -> anyhow::Result<Vec
     let current = current_session_open(now, &time_zone)?;
     anyhow::ensure!(
         last == current,
-        "{CUT_WARMUP_REFUSED}: the last `session_opens` {last} is not the current trading day's open {current}"
+        "{CUT_WARMUP_REFUSED}: the last `session_opens` {last} is not the current trading day's \
+         open {current}"
     );
 
     Ok(opens)
 }
 
-/// The latest civil 18:00 `America/New_York` at or before `now`.
+/// Returns the latest civil 18:00 `America/New_York` at or before `now`.
 fn current_session_open(now: UnixNanos, time_zone: &TimeZone) -> anyhow::Result<UnixNanos> {
     let now_ts = jiff::Timestamp::from(now);
     let today = now_ts.to_zoned(time_zone.clone()).date();
@@ -520,14 +524,15 @@ fn current_session_open(now: UnixNanos, time_zone: &TimeZone) -> anyhow::Result<
     Ok(UnixNanos::from(open.timestamp()))
 }
 
-/// Whether `req` sets `cut_warmup`: past admission, a request of the history/live join.
+/// Returns whether `req` sets `cut_warmup`: past admission, a request of the history/live join.
 pub(super) fn sets_cut_warmup(req: &RequestCommand) -> bool {
     request_params(req).and_then(|params| params.get_bool(CUT_WARMUP)) == Some(true)
 }
 
-/// The trading days from the one opening at `first` up to `end` (exclusive), each as its open
-/// and the next trading day's open, both at civil 18:00 `America/New_York` read through the time
-/// zone (never by adding 24 hours), so a day across a daylight-saving change lasts 23 or 25 hours.
+/// Returns the trading days from the one opening at `first` up to `end` (exclusive), each as its
+/// open and the next trading day's open, both at civil 18:00 `America/New_York` read through the
+/// time zone (never by adding 24 hours), so a day across a daylight-saving change lasts 23 or 25
+/// hours.
 #[cfg(feature = "streaming")]
 pub(super) fn trading_days(
     first: UnixNanos,

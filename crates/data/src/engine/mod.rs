@@ -1731,7 +1731,8 @@ impl DataEngine {
     ) -> anyhow::Result<()> {
         let request_id = *req.request_id();
         log::debug!(
-            "Dispatching the `cut_warmup` request {request_id} for {} ({} session opens, deadline {})",
+            "Dispatching the `cut_warmup` request {request_id} for {} ({} session opens, deadline \
+             {})",
             join.instrument_id,
             join.session_opens.len(),
             join.deadline,

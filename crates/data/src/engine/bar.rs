@@ -360,7 +360,10 @@ impl DataEngine {
         }
 
         if completed {
-            let joined = joined_release(&state, resp);
+            let joined = match resp {
+                DataResponse::Trades(r) => joined_release(&state, &r.data),
+                _ => None,
+            };
             self.release_request_bar_aggregators(&correlation_id, joined);
         }
     }
@@ -405,9 +408,7 @@ impl DataEngine {
                 resp,
                 pending,
                 sub_correlation_id: envelope.sub_correlation_id(),
-                joined: state
-                    .cut_warmup
-                    .then(|| JoinedRelease::from_answer(&resp.data)),
+                joined: joined_release(state, &resp.data),
             };
             let failure = envelope.failure_reason().map(str::to_owned);
             self.finish_interleaved(request_id, failure, Some(closing));
@@ -1035,8 +1036,8 @@ impl DataEngine {
         Ok(())
     }
 
-    /// Whether the live aggregator under `key` is warming up for a joined request (`cut_warmup`):
-    /// asked once when its deferred subscription is set up, never per trade.
+    /// Returns whether the live aggregator under `key` is warming up for a joined request
+    /// (`cut_warmup`): asked once when its deferred subscription is set up, never per trade.
     fn is_joined_warmup(&self, key: &BarAggregatorKey) -> bool {
         self.request_bar_aggregations.values().any(|state| {
             state.cut_warmup
@@ -1405,13 +1406,12 @@ impl BarAggregatorWarmup {
     }
 }
 
-/// The cut and the floor that release the held live trades of a joined request's builders, from
-/// its complete answer; `None` for every other request.
-fn joined_release(state: &RequestBarAggregation, resp: &DataResponse) -> Option<JoinedRelease> {
-    match resp {
-        DataResponse::Trades(r) if state.cut_warmup => Some(JoinedRelease::from_answer(&r.data)),
-        _ => None,
-    }
+/// Returns the cut and the floor that release the held live trades of a joined request's
+/// builders, from its complete `answered` trades; `None` for every other request.
+fn joined_release(state: &RequestBarAggregation, answered: &[TradeTick]) -> Option<JoinedRelease> {
+    state
+        .cut_warmup
+        .then(|| JoinedRelease::from_answer(answered))
 }
 
 /// Typed subscription for bar aggregator handlers.

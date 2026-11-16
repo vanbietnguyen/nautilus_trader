@@ -2559,8 +2559,14 @@ fn test_cut_warmup_refused_for_a_batch(
 #[rstest]
 #[case::absent(None, "it must ask for `bar_types`")]
 #[case::empty(Some(&[][..]), "it must ask for `bar_types`")]
-#[case::external(Some(&["1-TICK-LAST-EXTERNAL"][..]), "is not an internal, non-composite LAST bar type")]
-#[case::composite(Some(&["1-TICK-LAST-INTERNAL@1-TICK-EXTERNAL"][..]), "is not an internal, non-composite LAST bar type")]
+#[case::external(
+    Some(&["1-TICK-LAST-EXTERNAL"][..]),
+    "is not an internal, non-composite LAST bar type"
+)]
+#[case::composite(
+    Some(&["1-TICK-LAST-INTERNAL@1-TICK-EXTERNAL"][..]),
+    "is not an internal, non-composite LAST bar type"
+)]
 #[case::bid(Some(&["1-TICK-BID-INTERNAL"][..]), "is not an internal, non-composite LAST bar type")]
 fn test_cut_warmup_refused_without_internal_last_bar_types(
     audusd_sim: CurrencyPair,
@@ -2713,7 +2719,11 @@ fn test_cut_warmup_refused_without_the_tbbo_schema(
     None,
     "`session_opens` must be an array of UNIX nanoseconds"
 )]
-#[case::empty(NY_2026_11_10_2000, Some(&[][..]), "`session_opens` must name the current trading day's open")]
+#[case::empty(
+    NY_2026_11_10_2000,
+    Some(&[][..]),
+    "`session_opens` must name the current trading day's open"
+)]
 #[case::repeated(
     NY_2026_11_10_2000,
     Some(&[NY_2026_11_10_1800, NY_2026_11_10_1800][..]),
@@ -3162,6 +3172,78 @@ fn test_join_seams_serve_listed_days_and_name_missing_ones(
 
 #[cfg(feature = "streaming")]
 #[rstest]
+#[case::leading_seam(
+    vec![NY_2026_11_09_1800, NY_2026_11_10_1800, NY_2026_11_11_1800],
+    vec!["d09-open", "d09-last", "d10-open", "d10-last", "d11-open", "d11-last"],
+    None
+)]
+#[case::interior_missing_day(
+    vec![NY_2026_11_08_1800, NY_2026_11_09_1800, NY_2026_11_11_1800],
+    vec!["d08-open", "d08-last", "d09-open", "d09-last", "d11-open", "d11-last"],
+    Some("1 missing sessions (`missing_sessions`), the trading days opening 2026-11-10T18:00-05:00")
+)]
+#[case::trailing_missing_day(
+    vec![NY_2026_11_08_1800, NY_2026_11_09_1800, NY_2026_11_10_1800],
+    vec!["d08-open", "d08-last", "d09-open", "d09-last", "d10-open", "d10-last"],
+    Some("1 missing sessions (`missing_sessions`), the trading days opening 2026-11-11T18:00-05:00")
+)]
+fn test_join_seams_under_restamping_serve_each_trade_once(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] past_opens: Vec<u64>,
+    #[case] served: Vec<&str>,
+    #[case] missing: Option<&str>,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    // Restamped rows: each `ts_init` one second after its `ts_event`, within its trading day, a
+    // day's first row at its open by exchange time and its last at the day's last nanosecond
+    let shift = NANOSECONDS_IN_SECOND;
+    let restamped = |ts_event: u64, id: &str| {
+        let mut trade = split_trade(fixture.instrument_id, ts_event + shift, id);
+        trade.ts_event = UnixNanos::from(ts_event);
+        trade
+    };
+    let _catalog_dir = register_trade_catalog_with_trades(
+        &mut fixture.engine.borrow_mut(),
+        "join-seams-restamped",
+        &[
+            restamped(NY_2026_11_08_1800 - 1 - shift, "before-the-depth"),
+            restamped(NY_2026_11_08_1800, "d08-open"),
+            restamped(NY_2026_11_09_1800 - 1 - shift, "d08-last"),
+            restamped(NY_2026_11_09_1800, "d09-open"),
+            restamped(NY_2026_11_10_1800 - 1 - shift, "d09-last"),
+            restamped(NY_2026_11_10_1800, "d10-open"),
+            restamped(NY_2026_11_11_1800 - 1 - shift, "d10-last"),
+            restamped(NY_2026_11_11_1800, "d11-open"),
+            restamped(NY_2026_11_12_1800 - 1 - shift, "d11-last"),
+        ],
+        Some((NY_2026_11_08_1800 - 1, NY_2026_11_12_1800 - 1)),
+    );
+    let mut session_opens = past_opens;
+    session_opens.push(NY_2026_11_12_1800);
+
+    let answers = run_join(
+        &fixture,
+        NY_2026_11_12_2000,
+        &session_opens,
+        None,
+        &[(NY_2026_11_12_1800 + 1, "t1")],
+    );
+
+    let mut expected = served;
+    expected.push("t1");
+    assert_one_answer(
+        &answers,
+        &expected,
+        missing.map(|reason| vec![reason]).as_deref(),
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
 fn test_join_without_a_catalog_requests_the_replay_tail_alone(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
@@ -3224,7 +3306,8 @@ fn test_join_days_follow_civil_boundaries_across_daylight_saving_end(
         &answers,
         &["d30-open", "d30-late", "t1"],
         Some(&[
-            "1 missing sessions (`missing_sessions`), the trading days opening 2026-10-31T18:00-04:00",
+            "1 missing sessions (`missing_sessions`), the trading days opening \
+             2026-10-31T18:00-04:00",
         ]),
     );
 }
