@@ -2374,30 +2374,64 @@ fn assert_cut_warmup_refused(fixture: &mut JoinFixture, request: RequestCommand,
     );
 }
 
-/// Asserts `request` was admitted and reached the join's dispatcher (which refuses until the
-/// plan exists), no client was asked anything, and its request aggregators were cleaned up.
+/// Asserts `request` was admitted and its plan dispatched: the client received exactly one
+/// command, the replay tail, open-ended from the current trading day's open.
+#[cfg(feature = "streaming")]
+fn assert_reaches_join_dispatcher(fixture: &mut JoinFixture, request: RequestCommand) {
+    let current_open = joined_current_open(&request);
+    let (result, failures) = execute_recording_failures(&mut fixture.engine, request);
+    result.unwrap();
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_replay_tail(fixture, current_open);
+}
+
+/// Asserts `request` was admitted and reached the join's dispatcher, which refuses it without
+/// the `streaming` feature; no client was asked anything.
+#[cfg(not(feature = "streaming"))]
 fn assert_reaches_join_dispatcher(fixture: &mut JoinFixture, request: RequestCommand) {
     let (result, failures) = execute_recording_failures(&mut fixture.engine, request);
-    let error = result
-        .expect_err("the join's dispatcher refuses until its plan is built")
-        .to_string();
-    assert!(error.contains("the join's plan is not built"), "{error}");
-    assert!(error.contains("admitted 2 session opens"), "{error}");
-    assert_eq!(failures, vec![Some(error)]);
+    let error = result.unwrap_err().to_string();
     assert!(
-        fixture.recorder.borrow().is_empty(),
-        "the dispatcher sends nothing to a client: {:?}",
-        fixture.recorder.borrow()
+        error.contains("the join's plan needs the `streaming` feature"),
+        "{error}"
     );
+    assert_eq!(failures, vec![Some(error)]);
+    assert!(fixture.recorder.borrow().is_empty());
+}
 
-    // An aggregator left running would refuse the same live bar type
-    let ordinary = trades_request(
-        vec![fixture.instrument_id],
-        None,
-        fixture.client_id,
-        json!({ "bar_types": [fixture.bar_type.to_string()], "update_subscriptions": true }),
+/// The last `session_opens` of a joined `request`: the current trading day's open, `H`.
+#[cfg(feature = "streaming")]
+fn joined_current_open(request: &RequestCommand) -> u64 {
+    let RequestCommand::Trades(cmd) = request else {
+        panic!("a joined request is a trades request");
+    };
+    cmd.params.as_ref().unwrap()["session_opens"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .as_u64()
+        .unwrap()
+}
+
+/// Asserts the client received exactly one command, the join's replay tail: a trades request
+/// from `current_open` with no end and `replay_start = current_open`. Returns its request ID.
+#[cfg(feature = "streaming")]
+fn assert_replay_tail(fixture: &JoinFixture, current_open: u64) -> UUID4 {
+    let recorded = fixture.recorder.borrow();
+    let [DataCommand::Request(RequestCommand::Trades(tail))] = &recorded[..] else {
+        panic!("the client receives the replay tail alone: {recorded:?}");
+    };
+    assert_eq!(tail.instrument_ids, vec![fixture.instrument_id]);
+    assert_eq!(
+        tail.start,
+        Some(UnixNanos::from(current_open).to_datetime_utc())
     );
-    fixture.engine.execute_request(ordinary).unwrap();
+    assert_eq!(tail.end, None);
+    let params = tail.params.as_ref().unwrap();
+    assert_eq!(params.get_u64("replay_start"), Some(current_open));
+    assert_eq!(params.get_str("schema"), Some("tbbo"));
+    tail.request_id
 }
 
 #[rstest]
@@ -2815,4 +2849,385 @@ fn test_trades_request_with_cut_warmup_false_takes_the_ordinary_path(
         fixture.recorder.borrow().last(),
         Some(&DataCommand::Request(request))
     );
+}
+
+// More made-up trading-day opens and times for the join's plan
+#[cfg(feature = "streaming")]
+const NY_2026_11_11_1800: u64 = 1_794_438_000_000_000_000;
+#[cfg(feature = "streaming")]
+const NY_2026_11_12_1800: u64 = 1_794_524_400_000_000_000;
+#[cfg(feature = "streaming")]
+const NY_2026_11_12_2000: u64 = 1_794_531_600_000_000_000;
+#[cfg(feature = "streaming")]
+const NY_2026_10_30_1800_EDT: u64 = 1_793_397_600_000_000_000;
+#[cfg(feature = "streaming")]
+const NY_2026_10_31_1730_EDT: u64 = 1_793_482_200_000_000_000;
+#[cfg(feature = "streaming")]
+const NY_2026_10_31_1800_EDT: u64 = 1_793_484_000_000_000_000;
+#[cfg(feature = "streaming")]
+const NY_2026_11_01_1730_EST: u64 = 1_793_572_200_000_000_000;
+#[cfg(feature = "streaming")]
+const ONE_HOUR_NS: u64 = 3_600 * NANOSECONDS_IN_SECOND;
+
+/// One answer envelope the requester of a join received.
+#[cfg(feature = "streaming")]
+#[derive(Debug)]
+struct JoinAnswer {
+    trade_ids: Vec<TradeId>,
+    end: Option<UnixNanos>,
+    failure: Option<String>,
+}
+
+#[cfg(feature = "streaming")]
+fn record_join_answers(request_id: UUID4) -> Rc<RefCell<Vec<JoinAnswer>>> {
+    let answers = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&answers);
+    msgbus::register_response_handler(
+        &request_id,
+        TypedHandler::from(move |envelope: &DataResponseEnvelope| {
+            let (trade_ids, end) = match envelope.response() {
+                Some(DataResponse::Trades(resp)) => (
+                    resp.data.iter().map(|trade| trade.trade_id).collect(),
+                    resp.end,
+                ),
+                _ => (Vec::new(), None),
+            };
+            recorded.borrow_mut().push(JoinAnswer {
+                trade_ids,
+                end,
+                failure: envelope.failure_reason().map(str::to_owned),
+            });
+        }),
+    );
+    answers
+}
+
+/// Registers a made-up trades catalog holding `rows` (`ts_init`, trade ID).
+#[cfg(feature = "streaming")]
+fn register_join_catalog(
+    fixture: &mut JoinFixture,
+    label: &str,
+    rows: &[(u64, &str)],
+) -> CatalogTempDir {
+    let mut trades = rows
+        .iter()
+        .map(|(ts, id)| split_trade(fixture.instrument_id, *ts, id))
+        .collect::<Vec<_>>();
+    trades.sort_by_key(|trade| trade.ts_init);
+    let first = trades.first().unwrap().ts_init.as_u64();
+    let last = trades.last().unwrap().ts_init.as_u64();
+    register_trade_catalog_with_trades(&mut fixture.engine, label, &trades, Some((first, last)))
+}
+
+/// Executes a joined request over `session_opens` at `now_ns` with the parent's `start`, checks
+/// its replay tail, answers the tail with `tail` in one part and then completes it, and returns
+/// every answer the requester received.
+#[cfg(feature = "streaming")]
+fn run_join(
+    fixture: &mut JoinFixture,
+    now_ns: u64,
+    session_opens: &[u64],
+    start: Option<u64>,
+    tail: &[(u64, &str)],
+) -> Vec<JoinAnswer> {
+    let params = joined_params(fixture.bar_type, now_ns, session_opens);
+    let request_id = UUID4::new();
+    let request = RequestCommand::Trades(RequestTrades::new(
+        vec![fixture.instrument_id],
+        start.map(|start| UnixNanos::from(start).to_datetime_utc()),
+        None,
+        None,
+        Some(fixture.client_id),
+        request_id,
+        UnixNanos::default(),
+        Some(serde_json::from_value(params).unwrap()),
+    ));
+    let answers = record_join_answers(request_id);
+    let current_open = *session_opens.last().unwrap();
+
+    fixture.engine.execute_request(request).unwrap();
+    let tail_id = assert_replay_tail(fixture, current_open);
+    assert!(
+        answers.borrow().is_empty(),
+        "the join answers once its replay tail completes: {:?}",
+        answers.borrow()
+    );
+
+    let part = |trades: Vec<TradeTick>, completed: bool| {
+        DataResponseEnvelope::new(
+            DataResponse::Trades(TradesResponse::new(
+                tail_id,
+                fixture.client_id,
+                fixture.instrument_id,
+                trades,
+                Some(UnixNanos::from(current_open)),
+                None,
+                UnixNanos::from(now_ns),
+                None,
+            )),
+            completed,
+            None,
+        )
+    };
+    let tail = tail
+        .iter()
+        .map(|(ts, id)| split_trade(fixture.instrument_id, *ts, id))
+        .collect();
+    fixture.engine.response_envelope(part(tail, false));
+    assert!(answers.borrow().is_empty(), "{:?}", answers.borrow());
+    fixture.engine.response_envelope(part(Vec::new(), true));
+
+    answers.take()
+}
+
+#[cfg(feature = "streaming")]
+fn assert_one_answer(answers: &[JoinAnswer], expected: &[&str], failure: Option<&[&str]>) {
+    let [answer] = answers else {
+        panic!("the join answers in one envelope: {answers:?}");
+    };
+    assert_eq!(answer.trade_ids, trade_ids(expected));
+    assert_eq!(answer.end, None, "the rebuilt answer keeps its open end");
+    match (failure, &answer.failure) {
+        (None, None) => {}
+        (Some(parts), Some(reason)) => {
+            for part in parts {
+                assert!(reason.contains(part), "{reason:?} lacks {part:?}");
+            }
+        }
+        (expected, actual) => panic!("reason {actual:?}, expected {expected:?}"),
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_join_answers_catalog_rows_then_the_replay_tail(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let _catalog_dir = register_join_catalog(
+        &mut fixture,
+        "join-catalog-then-tail",
+        &[
+            (NY_2026_11_09_1800 - 1, "before-the-depth"),
+            (NY_2026_11_09_1800, "c1"),
+            (NY_2026_11_11_1800 + ONE_HOUR_NS, "c2"),
+            (NY_2026_11_12_1800 - 1, "c3"),
+        ],
+    );
+
+    let answers = run_join(
+        &mut fixture,
+        NY_2026_11_12_2000,
+        &[
+            NY_2026_11_09_1800,
+            NY_2026_11_10_1800,
+            NY_2026_11_11_1800,
+            NY_2026_11_12_1800,
+        ],
+        None,
+        // Stamped after the request was dispatched
+        &[(NY_2026_11_12_2000 + NANOSECONDS_IN_SECOND, "t1")],
+    );
+
+    assert_one_answer(&answers, &["c1", "c2", "c3", "t1"], None);
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_join_keeps_current_day_catalog_rows_outside_the_catalog_leg(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let _catalog_dir = register_join_catalog(
+        &mut fixture,
+        "join-current-day",
+        &[
+            (NY_2026_11_11_1800 + ONE_HOUR_NS, "c1"),
+            (NY_2026_11_12_1800, "catalog-at-the-open"),
+            (NY_2026_11_12_1800 + ONE_HOUR_NS, "catalog-today"),
+        ],
+    );
+
+    // The tail runs although the catalog holds some of the current day
+    let answers = run_join(
+        &mut fixture,
+        NY_2026_11_12_2000,
+        &[NY_2026_11_11_1800, NY_2026_11_12_1800],
+        None,
+        &[
+            (NY_2026_11_12_1800, "t-open"),
+            (NY_2026_11_12_1800 + ONE_HOUR_NS, "t-today"),
+        ],
+    );
+
+    assert_one_answer(&answers, &["c1", "t-open", "t-today"], None);
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+#[case::leading_seam(
+    vec![NY_2026_11_09_1800, NY_2026_11_10_1800, NY_2026_11_11_1800],
+    vec!["d09-open", "d09-last", "d10-open", "d10-last", "d11-open", "d11-last"],
+    None
+)]
+#[case::interior_missing_day(
+    vec![NY_2026_11_08_1800, NY_2026_11_09_1800, NY_2026_11_11_1800],
+    vec!["d08-open", "d08-last", "d09-open", "d09-last", "d11-open", "d11-last"],
+    Some("1 missing sessions (`missing_sessions`), the trading days opening 2026-11-10T18:00-05:00")
+)]
+#[case::trailing_missing_day(
+    vec![NY_2026_11_08_1800, NY_2026_11_09_1800, NY_2026_11_10_1800],
+    vec!["d08-open", "d08-last", "d09-open", "d09-last", "d10-open", "d10-last"],
+    Some("1 missing sessions (`missing_sessions`), the trading days opening 2026-11-11T18:00-05:00")
+)]
+fn test_join_seams_serve_listed_days_and_name_missing_ones(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] past_opens: Vec<u64>,
+    #[case] served: Vec<&str>,
+    #[case] missing: Option<&str>,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    // Each day's first and last nanosecond, as a restamped session's rows can reach them
+    let _catalog_dir = register_join_catalog(
+        &mut fixture,
+        "join-seams",
+        &[
+            (NY_2026_11_08_1800 - 1, "before-the-depth"),
+            (NY_2026_11_08_1800, "d08-open"),
+            (NY_2026_11_09_1800 - 1, "d08-last"),
+            (NY_2026_11_09_1800, "d09-open"),
+            (NY_2026_11_10_1800 - 1, "d09-last"),
+            (NY_2026_11_10_1800, "d10-open"),
+            (NY_2026_11_11_1800 - 1, "d10-last"),
+            (NY_2026_11_11_1800, "d11-open"),
+            (NY_2026_11_12_1800 - 1, "d11-last"),
+        ],
+    );
+    let mut session_opens = past_opens;
+    session_opens.push(NY_2026_11_12_1800);
+
+    let answers = run_join(
+        &mut fixture,
+        NY_2026_11_12_2000,
+        &session_opens,
+        None,
+        &[(NY_2026_11_12_1800 + 1, "t1")],
+    );
+
+    let mut expected = served;
+    expected.push("t1");
+    assert_one_answer(
+        &answers,
+        &expected,
+        missing.map(|reason| vec![reason]).as_deref(),
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_join_without_a_catalog_requests_the_replay_tail_alone(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+
+    let answers = run_join(
+        &mut fixture,
+        NY_2026_11_12_2000,
+        &[NY_2026_11_10_1800, NY_2026_11_11_1800, NY_2026_11_12_1800],
+        None,
+        &[(NY_2026_11_12_1800 + 1, "t1")],
+    );
+
+    assert_one_answer(
+        &answers,
+        &["t1"],
+        Some(&[
+            "no catalog is registered, so only the current session's replay was requested",
+            "2 missing sessions (`missing_sessions`), the trading days opening \
+             2026-11-10T18:00-05:00, 2026-11-11T18:00-05:00",
+        ]),
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_join_days_follow_civil_boundaries_across_daylight_saving_end(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_01_2000_EST);
+    // The 2026-10-31 day lasts 25 hours: to 2026-11-01 18:00 EST, not 17:00 EST
+    let _catalog_dir = register_join_catalog(
+        &mut fixture,
+        "join-daylight-saving",
+        &[
+            (NY_2026_10_30_1800_EDT, "d30-open"),
+            (NY_2026_10_31_1730_EDT, "d30-late"),
+            (NY_2026_10_31_1800_EDT, "d31-open"),
+            (NY_2026_11_01_1730_EST, "d31-late"),
+        ],
+    );
+
+    let answers = run_join(
+        &mut fixture,
+        NY_2026_11_01_2000_EST,
+        &[NY_2026_10_30_1800_EDT, NY_2026_11_01_1800_EST],
+        None,
+        &[(NY_2026_11_01_1800_EST + 1, "t1")],
+    );
+
+    assert_one_answer(
+        &answers,
+        &["d30-open", "d30-late", "t1"],
+        Some(&[
+            "1 missing sessions (`missing_sessions`), the trading days opening 2026-10-31T18:00-04:00",
+        ]),
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_join_answer_keeps_the_open_end_when_trimmed_to_its_start(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let _catalog_dir = register_join_catalog(
+        &mut fixture,
+        "join-open-end",
+        &[(NY_2026_11_11_1800 + ONE_HOUR_NS, "c1")],
+    );
+
+    // With a start the rebuilt answer is trimmed: to its start only, never to the catalog's end
+    let answers = run_join(
+        &mut fixture,
+        NY_2026_11_12_2000,
+        &[NY_2026_11_11_1800, NY_2026_11_12_1800],
+        Some(NY_2026_11_11_1800),
+        &[(NY_2026_11_12_2000 + NANOSECONDS_IN_SECOND, "t1")],
+    );
+
+    assert_one_answer(&answers, &["c1", "t1"], None);
 }

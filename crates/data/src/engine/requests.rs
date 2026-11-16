@@ -514,6 +514,62 @@ fn current_session_open(now: UnixNanos, time_zone: &TimeZone) -> anyhow::Result<
     Ok(UnixNanos::from(open.timestamp()))
 }
 
+/// Whether `req` sets `cut_warmup`: past admission, a request of the history/live join.
+pub(super) fn sets_cut_warmup(req: &RequestCommand) -> bool {
+    request_params(req).and_then(|params| params.get_bool(CUT_WARMUP)) == Some(true)
+}
+
+/// The trading days from the one opening at `first` up to `end` (exclusive), each as its open
+/// and the next trading day's open, both at civil 18:00 `America/New_York` read through the time
+/// zone (never by adding 24 hours), so a day across a daylight-saving change lasts 23 or 25 hours.
+#[cfg(feature = "streaming")]
+pub(super) fn trading_days(
+    first: UnixNanos,
+    end: UnixNanos,
+) -> anyhow::Result<Vec<(UnixNanos, UnixNanos)>> {
+    let time_zone = get_timezone(SESSION_TIME_ZONE)?;
+    let mut date = jiff::Timestamp::from(first)
+        .to_zoned(time_zone.clone())
+        .date();
+    let mut open = session_open_on(date, &time_zone)?;
+    let mut days = Vec::new();
+    while open < end {
+        date = date.tomorrow()?;
+        let next = session_open_on(date, &time_zone)?;
+        days.push((open, next));
+        open = next;
+    }
+    Ok(days)
+}
+
+#[cfg(feature = "streaming")]
+fn session_open_on(date: civil::Date, time_zone: &TimeZone) -> anyhow::Result<UnixNanos> {
+    let open = date
+        .to_datetime(SESSION_OPEN_TIME)
+        .to_zoned(time_zone.clone())?;
+    Ok(UnixNanos::from(open.timestamp()))
+}
+
+/// Names and counts the trading days a join did not serve, by their opens in New York time.
+#[cfg(feature = "streaming")]
+pub(super) fn describe_missing_sessions(missing: &[UnixNanos]) -> anyhow::Result<String> {
+    let time_zone = get_timezone(SESSION_TIME_ZONE)?;
+    let opens = missing
+        .iter()
+        .map(|open| {
+            jiff::Timestamp::from(*open)
+                .to_zoned(time_zone.clone())
+                .strftime("%Y-%m-%dT%H:%M%:z")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    Ok(format!(
+        "{} missing sessions (`missing_sessions`), the trading days opening {}",
+        missing.len(),
+        opens.join(", "),
+    ))
+}
+
 pub(super) fn time_zone_from_params(params: Option<&Params>) -> anyhow::Result<Option<TimeZone>> {
     let Some(value) = params.and_then(|params| params.get("time_zone")) else {
         return Ok(None);

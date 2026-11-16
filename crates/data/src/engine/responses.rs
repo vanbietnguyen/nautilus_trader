@@ -293,6 +293,15 @@ pub(super) fn rebuild_pipeline_response(
     Some(rebind_response_correlation(response, parent_id))
 }
 
+/// Keeps a join's rebuilt answer open-ended: its trades `end` is cleared, so the answer keeps the
+/// replay tail's open end and is not trimmed to the catalog leg's finite one. Runs between
+/// [`rebuild_pipeline_response`] and the trim of every rebuild of a join.
+pub(super) fn keep_open_end(rebuilt: &mut DataResponse) {
+    if let DataResponse::Trades(response) = rebuilt {
+        response.end = None;
+    }
+}
+
 pub(super) fn same_instrument(left: InstrumentId, right: InstrumentId) -> bool {
     left == right
         || (left.symbol.as_str() == right.symbol.as_str()

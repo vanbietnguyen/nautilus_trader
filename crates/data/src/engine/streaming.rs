@@ -14,15 +14,16 @@
 // -------------------------------------------------------------------------------------------------
 
 use ahash::{AHashMap, AHashSet};
+use anyhow::Context;
 use indexmap::IndexMap;
 use jiff::Timestamp;
 use nautilus_common::messages::data::{
     BarsResponse, BookDeltasResponse, BookDepthResponse, CustomDataResponse, DataRequestFailed,
-    DataResponse, FundingRatesResponse, InstrumentResponse, InstrumentsResponse, QuotesResponse,
-    RequestBars, RequestBookDeltas, RequestBookDepth, RequestCommand, RequestCustomData,
-    RequestFundingRates, RequestInstrument, RequestInstruments, RequestQuotes, RequestTrades,
-    SubscribeBars, SubscribeCommand, SubscribeCustomData, SubscribeQuotes, SubscribeTrades,
-    TradesResponse,
+    DataResponse, DataResponseEnvelope, FundingRatesResponse, InstrumentResponse,
+    InstrumentsResponse, QuotesResponse, RequestBars, RequestBookDeltas, RequestBookDepth,
+    RequestCommand, RequestCustomData, RequestFundingRates, RequestInstrument, RequestInstruments,
+    RequestQuotes, RequestTrades, SubscribeBars, SubscribeCommand, SubscribeCustomData,
+    SubscribeQuotes, SubscribeTrades, TradesResponse,
 };
 use nautilus_core::{
     Params, UUID4, UnixNanos,
@@ -40,7 +41,10 @@ use nautilus_persistence::catalog::traits::{CatalogInstrumentQuery, CatalogQuery
 use serde_json::Value;
 use ustr::Ustr;
 
-use super::{DataEngine, requests::request_params};
+use super::{
+    DataEngine,
+    requests::{describe_missing_sessions, request_params, trading_days},
+};
 
 const PARAM_SKIP_CATALOG_DATA: &str = "skip_catalog_data";
 pub(super) const PARAM_UPDATE_CATALOG: &str = "update_catalog";
@@ -48,6 +52,7 @@ const PARAM_FORCE_INSTRUMENT_UPDATE: &str = "force_instrument_update";
 const PARAM_SUBSCRIPTION_NAME: &str = "subscription_name";
 const PARAM_FROM_DAY_START: &str = "from_day_start";
 const CATALOG_CLIENT_ID: &str = "CATALOG";
+const PARAM_REPLAY_START: &str = "replay_start";
 
 pub(crate) type CatalogMap = AHashMap<Ustr, DataCatalog>;
 
@@ -530,7 +535,11 @@ impl DataEngine {
         if !skip_catalog_data && let Some(catalog) = winning_catalog {
             let request =
                 with_dates_for_pipeline(&req, Some(catalog_start_dt), Some(end_dt), now_ns);
-            plan.push(RequestLeg::Catalog { request, catalog });
+            plan.push(RequestLeg::Catalog {
+                request,
+                catalog,
+                unavailable: Vec::new(),
+            });
         }
 
         for (start, end) in missing_intervals {
@@ -585,6 +594,7 @@ impl DataEngine {
                 plan.push(RequestLeg::Catalog {
                     request: member,
                     catalog,
+                    unavailable: Vec::new(),
                 });
             }
 
@@ -633,6 +643,111 @@ impl DataEngine {
         Ok(None)
     }
 
+    /// Plans and dispatches the legs of an admitted join through the request pipeline.
+    pub(super) fn dispatch_join_plan(
+        &mut self,
+        req: RequestCommand,
+        session_opens: &[UnixNanos],
+    ) -> anyhow::Result<()> {
+        let plan = self.plan_join(&req, session_opens)?;
+        if !plan.missing_sessions.is_empty() {
+            log::warn!(
+                "Join {} misses {} past sessions of its depth",
+                req.request_id(),
+                plan.missing_sessions.len(),
+            );
+        }
+        self.dispatch_request_plan(req, plan.legs)
+    }
+
+    /// The plan of an admitted join over `session_opens` (strictly increasing trading-day opens,
+    /// the last the current one, `H`).
+    ///
+    /// Past sessions come from one catalog leg over `[first open, H)`, asked up to `H - 1 ns`
+    /// (the catalog's upper bound is inclusive), only when a catalog is registered. Rows own
+    /// their trading day by `ts_init` against the civil 18:00 New York boundaries, so a catalog
+    /// row at or after `H` stays outside the catalog leg. The asker lists in `session_opens` the
+    /// past days it verified; a day of the depth it does not list is not held: none of its rows
+    /// is used, and the day is named and counted in `missing_sessions`, as is every past day
+    /// when no catalog is registered. The current session always comes from one open-ended tail
+    /// from `H` with `replay_start = H`. The terminal's reason names the missing sessions and
+    /// says when no catalog is registered: a payload-free leg carries it, so it reaches the
+    /// rebuilt answer's failure reason with the other legs' failures.
+    fn plan_join(
+        &mut self,
+        req: &RequestCommand,
+        session_opens: &[UnixNanos],
+    ) -> anyhow::Result<JoinPlan> {
+        let (&current_open, past) = session_opens
+            .split_last()
+            .context("a join names the current trading day's open")?;
+        let key = request_identifier(req).context("a join is a trades request")?;
+        let instrument = key.identifier.as_deref().unwrap_or_default().to_owned();
+        let now = self.clock.borrow().timestamp_ns();
+        let days = match past.first() {
+            Some(&first) => trading_days(first, current_open)?,
+            None => Vec::new(),
+        };
+
+        let mut legs = Vec::with_capacity(3);
+        let mut missing_sessions = Vec::new();
+        let mut reasons = Vec::new();
+
+        if self.catalogs_registered() {
+            let mut unavailable = Vec::new();
+            for (open, next_open) in days {
+                if past.binary_search(&open).is_err() {
+                    missing_sessions.push(open);
+                    unavailable.push((open, next_open));
+                }
+            }
+
+            if let Some(&first) = past.first() {
+                let params = request_params(req).context("a join carries its parameters")?;
+                let catalog =
+                    self.catalog_for_update(&key.data_type, key.identifier.as_deref(), params)?;
+                let last = UnixNanos::from(current_open.as_u64() - 1);
+                let request = with_dates_for_pipeline(
+                    req,
+                    Some(first.to_datetime_utc()),
+                    Some(last.to_datetime_utc()),
+                    now,
+                );
+                legs.push(RequestLeg::Catalog {
+                    request,
+                    catalog,
+                    unavailable,
+                });
+            }
+        } else {
+            missing_sessions.extend(days.into_iter().map(|(open, _)| open));
+            reasons.push(
+                "no catalog is registered, so only the current session's replay was requested"
+                    .to_owned(),
+            );
+        }
+
+        let mut tail =
+            with_dates_for_pipeline(req, Some(current_open.to_datetime_utc()), None, now);
+        with_replay_start(&mut tail, current_open);
+        legs.push(RequestLeg::Client(tail));
+
+        if !missing_sessions.is_empty() {
+            reasons.push(describe_missing_sessions(&missing_sessions)?);
+        }
+        if !reasons.is_empty() {
+            legs.push(RequestLeg::Terminal {
+                request_id: UUID4::new(),
+                reason: format!("The join for {instrument}: {}", reasons.join("; ")),
+            });
+        }
+
+        Ok(JoinPlan {
+            legs,
+            missing_sessions,
+        })
+    }
+
     fn dispatch_request_plan(
         &mut self,
         parent: RequestCommand,
@@ -668,7 +783,11 @@ impl DataEngine {
             let request_id = leg.request_id();
 
             let result = match leg {
-                RequestLeg::Catalog { request, catalog } => {
+                RequestLeg::Catalog {
+                    request,
+                    catalog,
+                    unavailable,
+                } => {
                     let start = request_start(&request)
                         .map(datetime_to_unix_nanos_or_zero)
                         .expect("catalog leg has bounded start");
@@ -682,11 +801,21 @@ impl DataEngine {
                         .get_client(client_id.as_ref(), venue.as_ref())
                         .map(|value| value.client_id());
                     self.query_catalog_leg(&request, catalog, start, end, client, now)
-                        .map(|response| self.response(response))
+                        .map(|mut response| {
+                            drop_rows_of_unavailable_days(&mut response, &unavailable);
+                            self.response(response);
+                        })
                 }
                 RequestLeg::Client(request) => self.dispatch_request_to_client(request).map(|_| ()),
                 RequestLeg::Response(response) => {
                     self.response(response);
+                    Ok(())
+                }
+                RequestLeg::Terminal { request_id, reason } => {
+                    self.process_response_envelope(DataResponseEnvelope::terminal(
+                        request_id,
+                        Some(reason),
+                    ));
                     Ok(())
                 }
             };
@@ -1151,9 +1280,18 @@ enum RequestLeg {
     Catalog {
         request: RequestCommand,
         catalog: Ustr,
+        /// Half-open `[open, next open)` spans of the days whose rows the leg may not use,
+        /// ascending; empty outside a join.
+        unavailable: Vec<(UnixNanos, UnixNanos)>,
     },
     Client(RequestCommand),
     Response(DataResponse),
+    /// A payload-free leg that completes at once with `reason`, carried into the parent's
+    /// failure reason.
+    Terminal {
+        request_id: UUID4,
+        reason: String,
+    },
 }
 
 impl RequestLeg {
@@ -1161,7 +1299,50 @@ impl RequestLeg {
         match self {
             Self::Catalog { request, .. } | Self::Client(request) => *request.request_id(),
             Self::Response(response) => *response.correlation_id(),
+            Self::Terminal { request_id, .. } => *request_id,
         }
+    }
+}
+
+/// The legs of an admitted join and the past trading days it does not serve (by their opens).
+struct JoinPlan {
+    legs: Vec<RequestLeg>,
+    missing_sessions: Vec<UnixNanos>,
+}
+
+/// Drops the trades whose `ts_init` falls in one of the `unavailable` spans.
+fn drop_rows_of_unavailable_days(
+    response: &mut DataResponse,
+    unavailable: &[(UnixNanos, UnixNanos)],
+) {
+    if unavailable.is_empty() {
+        return;
+    }
+    let DataResponse::Trades(response) = response else {
+        return;
+    };
+    let is_unavailable = |ts_init: UnixNanos| {
+        let after = unavailable.partition_point(|(open, _)| *open <= ts_init);
+        after > 0 && ts_init < unavailable[after - 1].1
+    };
+    response.data = response
+        .data
+        .iter()
+        .filter(|trade| !is_unavailable(trade.ts_init))
+        .copied()
+        .collect::<Vec<_>>()
+        .into();
+}
+
+/// Sets the trades request's `replay_start` parameter: the client serves it by its replay.
+fn with_replay_start(request: &mut RequestCommand, replay_start: UnixNanos) {
+    if let RequestCommand::Trades(cmd) = request {
+        let mut params = cmd.params.as_deref().cloned().unwrap_or_default();
+        params.insert(
+            PARAM_REPLAY_START.to_owned(),
+            Value::from(replay_start.as_u64()),
+        );
+        cmd.params = Some(Params::new(params));
     }
 }
 

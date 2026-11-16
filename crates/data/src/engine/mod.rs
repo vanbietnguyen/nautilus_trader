@@ -138,10 +138,10 @@ use requests::{
     ContinuousFutureSource, RequestBarAggregation, admit_cut_warmup,
     continuous_future_request_from_bars, continuous_future_subscription_from_bars,
     has_continuous_future_params, request_bar_aggregation_from_params, request_params,
-    response_params,
+    response_params, sets_cut_warmup,
 };
 use responses::{
-    log_if_empty_response, parent_request_window, rebind_response_correlation,
+    keep_open_end, log_if_empty_response, parent_request_window, rebind_response_correlation,
     rebuild_pipeline_response, same_instrument,
 };
 use serde_json::Value;
@@ -1654,7 +1654,7 @@ impl DataEngine {
 
         // The join's dispatcher: before the schema bypass of the catalog path, catalog or not
         if let Some(join) = join {
-            let result = self.dispatch_joined_request(&req, &join);
+            let result = self.dispatch_joined_request(req, &join);
             if result.is_err() {
                 self.cleanup_request_bar_aggregators(&request_id);
             }
@@ -1691,23 +1691,46 @@ impl DataEngine {
 
     /// Dispatches an admitted `cut_warmup` request (the history/live join).
     ///
-    /// The join's plan of legs is not built yet, so the request is refused here, after its
-    /// aggregators were prepared and before any input reached them; the caller cleans them up.
-    /// The plan (`plan_join` over `join.session_opens`) dispatches the legs here, and the engine
-    /// arms `join.deadline` here, refusing the request when the timer cannot be registered.
+    /// Runs after the request's aggregators were prepared and before any input reached them; on
+    /// an error the caller cleans them up. The join's plan (`plan_join` over
+    /// `join.session_opens`) is dispatched through the request pipeline: past sessions from the
+    /// catalog, the current one from the client's replay. The engine arms `join.deadline` here,
+    /// refusing the request when the timer cannot be registered.
+    #[cfg_attr(
+        not(feature = "streaming"),
+        expect(
+            clippy::needless_pass_by_value,
+            clippy::needless_pass_by_ref_mut,
+            reason = "only the streaming build plans the join"
+        )
+    )]
     fn dispatch_joined_request(
-        &self,
-        req: &RequestCommand,
+        &mut self,
+        req: RequestCommand,
         join: &AdmittedJoin,
     ) -> anyhow::Result<()> {
-        anyhow::bail!(
-            "Cannot handle the `cut_warmup` request {} for {}: the join's plan is not built \
-             (admitted {} session opens, deadline {})",
+        log::debug!(
+            "Dispatching the `cut_warmup` request {} for {} ({} session opens, deadline {})",
             req.request_id(),
             join.instrument_id,
             join.session_opens.len(),
             join.deadline,
-        )
+        );
+
+        #[cfg(feature = "streaming")]
+        {
+            self.dispatch_join_plan(req, &join.session_opens)
+        }
+
+        #[cfg(not(feature = "streaming"))]
+        {
+            anyhow::bail!(
+                "Cannot handle the `cut_warmup` request {} for {}: the join's plan needs the \
+                 `streaming` feature",
+                req.request_id(),
+                join.instrument_id,
+            )
+        }
     }
 
     fn validate_request(req: &RequestCommand) -> anyhow::Result<()> {
@@ -2295,6 +2318,10 @@ impl DataEngine {
 
         if let DataResponse::BookDeltas(r) = &mut rebuilt {
             self.book_deltas_snapshot_replay(r);
+        }
+
+        if parent.as_ref().is_some_and(sets_cut_warmup) {
+            keep_open_end(&mut rebuilt);
         }
 
         // Client definitions can have a newer ts_init than the requested history
