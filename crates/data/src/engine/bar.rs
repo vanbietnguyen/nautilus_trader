@@ -24,8 +24,11 @@ use nautilus_common::{
     },
     msgbus::{self, MStr, Topic, TypedHandler},
 };
-use nautilus_core::{UUID4, datetime::get_timezone};
-use nautilus_model::data::{Bar, BarType, QuoteTick, TradeTick};
+use nautilus_core::{Params, UUID4, UnixNanos, datetime::get_timezone};
+use nautilus_model::{
+    data::{Bar, BarType, QuoteTick, TradeTick},
+    identifiers::ClientId,
+};
 
 use super::{
     AggregationSource, BAR_AGGREGATOR_PRIORITY, BarAggregation, BarAggregator, BarBarHandler,
@@ -41,8 +44,35 @@ use super::{
     log_error_on_cache_insert, process_engine_bar, request_bar_aggregation_from_params,
     request_params,
     requests::time_zone_from_params,
+    responses::parent_request_window,
     switchboard,
 };
+
+/// An interleaving request's own state, from before its aggregators start until its bars and its
+/// one terminal are out.
+#[derive(Debug, Default)]
+pub(super) struct InterleavedRequest {
+    /// Bars its aggregators completed and not yet delivered.
+    bars: Rc<RefCell<Vec<Bar>>>,
+    /// The client the request was dispatched to, once resolved.
+    client_id: Option<ClientId>,
+    /// The request's window and parameters, carried by bars delivered without a response.
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+    params: Option<Params>,
+}
+
+/// The completed answer of an interleaving trades request, delivered by
+/// [`DataEngine::finish_interleaved`] after the bars its clean-up completes.
+pub(super) struct ClosingPart<'a> {
+    /// The completed response, whose identity and window the last parts carry.
+    resp: &'a TradesResponse,
+    /// Its trades after its last delivered bar.
+    pending: Vec<TradeTick>,
+    sub_correlation_id: Option<UUID4>,
+    /// The cut and the floor of a joined request's answer.
+    joined: Option<JoinedRelease>,
+}
 
 impl DataEngine {
     pub(super) fn prepare_request_bar_aggregators_from_state(
@@ -54,6 +84,10 @@ impl DataEngine {
             anyhow::bail!(
                 "Cannot request aggregated bars: one of the aggregators in `bar_types` is already running"
             );
+        }
+
+        if state.interleave {
+            self.interleaved_requests.entry(request_id).or_default();
         }
 
         self.request_bar_aggregations
@@ -77,7 +111,36 @@ impl DataEngine {
             return Ok(());
         };
 
-        self.prepare_request_bar_aggregators_from_state(request_id, &state)
+        // The entry exists before the aggregators that deliver into it
+        if state.interleave {
+            let (start, end) = parent_request_window(Some(req));
+            let interleaved = InterleavedRequest {
+                start,
+                end,
+                params: request_params(req).cloned(),
+                ..InterleavedRequest::default()
+            };
+            self.interleaved_requests.insert(request_id, interleaved);
+        }
+
+        let result = self.prepare_request_bar_aggregators_from_state(request_id, &state);
+        if result.is_err() {
+            self.interleaved_requests.remove(&request_id);
+        }
+
+        result
+    }
+
+    /// Records the client an interleaving request (or a leg of its pipeline) was dispatched to.
+    pub(super) fn record_interleaved_client(&mut self, request_id: UUID4, client_id: ClientId) {
+        let owner = self
+            .request_pipeline_parent_request_id
+            .get(&request_id)
+            .map_or(request_id, |&(parent_id, _)| parent_id);
+
+        if let Some(interleaved) = self.interleaved_requests.get_mut(&owner) {
+            interleaved.client_id = Some(client_id);
+        }
     }
 
     fn can_start_request_bar_aggregators(
@@ -153,7 +216,10 @@ impl DataEngine {
                 .collect();
 
             let cache = Rc::clone(&self.cache);
-            let interleaved_bars = state.interleave.then(|| Rc::clone(&self.interleaved_bars));
+            let interleaved_bars = self
+                .interleaved_requests
+                .get(&request_id)
+                .map(|interleaved| Rc::clone(&interleaved.bars));
 
             let handler: Box<dyn FnMut(Bar)> = Box::new(move |bar: Bar| {
                 // Request-generated bars are delivered only through the cache, or as response
@@ -181,11 +247,16 @@ impl DataEngine {
 
     /// Cleans up the request's aggregators like [`Self::cleanup_request_bar_aggregators`], each
     /// joined builder releasing its held live trades through its own copy of `joined`.
+    ///
+    /// An interleaving request's entry still held here goes with them, undelivered: only
+    /// [`Self::finish_interleaved`], which takes the entry first, delivers its bars.
     fn release_request_bar_aggregators(
         &mut self,
         request_id: &UUID4,
         joined: Option<JoinedRelease>,
     ) -> bool {
+        self.interleaved_requests.remove(request_id);
+
         let Some(state) = self.request_bar_aggregations.remove(request_id) else {
             return false;
         };
@@ -299,9 +370,9 @@ impl DataEngine {
     /// Trades feed the request aggregators one at a time. A bar a trade completes is delivered
     /// before that trade, except a `RANGE_INCLUSIVE` bar, which contains its completing trade and
     /// is delivered after it (the live publication order). Each bar delivery first sends the
-    /// trades gathered since the previous one. The last part, the trades after the last completed
-    /// bar (possibly none), carries the envelope's completion; a completed envelope ends the
-    /// request.
+    /// trades gathered since the previous one. The last part of a partial envelope, the trades
+    /// after the last completed bar (possibly none), is sent as a part; a completed envelope ends
+    /// the request through [`Self::finish_interleaved`], with its reason.
     pub(super) fn respond_interleaved_trades(
         &mut self,
         resp: &TradesResponse,
@@ -309,12 +380,17 @@ impl DataEngine {
         envelope: &DataResponseEnvelope,
     ) {
         let request_id = resp.correlation_id;
+        let bars = self
+            .interleaved_requests
+            .get(&request_id)
+            .map(|interleaved| Rc::clone(&interleaved.bars))
+            .unwrap_or_default();
         let mut pending = Vec::new();
 
         for trade in resp.data.iter() {
             self.update_request_bar_aggregators_from_trade(state, request_id, *trade);
 
-            let completed = std::mem::take(&mut *self.interleaved_bars.borrow_mut());
+            let completed = std::mem::take(&mut *bars.borrow_mut());
             let (after, before): (Vec<Bar>, Vec<Bar>) = completed
                 .into_iter()
                 .partition(|bar| bar.bar_type.spec().aggregation == BarAggregation::RangeInclusive);
@@ -325,21 +401,85 @@ impl DataEngine {
         }
 
         if envelope.completed() {
-            let joined = state
-                .cut_warmup
-                .then(|| JoinedRelease::from_answer(&resp.data));
-            self.release_request_bar_aggregators(&request_id, joined);
-            let remaining = std::mem::take(&mut *self.interleaved_bars.borrow_mut());
-            send_interleaved_bars(resp, &mut pending, remaining);
+            let closing = ClosingPart {
+                resp,
+                pending,
+                sub_correlation_id: envelope.sub_correlation_id(),
+                joined: state
+                    .cut_warmup
+                    .then(|| JoinedRelease::from_answer(&resp.data)),
+            };
+            let failure = envelope.failure_reason().map(str::to_owned);
+            self.finish_interleaved(request_id, failure, Some(closing));
+            return;
         }
 
         let last = DataResponseEnvelope::new(
             DataResponse::Trades(trades_part(resp, pending)),
-            envelope.completed(),
+            false,
             envelope.sub_correlation_id(),
         )
         .with_correlation_id(*envelope.correlation_id());
         msgbus::send_response_envelope(&last);
+    }
+
+    /// Ends an interleaving request: on its completed answer (`closing`), on a payload-free
+    /// failure, or on expiry.
+    ///
+    /// Takes the request's entry, cleans up its aggregators (a joined request's builders
+    /// releasing through the answer's cut and floor), and delivers the bars that clean-up
+    /// completed: with the answer's identity, or with the dispatched client's and the request's
+    /// window when there is no answer and a client was resolved (none otherwise). Then sends
+    /// exactly one terminal, the answer's last trades part when there is one, carrying `failure`
+    /// when there is a reason.
+    pub(super) fn finish_interleaved(
+        &mut self,
+        request_id: UUID4,
+        failure: Option<String>,
+        closing: Option<ClosingPart<'_>>,
+    ) {
+        let interleaved = self
+            .interleaved_requests
+            .remove(&request_id)
+            .unwrap_or_default();
+        let joined = closing.as_ref().and_then(|closing| closing.joined);
+        self.release_request_bar_aggregators(&request_id, joined);
+        let remaining = std::mem::take(&mut *interleaved.bars.borrow_mut());
+
+        let terminal = if let Some(ClosingPart {
+            resp,
+            mut pending,
+            sub_correlation_id,
+            ..
+        }) = closing
+        {
+            send_interleaved_bars(resp, &mut pending, remaining);
+            DataResponseEnvelope::new(
+                DataResponse::Trades(trades_part(resp, pending)),
+                true,
+                sub_correlation_id,
+            )
+            .with_correlation_id(request_id)
+        } else {
+            if let Some(client_id) = interleaved.client_id {
+                let ts_init = self.clock.borrow().timestamp_ns();
+                send_bars_parts(
+                    request_id,
+                    client_id,
+                    (interleaved.start, interleaved.end),
+                    ts_init,
+                    interleaved.params.as_ref(),
+                    remaining,
+                );
+            }
+            DataResponseEnvelope::terminal(request_id, None)
+        };
+
+        let terminal = match failure {
+            Some(reason) => terminal.with_failure(reason),
+            None => terminal,
+        };
+        msgbus::send_response_envelope(&terminal);
     }
 
     pub(super) fn update_request_bar_aggregators_from_quote(
@@ -1312,6 +1452,26 @@ fn send_interleaved_bars(resp: &TradesResponse, pending: &mut Vec<TradeTick>, ba
         msgbus::send_response_part(&resp.correlation_id, &DataResponse::Trades(trades));
     }
 
+    send_bars_parts(
+        resp.correlation_id,
+        resp.client_id,
+        (resp.start, resp.end),
+        resp.ts_init,
+        resp.params.as_ref(),
+        bars,
+    );
+}
+
+/// Sends `bars` as one bars part per bar type in completion order, each carrying the request's
+/// identity and window.
+fn send_bars_parts(
+    correlation_id: UUID4,
+    client_id: ClientId,
+    (start, end): (Option<UnixNanos>, Option<UnixNanos>),
+    ts_init: UnixNanos,
+    params: Option<&Params>,
+    bars: Vec<Bar>,
+) {
     let mut bars_by_type: IndexMap<BarType, Vec<Bar>> = IndexMap::new();
     for bar in bars {
         bars_by_type.entry(bar.bar_type).or_default().push(bar);
@@ -1319,16 +1479,16 @@ fn send_interleaved_bars(resp: &TradesResponse, pending: &mut Vec<TradeTick>, ba
 
     for (bar_type, data) in bars_by_type {
         let bars = BarsResponse::new(
-            resp.correlation_id,
-            resp.client_id,
+            correlation_id,
+            client_id,
             bar_type,
             data,
-            resp.start,
-            resp.end,
-            resp.ts_init,
-            resp.params.clone(),
+            start,
+            end,
+            ts_init,
+            params.cloned(),
         );
-        msgbus::send_response_part(&resp.correlation_id, &DataResponse::Bars(bars));
+        msgbus::send_response_part(&correlation_id, &DataResponse::Bars(bars));
     }
 }
 
@@ -1341,13 +1501,17 @@ mod tests {
     use nautilus_common::{
         cache::Cache,
         clock::{Clock, VirtualClock},
-        messages::data::SubscribeBars,
+        messages::data::{
+            DataResponse, DataResponseEnvelope, RequestCommand, RequestTrades, SubscribeBars,
+            TradesResponse,
+        },
         msgbus::MessageBus,
     };
     use nautilus_core::{UUID4, UnixNanos, datetime::get_timezone};
     use nautilus_model::{
-        data::{Bar, BarType},
-        identifiers::TraderId,
+        data::{Bar, BarType, TradeTick},
+        enums::AggressorSide,
+        identifiers::{ClientId, TradeId, TraderId},
         instruments::{InstrumentAny, stubs::audusd_sim},
         types::{Price, Quantity},
     };
@@ -1591,5 +1755,102 @@ mod tests {
         raw.iter()
             .map(|bar_type| BarType::from(format!("AUD/USD.SIM-{bar_type}").as_str()))
             .collect()
+    }
+
+    /// An engine without clients, and an interleaved trades request for AUD/USD 1-TICK bars.
+    fn interleaved_engine() -> (DataEngine, RequestCommand) {
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CurrencyPair(audusd_sim()))
+            .unwrap();
+        let engine = DataEngine::new(clock, cache, None);
+        let params: nautilus_core::Params = serde_json::from_value(serde_json::json!({
+            "bar_types": ["AUD/USD.SIM-1-TICK-LAST-INTERNAL"],
+            "update_subscriptions": false,
+            "interleave": true,
+        }))
+        .unwrap();
+        let request = RequestCommand::Trades(RequestTrades::new(
+            audusd_sim().id,
+            None,
+            None,
+            None,
+            Some(ClientId::new("SIM")),
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(params),
+        ));
+        (engine, request)
+    }
+
+    fn trades_envelope(request_id: UUID4, ts: u64, completed: bool) -> DataResponseEnvelope {
+        let trade = TradeTick::new(
+            audusd_sim().id,
+            Price::from("0.65000"),
+            Quantity::from(1),
+            AggressorSide::Buy,
+            TradeId::new(ts.to_string()),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        );
+        DataResponseEnvelope::new(
+            DataResponse::Trades(TradesResponse::new(
+                request_id,
+                ClientId::new("SIM"),
+                audusd_sim().id,
+                vec![trade],
+                None,
+                None,
+                UnixNanos::from(ts),
+                None,
+            )),
+            completed,
+            None,
+        )
+    }
+
+    #[rstest]
+    #[case::completed_answer(true)]
+    #[case::payload_free_failure(false)]
+    fn test_interleaved_entry_lives_through_partial_envelopes_until_the_request_ends(
+        #[case] completed_answer: bool,
+    ) {
+        let _msgbus = MessageBus::new(TraderId::new("TESTER-001"), UUID4::new(), None, None)
+            .register_message_bus();
+        let (mut engine, request) = interleaved_engine();
+        let request_id = *request.request_id();
+        engine.prepare_request_bar_aggregators(&request).unwrap();
+
+        for ts in 1..=3 {
+            assert!(engine.interleaved_requests.contains_key(&request_id));
+            engine.response_envelope(trades_envelope(request_id, ts, false));
+        }
+        assert!(engine.interleaved_requests.contains_key(&request_id));
+        if completed_answer {
+            engine.response_envelope(trades_envelope(request_id, 4, true));
+        } else {
+            engine.response_envelope(DataResponseEnvelope::terminal(
+                request_id,
+                Some("the source stopped".to_owned()),
+            ));
+        }
+
+        assert!(engine.interleaved_requests.is_empty());
+        assert!(engine.request_bar_aggregations.is_empty());
+    }
+
+    #[rstest]
+    fn test_interleaved_dispatch_error_leaves_no_entry() {
+        let _msgbus = MessageBus::new(TraderId::new("TESTER-001"), UUID4::new(), None, None)
+            .register_message_bus();
+        let (mut engine, request) = interleaved_engine();
+
+        let error = engine.execute_request(request).unwrap_err();
+
+        assert!(error.to_string().contains("no client found"), "{error}");
+        assert!(engine.interleaved_requests.is_empty());
+        assert!(engine.request_bar_aggregations.is_empty());
     }
 }

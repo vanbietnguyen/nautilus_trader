@@ -3725,3 +3725,623 @@ fn test_update_subscriptions_request_without_cut_warmup_releases_without_the_cut
         ]
     );
 }
+
+/// One envelope the bus delivered for a request: its payload, as the parts recorder sees it,
+/// and its completion and reason.
+#[derive(Debug, PartialEq)]
+struct Delivered {
+    part: Option<ResponsePart>,
+    completed: bool,
+    failure: Option<String>,
+}
+
+fn part(part: ResponsePart) -> Delivered {
+    Delivered {
+        part: Some(part),
+        completed: false,
+        failure: None,
+    }
+}
+
+fn terminal(part: Option<ResponsePart>, failure: Option<&str>) -> Delivered {
+    Delivered {
+        part,
+        completed: true,
+        failure: failure.map(str::to_owned),
+    }
+}
+
+/// Records every response envelope the bus delivers, terminals included: the bus drops a
+/// request's handler at its first terminal, so only a tap sees a second one.
+#[derive(Default)]
+struct ResponseTap(RefCell<Vec<(UUID4, Delivered)>>);
+
+impl BusTap for ResponseTap {
+    fn on_publish(&self, _topic: MStr<Topic>, _message: &dyn Any) {}
+
+    fn on_send(&self, _endpoint: MStr<Endpoint>, _message: &dyn Any) {}
+
+    fn on_response(&self, correlation_id: &UUID4, message: &dyn Any) {
+        let Some(envelope) = message.downcast_ref::<DataResponseEnvelope>() else {
+            return;
+        };
+        let id = *correlation_id;
+        let part = match envelope.response() {
+            Some(DataResponse::Trades(resp)) => Some(ResponsePart::Trades(
+                id,
+                resp.data.iter().map(|trade| trade.trade_id).collect(),
+            )),
+            Some(DataResponse::Bars(resp)) => Some(ResponsePart::Bars(
+                id,
+                resp.bar_type,
+                resp.data.iter().map(|bar| bar.ts_event).collect(),
+            )),
+            _ => None,
+        };
+        self.0.borrow_mut().push((
+            id,
+            Delivered {
+                part,
+                completed: envelope.completed(),
+                failure: envelope.failure_reason().map(str::to_owned),
+            },
+        ));
+    }
+}
+
+/// A [`ResponseTap`] installed on this thread's bus until dropped.
+struct TappedResponses(Rc<ResponseTap>);
+
+impl TappedResponses {
+    fn install() -> Self {
+        let tap = Rc::new(ResponseTap::default());
+        msgbus::set_bus_tap(Rc::clone(&tap) as Rc<dyn BusTap>);
+        Self(tap)
+    }
+
+    /// Takes what was delivered for `request_id` so far, in order.
+    fn take(&self, request_id: UUID4) -> Vec<Delivered> {
+        let all = std::mem::take(&mut *self.0.0.borrow_mut());
+        let (taken, kept): (Vec<_>, Vec<_>) =
+            all.into_iter().partition(|(id, _)| *id == request_id);
+        *self.0.0.borrow_mut() = kept;
+        taken.into_iter().map(|(_, delivered)| delivered).collect()
+    }
+}
+
+impl Drop for TappedResponses {
+    fn drop(&mut self) {
+        msgbus::clear_bus_tap();
+    }
+}
+
+const SECOND_NS: u64 = NANOSECONDS_IN_SECOND;
+
+fn second_bars(instrument_id: InstrumentId) -> BarType {
+    BarType::from(format!("{instrument_id}-1-SECOND-LAST-INTERNAL").as_str())
+}
+
+/// Executes an interleaved trades request for `instrument_id` aggregated into `bar_types`.
+fn execute_interleaved(
+    fixture: &mut JoinFixture,
+    instrument_id: InstrumentId,
+    bar_types: &[BarType],
+    update_subscriptions: bool,
+) -> UUID4 {
+    let params = json!({
+        "bar_types": bar_types.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "update_subscriptions": update_subscriptions,
+        "interleave": true,
+    });
+    let request = trades_request(vec![instrument_id], None, fixture.client_id, params);
+    let request_id = *request.request_id();
+    fixture.engine.execute_request(request).unwrap();
+    request_id
+}
+
+/// Answers `request_id` with trades (`ts`, trade ID) of `instrument_id` in one envelope.
+fn answer_trades(
+    fixture: &JoinFixture,
+    request_id: UUID4,
+    instrument_id: InstrumentId,
+    trades: &[(u64, &str)],
+    completed: bool,
+) -> DataResponseEnvelope {
+    let trades: Vec<_> = trades
+        .iter()
+        .map(|(ts, id)| make_trade(instrument_id, "1.0000", 1, id, *ts))
+        .collect();
+    DataResponseEnvelope::new(
+        DataResponse::Trades(TradesResponse::new(
+            request_id,
+            fixture.client_id,
+            instrument_id,
+            trades,
+            None,
+            None,
+            UnixNanos::default(),
+            None,
+        )),
+        completed,
+        None,
+    )
+}
+
+fn at_ns(ts: &[u64]) -> Vec<UnixNanos> {
+    ts.iter().copied().map(UnixNanos::from).collect()
+}
+
+#[rstest]
+fn test_interleaved_answer_keeps_its_failure_reason_on_its_one_terminal(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let tick = fixture.bar_type;
+    let tap = TappedResponses::install();
+
+    let request_id = execute_interleaved(&mut fixture, id, &[tick], false);
+    let failed = answer_trades(&fixture, request_id, id, &[(1, "t1"), (2, "t2")], true)
+        .with_failure("the source stopped".to_owned());
+    fixture.engine.response_envelope(failed);
+
+    assert_eq!(
+        tap.take(request_id),
+        vec![
+            part(ResponsePart::Bars(request_id, tick, at_ns(&[1]))),
+            part(ResponsePart::Trades(request_id, trade_ids(&["t1"]))),
+            part(ResponsePart::Bars(request_id, tick, at_ns(&[2]))),
+            terminal(
+                Some(ResponsePart::Trades(request_id, trade_ids(&["t2"]))),
+                Some("the source stopped"),
+            ),
+        ]
+    );
+}
+
+#[rstest]
+fn test_interleaved_failure_after_a_part_delivers_its_bars_once_and_none_to_the_next_request(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let seconds = second_bars(id);
+    let tick = fixture.bar_type;
+    let tap = TappedResponses::install();
+
+    let first = execute_interleaved(&mut fixture, id, &[seconds], false);
+    let answer = answer_trades(
+        &fixture,
+        first,
+        id,
+        &[(SECOND_NS / 5, "a1"), (SECOND_NS + SECOND_NS / 5, "a2")],
+        false,
+    );
+    fixture.engine.response_envelope(answer);
+    fixture
+        .engine
+        .response_envelope(DataResponseEnvelope::terminal(
+            first,
+            Some("the source stopped".to_owned()),
+        ));
+
+    let second = execute_interleaved(&mut fixture, id, &[tick], false);
+    let answer = answer_trades(&fixture, second, id, &[(5 * SECOND_NS, "b1")], true);
+    fixture.engine.response_envelope(answer);
+
+    assert_eq!(
+        tap.take(second),
+        vec![
+            part(ResponsePart::Bars(second, tick, at_ns(&[5 * SECOND_NS]))),
+            terminal(Some(ResponsePart::Trades(second, trade_ids(&["b1"]))), None),
+        ]
+    );
+    // The bar a2 completed is pending until the clean-up flushes it
+    assert_eq!(
+        tap.take(first),
+        vec![
+            part(ResponsePart::Trades(first, trade_ids(&["a1", "a2"]))),
+            part(ResponsePart::Bars(
+                first,
+                seconds,
+                at_ns(&[SECOND_NS + SECOND_NS / 5])
+            )),
+            terminal(None, Some("the source stopped")),
+        ]
+    );
+}
+
+#[rstest]
+fn test_interleaved_completion_delivers_its_clean_up_bars_then_one_terminal(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let seconds = second_bars(id);
+    let tap = TappedResponses::install();
+
+    let request_id = execute_interleaved(&mut fixture, id, &[seconds], false);
+    let answer = answer_trades(
+        &fixture,
+        request_id,
+        id,
+        &[(SECOND_NS / 5, "a1"), (SECOND_NS + SECOND_NS / 5, "a2")],
+        true,
+    );
+    fixture.engine.response_envelope(answer);
+
+    // The bar a2 completed is pending until the clean-up flushes it
+    assert_eq!(
+        tap.take(request_id),
+        vec![
+            part(ResponsePart::Trades(request_id, trade_ids(&["a1", "a2"]))),
+            part(ResponsePart::Bars(
+                request_id,
+                seconds,
+                at_ns(&[SECOND_NS + SECOND_NS / 5])
+            )),
+            terminal(Some(ResponsePart::Trades(request_id, Vec::new())), None),
+        ]
+    );
+}
+
+#[rstest]
+fn test_interleaved_failure_before_any_part_delivers_held_trades_bars_through_the_dispatched_client(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let tick = fixture.bar_type;
+    let tap = TappedResponses::install();
+
+    let request_id = execute_interleaved(&mut fixture, id, &[tick], true);
+    fixture
+        .engine
+        .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+            SubscribeBars::new(
+                tick,
+                Some(client_id),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )));
+    for (ts, trade_id) in [(10, "live-1"), (20, "live-2")] {
+        fixture
+            .engine
+            .process_data(Data::Trade(make_trade(id, "1.0000", 1, trade_id, ts)));
+    }
+    fixture
+        .engine
+        .response_envelope(DataResponseEnvelope::terminal(
+            request_id,
+            Some("the source stopped".to_owned()),
+        ));
+
+    assert_eq!(
+        tap.take(request_id),
+        vec![
+            part(ResponsePart::Bars(request_id, tick, at_ns(&[10, 20]))),
+            terminal(None, Some("the source stopped")),
+        ]
+    );
+}
+
+#[rstest]
+fn test_interleaved_dispatch_error_sends_one_terminal_and_no_bars(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+) {
+    let _ = stub_msgbus;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    let id = audusd_sim.id;
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+    let mut engine = DataEngine::new(clock, cache, None);
+    let tap = TappedResponses::install();
+    let params = json!({
+        "bar_types": [second_bars(id).to_string()],
+        "update_subscriptions": false,
+        "interleave": true,
+    });
+    let request = trades_request(vec![id], None, client_id, params);
+    let request_id = *request.request_id();
+
+    let error = engine.execute_request(request).unwrap_err().to_string();
+
+    assert!(error.contains("no client found"), "{error}");
+    assert_eq!(tap.take(request_id), vec![terminal(None, Some(&error))]);
+}
+
+#[rstest]
+fn test_two_interleaved_requests_one_after_the_other_each_get_their_own_bars(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let seconds = second_bars(id);
+    let tap = TappedResponses::install();
+
+    let first = execute_interleaved(&mut fixture, id, &[seconds], false);
+    let answer = answer_trades(
+        &fixture,
+        first,
+        id,
+        &[(SECOND_NS / 5, "a1"), (SECOND_NS + SECOND_NS / 5, "a2")],
+        true,
+    );
+    fixture.engine.response_envelope(answer);
+    // The same trades again: each request's aggregators are its own
+    let second = execute_interleaved(&mut fixture, id, &[seconds], false);
+    let answer = answer_trades(
+        &fixture,
+        second,
+        id,
+        &[(SECOND_NS / 5, "b1"), (SECOND_NS + SECOND_NS / 5, "b2")],
+        true,
+    );
+    fixture.engine.response_envelope(answer);
+
+    assert_eq!(
+        tap.take(first),
+        vec![
+            part(ResponsePart::Trades(first, trade_ids(&["a1", "a2"]))),
+            part(ResponsePart::Bars(
+                first,
+                seconds,
+                at_ns(&[SECOND_NS + SECOND_NS / 5])
+            )),
+            terminal(Some(ResponsePart::Trades(first, Vec::new())), None),
+        ]
+    );
+    assert_eq!(
+        tap.take(second),
+        vec![
+            part(ResponsePart::Trades(second, trade_ids(&["b1", "b2"]))),
+            part(ResponsePart::Bars(
+                second,
+                seconds,
+                at_ns(&[SECOND_NS + SECOND_NS / 5])
+            )),
+            terminal(Some(ResponsePart::Trades(second, Vec::new())), None),
+        ]
+    );
+}
+
+#[rstest]
+fn test_two_interleaved_requests_at_the_same_time_for_different_instruments_each_get_their_own_bars(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let gbpusd = gbpusd_sim();
+    let (aud, gbp) = (fixture.instrument_id, gbpusd.id);
+    fixture
+        .engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(gbpusd))
+        .unwrap();
+    let (aud_seconds, gbp_seconds) = (second_bars(aud), second_bars(gbp));
+    let tap = TappedResponses::install();
+
+    let first = execute_interleaved(&mut fixture, aud, &[aud_seconds], false);
+    let second = execute_interleaved(&mut fixture, gbp, &[gbp_seconds], false);
+    let (a1, a2) = (SECOND_NS / 5, SECOND_NS + SECOND_NS / 5);
+    let (b1, b2, b3) = (
+        SECOND_NS / 4,
+        SECOND_NS + SECOND_NS / 4,
+        2 * SECOND_NS + SECOND_NS / 4,
+    );
+    let answer = answer_trades(&fixture, first, aud, &[(a1, "a1"), (a2, "a2")], false);
+    fixture.engine.response_envelope(answer);
+    let answer = answer_trades(&fixture, second, gbp, &[(b1, "b1"), (b2, "b2")], false);
+    fixture.engine.response_envelope(answer);
+    fixture
+        .engine
+        .response_envelope(DataResponseEnvelope::terminal(
+            first,
+            Some("the source stopped".to_owned()),
+        ));
+    let answer = answer_trades(&fixture, second, gbp, &[(b3, "b3")], true);
+    fixture.engine.response_envelope(answer);
+
+    // A completed time bar is pending until the next one completes or the clean-up flushes it
+    assert_eq!(
+        tap.take(second),
+        vec![
+            part(ResponsePart::Trades(second, trade_ids(&["b1", "b2"]))),
+            part(ResponsePart::Bars(second, gbp_seconds, at_ns(&[b2]))),
+            part(ResponsePart::Trades(second, trade_ids(&["b3"]))),
+            part(ResponsePart::Bars(second, gbp_seconds, at_ns(&[b3]))),
+            terminal(Some(ResponsePart::Trades(second, Vec::new())), None),
+        ]
+    );
+    assert_eq!(
+        tap.take(first),
+        vec![
+            part(ResponsePart::Trades(first, trade_ids(&["a1", "a2"]))),
+            part(ResponsePart::Bars(first, aud_seconds, at_ns(&[a2]))),
+            terminal(None, Some("the source stopped")),
+        ]
+    );
+}
+
+#[rstest]
+fn test_interleaved_request_routes_three_partial_envelopes_to_its_entry_until_the_completed_one(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let seconds = second_bars(id);
+    let tap = TappedResponses::install();
+
+    let request_id = execute_interleaved(&mut fixture, id, &[seconds], false);
+    for (index, trade_id) in ["a1", "a2", "a3"].into_iter().enumerate() {
+        let ts = index as u64 * SECOND_NS + SECOND_NS / 5;
+        let answer = answer_trades(&fixture, request_id, id, &[(ts, trade_id)], false);
+        fixture.engine.response_envelope(answer);
+    }
+    let answer = answer_trades(&fixture, request_id, id, &[], true);
+    fixture.engine.response_envelope(answer);
+
+    // A completed time bar is pending until the next one completes or the clean-up flushes it
+    let bars = |ts: u64| part(ResponsePart::Bars(request_id, seconds, at_ns(&[ts])));
+    let trades = |id: &str| part(ResponsePart::Trades(request_id, trade_ids(&[id])));
+    assert_eq!(
+        tap.take(request_id),
+        vec![
+            trades("a1"),
+            trades("a2"),
+            bars(SECOND_NS + SECOND_NS / 5),
+            trades("a3"),
+            bars(2 * SECOND_NS + SECOND_NS / 5),
+            terminal(Some(ResponsePart::Trades(request_id, Vec::new())), None),
+        ]
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_joined_interleaved_request_answers_once_after_three_partial_envelopes_with_its_reason(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let tick = fixture.bar_type;
+    let tap = TappedResponses::install();
+    let mut params = joined_params(tick, NY_2026_11_12_2000, &[NY_2026_11_12_1800]);
+    params["interleave"] = json!(true);
+    let request = trades_request(vec![id], None, client_id, params);
+    let request_id = *request.request_id();
+
+    fixture.engine.execute_request(request).unwrap();
+    let tail_id = assert_replay_tail(&fixture, NY_2026_11_12_1800);
+    let tail_part = |trades: Vec<TradeTick>, completed: bool| {
+        DataResponseEnvelope::new(
+            DataResponse::Trades(TradesResponse::new(
+                tail_id,
+                client_id,
+                id,
+                trades,
+                Some(UnixNanos::from(NY_2026_11_12_1800)),
+                None,
+                UnixNanos::from(NY_2026_11_12_2000),
+                None,
+            )),
+            completed,
+            None,
+        )
+    };
+    for (offset, trade_id) in [(1, "r1"), (2, "r2"), (3, "r3")] {
+        let trade = split_trade(id, NY_2026_11_12_1800 + offset, trade_id);
+        fixture
+            .engine
+            .response_envelope(tail_part(vec![trade], false));
+        assert!(tap.take(request_id).is_empty(), "the join answers once");
+    }
+    fixture
+        .engine
+        .response_envelope(tail_part(Vec::new(), true));
+
+    let delivered = tap.take(request_id);
+    let bars = |offset: u64| {
+        part(ResponsePart::Bars(
+            request_id,
+            tick,
+            at_ns(&[NY_2026_11_12_1800 + offset]),
+        ))
+    };
+    let trades = |id: &str| part(ResponsePart::Trades(request_id, trade_ids(&[id])));
+    let [b1, r1, b2, r2, b3, last] = &delivered[..] else {
+        panic!("three bars, two trades parts and one terminal: {delivered:?}");
+    };
+    assert_eq!(
+        [b1, r1, b2, r2, b3],
+        [&bars(1), &trades("r1"), &bars(2), &trades("r2"), &bars(3)]
+    );
+    assert_eq!(
+        last.part,
+        Some(ResponsePart::Trades(request_id, trade_ids(&["r3"])))
+    );
+    assert!(last.completed);
+    let reason = last.failure.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("no catalog is registered"),
+        "the join's reason reaches its terminal: {reason:?}"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_joined_interleaved_request_without_a_client_ends_with_one_terminal_and_its_reasons(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+) {
+    let _ = stub_msgbus;
+    let mut virtual_clock = VirtualClock::new();
+    let _ = virtual_clock.advance_time(UnixNanos::from(NY_2026_11_12_2000), true);
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(virtual_clock));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    let id = audusd_sim.id;
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+    let mut engine = DataEngine::new(clock, cache, None);
+    let tick = BarType::from(format!("{id}-1-TICK-LAST-INTERNAL").as_str());
+    let tap = TappedResponses::install();
+    let mut params = joined_params(tick, NY_2026_11_12_2000, &[NY_2026_11_12_1800]);
+    params["interleave"] = json!(true);
+    let request = trades_request(vec![id], None, client_id, params);
+    let request_id = *request.request_id();
+
+    engine.execute_request(request).unwrap();
+
+    let delivered = tap.take(request_id);
+    let [only] = &delivered[..] else {
+        panic!("one terminal: {delivered:?}");
+    };
+    assert_eq!((&only.part, only.completed), (&None, true));
+    let reason = only.failure.as_deref().unwrap_or_default();
+    assert!(reason.contains("no client found"), "{reason:?}");
+    assert!(reason.contains("no catalog is registered"), "{reason:?}");
+}

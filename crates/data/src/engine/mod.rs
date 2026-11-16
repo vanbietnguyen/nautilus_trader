@@ -65,7 +65,10 @@ use ::futures::future::join_all;
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 pub use bar::BarAggregatorSubscription;
-use bar::{BarAggregationSubscription, BarAggregatorKey, BarAggregatorWarmup, bar_aggregator_key};
+use bar::{
+    BarAggregationSubscription, BarAggregatorKey, BarAggregatorWarmup, InterleavedRequest,
+    bar_aggregator_key,
+};
 use book::{
     BookDeltasKey, BookSnapshotInfos, BookSnapshotKey, BookSnapshotSource, BookSnapshotter,
     BookSubscription, BookSubscriptionOwner, BookUpdater,
@@ -221,9 +224,8 @@ pub struct DataEngine {
     /// `RANGE_INCLUSIVE` bars completed while their completing update is being delivered,
     /// published once that delivery returns.
     deferred_bars: Rc<RefCell<VecDeque<Bar>>>,
-    /// Bars completed by the request aggregators of an interleaving trades request, taken
-    /// after each trade to order the response parts.
-    interleaved_bars: Rc<RefCell<Vec<Bar>>>,
+    /// Each interleaving request's own state, until its bars and its one terminal are out.
+    interleaved_requests: AHashMap<UUID4, InterleavedRequest>,
     option_chain_bootstrapper: Option<Rc<OptionChainBootstrapper>>,
     pending_option_chain_requests: AHashMap<UUID4, PendingOptionChainRequest>,
     option_chain_greeks_bootstraps: AHashMap<OptionSeriesId, OptionChainGreeksBootstrap>,
@@ -305,7 +307,7 @@ impl DataEngine {
             option_chain_instrument_index: AHashMap::new(),
             deferred_cmd_queue: Rc::new(RefCell::new(VecDeque::new())),
             deferred_bars: Rc::new(RefCell::new(VecDeque::new())),
-            interleaved_bars: Rc::new(RefCell::new(Vec::new())),
+            interleaved_requests: AHashMap::new(),
             option_chain_bootstrapper: None,
             pending_option_chain_requests: AHashMap::new(),
             option_chain_greeks_bootstraps: AHashMap::new(),
@@ -557,6 +559,7 @@ impl DataEngine {
         self.subscriptions_bar_aggregation.clear();
 
         self.request_bar_aggregations.clear();
+        self.interleaved_requests.clear();
         self.inflight_requests.clear();
         self.request_pipeline_parent_request.clear();
         self.request_pipeline_n_components.clear();
@@ -1767,8 +1770,8 @@ impl DataEngine {
         &mut self,
         req: RequestCommand,
     ) -> anyhow::Result<ClientId> {
-        self.inflight_requests
-            .insert(*req.request_id(), req.clone());
+        let request_id = *req.request_id();
+        self.inflight_requests.insert(request_id, req.clone());
         let client_id = req.client_id().copied();
         let venue = req.venue().copied();
         let Some(client) = self.get_client(client_id.as_ref(), venue.as_ref()) else {
@@ -1804,6 +1807,7 @@ impl DataEngine {
             e.context(context)
         })?;
 
+        self.record_interleaved_client(request_id, resolved_client_id);
         Ok(resolved_client_id)
     }
 
@@ -2117,7 +2121,14 @@ impl DataEngine {
             return;
         }
 
-        self.cleanup_request_bar_aggregators(envelope.correlation_id());
+        let request_id = *envelope.correlation_id();
+        if self.interleaved_requests.contains_key(&request_id) {
+            let failure = envelope.failure_reason().map(str::to_owned);
+            self.finish_interleaved(request_id, failure, None);
+            return;
+        }
+
+        self.cleanup_request_bar_aggregators(&request_id);
         msgbus::send_response_envelope(envelope);
     }
 
