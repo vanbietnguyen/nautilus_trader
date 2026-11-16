@@ -23,6 +23,13 @@
 //! quotes for the same instrument on its ordinary feed session, a second concurrent gateway
 //! session on the same key.
 //!
+//! The client decodes the replay with `TsEventSource::Exchange`: a trade's `ts_event` is the
+//! record header's exchange (matching-engine) time, or its `ts_recv` when the header time is
+//! undefined, and its `ts_init` is its `ts_recv`. So `first_ts_event_ms`, `last_ts_event_ms`,
+//! `min_event_offset_ms` and `halt_hour_trades` read exchange time; `first_ts_init_ms`,
+//! `last_ts_init_ms`, `ts_init_non_decreasing` and `ts_init_decreases` read receive time; and
+//! `max_init_minus_event_ns` is the largest receive time less exchange time.
+//!
 //! Output, on stdout, holds counts and timings only: never a price, size, side, quote or trade
 //! row, and no raw timestamp other than as an offset from `--start-ns`.
 //! - The adapter's `info` lines, including its one summary line at the replay's end
@@ -61,7 +68,10 @@ use nautilus_core::{
     Params, UUID4, UnixNanos, datetime::get_timezone, string::secret::SecretString,
     time::get_atomic_clock_realtime,
 };
-use nautilus_databento::data::{DatabentoDataClient, DatabentoDataClientConfig};
+use nautilus_databento::{
+    data::{DatabentoDataClient, DatabentoDataClientConfig},
+    decode::{DatabentoDecodeConfig, TsEventSource},
+};
 use nautilus_model::{
     data::Data,
     identifiers::{ClientId, InstrumentId, TraderId, futures::FuturesYearDigits},
@@ -135,7 +145,7 @@ impl Outcome {
     }
 }
 
-/// The receive and arrival times of one trade, in UNIX nanoseconds.
+/// The receive (`ts_init`) and exchange (`ts_event`) times of one trade, in UNIX nanoseconds.
 #[derive(Clone, Copy, Debug)]
 struct TradeTimes {
     ts_init: u64,
@@ -311,6 +321,10 @@ fn client_config(key: &SecretString) -> DatabentoDataClientConfig {
         true,  // bars_timestamp_on_close
     );
     config.futures_year_digits = FuturesYearDigits::One;
+    config.decode_config = Some(DatabentoDecodeConfig {
+        ts_event_source: TsEventSource::Exchange,
+        ..DatabentoDecodeConfig::default()
+    });
     config
 }
 
@@ -502,6 +516,16 @@ mod tests {
 
     fn tally(start_ns: u64) -> ReplayTally {
         ReplayTally::new(start_ns, get_timezone("America/New_York").unwrap())
+    }
+
+    #[rstest]
+    fn test_client_config_decodes_replays_on_exchange_time() {
+        let config = client_config(&SecretString::from("db-made-up-key"));
+
+        assert_eq!(
+            config.decode_config.map(|config| config.ts_event_source),
+            Some(TsEventSource::Exchange)
+        );
     }
 
     #[rstest]

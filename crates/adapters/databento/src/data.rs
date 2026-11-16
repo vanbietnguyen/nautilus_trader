@@ -70,6 +70,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     common::{Credential, DATABENTO_VENUE, ohlcv_schema_from_aggregation},
+    decode::DatabentoDecodeConfig,
     historical::{DatabentoHistoricalClient, RangeQueryParams},
     live::{
         DatabentoFeedHandler, DatabentoMessage, HandlerCommand, LiveSessionSpec, ReplaySummary,
@@ -148,6 +149,14 @@ pub struct DatabentoDataClientConfig {
     /// bound; the caller has then seen any partial responses already sent, followed by the
     /// failure, and trades decoded but not yet sent are lost.
     pub replay_bound_secs: Option<u64>,
+    /// Decode configuration for `replay_start` trades replays (None decodes as the default
+    /// configuration does, `ts_event` from `ts_recv`). With [`TsEventSource::Exchange`] a
+    /// replayed trade's `ts_event` is the record header `ts_event` (exchange time), or `ts_recv`
+    /// when that is undefined, and its `ts_init` stays `ts_recv`. The live feed session does not
+    /// read this field: it always decodes with the default configuration.
+    ///
+    /// [`TsEventSource::Exchange`]: crate::decode::TsEventSource::Exchange
+    pub decode_config: Option<DatabentoDecodeConfig>,
 }
 
 #[cfg(feature = "python")]
@@ -180,6 +189,7 @@ impl DatabentoDataClientConfig {
             historical_base_url: None,
             live_gateway_addr: None,
             replay_bound_secs: None,
+            decode_config: None,
         }
     }
 
@@ -490,6 +500,7 @@ impl DatabentoDataClient {
                 .replay_bound_secs
                 .unwrap_or(DEFAULT_REPLAY_BOUND_SECS),
         );
+        let decode_config = self.config.decode_config.clone();
 
         self.spawn_task(async move {
             let response = |trades: Vec<TradeTick>| {
@@ -520,7 +531,7 @@ impl DatabentoDataClient {
                     replay_start,
                     until,
                     REPLAY_IDLE,
-                    None,
+                    decode_config.as_ref(),
                     &mut batch,
                     &mut summary,
                     |trades| send(trades, false),

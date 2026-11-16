@@ -33,7 +33,10 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
-use nautilus_databento::data::{DatabentoDataClient, DatabentoDataClientConfig};
+use nautilus_databento::{
+    data::{DatabentoDataClient, DatabentoDataClientConfig},
+    decode::{DatabentoDecodeConfig, TsEventSource},
+};
 use nautilus_model::{
     data::TradeTick,
     identifiers::{ClientId, InstrumentId, futures::FuturesYearDigits},
@@ -74,6 +77,17 @@ fn replay_client_with_bound(
     DatabentoDataClient,
     tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
 ) {
+    replay_client_with(gateway_addr, replay_bound_secs, None)
+}
+
+fn replay_client_with(
+    gateway_addr: String,
+    replay_bound_secs: Option<u64>,
+    decode_config: Option<DatabentoDecodeConfig>,
+) -> (
+    DatabentoDataClient,
+    tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+) {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     replace_data_event_sender(sender);
 
@@ -86,6 +100,7 @@ fn replay_client_with_bound(
     config.live_gateway_addr = Some(gateway_addr);
     config.futures_year_digits = FuturesYearDigits::One;
     config.replay_bound_secs = replay_bound_secs;
+    config.decode_config = decode_config;
     let client = DatabentoDataClient::new(
         ClientId::from("DATABENTO-REPLAY"),
         config,
@@ -494,6 +509,51 @@ async fn test_replay_gateway_error_fails_with_its_code_name() {
         failed.reason.contains("ReplayDataAgedOut"),
         "{}",
         failed.reason
+    );
+
+    server.stop().await;
+}
+
+fn exchange_time_config() -> DatabentoDecodeConfig {
+    DatabentoDecodeConfig {
+        ts_event_source: TsEventSource::Exchange,
+        ..DatabentoDecodeConfig::default()
+    }
+}
+
+// The made-up trade's receive time, and an exchange time 1.5 µs before it
+const TS_RECV: u64 = REPLAY_START + 500_000_000;
+const TS_EXCHANGE: u64 = TS_RECV - 1_500;
+
+#[rstest]
+#[case::exchange_time(Some(exchange_time_config()), TS_EXCHANGE, TS_EXCHANGE)]
+#[case::exchange_time_undefined_header(Some(exchange_time_config()), dbn::UNDEF_TIMESTAMP, TS_RECV)]
+#[case::receive_time(Some(DatabentoDecodeConfig::default()), TS_EXCHANGE, TS_RECV)]
+#[case::no_decode_config(None, TS_EXCHANGE, TS_RECV)]
+#[tokio::test]
+async fn test_replay_stamps_ts_event_by_the_client_decode_config(
+    #[case] decode_config: Option<DatabentoDecodeConfig>,
+    #[case] header_ts_event: u64,
+    #[case] expected_ts_event: u64,
+) {
+    let server = MockLsgServer::new(TEST_DATASET).await;
+    let (client, mut receiver) = replay_client_with(server.addr(), None, decode_config);
+    let mut trade = tbbo_trade(TS_RECV, 1);
+    trade.hd.ts_event = header_ts_event;
+    serve_replay(&server, [trade]);
+
+    client.request_trades(replay_request()).unwrap();
+    let envelopes = recv_until_completed(&mut receiver).await;
+
+    let trades: Vec<TradeTick> = envelopes.iter().flat_map(envelope_trades).collect();
+    let times: Vec<(UnixNanos, UnixNanos)> = trades
+        .iter()
+        .map(|trade| (trade.ts_event, trade.ts_init))
+        .collect();
+    assert_eq!(
+        times,
+        [(UnixNanos::from(expected_ts_event), UnixNanos::from(TS_RECV))],
+        "(ts_event, ts_init) of the replayed trade"
     );
 
     server.stop().await;
