@@ -74,8 +74,9 @@ pub(super) struct WarmupCounts {
     pub(super) dropped: u64,
     /// Fed trades whose `ts_init` was raised to the floor.
     pub(super) floored: u64,
-    /// Answered trades without an exchange time: their receive time stands in and can over-cut.
-    pub(super) fallback_rows: u64,
+    /// Answered trades whose `ts_event` equals their `ts_init`: a hint of the adapter's fallback
+    /// to the receive time, not a count of it (a defined exchange time can equal it too).
+    pub(super) equal_stamp_rows: u64,
 }
 
 /// The cut and the rolling floor through which one joined builder takes live trades after its
@@ -105,9 +106,7 @@ impl JoinedRelease {
                 .max(),
             floor: answered.iter().map(|trade| trade.ts_init).max(),
             counts: WarmupCounts {
-                // A replayed or restamp-free row decoded without an exchange time carries its
-                // receive time as both stamps
-                fallback_rows: answered
+                equal_stamp_rows: answered
                     .iter()
                     .filter(|trade| trade.ts_event == trade.ts_init)
                     .count() as u64,
@@ -189,12 +188,12 @@ impl WarmupBuffer<TradeTick> {
         let counts = release.counts;
         log::info!(
             "Released the joined warm-up of {bar_type}: held={}, flushed={}, dropped={}, \
-             floored={}, fallback_rows={}",
+             floored={}, equal_stamp_rows={}",
             counts.held,
             counts.flushed,
             counts.dropped,
             counts.floored,
-            counts.fallback_rows,
+            counts.equal_stamp_rows,
         );
 
         *joined.0.borrow_mut() = Some(release);
@@ -259,7 +258,6 @@ pub(super) struct BarTradeHandler {
     aggregator: WeakCell<Box<dyn BarAggregator>>,
     bar_type: BarType,
     warmup: Option<WarmupBuffer<TradeTick>>,
-    joined: Option<JoinedSlot>,
 }
 
 impl BarTradeHandler {
@@ -268,19 +266,12 @@ impl BarTradeHandler {
             aggregator: WeakCell::from(Rc::downgrade(aggregator)),
             bar_type,
             warmup: None,
-            joined: None,
         }
     }
 
     /// Holds incoming data in `warmup` until the buffer is released.
     pub(super) fn with_warmup(mut self, warmup: Option<WarmupBuffer<TradeTick>>) -> Self {
         self.warmup = warmup;
-        self
-    }
-
-    /// Takes the live trades after the warm-up through the release `joined` receives, if any.
-    pub(super) fn with_joined(mut self, joined: Option<JoinedSlot>) -> Self {
-        self.joined = joined;
         self
     }
 }
@@ -299,18 +290,56 @@ impl Handler<TradeTick> for BarTradeHandler {
             return;
         }
 
-        let Some(agg) = self.aggregator.upgrade() else {
-            return;
-        };
+        if let Some(agg) = self.aggregator.upgrade() {
+            agg.borrow_mut().handle_trade(*trade);
+        }
+    }
+}
 
-        // A joined builder takes a private copy; every other subscriber keeps the original
-        match &self.joined {
-            Some(joined) => {
-                if let Some(copy) = joined.admit(trade) {
-                    agg.borrow_mut().handle_trade(copy);
-                }
-            }
-            None => agg.borrow_mut().handle_trade(*trade),
+/// Message handler for the trades of a joined warm-up's builder (the history/live join).
+///
+/// Holds the live trades while the request replays, then takes every later live trade through
+/// the release its slot receives: the builder gets a private copy, every other subscriber keeps
+/// the original. Only a joined warm-up gets this handler; every other trade-fed builder gets a
+/// [`BarTradeHandler`].
+#[derive(Debug)]
+pub(super) struct JoinedTradeHandler {
+    aggregator: WeakCell<Box<dyn BarAggregator>>,
+    bar_type: BarType,
+    warmup: WarmupBuffer<TradeTick>,
+    joined: JoinedSlot,
+}
+
+impl JoinedTradeHandler {
+    pub(super) fn new(
+        aggregator: &Rc<RefCell<Box<dyn BarAggregator>>>,
+        bar_type: BarType,
+        warmup: WarmupBuffer<TradeTick>,
+        joined: JoinedSlot,
+    ) -> Self {
+        Self {
+            aggregator: WeakCell::from(Rc::downgrade(aggregator)),
+            bar_type,
+            warmup,
+            joined,
+        }
+    }
+}
+
+impl Handler<TradeTick> for JoinedTradeHandler {
+    fn id(&self) -> Ustr {
+        Ustr::from(&format!("JoinedTradeHandler|{}", self.bar_type))
+    }
+
+    fn handle(&self, trade: &TradeTick) {
+        if self.warmup.hold(trade) {
+            return;
+        }
+
+        if let Some(agg) = self.aggregator.upgrade()
+            && let Some(copy) = self.joined.admit(trade)
+        {
+            agg.borrow_mut().handle_trade(copy);
         }
     }
 }
@@ -412,7 +441,7 @@ mod tests {
     };
     use rstest::rstest;
 
-    use super::{BarTradeHandler, JoinedRelease, JoinedSlot, WarmupBuffer, WarmupCounts};
+    use super::{JoinedRelease, JoinedSlot, JoinedTradeHandler, WarmupBuffer, WarmupCounts};
     use crate::aggregation::{BarAggregator, TickBarAggregator};
 
     const MS: u64 = NANOSECONDS_IN_MILLISECOND;
@@ -469,7 +498,7 @@ mod tests {
     struct HeldBuilder {
         bar_type: BarType,
         aggregator: Rc<RefCell<Box<dyn BarAggregator>>>,
-        handler: BarTradeHandler,
+        handler: JoinedTradeHandler,
         buffer: WarmupBuffer<TradeTick>,
         joined: JoinedSlot,
         bars: Rc<RefCell<Vec<Bar>>>,
@@ -488,9 +517,8 @@ mod tests {
 
         let buffer = WarmupBuffer::new();
         let joined = JoinedSlot::default();
-        let handler = BarTradeHandler::new(&aggregator, bar_type)
-            .with_warmup(Some(buffer.clone()))
-            .with_joined(Some(joined.clone()));
+        let handler =
+            JoinedTradeHandler::new(&aggregator, bar_type, buffer.clone(), joined.clone());
         for trade in held {
             handler.handle(trade);
         }
@@ -523,7 +551,7 @@ mod tests {
 
     #[rstest]
     fn test_joined_release_counts_what_it_held() {
-        // The answer's cut is 160 ms; its second row has no exchange time (both stamps equal)
+        // The answer's cut is 160 ms; its second row has equal stamps
         let answered = [
             trade(100 * MS, 150 * MS, "a1"),
             trade(160 * MS, 160 * MS, "a2"),
@@ -547,7 +575,7 @@ mod tests {
                 flushed: 2,
                 dropped: 2,
                 floored: 1,
-                fallback_rows: 1,
+                equal_stamp_rows: 1,
             }
         );
         assert_eq!(
@@ -556,7 +584,7 @@ mod tests {
                 Level::Info,
                 format!(
                     "Released the joined warm-up of {}: held=4, flushed=2, dropped=2, floored=1, \
-                     fallback_rows=1",
+                     equal_stamp_rows=1",
                     builder.bar_type
                 ),
             )]
@@ -566,6 +594,21 @@ mod tests {
             builder.built(),
             [150 * MS, 160 * MS, 160 * MS, 180 * MS].map(UnixNanos::from)
         );
+    }
+
+    #[rstest]
+    fn test_equal_stamp_rows_counts_a_defined_exchange_time_equal_to_the_receive_time() {
+        // The engine sees two stamps, not their provenance: a row whose exchange time is defined
+        // and happens to equal its receive time is counted like a fallback row
+        let answered = [
+            trade(100 * MS, 150 * MS, "distinct-stamps"),
+            trade(160 * MS + 7, 160 * MS + 7, "defined-and-equal"),
+            trade(170 * MS + 1, 170 * MS, "one-nanosecond-apart"),
+        ];
+
+        let release = JoinedRelease::from_answer(&answered);
+
+        assert_eq!(release.counts.equal_stamp_rows, 1);
     }
 
     #[rstest]
@@ -598,7 +641,7 @@ mod tests {
             logs[1].1,
             format!(
                 "Released the joined warm-up of {}: held=1, flushed=1, dropped=0, floored=0, \
-                 fallback_rows=0",
+                 equal_stamp_rows=0",
                 builder.bar_type
             )
         );

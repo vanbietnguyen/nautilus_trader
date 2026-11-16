@@ -4577,6 +4577,95 @@ fn test_joined_request_expires_with_its_answered_part_rebuilt_open_and_one_termi
 
 #[cfg(feature = "streaming")]
 #[rstest]
+fn test_joined_request_expiry_releases_the_held_live_trades_through_the_answered_cut_and_floor(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let bar_type = fixture.bar_type;
+    let tap = TappedResponses::install();
+    let (request_id, tail_id) = execute_join(&fixture, &[NY_2026_11_12_1800], false);
+    fixture
+        .engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+            SubscribeBars::new(
+                bar_type,
+                Some(fixture.client_id),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )));
+    for trade in [
+        // In the answered cut's millisecond: the answer holds it already
+        release_trade(
+            id,
+            100 * MS_NS + MS_NS / 2,
+            205 * MS_NS,
+            "0.65010",
+            "overlap",
+        ),
+        // Past the cut, received below the answer's last `ts_init`
+        release_trade(id, 101 * MS_NS, 150 * MS_NS, "0.65020", "below-the-floor"),
+    ] {
+        fixture.engine.borrow_mut().process_data(Data::Trade(trade));
+    }
+    // The tail answers one part and never completes
+    fixture
+        .engine
+        .borrow_mut()
+        .response_envelope(DataResponseEnvelope::new(
+            DataResponse::Trades(TradesResponse::new(
+                tail_id,
+                fixture.client_id,
+                id,
+                vec![release_trade(id, 100 * MS_NS, 200 * MS_NS, "0.65000", "r1")],
+                Some(UnixNanos::from(NY_2026_11_12_1800)),
+                None,
+                UnixNanos::from(NY_2026_11_12_2000),
+                None,
+            )),
+            false,
+            None,
+        ));
+
+    run_timers(move_join_clock(&fixture, JOIN_DEADLINE));
+    let later = release_trade(id, 102 * MS_NS, 210 * MS_NS, "0.65030", "later");
+    fixture.engine.borrow_mut().process_data(Data::Trade(later));
+
+    assert_eq!(
+        built_bars(&fixture, bar_type),
+        vec![
+            at("0.65000", 200 * MS_NS),
+            at("0.65020", 200 * MS_NS),
+            at("0.65030", 210 * MS_NS),
+        ]
+    );
+    let [only] = &tap.take(request_id)[..] else {
+        panic!("one terminal at the deadline");
+    };
+    assert_eq!(
+        (&only.part, only.completed),
+        (
+            &Some(ResponsePart::Trades(request_id, trade_ids(&["r1"]))),
+            true
+        )
+    );
+    let reason = only.failure.as_deref().unwrap_or_default();
+    assert!(reason.starts_with("deadline; "), "{reason:?}");
+    assert_eq!(join_timer(&fixture), None);
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
 #[case::ordinary(false)]
 #[case::interleaved(true)]
 fn test_late_envelopes_after_expiry_are_dropped_and_counted_until_the_legs_terminal(

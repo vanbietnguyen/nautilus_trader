@@ -40,7 +40,7 @@ use super::{
     UnsubscribeCommand, UnsubscribeQuotes, UnsubscribeTrades, ValueBarAggregator,
     ValueImbalanceBarAggregator, ValueRunsBarAggregator, VolumeBarAggregator,
     VolumeImbalanceBarAggregator, VolumeRunsBarAggregator,
-    handlers::{JoinedRelease, JoinedSlot, WarmupBuffer},
+    handlers::{JoinedRelease, JoinedSlot, JoinedTradeHandler, WarmupBuffer},
     log_error_on_cache_insert, process_engine_bar, request_bar_aggregation_from_params,
     request_params,
     requests::time_zone_from_params,
@@ -957,16 +957,28 @@ impl DataEngine {
                 subscriptions.push(BarAggregatorSubscription::Bar { topic, handler });
             } else if bar_type.spec().price_type == PriceType::Last {
                 let topic = switchboard::get_trades_topic(bar_type.instrument_id());
-                let buffer = defer.then(WarmupBuffer::new);
-                let joined = defer.then(JoinedSlot::default);
-                let handler = TypedHandler::new(
-                    BarTradeHandler::new(&aggregator, bar_type_std)
-                        .with_warmup(buffer.clone())
-                        .with_joined(joined.clone()),
-                );
-                warmup = buffer
-                    .zip(joined)
-                    .map(|(buffer, joined)| BarAggregatorWarmup::Trade(buffer, joined));
+                // Chosen once here: only a joined warm-up's builder takes trades through a slot
+                let handler = if defer && self.is_joined_warmup(&key) {
+                    let buffer = WarmupBuffer::new();
+                    let joined = JoinedSlot::default();
+                    warmup = Some(BarAggregatorWarmup::JoinedTrade(
+                        buffer.clone(),
+                        joined.clone(),
+                    ));
+                    TypedHandler::new(JoinedTradeHandler::new(
+                        &aggregator,
+                        bar_type_std,
+                        buffer,
+                        joined,
+                    ))
+                } else {
+                    let buffer = defer.then(WarmupBuffer::new);
+                    let handler = TypedHandler::new(
+                        BarTradeHandler::new(&aggregator, bar_type_std).with_warmup(buffer.clone()),
+                    );
+                    warmup = buffer.map(BarAggregatorWarmup::Trade);
+                    handler
+                };
                 msgbus::subscribe_trades(
                     topic.into(),
                     handler.clone(),
@@ -1021,6 +1033,19 @@ impl DataEngine {
         aggregator.borrow_mut().set_is_running(true);
 
         Ok(())
+    }
+
+    /// Whether the live aggregator under `key` is warming up for a joined request (`cut_warmup`):
+    /// asked once when its deferred subscription is set up, never per trade.
+    fn is_joined_warmup(&self, key: &BarAggregatorKey) -> bool {
+        self.request_bar_aggregations.values().any(|state| {
+            state.cut_warmup
+                && state.update_subscriptions
+                && state
+                    .bar_types
+                    .iter()
+                    .any(|bar_type| bar_aggregator_key(*bar_type, None) == *key)
+        })
     }
 
     fn subscribe_bar_aggregator(&mut self, cmd: &SubscribeBars) -> Option<SubscribeCommand> {
@@ -1332,10 +1357,11 @@ fn sources_before_dependents(bar_types: &[BarType]) -> Vec<BarType> {
 #[derive(Debug)]
 pub(super) enum BarAggregatorWarmup {
     Bar(WarmupBuffer<Bar>),
-    /// Held trades, and the slot through which the handler takes later trades once a joined
-    /// warm-up is released.
-    Trade(WarmupBuffer<TradeTick>, JoinedSlot),
+    Trade(WarmupBuffer<TradeTick>),
     Quote(WarmupBuffer<QuoteTick>),
+    /// A joined warm-up's held trades, and the slot through which its handler takes later trades
+    /// once the warm-up is released.
+    JoinedTrade(WarmupBuffer<TradeTick>, JoinedSlot),
 }
 
 impl BarAggregatorWarmup {
@@ -1346,7 +1372,7 @@ impl BarAggregatorWarmup {
                 .release()
                 .into_iter()
                 .for_each(|bar| aggregator.handle_bar(bar)),
-            Self::Trade(buffer, _) => buffer
+            Self::Trade(buffer) => buffer
                 .release()
                 .into_iter()
                 .for_each(|trade| aggregator.handle_trade(trade)),
@@ -1354,6 +1380,10 @@ impl BarAggregatorWarmup {
                 .release()
                 .into_iter()
                 .for_each(|quote| aggregator.handle_quote(quote)),
+            Self::JoinedTrade(buffer, _) => buffer
+                .release()
+                .into_iter()
+                .for_each(|trade| aggregator.handle_trade(trade)),
         }
     }
 
@@ -1367,10 +1397,10 @@ impl BarAggregatorWarmup {
         bar_type: BarType,
     ) {
         match self {
-            Self::Trade(buffer, joined) => {
+            Self::JoinedTrade(buffer, joined) => {
                 buffer.release_joined(joined, release, aggregator, bar_type);
             }
-            Self::Bar(_) | Self::Quote(_) => self.release(aggregator),
+            Self::Bar(_) | Self::Trade(_) | Self::Quote(_) => self.release(aggregator),
         }
     }
 }
@@ -1518,8 +1548,8 @@ mod tests {
     use rstest::rstest;
 
     use super::{
-        bar_aggregator_key, request_bar_aggregation_from_params, sources_before_dependents,
-        time_zone_from_params,
+        BarAggregatorSubscription, BarAggregatorWarmup, bar_aggregator_key,
+        request_bar_aggregation_from_params, sources_before_dependents, time_zone_from_params,
     };
     use crate::engine::{DataEngine, config::DataEngineConfig};
 
@@ -1852,5 +1882,71 @@ mod tests {
         assert!(error.to_string().contains("no client found"), "{error}");
         assert!(engine.interleaved_requests.is_empty());
         assert!(engine.request_bar_aggregations.is_empty());
+    }
+
+    #[rstest]
+    #[case::plain_live(None, "BarTradeHandler", None)]
+    #[case::ordinary_warmup(Some(false), "BarTradeHandler", Some("Trade"))]
+    #[case::joined_warmup(Some(true), "JoinedTradeHandler", Some("JoinedTrade"))]
+    fn test_only_a_joined_warmup_subscribes_the_joined_trade_handler(
+        #[case] cut_warmup: Option<bool>,
+        #[case] handler_name: &str,
+        #[case] warmup: Option<&str>,
+    ) {
+        let _msgbus = MessageBus::new(TraderId::new("TESTER-001"), UUID4::new(), None, None)
+            .register_message_bus();
+        let (mut engine, _) = interleaved_engine();
+        let bar_type = BarType::from("AUD/USD.SIM-1-TICK-LAST-INTERNAL");
+
+        // A running `update_subscriptions` request defers the live subscription to its warm-up
+        if let Some(cut_warmup) = cut_warmup {
+            let params: nautilus_core::Params = serde_json::from_value(serde_json::json!({
+                "bar_types": [bar_type.to_string()],
+                "update_subscriptions": true,
+                "cut_warmup": cut_warmup,
+            }))
+            .unwrap();
+            let request = RequestCommand::Trades(RequestTrades::new(
+                audusd_sim().id,
+                None,
+                None,
+                None,
+                Some(ClientId::new("SIM")),
+                UUID4::new(),
+                UnixNanos::default(),
+                Some(params),
+            ));
+            engine.prepare_request_bar_aggregators(&request).unwrap();
+        }
+        engine
+            .subscribe_bars(&SubscribeBars::new(
+                bar_type,
+                None,
+                Some(bar_type.instrument_id().venue),
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+            .unwrap();
+
+        let key = bar_aggregator_key(bar_type, None);
+        let handler_ids: Vec<String> = engine.bar_aggregator_handlers[&key]
+            .iter()
+            .map(|subscription| match subscription {
+                BarAggregatorSubscription::Trade { handler, .. } => handler.id().to_string(),
+                other => panic!("not a trade subscription: {other:?}"),
+            })
+            .collect();
+        assert_eq!(handler_ids, [format!("{handler_name}|{bar_type}")]);
+        let warmup_kind = engine
+            .bar_aggregator_warmups
+            .get(&key)
+            .map(|warmup| match warmup {
+                BarAggregatorWarmup::Trade(_) => "Trade",
+                BarAggregatorWarmup::JoinedTrade(..) => "JoinedTrade",
+                other => panic!("not a trade warm-up: {other:?}"),
+            });
+        assert_eq!(warmup_kind, warmup);
     }
 }
