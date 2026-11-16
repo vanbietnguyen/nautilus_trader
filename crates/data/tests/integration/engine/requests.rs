@@ -2244,3 +2244,575 @@ fn test_trades_request_without_interleave_sends_one_response(
         )]
     );
 }
+
+// Made-up clock times and trading-day opens (civil 18:00 New York) for the join's admission
+const NY_2026_11_08_1800: u64 = 1_794_178_800_000_000_000;
+const NY_2026_11_09_1700: u64 = 1_794_261_600_000_000_000;
+const NY_2026_11_09_1800: u64 = 1_794_265_200_000_000_000;
+const NY_2026_11_10_1730: u64 = 1_794_349_800_000_000_000;
+const NY_2026_11_10_1800: u64 = 1_794_351_600_000_000_000;
+const NY_2026_11_10_2000: u64 = 1_794_358_800_000_000_000;
+// Around the end of daylight saving time, 2026-11-01 02:00 New York
+const NY_2026_10_29_1800_EDT: u64 = 1_793_311_200_000_000_000;
+const NY_2026_11_01_1700_EST: u64 = 1_793_570_400_000_000_000; // 2026-10-29 18:00 EDT + 72 h
+const NY_2026_11_01_1800_EST: u64 = 1_793_574_000_000_000_000;
+const NY_2026_11_01_2000_EST: u64 = 1_793_581_200_000_000_000;
+const JOIN_DEADLINE_AFTER_NS: u64 = 120 * NANOSECONDS_IN_SECOND;
+const CUT_WARMUP_REFUSED: &str = "Cannot admit a `cut_warmup` request";
+
+struct JoinFixture {
+    engine: DataEngine,
+    recorder: Rc<RefCell<Vec<DataCommand>>>,
+    instrument_id: InstrumentId,
+    bar_type: BarType,
+    client_id: ClientId,
+}
+
+/// An engine whose clock reads `now_ns`, with a recording mock client.
+fn join_fixture(
+    audusd_sim: CurrencyPair,
+    client_id: ClientId,
+    venue: Venue,
+    now_ns: u64,
+) -> JoinFixture {
+    let mut virtual_clock = VirtualClock::new();
+    let _ = virtual_clock.advance_time(UnixNanos::from(now_ns), true);
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(virtual_clock));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+
+    let instrument_id = audusd_sim.id;
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+
+    let mut engine = DataEngine::new(clock, Rc::clone(&cache), None);
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        cache,
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut engine,
+    );
+
+    JoinFixture {
+        engine,
+        recorder,
+        instrument_id,
+        bar_type: BarType::from(format!("{instrument_id}-1-TICK-LAST-INTERNAL").as_str()),
+        client_id,
+    }
+}
+
+/// The parameters of an admissible joined request at `now_ns`.
+fn joined_params(bar_type: BarType, now_ns: u64, session_opens: &[u64]) -> Value {
+    json!({
+        "cut_warmup": true,
+        "bar_types": [bar_type.to_string()],
+        "update_subscriptions": true,
+        "deadline": now_ns + JOIN_DEADLINE_AFTER_NS,
+        "schema": "tbbo",
+        "session_opens": session_opens,
+    })
+}
+
+fn trades_request(
+    instrument_ids: Vec<InstrumentId>,
+    end: Option<u64>,
+    client_id: ClientId,
+    params: Value,
+) -> RequestCommand {
+    RequestCommand::Trades(RequestTrades::new(
+        instrument_ids,
+        None,
+        end.map(|end| UnixNanos::from(end).to_datetime_utc()),
+        None,
+        Some(client_id),
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(serde_json::from_value(params).unwrap()),
+    ))
+}
+
+/// Executes `request`; returns its error and the failure reasons of the terminal envelopes the
+/// requester received.
+fn execute_recording_failures(
+    engine: &mut DataEngine,
+    request: RequestCommand,
+) -> (anyhow::Result<()>, Vec<Option<String>>) {
+    let failures = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&failures);
+    msgbus::register_response_handler(
+        request.request_id(),
+        TypedHandler::from(move |envelope: &DataResponseEnvelope| {
+            recorded
+                .borrow_mut()
+                .push(envelope.failure_reason().map(str::to_owned));
+        }),
+    );
+    let result = engine.execute_request(request);
+    (result, failures.take())
+}
+
+/// Asserts `request` is refused on the command with a reason containing `reason`, the requester
+/// receives that reason in one terminal, and no client is asked anything.
+fn assert_cut_warmup_refused(fixture: &mut JoinFixture, request: RequestCommand, reason: &str) {
+    let (result, failures) = execute_recording_failures(&mut fixture.engine, request);
+    let error = result
+        .expect_err("a `cut_warmup` request failing a condition must be refused")
+        .to_string();
+    assert!(error.starts_with(CUT_WARMUP_REFUSED), "{error}");
+    assert!(error.contains(reason), "{error}");
+    assert_eq!(failures, vec![Some(error)]);
+    assert!(
+        fixture.recorder.borrow().is_empty(),
+        "a refused request reaches no client: {:?}",
+        fixture.recorder.borrow()
+    );
+}
+
+/// Asserts `request` was admitted and reached the join's dispatcher (which refuses until the
+/// plan exists), no client was asked anything, and its request aggregators were cleaned up.
+fn assert_reaches_join_dispatcher(fixture: &mut JoinFixture, request: RequestCommand) {
+    let (result, failures) = execute_recording_failures(&mut fixture.engine, request);
+    let error = result
+        .expect_err("the join's dispatcher refuses until its plan is built")
+        .to_string();
+    assert!(error.contains("the join's plan is not built"), "{error}");
+    assert!(error.contains("admitted 2 session opens"), "{error}");
+    assert_eq!(failures, vec![Some(error)]);
+    assert!(
+        fixture.recorder.borrow().is_empty(),
+        "the dispatcher sends nothing to a client: {:?}",
+        fixture.recorder.borrow()
+    );
+
+    // An aggregator left running would refuse the same live bar type
+    let ordinary = trades_request(
+        vec![fixture.instrument_id],
+        None,
+        fixture.client_id,
+        json!({ "bar_types": [fixture.bar_type.to_string()], "update_subscriptions": true }),
+    );
+    fixture.engine.execute_request(ordinary).unwrap();
+}
+
+#[rstest]
+#[case::after_the_open(NY_2026_11_10_2000, [NY_2026_11_09_1800, NY_2026_11_10_1800])]
+#[case::before_the_open(NY_2026_11_10_1730, [NY_2026_11_08_1800, NY_2026_11_09_1800])]
+#[case::across_daylight_saving_end(
+    NY_2026_11_01_2000_EST,
+    [NY_2026_10_29_1800_EDT, NY_2026_11_01_1800_EST]
+)]
+fn test_admitted_cut_warmup_request_reaches_the_join_dispatcher(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] now_ns: u64,
+    #[case] session_opens: [u64; 2],
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, now_ns);
+    let request = trades_request(
+        vec![fixture.instrument_id],
+        None,
+        client_id,
+        joined_params(fixture.bar_type, now_ns, &session_opens),
+    );
+
+    assert_reaches_join_dispatcher(&mut fixture, request);
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_admitted_cut_warmup_request_reaches_the_join_dispatcher_with_a_catalog(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let _catalog_dir = register_trade_catalog_with_trades(
+        &mut fixture.engine,
+        "join-admission",
+        &[split_trade(fixture.instrument_id, 2_000, "catalog-1")],
+        Some((1_000, 2_000)),
+    );
+    let request = trades_request(
+        vec![fixture.instrument_id],
+        None,
+        client_id,
+        joined_params(
+            fixture.bar_type,
+            NY_2026_11_10_2000,
+            &[NY_2026_11_09_1800, NY_2026_11_10_1800],
+        ),
+    );
+
+    // The schema bypass of the catalog path would send this request to the client
+    assert_reaches_join_dispatcher(&mut fixture, request);
+}
+
+#[rstest]
+fn test_cut_warmup_refused_for_a_request_other_than_trades(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let params = joined_params(
+        fixture.bar_type,
+        NY_2026_11_10_2000,
+        &[NY_2026_11_09_1800, NY_2026_11_10_1800],
+    );
+    let request = RequestCommand::Quotes(RequestQuotes::new(
+        fixture.instrument_id,
+        None,
+        None,
+        None,
+        Some(client_id),
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(serde_json::from_value(params).unwrap()),
+    ));
+
+    assert_cut_warmup_refused(
+        &mut fixture,
+        request,
+        "only a trades request can set `cut_warmup`",
+    );
+}
+
+#[rstest]
+fn test_cut_warmup_refused_for_a_batch(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let request = trades_request(
+        vec![fixture.instrument_id, InstrumentId::from("EUR/USD.SIM")],
+        None,
+        client_id,
+        joined_params(
+            fixture.bar_type,
+            NY_2026_11_10_2000,
+            &[NY_2026_11_09_1800, NY_2026_11_10_1800],
+        ),
+    );
+
+    assert_cut_warmup_refused(
+        &mut fixture,
+        request,
+        "it must name exactly one instrument (batches are refused), received 2",
+    );
+}
+
+#[rstest]
+#[case::absent(None, "it must ask for `bar_types`")]
+#[case::empty(Some(&[][..]), "it must ask for `bar_types`")]
+#[case::external(Some(&["1-TICK-LAST-EXTERNAL"][..]), "is not an internal, non-composite LAST bar type")]
+#[case::composite(Some(&["1-TICK-LAST-INTERNAL@1-TICK-EXTERNAL"][..]), "is not an internal, non-composite LAST bar type")]
+#[case::bid(Some(&["1-TICK-BID-INTERNAL"][..]), "is not an internal, non-composite LAST bar type")]
+fn test_cut_warmup_refused_without_internal_last_bar_types(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] bar_type_specs: Option<&[&str]>,
+    #[case] reason: &str,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let mut params = joined_params(
+        fixture.bar_type,
+        NY_2026_11_10_2000,
+        &[NY_2026_11_09_1800, NY_2026_11_10_1800],
+    );
+    let instrument_id = fixture.instrument_id;
+    match bar_type_specs {
+        None => {
+            params.as_object_mut().unwrap().remove("bar_types");
+        }
+        Some(specs) => {
+            params["bar_types"] = json!(
+                specs
+                    .iter()
+                    .map(|spec| format!("{instrument_id}-{spec}"))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+    let request = trades_request(vec![instrument_id], None, client_id, params);
+
+    assert_cut_warmup_refused(&mut fixture, request, reason);
+}
+
+#[rstest]
+#[case::absent(None)]
+#[case::disabled(Some(false))]
+fn test_cut_warmup_refused_without_update_subscriptions(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] update_subscriptions: Option<bool>,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let mut params = joined_params(
+        fixture.bar_type,
+        NY_2026_11_10_2000,
+        &[NY_2026_11_09_1800, NY_2026_11_10_1800],
+    );
+    match update_subscriptions {
+        None => {
+            params
+                .as_object_mut()
+                .unwrap()
+                .remove("update_subscriptions");
+        }
+        Some(value) => params["update_subscriptions"] = json!(value),
+    }
+    let request = trades_request(vec![fixture.instrument_id], None, client_id, params);
+
+    assert_cut_warmup_refused(&mut fixture, request, "it must set `update_subscriptions`");
+}
+
+#[rstest]
+#[case::absent(None, "it must give a `deadline` in UNIX nanoseconds")]
+#[case::at_the_clock(Some(NY_2026_11_10_2000), "is not after the clock's time")]
+fn test_cut_warmup_refused_without_a_valid_deadline(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] deadline: Option<u64>,
+    #[case] reason: &str,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let mut params = joined_params(
+        fixture.bar_type,
+        NY_2026_11_10_2000,
+        &[NY_2026_11_09_1800, NY_2026_11_10_1800],
+    );
+    match deadline {
+        None => {
+            params.as_object_mut().unwrap().remove("deadline");
+        }
+        Some(value) => params["deadline"] = json!(value),
+    }
+    let request = trades_request(vec![fixture.instrument_id], None, client_id, params);
+
+    assert_cut_warmup_refused(&mut fixture, request, reason);
+}
+
+#[rstest]
+fn test_cut_warmup_refused_with_an_end(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let request = trades_request(
+        vec![fixture.instrument_id],
+        Some(NY_2026_11_10_2000),
+        client_id,
+        joined_params(
+            fixture.bar_type,
+            NY_2026_11_10_2000,
+            &[NY_2026_11_09_1800, NY_2026_11_10_1800],
+        ),
+    );
+
+    assert_cut_warmup_refused(&mut fixture, request, "it must be open-ended (no end)");
+}
+
+#[rstest]
+#[case::absent(None)]
+#[case::trades(Some("trades"))]
+fn test_cut_warmup_refused_without_the_tbbo_schema(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] schema: Option<&str>,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let mut params = joined_params(
+        fixture.bar_type,
+        NY_2026_11_10_2000,
+        &[NY_2026_11_09_1800, NY_2026_11_10_1800],
+    );
+    match schema {
+        None => {
+            params.as_object_mut().unwrap().remove("schema");
+        }
+        Some(value) => params["schema"] = json!(value),
+    }
+    let request = trades_request(vec![fixture.instrument_id], None, client_id, params);
+
+    assert_cut_warmup_refused(&mut fixture, request, "it must set `schema` to `tbbo`");
+}
+
+#[rstest]
+#[case::absent(
+    NY_2026_11_10_2000,
+    None,
+    "`session_opens` must be an array of UNIX nanoseconds"
+)]
+#[case::empty(NY_2026_11_10_2000, Some(&[][..]), "`session_opens` must name the current trading day's open")]
+#[case::repeated(
+    NY_2026_11_10_2000,
+    Some(&[NY_2026_11_10_1800, NY_2026_11_10_1800][..]),
+    "`session_opens` must be strictly increasing"
+)]
+#[case::decreasing(
+    NY_2026_11_10_2000,
+    Some(&[NY_2026_11_10_1800, NY_2026_11_09_1800][..]),
+    "`session_opens` must be strictly increasing"
+)]
+#[case::not_at_eighteen(
+    NY_2026_11_10_2000,
+    Some(&[NY_2026_11_09_1700, NY_2026_11_10_1800][..]),
+    "not at 18:00 America/New_York"
+)]
+#[case::added_hours_across_daylight_saving_end(
+    NY_2026_11_01_2000_EST,
+    Some(&[NY_2026_10_29_1800_EDT, NY_2026_11_01_1700_EST][..]),
+    "not at 18:00 America/New_York"
+)]
+#[case::previous_day_last(
+    NY_2026_11_10_2000,
+    Some(&[NY_2026_11_08_1800, NY_2026_11_09_1800][..]),
+    "is not the current trading day's open"
+)]
+#[case::open_still_ahead(
+    NY_2026_11_10_1730,
+    Some(&[NY_2026_11_09_1800, NY_2026_11_10_1800][..]),
+    "is not the current trading day's open"
+)]
+fn test_cut_warmup_refused_without_verified_session_opens(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] now_ns: u64,
+    #[case] session_opens: Option<&[u64]>,
+    #[case] reason: &str,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, now_ns);
+    let mut params = joined_params(fixture.bar_type, now_ns, session_opens.unwrap_or_default());
+    if session_opens.is_none() {
+        params.as_object_mut().unwrap().remove("session_opens");
+    }
+    let request = trades_request(vec![fixture.instrument_id], None, client_id, params);
+
+    assert_cut_warmup_refused(&mut fixture, request, reason);
+}
+
+#[rstest]
+fn test_cut_warmup_refused_when_not_a_boolean(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let mut params = joined_params(
+        fixture.bar_type,
+        NY_2026_11_10_2000,
+        &[NY_2026_11_09_1800, NY_2026_11_10_1800],
+    );
+    params["cut_warmup"] = json!("true");
+    let request = trades_request(vec![fixture.instrument_id], None, client_id, params);
+
+    assert_cut_warmup_refused(&mut fixture, request, "`cut_warmup` must be a boolean");
+}
+
+#[rstest]
+#[case::open_end(true, "it must be open-ended (no end)")]
+#[case::no_bar_types_given(false, "it must ask for `bar_types`")]
+fn test_cut_warmup_refused_before_request_aggregators(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] with_end: bool,
+    #[case] reason: &str,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    fixture
+        .engine
+        .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+            SubscribeBars::new(
+                fixture.bar_type,
+                Some(client_id),
+                Some(venue),
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )));
+    fixture.recorder.borrow_mut().clear();
+
+    let mut params = joined_params(
+        fixture.bar_type,
+        NY_2026_11_10_2000,
+        &[NY_2026_11_09_1800, NY_2026_11_10_1800],
+    );
+    if !with_end {
+        params.as_object_mut().unwrap().remove("bar_types");
+    }
+    let request = trades_request(
+        vec![fixture.instrument_id],
+        with_end.then_some(NY_2026_11_10_2000),
+        client_id,
+        params,
+    );
+
+    // Preparing the request aggregators first would fail on the running live aggregator, or,
+    // without `bar_types`, take the ordinary path to the client
+    assert_cut_warmup_refused(&mut fixture, request, reason);
+}
+
+#[rstest]
+fn test_trades_request_with_cut_warmup_false_takes_the_ordinary_path(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_10_2000);
+    let request = trades_request(
+        vec![fixture.instrument_id],
+        None,
+        client_id,
+        json!({ "cut_warmup": false, "bar_types": [fixture.bar_type.to_string()] }),
+    );
+
+    fixture.engine.execute_request(request.clone()).unwrap();
+
+    assert_eq!(
+        fixture.recorder.borrow().last(),
+        Some(&DataCommand::Request(request))
+    );
+}

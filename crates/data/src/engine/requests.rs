@@ -17,7 +17,7 @@ use std::{cmp, str::FromStr};
 
 use anyhow::Context;
 use indexmap::IndexMap;
-use jiff::tz::TimeZone;
+use jiff::{civil, tz::TimeZone};
 use nautilus_common::messages::data::{DataResponse, RequestBars, RequestCommand, SubscribeBars};
 use nautilus_core::{Params, UUID4, UnixNanos, datetime::get_timezone};
 use nautilus_model::{
@@ -38,6 +38,15 @@ const LAST_POST_INSTRUMENT_ID: &str = "last_post_instrument_id";
 const FIRST_PRE_INSTRUMENT_ID: &str = "first_pre_instrument_id";
 const BAR_TYPES: &str = "bar_types";
 const INTERLEAVE: &str = "interleave";
+const UPDATE_SUBSCRIPTIONS: &str = "update_subscriptions";
+const SCHEMA: &str = "schema";
+const CUT_WARMUP: &str = "cut_warmup";
+const DEADLINE: &str = "deadline";
+const SESSION_OPENS: &str = "session_opens";
+const CUT_WARMUP_REFUSED: &str = "Cannot admit a `cut_warmup` request";
+const JOIN_SCHEMA: &str = "tbbo";
+const SESSION_TIME_ZONE: &str = "America/New_York";
+const SESSION_OPEN_TIME: civil::Time = civil::time(18, 0, 0, 0);
 
 #[derive(Debug, Clone)]
 pub(super) struct RequestBarAggregation {
@@ -287,17 +296,7 @@ pub(super) fn request_bar_aggregation_from_params(
         return Ok(None);
     };
 
-    let values = value
-        .as_array()
-        .context("`bar_types` request parameter must be an array")?;
-    let mut bar_types = Vec::with_capacity(values.len());
-    for value in values {
-        let raw = value
-            .as_str()
-            .context("`bar_types` request parameter must contain strings")?;
-        bar_types
-            .push(BarType::from_str(raw).context("failed to parse `bar_types` request parameter")?);
-    }
+    let bar_types = parse_bar_types(value)?;
 
     if bar_types.is_empty() {
         return Ok(None);
@@ -317,7 +316,7 @@ pub(super) fn request_bar_aggregation_from_params(
         }
     }
 
-    let update_subscriptions = params.get_bool("update_subscriptions").unwrap_or(false);
+    let update_subscriptions = params.get_bool(UPDATE_SUBSCRIPTIONS).unwrap_or(false);
     let skip_first_non_full_bar = params.get_bool("skip_first_non_full_bar");
     let interleave = params.get_bool(INTERLEAVE).unwrap_or(false);
 
@@ -329,6 +328,190 @@ pub(super) fn request_bar_aggregation_from_params(
         time_zone: time_zone_from_params(Some(params))?,
         interleave,
     }))
+}
+
+fn parse_bar_types(value: &Value) -> anyhow::Result<Vec<BarType>> {
+    let values = value
+        .as_array()
+        .context("`bar_types` request parameter must be an array")?;
+    let mut bar_types = Vec::with_capacity(values.len());
+    for value in values {
+        let raw = value
+            .as_str()
+            .context("`bar_types` request parameter must contain strings")?;
+        bar_types
+            .push(BarType::from_str(raw).context("failed to parse `bar_types` request parameter")?);
+    }
+    Ok(bar_types)
+}
+
+/// A request the engine admitted for the history/live join (`cut_warmup`): the trades of one
+/// instrument, past whole sessions and the current one, cut against the live stream.
+#[derive(Debug)]
+pub(super) struct AdmittedJoin {
+    pub(super) instrument_id: InstrumentId,
+    /// The engine's deadline for the whole request (UNIX nanoseconds, after the clock's time
+    /// at admission).
+    pub(super) deadline: UnixNanos,
+    /// The trading-day opens of the requested depth, strictly increasing, each at civil 18:00
+    /// `America/New_York`; the last is the current trading day's open (`H`).
+    pub(super) session_opens: Vec<UnixNanos>,
+}
+
+/// Admits a request that sets `cut_warmup`, or refuses it with a reason naming the first
+/// condition it fails.
+///
+/// A request without `cut_warmup` (or with it false) returns `None` and takes the ordinary path:
+/// only the absent parameter is read, and `now` is not called. An admitted request is a trades
+/// request for one instrument that asks for internal, non-composite `LAST` bar types, sets
+/// `update_subscriptions`, gives a `deadline` after `now`, is open-ended (no end), sets `schema`
+/// to `tbbo` and gives verified `session_opens` (see [`verified_session_opens`]).
+///
+/// # Errors
+///
+/// Returns an error naming the failed condition when the request sets `cut_warmup` and is not
+/// admitted.
+pub(super) fn admit_cut_warmup(
+    req: &RequestCommand,
+    now: impl FnOnce() -> UnixNanos,
+) -> anyhow::Result<Option<AdmittedJoin>> {
+    let Some(params) = request_params(req) else {
+        return Ok(None);
+    };
+    let Some(value) = params.get(CUT_WARMUP) else {
+        return Ok(None);
+    };
+    match value.as_bool() {
+        Some(true) => {}
+        Some(false) => return Ok(None),
+        None => anyhow::bail!("{CUT_WARMUP_REFUSED}: `cut_warmup` must be a boolean"),
+    }
+
+    let RequestCommand::Trades(cmd) = req else {
+        anyhow::bail!("{CUT_WARMUP_REFUSED}: only a trades request can set `cut_warmup`");
+    };
+    let [instrument_id] = cmd.instrument_ids[..] else {
+        anyhow::bail!(
+            "{CUT_WARMUP_REFUSED}: it must name exactly one instrument (batches are refused), received {}",
+            cmd.instrument_ids.len(),
+        );
+    };
+
+    let bar_types = params
+        .get(BAR_TYPES)
+        .map(parse_bar_types)
+        .transpose()?
+        .unwrap_or_default();
+    anyhow::ensure!(
+        !bar_types.is_empty(),
+        "{CUT_WARMUP_REFUSED}: it must ask for `bar_types`"
+    );
+    if let Some(bar_type) = bar_types.iter().find(|bar_type| {
+        !bar_type.is_internally_aggregated()
+            || bar_type.is_composite()
+            || bar_type.spec().price_type != PriceType::Last
+    }) {
+        anyhow::bail!(
+            "{CUT_WARMUP_REFUSED}: {bar_type} is not an internal, non-composite LAST bar type"
+        );
+    }
+
+    anyhow::ensure!(
+        params.get_bool(UPDATE_SUBSCRIPTIONS) == Some(true),
+        "{CUT_WARMUP_REFUSED}: it must set `update_subscriptions`"
+    );
+
+    let now = now();
+    let deadline = params
+        .get_u64(DEADLINE)
+        .map(UnixNanos::from)
+        .with_context(|| {
+            format!("{CUT_WARMUP_REFUSED}: it must give a `deadline` in UNIX nanoseconds")
+        })?;
+    anyhow::ensure!(
+        deadline > now,
+        "{CUT_WARMUP_REFUSED}: its `deadline` {deadline} is not after the clock's time {now}"
+    );
+
+    anyhow::ensure!(
+        cmd.end.is_none(),
+        "{CUT_WARMUP_REFUSED}: it must be open-ended (no end)"
+    );
+    anyhow::ensure!(
+        params.get_str(SCHEMA) == Some(JOIN_SCHEMA),
+        "{CUT_WARMUP_REFUSED}: it must set `schema` to `{JOIN_SCHEMA}`"
+    );
+
+    let session_opens = verified_session_opens(params, now)?;
+
+    Ok(Some(AdmittedJoin {
+        instrument_id,
+        deadline,
+        session_opens,
+    }))
+}
+
+/// The `session_opens` parameter, verified: strictly increasing instants, each at civil 18:00
+/// `America/New_York` of its day (read through the time zone, so a daylight-saving change moves
+/// the UTC instant), the last one the current trading day's open by `now`.
+fn verified_session_opens(params: &Params, now: UnixNanos) -> anyhow::Result<Vec<UnixNanos>> {
+    let values = params
+        .get(SESSION_OPENS)
+        .and_then(Value::as_array)
+        .with_context(|| {
+            format!("{CUT_WARMUP_REFUSED}: `session_opens` must be an array of UNIX nanoseconds")
+        })?;
+    let time_zone = get_timezone(SESSION_TIME_ZONE)?;
+
+    let mut opens: Vec<UnixNanos> = Vec::with_capacity(values.len());
+    for value in values {
+        let open = value.as_u64().map(UnixNanos::from).with_context(|| {
+            format!("{CUT_WARMUP_REFUSED}: `session_opens` must contain UNIX nanoseconds")
+        })?;
+        if let Some(previous) = opens.last() {
+            anyhow::ensure!(
+                open > *previous,
+                "{CUT_WARMUP_REFUSED}: `session_opens` must be strictly increasing, {open} follows {previous}"
+            );
+        }
+        let civil = jiff::Timestamp::from(open).to_zoned(time_zone.clone());
+        anyhow::ensure!(
+            civil.time() == SESSION_OPEN_TIME,
+            "{CUT_WARMUP_REFUSED}: `session_opens` {open} is at {civil}, not at 18:00 {SESSION_TIME_ZONE}"
+        );
+        opens.push(open);
+    }
+
+    let Some(&last) = opens.last() else {
+        anyhow::bail!(
+            "{CUT_WARMUP_REFUSED}: `session_opens` must name the current trading day's open"
+        );
+    };
+    let current = current_session_open(now, &time_zone)?;
+    anyhow::ensure!(
+        last == current,
+        "{CUT_WARMUP_REFUSED}: the last `session_opens` {last} is not the current trading day's open {current}"
+    );
+
+    Ok(opens)
+}
+
+/// The latest civil 18:00 `America/New_York` at or before `now`.
+fn current_session_open(now: UnixNanos, time_zone: &TimeZone) -> anyhow::Result<UnixNanos> {
+    let now_ts = jiff::Timestamp::from(now);
+    let today = now_ts.to_zoned(time_zone.clone()).date();
+    let open_today = today
+        .to_datetime(SESSION_OPEN_TIME)
+        .to_zoned(time_zone.clone())?;
+    let open = if open_today.timestamp() <= now_ts {
+        open_today
+    } else {
+        today
+            .yesterday()?
+            .to_datetime(SESSION_OPEN_TIME)
+            .to_zoned(time_zone.clone())?
+    };
+    Ok(UnixNanos::from(open.timestamp()))
 }
 
 pub(super) fn time_zone_from_params(params: Option<&Params>) -> anyhow::Result<Option<TimeZone>> {

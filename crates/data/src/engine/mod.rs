@@ -134,10 +134,11 @@ use option_chain::{
     OptionChainBootstrapper, OptionChainGreeksBootstrap, PendingOptionChainRequest,
 };
 use requests::{
-    ContinuousFutureRequest, ContinuousFutureRequestState, ContinuousFutureSegment,
-    ContinuousFutureSource, RequestBarAggregation, continuous_future_request_from_bars,
-    continuous_future_subscription_from_bars, has_continuous_future_params,
-    request_bar_aggregation_from_params, request_params, response_params,
+    AdmittedJoin, ContinuousFutureRequest, ContinuousFutureRequestState, ContinuousFutureSegment,
+    ContinuousFutureSource, RequestBarAggregation, admit_cut_warmup,
+    continuous_future_request_from_bars, continuous_future_subscription_from_bars,
+    has_continuous_future_params, request_bar_aggregation_from_params, request_params,
+    response_params,
 };
 use responses::{
     log_if_empty_response, parent_request_window, rebind_response_correlation,
@@ -1625,6 +1626,8 @@ impl DataEngine {
 
     fn execute_request_inner(&mut self, req: RequestCommand) -> anyhow::Result<()> {
         Self::validate_request(&req)?;
+        // Refused on the command, before any request aggregator exists
+        let join = admit_cut_warmup(&req, || self.clock.borrow().timestamp_ns())?;
         #[cfg(feature = "streaming")]
         self.validate_catalog_update(&req)?;
 
@@ -1648,6 +1651,15 @@ impl DataEngine {
 
         let request_id = *req.request_id();
         self.prepare_request_bar_aggregators(&req)?;
+
+        // The join's dispatcher: before the schema bypass of the catalog path, catalog or not
+        if let Some(join) = join {
+            let result = self.dispatch_joined_request(&req, &join);
+            if result.is_err() {
+                self.cleanup_request_bar_aggregators(&request_id);
+            }
+            return result;
+        }
 
         if has_time_range_pipeline_params(request_params(&req))
             && is_time_range_pipeline_variant(&req)
@@ -1675,6 +1687,27 @@ impl DataEngine {
         }
 
         result.map(|_| ())
+    }
+
+    /// Dispatches an admitted `cut_warmup` request (the history/live join).
+    ///
+    /// The join's plan of legs is not built yet, so the request is refused here, after its
+    /// aggregators were prepared and before any input reached them; the caller cleans them up.
+    /// The plan (`plan_join` over `join.session_opens`) dispatches the legs here, and the engine
+    /// arms `join.deadline` here, refusing the request when the timer cannot be registered.
+    fn dispatch_joined_request(
+        &self,
+        req: &RequestCommand,
+        join: &AdmittedJoin,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Cannot handle the `cut_warmup` request {} for {}: the join's plan is not built \
+             (admitted {} session opens, deadline {})",
+            req.request_id(),
+            join.instrument_id,
+            join.session_opens.len(),
+            join.deadline,
+        )
     }
 
     fn validate_request(req: &RequestCommand) -> anyhow::Result<()> {
