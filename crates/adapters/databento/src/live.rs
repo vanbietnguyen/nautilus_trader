@@ -47,7 +47,7 @@ use nautilus_core::{
     time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
-    data::{Data, InstrumentStatus, OrderBookDelta, OrderBookDeltas},
+    data::{Data, InstrumentStatus, OrderBookDelta, OrderBookDeltas, TradeTick},
     enums::RecordFlag,
     identifiers::{InstrumentId, Symbol, Venue, futures::FuturesYearDigits},
     instruments::{Instrument, InstrumentAny},
@@ -64,13 +64,21 @@ use super::{
 };
 use crate::{
     common::{Credential, build_publisher_venue_map, load_publishers},
-    decode::{decode_instrument_def_msg, decode_record},
+    decode::{
+        DatabentoDecodeConfig, decode_instrument_def_msg, decode_record, decode_record_with_config,
+    },
     symbology::{
         check_consistent_symbology, dataset_uses_futures_symbology, infer_symbology_type,
         raw_symbol, resolve_futures_instrument_id,
     },
     types::PublisherId,
 };
+
+/// Hardcoded timeout for connecting to the live gateway for now.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Trades decoded by [`replay_trades`] before they are handed on together.
+const REPLAY_BATCH_SIZE: usize = 10_000;
 
 #[derive(Debug)]
 pub enum HandlerCommand {
@@ -595,7 +603,7 @@ impl DatabentoFeedHandler {
         let mut buffered_deltas: AHashMap<InstrumentId, Vec<OrderBookDelta>> = AHashMap::new();
         let mut initialized_books = HashSet::new();
         let mut trade_sources: AHashMap<InstrumentId, u8> = AHashMap::new();
-        let timeout = Duration::from_secs(5); // Hardcoded timeout for now
+        let timeout = CONNECT_TIMEOUT;
 
         let gateway_addr = self.gateway_addr.clone();
         let api_key = SecretString::from(self.credential.api_key().to_owned());
@@ -1121,6 +1129,209 @@ impl DatabentoFeedHandler {
             log::debug!("Could not send close message: {e}");
         }
     }
+}
+
+/// A private live gateway session that replays the trades of one instrument.
+///
+/// The session is separate from the dataset feed handler's session, so a replay never
+/// shares the feed's connection, subscriptions, or channels.
+#[derive(Debug, Clone)]
+pub(crate) struct LiveSessionSpec {
+    pub(crate) credential: Credential,
+    pub(crate) dataset: String,
+    pub(crate) gateway_addr: Option<String>,
+    pub(crate) instrument_id: InstrumentId,
+    pub(crate) publisher_venue_map: Arc<IndexMap<PublisherId, Venue>>,
+    pub(crate) futures_year_digits: FuturesYearDigits,
+    pub(crate) price_precision: Option<u8>,
+}
+
+/// How a [`replay_trades`] session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayEnd {
+    /// The gateway sent `ReplayCompleted`: the replay reached real time.
+    Completed,
+}
+
+/// Replays the trades of one instrument from `start` through a private live gateway session.
+///
+/// Subscribes the `tbbo` schema with `start`, then starts the session. Each trade is decoded
+/// with `ts_init` taken from the record's `ts_recv`; a trade whose `ts_recv` is below
+/// `keep_from` is discarded. Decoded trades collect in `batch` and are handed to `deliver`
+/// every [`REPLAY_BATCH_SIZE`] trades. When the gateway reports `ReplayCompleted`, the
+/// remaining batch is delivered and the replay ends.
+///
+/// # Errors
+///
+/// Returns an error if the connection, subscription, session start, record decoding or
+/// `deliver` fails, or if the gateway ends the session before the replay completes.
+pub(crate) async fn replay_trades(
+    session: LiveSessionSpec,
+    start: UnixNanos,
+    keep_from: UnixNanos,
+    decode_config: Option<&DatabentoDecodeConfig>,
+    batch: &mut Vec<TradeTick>,
+    mut deliver: impl FnMut(Vec<TradeTick>) -> anyhow::Result<()>,
+) -> anyhow::Result<ReplayEnd> {
+    let LiveSessionSpec {
+        credential,
+        dataset,
+        gateway_addr,
+        instrument_id,
+        publisher_venue_map,
+        futures_year_digits,
+        price_precision,
+    } = session;
+    let raw = raw_symbol(instrument_id.symbol.as_str(), &dataset, futures_year_digits);
+
+    let symbol_venue_map = AtomicMap::new();
+    symbol_venue_map.insert(instrument_id.symbol, instrument_id.venue);
+
+    let mut price_precision_overrides = AHashMap::new();
+    if let Some(precision) = price_precision {
+        price_precision_overrides.insert(Symbol::from(raw.as_str()), precision);
+    }
+
+    let api_key = SecretString::from(credential.api_key().to_owned());
+    let connect_dataset = dataset.clone();
+    let mut client = tokio::time::timeout(CONNECT_TIMEOUT, async move {
+        let base = databento::LiveClient::builder();
+        let base = if let Some(addr) = gateway_addr {
+            base.addr(addr).await?
+        } else {
+            base
+        };
+        base.user_agent_extension(NAUTILUS_USER_AGENT.into())
+            .key(api_key.expose_secret().to_owned())?
+            .dataset(connect_dataset)
+            .build()
+            .await
+    })
+    .await?
+    .map_err(|e| anyhow::anyhow!("Failed to connect to Databento LSG: {e}"))?;
+
+    let subscription = Subscription::builder()
+        .schema(dbn::Schema::Tbbo)
+        .symbols(raw)
+        .stype_in(dbn::SType::RawSymbol)
+        .start(OffsetDateTime::from_unix_timestamp_nanos(i128::from(
+            start.as_u64(),
+        ))?)
+        .build();
+    client.subscribe(subscription).await?;
+    client.start().await?;
+    log::info!("Replaying {instrument_id} trades on {dataset} from {start}");
+
+    let mut symbol_map = PitSymbolMap::new();
+    let mut instrument_id_map: AHashMap<u32, CachedInstrumentId> = AHashMap::new();
+    let mut subscription_price_precision_map: AHashMap<u32, u8> = AHashMap::new();
+    // The session subscribes no definitions, so precision comes from overrides or the default
+    let instrument_def_price_precision_map: AHashMap<u32, u8> = AHashMap::new();
+
+    loop {
+        let Some(record) = client.next_record().await? else {
+            anyhow::bail!("Gateway ended the {instrument_id} replay session before it completed");
+        };
+
+        if let Some(msg) = record.get::<dbn::TbboMsg>() {
+            if msg.ts_recv < keep_from.as_u64() {
+                continue;
+            }
+
+            let record_instrument_id = replay_instrument_id(
+                &record,
+                &symbol_map,
+                &publisher_venue_map,
+                &symbol_venue_map,
+                &mut instrument_id_map,
+                futures_year_digits,
+            )?;
+            let price_precision = resolve_price_precision(
+                msg.hd.instrument_id,
+                symbol_map.get_for_rec(&record).map(String::as_str),
+                &instrument_def_price_precision_map,
+                &subscription_price_precision_map,
+                &price_precision_overrides,
+            );
+            let (_, trade) = decode_record_with_config(
+                &record,
+                record_instrument_id,
+                price_precision,
+                None,
+                true,
+                false,
+                decode_config,
+            )?;
+
+            if let Some(Data::Trade(trade)) = trade {
+                batch.push(trade);
+            }
+
+            if batch.len() >= REPLAY_BATCH_SIZE {
+                deliver(std::mem::take(batch))?;
+            }
+        } else if let Some(msg) = record.get::<dbn::SymbolMappingMsg>() {
+            update_price_precision_map_with_symbol_mapping_msg(
+                msg,
+                &price_precision_overrides,
+                &mut subscription_price_precision_map,
+            )?;
+            handle_symbol_mapping_msg(
+                msg,
+                &mut symbol_map,
+                &symbol_venue_map,
+                &mut instrument_id_map,
+            )?;
+        } else if let Some(msg) = record.get::<dbn::SystemMsg>() {
+            if matches!(msg.code(), Ok(dbn::SystemCode::ReplayCompleted)) {
+                if !batch.is_empty() {
+                    deliver(std::mem::take(batch))?;
+                }
+                return Ok(ReplayEnd::Completed);
+            }
+        } else if let Some(msg) = record.get::<dbn::ErrorMsg>() {
+            handle_error_msg(msg);
+        }
+    }
+}
+
+/// Resolves the instrument ID of a replayed record as the feed handler does for live records.
+fn replay_instrument_id(
+    record: &dbn::RecordRef,
+    symbol_map: &PitSymbolMap,
+    publisher_venue_map: &IndexMap<PublisherId, Venue>,
+    symbol_venue_map: &AtomicMap<Symbol, Venue>,
+    instrument_id_map: &mut AHashMap<u32, CachedInstrumentId>,
+    futures_year_digits: FuturesYearDigits,
+) -> anyhow::Result<InstrumentId> {
+    if let Some(cached) = instrument_id_map.get(&record.header().instrument_id) {
+        return Ok(cached.id());
+    }
+
+    let instrument_id = update_instrument_id_map(
+        record,
+        symbol_map,
+        publisher_venue_map,
+        symbol_venue_map,
+        instrument_id_map,
+    )?;
+    let mut instrument_id = resolve_futures_instrument_id(
+        record,
+        instrument_id,
+        futures_year_digits,
+        &symbol_venue_map.load(),
+        None,
+    )?;
+
+    if let Some(venue) = symbol_venue_map.get_cloned(&instrument_id.symbol) {
+        instrument_id.venue = venue;
+    }
+
+    instrument_id_map.insert(
+        record.header().instrument_id,
+        CachedInstrumentId::Inferred(instrument_id),
+    );
+    Ok(instrument_id)
 }
 
 #[derive(Debug, Clone, Copy)]

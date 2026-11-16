@@ -58,7 +58,9 @@ use nautilus_live::{
     SocketControl, SocketControlFactory, SocketReconnectRequestOutcome, task::TaskGroup,
 };
 use nautilus_model::{
-    data::{BarSpecification, BarType, CustomData, Data, DataType, custom::CustomDataTrait},
+    data::{
+        BarSpecification, BarType, CustomData, Data, DataType, TradeTick, custom::CustomDataTrait,
+    },
     enums::{BarAggregation, PriceType},
     identifiers::{ClientId, InstrumentId, Symbol, Venue, futures::FuturesYearDigits},
     instruments::{Instrument, InstrumentAny},
@@ -69,7 +71,10 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     common::{Credential, DATABENTO_VENUE, ohlcv_schema_from_aggregation},
     historical::{DatabentoHistoricalClient, RangeQueryParams},
-    live::{DatabentoFeedHandler, DatabentoMessage, HandlerCommand},
+    live::{
+        DatabentoFeedHandler, DatabentoMessage, HandlerCommand, LiveSessionSpec, ReplayEnd,
+        replay_trades,
+    },
     loader::DatabentoDataLoader,
     symbology::{
         check_consistent_symbology, infer_symbology_type, instrument_id_to_symbol_string,
@@ -79,7 +84,12 @@ use crate::{
 };
 
 const PRICE_PRECISION_PARAM: &str = "price_precision";
+const REPLAY_START_PARAM: &str = "replay_start";
 const SCHEMA_PARAM: &str = "schema";
+/// How far before `replay_start` a trades replay begins, so the gateway still sends every trade
+/// received from `replay_start` on (the lag bound). The value is a placeholder, to be set from
+/// measured evidence.
+pub(crate) const REPLAY_LAG_BOUND: DurationNanos = DurationNanos::from_secs(1);
 const MBP10_DEPTH: usize = 10;
 const QUOTE_SCHEMAS: &[dbn::Schema] = &[
     dbn::Schema::Mbp1,
@@ -405,6 +415,106 @@ impl DatabentoDataClient {
         if let Err(e) = self.task_handles.spawn(future) {
             log::debug!("Skipping Databento task after shutdown began: {e}");
         }
+    }
+
+    /// Serves an open-ended trades request carrying `replay_start` by a live gateway replay.
+    ///
+    /// The replay runs on a private gateway session from `replay_start` less
+    /// [`REPLAY_LAG_BOUND`] and keeps the trades received at or after `replay_start`. Each batch
+    /// is sent as a partial response, then one empty response completes the request. The
+    /// historical client is never called.
+    fn request_trades_replay(
+        &self,
+        request: RequestTrades,
+        replay_start: UnixNanos,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            request.end.is_none(),
+            "A `{REPLAY_START_PARAM}` trades request must be open-ended (no end)"
+        );
+        let schema = schema_from_params(request.params.as_ref(), dbn::Schema::Tbbo, TRADE_SCHEMAS)?;
+        anyhow::ensure!(
+            schema == dbn::Schema::Tbbo,
+            "A `{REPLAY_START_PARAM}` trades request is served only from the `tbbo` schema"
+        );
+        let [instrument_id] = request.instrument_ids[..] else {
+            anyhow::bail!(
+                "A `{REPLAY_START_PARAM}` trades request must name exactly one instrument"
+            );
+        };
+        anyhow::ensure!(
+            request.limit.is_none(),
+            "A record limit is unsupported for `{REPLAY_START_PARAM}` trades requests"
+        );
+        let symbol = instrument_id.symbol.to_string();
+        anyhow::ensure!(
+            infer_symbology_type(&symbol) == dbn::SType::RawSymbol,
+            "Unsupported symbol {symbol} for a Databento replay, only raw symbols are available \
+             (not continuous or parent symbols)",
+        );
+
+        let session = LiveSessionSpec {
+            credential: self.config.credential.clone(),
+            dataset: self.get_dataset_for_venue(instrument_id.venue)?,
+            gateway_addr: self.config.live_gateway_addr.clone(),
+            instrument_id,
+            publisher_venue_map: self.publisher_venue_map.clone(),
+            futures_year_digits: self.config.futures_year_digits,
+            price_precision: price_precision_from_params(request.params.as_ref())?,
+        };
+        let data_sender = self.data_sender.clone();
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let request_id = request.request_id;
+        let start = datetime_to_unix_nanos(request.start);
+        let params = request.params;
+        let replay_from = replay_start.saturating_sub(REPLAY_LAG_BOUND);
+
+        self.spawn_task(async move {
+            let response = |trades: Vec<TradeTick>| {
+                DataResponse::Trades(TradesResponse::new(
+                    request_id,
+                    client_id,
+                    instrument_id,
+                    trades,
+                    start,
+                    None,
+                    get_atomic_clock_realtime().get_time_ns(),
+                    params.clone(),
+                ))
+            };
+            let send = |trades: Vec<TradeTick>, completed: bool| {
+                let envelope = DataResponseEnvelope::new(response(trades), completed, None);
+                data_sender
+                    .send(DataEvent::ResponseEnvelope(envelope))
+                    .map_err(|e| anyhow::anyhow!("Failed to send replay response: {e}"))
+            };
+            let mut batch = Vec::new();
+            let result = replay_trades(
+                session,
+                replay_from,
+                replay_start,
+                None,
+                &mut batch,
+                |trades| send(trades, false),
+            )
+            .await;
+
+            match result {
+                Ok(ReplayEnd::Completed) => {
+                    if let Err(e) = send(Vec::new(), true) {
+                        log::error!("{e}");
+                    }
+                }
+                Err(e) => send_request_result(
+                    &data_sender,
+                    request_id,
+                    None,
+                    &[format!("Replay of {instrument_id}: {e}")],
+                ),
+            }
+        });
+
+        Ok(())
     }
 
     /// Initializes the live feed handler for streaming data.
@@ -1060,6 +1170,10 @@ impl DataClient for DatabentoDataClient {
     }
 
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
+        if let Some(replay_start) = replay_start_from_params(request.params.as_ref()) {
+            return self.request_trades_replay(request, replay_start);
+        }
+
         anyhow::ensure!(
             request.instrument_ids.len() == 1 || request.limit.is_none(),
             "A record limit is unsupported for multi-instrument requests"
@@ -1634,6 +1748,12 @@ fn requested_instrument(
         .rev()
         .find(|instrument| instrument.id() == instrument_id)
         .cloned()
+}
+
+fn replay_start_from_params(params: Option<&Params>) -> Option<UnixNanos> {
+    params
+        .and_then(|params| params.get_u64(REPLAY_START_PARAM))
+        .map(UnixNanos::from)
 }
 
 fn price_precision_from_params(params: Option<&Params>) -> anyhow::Result<Option<u8>> {
@@ -2790,6 +2910,115 @@ mod tests {
         assert_eq!(response.client_id(), &client_id);
         assert_eq!(response.params(), Some(&params));
         assert_eq!(response.record_count(), Some(0));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_request_trades_without_replay_start_opens_no_gateway_session() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data")
+            .join("test_data.tbbo.dbn.zst");
+        let decoder = Decoder::from_zstd_file(path).unwrap();
+        let mut metadata = decoder.metadata().clone();
+        metadata.dataset = "GLBX.MDP3".to_owned();
+        let mut body = Vec::new();
+        {
+            let mut encoder = dbn::encode::dbn::Encoder::with_zstd(&mut body, &metadata).unwrap();
+            encoder.flush().unwrap();
+        }
+
+        let historical = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/", historical.local_addr().unwrap());
+        let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = tokio::spawn(serve_historical_response(historical, body));
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_data_event_sender(sender);
+
+        let mut config = DatabentoDataClientConfig::new(
+            "32-character-with-lots-of-filler",
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("publishers.json"),
+            false,
+            true,
+        );
+        config.historical_base_url = Some(base_url);
+        config.live_gateway_addr = Some(gateway.local_addr().unwrap().to_string());
+        let client_id = ClientId::from("DATABENTO-NO-REPLAY");
+        let client =
+            DatabentoDataClient::new(client_id, config, get_atomic_clock_realtime()).unwrap();
+        let start = UnixNanos::from(1_717_423_200_000_000_000);
+        let params = Params::new(
+            [
+                (PRICE_PRECISION_PARAM.to_owned(), json!(2)),
+                (SCHEMA_PARAM.to_owned(), json!("tbbo")),
+            ]
+            .into(),
+        );
+
+        client
+            .request_trades(RequestTrades::new(
+                InstrumentId::from("ESM4.GLBX"),
+                Some(start.to_datetime_utc()),
+                None,
+                None,
+                Some(client_id),
+                UUID4::new(),
+                UnixNanos::from(37),
+                Some(params),
+            ))
+            .unwrap();
+
+        let event = tokio::select! {
+            event = receiver.recv() => event.unwrap(),
+            result = gateway.accept() => panic!("Unexpected gateway connection: {result:?}"),
+            () = tokio::time::sleep(Duration::from_secs(5)) => panic!("Request did not finish"),
+        };
+
+        let DataEvent::ResponseEnvelope(envelope) = event else {
+            panic!("expected completed response, received {event:?}");
+        };
+        assert!(envelope.completed());
+        let request = server.await.unwrap();
+        assert!(request.split('&').any(|field| field == "schema=tbbo"));
+    }
+
+    #[rstest]
+    #[case::with_end(
+        Some(1_717_423_260_000_000_000),
+        None,
+        "A `replay_start` trades request must be open-ended (no end)"
+    )]
+    #[case::trades_schema(
+        None,
+        Some("trades"),
+        "A `replay_start` trades request is served only from the `tbbo` schema"
+    )]
+    fn test_request_trades_refuses_replay_start_request(
+        #[case] end: Option<u64>,
+        #[case] schema: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let client = test_data_client();
+        let replay_start = UnixNanos::from(1_717_423_200_000_000_000);
+        let mut params = IndexMap::new();
+        params.insert(REPLAY_START_PARAM.to_owned(), json!(replay_start.as_u64()));
+        if let Some(schema) = schema {
+            params.insert(SCHEMA_PARAM.to_owned(), json!(schema));
+        }
+
+        let error = client
+            .request_trades(RequestTrades::new(
+                InstrumentId::from("ESM4.GLBX"),
+                Some(replay_start.to_datetime_utc()),
+                end.map(|end| UnixNanos::from(end).to_datetime_utc()),
+                None,
+                None,
+                UUID4::new(),
+                UnixNanos::from(37),
+                Some(Params::new(params)),
+            ))
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), expected);
     }
 
     #[rstest]

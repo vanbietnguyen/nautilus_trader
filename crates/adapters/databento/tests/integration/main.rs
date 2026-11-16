@@ -24,3 +24,5 @@ mod batches;
 mod common;
 #[cfg(feature = "live")]
 mod feed_handler;
+#[cfg(feature = "live")]
+mod replay;

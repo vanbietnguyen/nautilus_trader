@@ -18,7 +18,10 @@
 //! Modeled after databento's own `MockGateway` + `Fixture` pattern
 //! in `databento-0.44.0/src/live/client.rs`.
 
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    fmt::Debug,
+    sync::{Arc, Mutex},
+};
 
 use databento::dbn::{MetadataBuilder, SType, encode::dbn::AsyncMetadataEncoder, record::HasRType};
 use tokio::{
@@ -57,15 +60,17 @@ struct MockGateway {
     dataset: String,
     listener: TcpListener,
     stream: Option<BufReader<TcpStream>>,
+    subscription_lines: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockGateway {
-    async fn new(dataset: String) -> Self {
+    async fn new(dataset: String, subscription_lines: Arc<Mutex<Vec<String>>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         Self {
             dataset,
             listener,
             stream: None,
+            subscription_lines,
         }
     }
 
@@ -96,7 +101,11 @@ impl MockGateway {
     }
 
     async fn expect_subscription(&mut self) {
-        let _sub_line = self.read_line().await;
+        let sub_line = self.read_line().await;
+        self.subscription_lines
+            .lock()
+            .unwrap()
+            .push(sub_line.trim_end().to_string());
     }
 
     async fn start(&mut self) {
@@ -155,13 +164,15 @@ impl MockGateway {
 pub(crate) struct MockLsgServer {
     tx: tokio::sync::mpsc::UnboundedSender<MockEvent>,
     port: u16,
+    subscription_lines: Arc<Mutex<Vec<String>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl MockLsgServer {
     pub(crate) async fn new(dataset: &str) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut gateway = MockGateway::new(dataset.to_string()).await;
+        let subscription_lines = Arc::new(Mutex::new(Vec::new()));
+        let mut gateway = MockGateway::new(dataset.to_string(), subscription_lines.clone()).await;
         let port = gateway.port();
 
         let task = tokio::task::spawn(async move {
@@ -181,7 +192,12 @@ impl MockLsgServer {
             }
         });
 
-        Self { tx, port, task }
+        Self {
+            tx,
+            port,
+            subscription_lines,
+            task,
+        }
     }
 
     pub(crate) fn addr(&self) -> String {
@@ -200,6 +216,11 @@ impl MockLsgServer {
 
     pub(crate) fn expect_subscription(&self) {
         self.tx.send(MockEvent::ExpectSubscription).unwrap();
+    }
+
+    /// Returns the subscription lines the gateway has read, oldest first.
+    pub(crate) fn subscription_lines(&self) -> Vec<String> {
+        self.subscription_lines.lock().unwrap().clone()
     }
 
     pub(crate) fn start(&self) {
