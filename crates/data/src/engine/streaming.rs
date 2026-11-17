@@ -43,7 +43,7 @@ use ustr::Ustr;
 
 use super::{
     DataEngine,
-    requests::{describe_missing_sessions, request_params, trading_days},
+    requests::{describe_missing_sessions, request_params, sets_quotes, trading_days},
 };
 
 const PARAM_SKIP_CATALOG_DATA: &str = "skip_catalog_data";
@@ -801,9 +801,29 @@ impl DataEngine {
                         .get_client(client_id.as_ref(), venue.as_ref())
                         .map(|value| value.client_id());
                     self.query_catalog_leg(&request, catalog, start, end, client, now)
-                        .map(|mut response| {
+                        .and_then(|mut response| {
+                            let quotes = match &request {
+                                RequestCommand::Trades(cmd) if sets_quotes(&request) => {
+                                    Some(self.query_catalog_leg_quotes(
+                                        cmd,
+                                        catalog,
+                                        (start, end),
+                                        &unavailable,
+                                        client,
+                                        now,
+                                    )?)
+                                }
+                                _ => None,
+                            };
                             drop_rows_of_unavailable_days(&mut response, &unavailable);
+                            // The leg's quotes go into its slot first; its trades complete it
+                            if let Some(quotes) = quotes {
+                                self.response_envelope(DataResponseEnvelope::new(
+                                    quotes, false, None,
+                                ));
+                            }
                             self.response(response);
+                            Ok(())
                         })
                 }
                 RequestLeg::Client(request) => self.dispatch_request_to_client(request).map(|_| ()),
@@ -967,6 +987,61 @@ impl DataEngine {
                 anyhow::bail!("query_catalog_leg called with non-catalog-eligible variant {leg:?}")
             }
         }
+    }
+
+    /// Returns the quotes of a trades catalog leg that sets `quotes`: the instrument's quotes in
+    /// `catalog_name` over the leg's window, those of the `unavailable` days dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog does not cover the instrument's quotes over the window
+    /// outside the `unavailable` days, or if the query fails; the leg then fails.
+    fn query_catalog_leg_quotes(
+        &mut self,
+        cmd: &RequestTrades,
+        catalog_name: Ustr,
+        (start_ns, end_ns): (UnixNanos, UnixNanos),
+        unavailable: &[(UnixNanos, UnixNanos)],
+        used_client_id: Option<ClientId>,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<DataResponse> {
+        let instrument_id = cmd.single_instrument_id()?;
+        let identifier = instrument_id.to_string();
+        let catalog = self.catalogs.get_mut(&catalog_name).ok_or_else(|| {
+            anyhow::anyhow!("Catalog {catalog_name} disappeared between intervals query and read")
+        })?;
+
+        let key = RequestCatalogKey::new(NautilusDataType::QuoteTick, Some(identifier.clone()));
+        let missing = catalog_missing_intervals(catalog, start_ns.as_u64(), end_ns.as_u64(), &key)?;
+        if let Some((first, last)) = missing
+            .into_iter()
+            .find(|&interval| !within_unavailable_days(interval, unavailable))
+        {
+            anyhow::bail!(
+                "Catalog {catalog_name} does not cover the quotes of {instrument_id} from {first} \
+                 to {last}"
+            );
+        }
+
+        let data = quote_ticks_from_query_result(
+            catalog.query_batch(
+                &CatalogQuery::new(NautilusDataType::QuoteTick)
+                    .with_identifiers(Some(vec![identifier]))
+                    .with_range(Some(start_ns), Some(end_ns)),
+            )?,
+        )?;
+        let mut response = DataResponse::Quotes(QuotesResponse::new(
+            cmd.request_id,
+            resolve_response_client_id(cmd.client_id, used_client_id),
+            cmd.instrument_ids.clone(),
+            data,
+            Some(start_ns),
+            Some(end_ns),
+            ts_init,
+            Some(catalog_response_params(cmd.params.as_ref())),
+        ));
+        drop_rows_of_unavailable_days(&mut response, unavailable);
+        Ok(response)
     }
 
     fn dispatch_instrument_catalog_request(&mut self, req: RequestCommand) -> anyhow::Result<()> {
@@ -1310,7 +1385,7 @@ struct JoinPlan {
     missing_sessions: Vec<UnixNanos>,
 }
 
-/// Drops the trades whose `ts_init` falls in one of the `unavailable` spans.
+/// Drops the trades or quotes whose `ts_init` falls in one of the `unavailable` spans.
 fn drop_rows_of_unavailable_days(
     response: &mut DataResponse,
     unavailable: &[(UnixNanos, UnixNanos)],
@@ -1318,20 +1393,53 @@ fn drop_rows_of_unavailable_days(
     if unavailable.is_empty() {
         return;
     }
-    let DataResponse::Trades(response) = response else {
-        return;
-    };
     let is_unavailable = |ts_init: UnixNanos| {
         let after = unavailable.partition_point(|(open, _)| *open <= ts_init);
         after > 0 && ts_init < unavailable[after - 1].1
     };
-    response.data = response
-        .data
-        .iter()
-        .filter(|trade| !is_unavailable(trade.ts_init))
-        .copied()
-        .collect::<Vec<_>>()
-        .into();
+    match response {
+        DataResponse::Trades(response) => {
+            response.data = response
+                .data
+                .iter()
+                .filter(|trade| !is_unavailable(trade.ts_init))
+                .copied()
+                .collect::<Vec<_>>()
+                .into();
+        }
+        DataResponse::Quotes(response) => {
+            response.data = response
+                .data
+                .iter()
+                .filter(|quote| !is_unavailable(quote.ts_init))
+                .copied()
+                .collect::<Vec<_>>()
+                .into();
+        }
+        _ => {}
+    }
+}
+
+/// Returns whether the inclusive interval `(first, last)` lies wholly in the `unavailable` spans
+/// (half-open, ascending).
+fn within_unavailable_days(
+    (first, last): (u64, u64),
+    unavailable: &[(UnixNanos, UnixNanos)],
+) -> bool {
+    let mut uncovered = first;
+    for &(open, next_open) in unavailable {
+        if next_open.as_u64() <= uncovered {
+            continue;
+        }
+        if open.as_u64() > uncovered {
+            return false;
+        }
+        if next_open.as_u64() > last {
+            return true;
+        }
+        uncovered = next_open.as_u64();
+    }
+    false
 }
 
 /// Sets the trades request's `replay_start` parameter: the client serves it by its replay.

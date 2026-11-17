@@ -43,6 +43,7 @@ const SCHEMA: &str = "schema";
 const CUT_WARMUP: &str = "cut_warmup";
 const DEADLINE: &str = "deadline";
 const SESSION_OPENS: &str = "session_opens";
+const QUOTES: &str = "quotes";
 const CUT_WARMUP_REFUSED: &str = "Cannot admit a `cut_warmup` request";
 const JOIN_SCHEMA: &str = "tbbo";
 const SESSION_TIME_ZONE: &str = "America/New_York";
@@ -527,6 +528,13 @@ fn current_session_open(now: UnixNanos, time_zone: &TimeZone) -> anyhow::Result<
 /// Returns whether `req` sets `cut_warmup`: past admission, a request of the history/live join.
 pub(super) fn sets_cut_warmup(req: &RequestCommand) -> bool {
     request_params(req).and_then(|params| params.get_bool(CUT_WARMUP)) == Some(true)
+}
+
+/// Returns whether `req` is a trades request that sets `quotes`: its catalog legs also answer the
+/// instrument's quotes, delivered with its trades in one time order.
+pub(super) fn sets_quotes(req: &RequestCommand) -> bool {
+    matches!(req, RequestCommand::Trades(_))
+        && request_params(req).and_then(|params| params.get_bool(QUOTES)) == Some(true)
 }
 
 /// Returns the trading days from the one opening at `first` up to `end` (exclusive), each as its

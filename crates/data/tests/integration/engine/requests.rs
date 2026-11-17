@@ -5029,3 +5029,676 @@ fn test_engine_reset_ends_join_deadlines_and_leg_suppressions(
     );
     assert_eq!(join_timer(&fixture), None);
 }
+
+/// What one envelope of a `quotes` request carried: its quotes (by `ts_init`), its trades (by
+/// trade ID) or its bars (by `ts_event`), with its completion and reason.
+#[cfg(feature = "streaming")]
+#[derive(Debug, PartialEq)]
+enum QuotedPart {
+    Quotes(Vec<u64>),
+    Trades(Vec<TradeId>),
+    Bars(Vec<UnixNanos>),
+    Nothing,
+}
+
+#[cfg(feature = "streaming")]
+#[derive(Debug, PartialEq)]
+struct QuotedDelivery {
+    part: QuotedPart,
+    completed: bool,
+    failure: Option<String>,
+}
+
+#[cfg(feature = "streaming")]
+fn quoted(part: QuotedPart) -> QuotedDelivery {
+    QuotedDelivery {
+        part,
+        completed: false,
+        failure: None,
+    }
+}
+
+#[cfg(feature = "streaming")]
+fn quoted_end(part: QuotedPart, failure: Option<&str>) -> QuotedDelivery {
+    QuotedDelivery {
+        part,
+        completed: true,
+        failure: failure.map(str::to_owned),
+    }
+}
+
+/// Records every response envelope the bus delivers for one request, terminals included.
+#[cfg(feature = "streaming")]
+struct QuotedTap {
+    request_id: UUID4,
+    delivered: RefCell<Vec<QuotedDelivery>>,
+}
+
+#[cfg(feature = "streaming")]
+impl BusTap for QuotedTap {
+    fn on_publish(&self, _topic: MStr<Topic>, _message: &dyn Any) {}
+
+    fn on_send(&self, _endpoint: MStr<Endpoint>, _message: &dyn Any) {}
+
+    fn on_response(&self, correlation_id: &UUID4, message: &dyn Any) {
+        let Some(envelope) = message.downcast_ref::<DataResponseEnvelope>() else {
+            return;
+        };
+        if *correlation_id != self.request_id {
+            return;
+        }
+        let part = match envelope.response() {
+            Some(DataResponse::Quotes(resp)) => QuotedPart::Quotes(
+                resp.data
+                    .iter()
+                    .map(|quote| quote.ts_init.as_u64())
+                    .collect(),
+            ),
+            Some(DataResponse::Trades(resp)) => {
+                QuotedPart::Trades(resp.data.iter().map(|trade| trade.trade_id).collect())
+            }
+            Some(DataResponse::Bars(resp)) => {
+                QuotedPart::Bars(resp.data.iter().map(|bar| bar.ts_event).collect())
+            }
+            _ => QuotedPart::Nothing,
+        };
+        self.delivered.borrow_mut().push(QuotedDelivery {
+            part,
+            completed: envelope.completed(),
+            failure: envelope.failure_reason().map(str::to_owned),
+        });
+    }
+}
+
+/// A [`QuotedTap`] for `request_id` installed on this thread's bus until dropped.
+#[cfg(feature = "streaming")]
+struct QuotedResponses(Rc<QuotedTap>);
+
+#[cfg(feature = "streaming")]
+impl QuotedResponses {
+    fn install(request_id: UUID4) -> Self {
+        let tap = Rc::new(QuotedTap {
+            request_id,
+            delivered: RefCell::new(Vec::new()),
+        });
+        msgbus::set_bus_tap(Rc::clone(&tap) as Rc<dyn BusTap>);
+        Self(tap)
+    }
+
+    fn take(&self) -> Vec<QuotedDelivery> {
+        self.0.delivered.take()
+    }
+}
+
+#[cfg(feature = "streaming")]
+impl Drop for QuotedResponses {
+    fn drop(&mut self) {
+        msgbus::clear_bus_tap();
+    }
+}
+
+/// A print without an aggressor (the side the quote in force decides).
+#[cfg(feature = "streaming")]
+fn unsided_trade(instrument_id: InstrumentId, ts: u64, price: &str, trade_id: &str) -> TradeTick {
+    TradeTick::new(
+        instrument_id,
+        Price::from(price),
+        Quantity::from(1),
+        AggressorSide::NoAggressor,
+        TradeId::new(trade_id),
+        UnixNanos::from(ts),
+        UnixNanos::from(ts),
+    )
+}
+
+/// One catalog run of a quoted catalog: its file interval, its quotes (`ts`, bid, ask) and its
+/// trades (`ts`, trade ID).
+#[cfg(feature = "streaming")]
+struct QuotedRun<'a> {
+    interval: (u64, u64),
+    quotes: &'a [(u64, &'a str, &'a str)],
+    trades: &'a [(u64, &'a str)],
+}
+
+/// Registers a made-up catalog holding quotes and trades, one file of each per run (a run with
+/// no rows of a kind writes no file of it).
+#[cfg(feature = "streaming")]
+fn register_quoted_catalog(
+    fixture: &JoinFixture,
+    label: &str,
+    runs: &[QuotedRun],
+) -> CatalogTempDir {
+    let catalog_dir = CatalogTempDir::new(label);
+    let catalog = ParquetDataCatalog::new(catalog_dir.path(), None, None, None, None);
+    for run in runs {
+        let (start, end) = (
+            Some(UnixNanos::from(run.interval.0)),
+            Some(UnixNanos::from(run.interval.1)),
+        );
+        let quotes: Vec<_> = run
+            .quotes
+            .iter()
+            .map(|(ts, bid, ask)| make_quote(fixture.instrument_id, bid, ask, *ts))
+            .collect();
+        if !quotes.is_empty() {
+            catalog.write_to_parquet(&quotes, start, end, None).unwrap();
+        }
+        // Each print is at the ask of the quote in force before it
+        let trades: Vec<_> = run
+            .trades
+            .iter()
+            .map(|(ts, id)| unsided_trade(fixture.instrument_id, *ts, "1.0002", id))
+            .collect();
+        if !trades.is_empty() {
+            catalog.write_to_parquet(&trades, start, end, None).unwrap();
+        }
+    }
+    fixture
+        .engine
+        .borrow_mut()
+        .register_catalog(Box::new(catalog), None);
+    catalog_dir
+}
+
+/// The quote counterexample's catalog: changing quotes, prints without an aggressor, a quote
+/// and a trade at equal stamps, over two runs spliced at 2 000 ns (a quote and a trade at the
+/// splice).
+#[cfg(feature = "streaming")]
+const COUNTEREXAMPLE: [QuotedRun<'static>; 2] = [
+    QuotedRun {
+        interval: (1_000, 1_999),
+        quotes: &[(1_000, "1.0000", "1.0002"), (1_500, "1.0002", "1.0004")],
+        trades: &[(1_000, "t1"), (1_200, "t2"), (1_500, "t3")],
+    },
+    QuotedRun {
+        interval: (2_000, 2_999),
+        quotes: &[(2_000, "1.0001", "1.0002"), (2_500, "1.0002", "1.0003")],
+        trades: &[(2_000, "t4"), (2_700, "t5")],
+    },
+];
+
+/// An ordinary trades request for the window `[start, end]` with `params`.
+#[cfg(feature = "streaming")]
+fn windowed_trades_request(
+    fixture: &JoinFixture,
+    (start, end): (u64, u64),
+    params: Value,
+) -> RequestCommand {
+    RequestCommand::Trades(RequestTrades::new(
+        vec![fixture.instrument_id],
+        Some(UnixNanos::from(start).to_datetime_utc()),
+        Some(UnixNanos::from(end).to_datetime_utc()),
+        None,
+        Some(fixture.client_id),
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(serde_json::from_value(params).unwrap()),
+    ))
+}
+
+/// Executes `request` and returns every envelope its requester was sent.
+#[cfg(feature = "streaming")]
+fn run_quoted(fixture: &JoinFixture, request: RequestCommand) -> Vec<QuotedDelivery> {
+    let tap = QuotedResponses::install(*request.request_id());
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+    tap.take()
+}
+
+/// How a request of the quote tests builds bars.
+#[cfg(feature = "streaming")]
+#[derive(Clone, Copy, Debug)]
+enum QuotedBars {
+    None,
+    Ticks,
+    InterleavedTicks,
+}
+
+#[cfg(feature = "streaming")]
+fn quoted_params(fixture: &JoinFixture, bars: QuotedBars, quotes: Option<bool>) -> Value {
+    let mut params = match bars {
+        QuotedBars::None => json!({}),
+        QuotedBars::Ticks => json!({
+            "bar_types": [fixture.bar_type.to_string()],
+            "update_subscriptions": false,
+        }),
+        QuotedBars::InterleavedTicks => json!({
+            "bar_types": [fixture.bar_type.to_string()],
+            "update_subscriptions": false,
+            "interleave": true,
+        }),
+    };
+    if let Some(quotes) = quotes {
+        params["quotes"] = json!(quotes);
+    }
+    params
+}
+
+#[cfg(feature = "streaming")]
+fn quotes_at(ts: &[u64]) -> QuotedPart {
+    QuotedPart::Quotes(ts.to_vec())
+}
+
+#[cfg(feature = "streaming")]
+fn trades_of(ids: &[&str]) -> QuotedPart {
+    QuotedPart::Trades(trade_ids(ids))
+}
+
+#[cfg(feature = "streaming")]
+fn bars_at(ts: &[u64]) -> QuotedPart {
+    QuotedPart::Bars(at_ns(ts))
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+#[case::builds_no_bars(QuotedBars::None)]
+#[case::builds_tick_bars(QuotedBars::Ticks)]
+#[case::interleaves_tick_bars(QuotedBars::InterleavedTicks)]
+fn test_quotes_request_answers_quotes_and_trades_in_one_time_order_quote_first_on_a_tie(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] bars: QuotedBars,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let _catalog_dir = register_quoted_catalog(&fixture, "quotes-counterexample", &COUNTEREXAMPLE);
+    let params = quoted_params(&fixture, bars, Some(true));
+    let request = windowed_trades_request(&fixture, (1_000, 2_999), params);
+
+    let delivered = run_quoted(&fixture, request);
+
+    let expected = match bars {
+        QuotedBars::None | QuotedBars::Ticks => vec![
+            quoted(quotes_at(&[1_000])),
+            quoted(trades_of(&["t1", "t2"])),
+            quoted(quotes_at(&[1_500])),
+            quoted(trades_of(&["t3"])),
+            quoted(quotes_at(&[2_000])),
+            quoted(trades_of(&["t4"])),
+            quoted(quotes_at(&[2_500])),
+            quoted_end(trades_of(&["t5"]), None),
+        ],
+        // A tick bar goes out before the trade that completes it; quotes build no LAST bar
+        QuotedBars::InterleavedTicks => vec![
+            quoted(quotes_at(&[1_000])),
+            quoted(bars_at(&[1_000])),
+            quoted(trades_of(&["t1"])),
+            quoted(bars_at(&[1_200])),
+            quoted(trades_of(&["t2"])),
+            quoted(quotes_at(&[1_500])),
+            quoted(bars_at(&[1_500])),
+            quoted(trades_of(&["t3"])),
+            quoted(quotes_at(&[2_000])),
+            quoted(bars_at(&[2_000])),
+            quoted(trades_of(&["t4"])),
+            quoted(quotes_at(&[2_500])),
+            quoted(bars_at(&[2_700])),
+            quoted_end(trades_of(&["t5"]), None),
+        ],
+    };
+    assert_eq!(delivered, expected);
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_quotes_request_ending_with_a_quote_completes_with_an_empty_trades_part(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let _catalog_dir = register_quoted_catalog(
+        &fixture,
+        "quotes-ending-with-a-quote",
+        &[QuotedRun {
+            interval: (1_000, 1_999),
+            quotes: &[(1_000, "1.0000", "1.0002"), (1_900, "1.0001", "1.0003")],
+            trades: &[(1_100, "t1")],
+        }],
+    );
+    let params = quoted_params(&fixture, QuotedBars::None, Some(true));
+    let request = windowed_trades_request(&fixture, (1_000, 1_999), params);
+
+    assert_eq!(
+        run_quoted(&fixture, request),
+        vec![
+            quoted(quotes_at(&[1_000])),
+            quoted(trades_of(&["t1"])),
+            quoted(quotes_at(&[1_900])),
+            quoted_end(trades_of(&[]), None),
+        ]
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+#[case::builds_no_bars(QuotedBars::None)]
+#[case::interleaves_tick_bars(QuotedBars::InterleavedTicks)]
+fn test_quotes_request_with_incomplete_quote_coverage_fails_with_one_terminal(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] bars: QuotedBars,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    // The trades cover the window; the quotes miss 2 000 to 2 099 between their runs
+    let _catalog_dir = register_quoted_catalog(
+        &fixture,
+        "quotes-incomplete",
+        &[
+            QuotedRun {
+                interval: (1_000, 2_999),
+                quotes: &[],
+                trades: &[(1_000, "t1"), (2_050, "t2")],
+            },
+            QuotedRun {
+                interval: (1_000, 1_999),
+                quotes: &[(1_000, "1.0000", "1.0002")],
+                trades: &[],
+            },
+            QuotedRun {
+                interval: (2_100, 2_999),
+                quotes: &[(2_100, "1.0001", "1.0003")],
+                trades: &[],
+            },
+        ],
+    );
+    let params = quoted_params(&fixture, bars, Some(true));
+    let request = windowed_trades_request(&fixture, (1_000, 2_999), params);
+
+    assert_eq!(
+        run_quoted(&fixture, request),
+        vec![quoted_end(
+            QuotedPart::Nothing,
+            Some("Catalog catalog_0 does not cover the quotes of AUD/USD.SIM from 2000 to 2099"),
+        )]
+    );
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+}
+
+/// Executes a joined `quotes` request over `session_opens` at 2026-11-12 20:00 New York and
+/// returns its ID and its replay tail's.
+#[cfg(feature = "streaming")]
+fn execute_quoted_join(fixture: &JoinFixture, session_opens: &[u64]) -> (UUID4, UUID4) {
+    let mut params = joined_params(fixture.bar_type, NY_2026_11_12_2000, session_opens);
+    params["quotes"] = json!(true);
+    let request = trades_request(vec![fixture.instrument_id], None, fixture.client_id, params);
+    let request_id = *request.request_id();
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+    (request_id, assert_replay_tail(fixture, NY_2026_11_12_1800))
+}
+
+/// Completes the replay tail `tail_id` of a joined request with no trades.
+#[cfg(feature = "streaming")]
+fn complete_empty_tail(fixture: &JoinFixture, tail_id: UUID4) {
+    fixture
+        .engine
+        .borrow_mut()
+        .response_envelope(DataResponseEnvelope::new(
+            DataResponse::Trades(TradesResponse::new(
+                tail_id,
+                fixture.client_id,
+                fixture.instrument_id,
+                Vec::<TradeTick>::new(),
+                Some(UnixNanos::from(NY_2026_11_12_1800)),
+                None,
+                UnixNanos::from(NY_2026_11_12_2000),
+                None,
+            )),
+            true,
+            None,
+        ));
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_joined_quotes_request_serves_listed_days_quotes_and_skips_an_unlisted_day(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let hour = ONE_HOUR_NS;
+    // The trading day opening 2026-11-10 is not listed: its quotes stop half-way and its rows
+    // are not served; the listed days' quotes are complete
+    let _catalog_dir = register_quoted_catalog(
+        &fixture,
+        "joined-quotes-unlisted-day",
+        &[
+            QuotedRun {
+                interval: (NY_2026_11_09_1800, NY_2026_11_12_1800 - 1),
+                quotes: &[],
+                trades: &[
+                    (NY_2026_11_09_1800 + 2 * hour, "c1"),
+                    (NY_2026_11_10_1800 + 2 * hour, "c2"),
+                    (NY_2026_11_11_1800 + 2 * hour, "c3"),
+                ],
+            },
+            QuotedRun {
+                interval: (NY_2026_11_09_1800, NY_2026_11_10_1800 + hour),
+                quotes: &[
+                    (NY_2026_11_09_1800 + hour, "1.0000", "1.0002"),
+                    (NY_2026_11_10_1800 + hour / 2, "1.0001", "1.0003"),
+                ],
+                trades: &[],
+            },
+            QuotedRun {
+                interval: (NY_2026_11_11_1800, NY_2026_11_12_1800 - 1),
+                quotes: &[(NY_2026_11_11_1800 + hour, "1.0002", "1.0004")],
+                trades: &[],
+            },
+        ],
+    );
+
+    let (request_id, tail_id) = execute_quoted_join(
+        &fixture,
+        &[NY_2026_11_09_1800, NY_2026_11_11_1800, NY_2026_11_12_1800],
+    );
+    let tap = QuotedResponses::install(request_id);
+    complete_empty_tail(&fixture, tail_id);
+
+    let delivered = tap.take();
+    let [first, second, third, last] = &delivered[..] else {
+        panic!("four parts: {delivered:?}");
+    };
+    assert_eq!(
+        [first, second, third],
+        [
+            &quoted(quotes_at(&[NY_2026_11_09_1800 + hour])),
+            &quoted(trades_of(&["c1"])),
+            &quoted(quotes_at(&[NY_2026_11_11_1800 + hour])),
+        ]
+    );
+    assert_eq!((&last.part, last.completed), (&trades_of(&["c3"]), true));
+    let reason = last.failure.as_deref().unwrap();
+    assert!(reason.contains("1 missing sessions"), "{reason}");
+    assert!(!reason.contains("quotes"), "{reason}");
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_joined_quotes_request_releases_through_the_whole_answer_when_it_ends_with_a_quote(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let bar_type = fixture.bar_type;
+    let answered_at = NY_2026_11_11_1800 + ONE_HOUR_NS;
+    let _catalog_dir = register_quoted_catalog(
+        &fixture,
+        "joined-quotes-release",
+        &[QuotedRun {
+            interval: (NY_2026_11_11_1800, NY_2026_11_12_1800 - 1),
+            quotes: &[
+                (answered_at - 1, "1.0000", "1.0002"),
+                (answered_at + 1, "1.0001", "1.0003"),
+            ],
+            trades: &[(answered_at, "a1")],
+        }],
+    );
+
+    let (request_id, tail_id) =
+        execute_quoted_join(&fixture, &[NY_2026_11_11_1800, NY_2026_11_12_1800]);
+    fixture
+        .engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+            SubscribeBars::new(
+                bar_type,
+                Some(fixture.client_id),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )));
+    // The answered trade received live later, then a trade after it
+    let live = |ts_event: u64, ts_init: u64, price: &str, trade_id: &str| {
+        Data::Trade(TradeTick::new(
+            id,
+            Price::from(price),
+            Quantity::from(1),
+            AggressorSide::NoAggressor,
+            TradeId::new(trade_id),
+            UnixNanos::from(ts_event),
+            UnixNanos::from(ts_init),
+        ))
+    };
+    for trade in [
+        live(answered_at, NY_2026_11_12_2000, "1.0002", "a1"),
+        live(
+            NY_2026_11_12_2000,
+            NY_2026_11_12_2000 + MS_NS,
+            "1.0005",
+            "h2",
+        ),
+    ] {
+        fixture.engine.borrow_mut().process_data(trade);
+    }
+    let tap = QuotedResponses::install(request_id);
+    complete_empty_tail(&fixture, tail_id);
+
+    assert_eq!(
+        tap.take(),
+        vec![
+            quoted(quotes_at(&[answered_at - 1])),
+            quoted(trades_of(&["a1"])),
+            quoted(quotes_at(&[answered_at + 1])),
+            quoted_end(trades_of(&[]), None),
+        ]
+    );
+    // The held a1 is in the answer's cut: built once
+    assert_eq!(
+        built_bars(&fixture, bar_type),
+        vec![
+            (Price::from("1.0002"), UnixNanos::from(answered_at)),
+            (
+                Price::from("1.0005"),
+                UnixNanos::from(NY_2026_11_12_2000 + MS_NS)
+            ),
+        ]
+    );
+}
+
+/// How a request of the parameter-absent test is answered.
+#[cfg(feature = "streaming")]
+#[derive(Clone, Copy, Debug)]
+enum UnquotedPath {
+    Ordinary,
+    Interleaved,
+    Joined,
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+#[case::ordinary(UnquotedPath::Ordinary)]
+#[case::interleaved(UnquotedPath::Interleaved)]
+#[case::joined(UnquotedPath::Joined)]
+fn test_trades_request_without_quotes_answers_as_before_from_a_catalog_holding_quotes(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] path: UnquotedPath,
+    #[values(None, Some(false))] quotes: Option<bool>,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let hour = ONE_HOUR_NS;
+    let (c1, c2) = (NY_2026_11_11_1800 + hour, NY_2026_11_11_1800 + 2 * hour);
+    let _catalog_dir = register_quoted_catalog(
+        &fixture,
+        "unquoted",
+        &[QuotedRun {
+            interval: (NY_2026_11_11_1800, NY_2026_11_12_1800 - 1),
+            quotes: &[(c1, "1.0000", "1.0002"), (c1 + 1, "1.0001", "1.0003")],
+            trades: &[(c1, "c1"), (c2, "c2")],
+        }],
+    );
+
+    let delivered = match path {
+        UnquotedPath::Ordinary | UnquotedPath::Interleaved => {
+            let bars = match path {
+                UnquotedPath::Ordinary => QuotedBars::None,
+                _ => QuotedBars::InterleavedTicks,
+            };
+            let params = quoted_params(&fixture, bars, quotes);
+            let window = (NY_2026_11_11_1800, NY_2026_11_12_1800 - 1);
+            run_quoted(&fixture, windowed_trades_request(&fixture, window, params))
+        }
+        UnquotedPath::Joined => {
+            let mut params = joined_params(
+                fixture.bar_type,
+                NY_2026_11_12_2000,
+                &[NY_2026_11_11_1800, NY_2026_11_12_1800],
+            );
+            if let Some(quotes) = quotes {
+                params["quotes"] = json!(quotes);
+            }
+            let request = trades_request(vec![fixture.instrument_id], None, client_id, params);
+            let tap = QuotedResponses::install(*request.request_id());
+            fixture
+                .engine
+                .borrow_mut()
+                .execute_request(request)
+                .unwrap();
+            let tail_id = assert_replay_tail(&fixture, NY_2026_11_12_1800);
+            complete_empty_tail(&fixture, tail_id);
+            tap.take()
+        }
+    };
+
+    let expected = match path {
+        UnquotedPath::Ordinary | UnquotedPath::Joined => {
+            vec![quoted_end(trades_of(&["c1", "c2"]), None)]
+        }
+        UnquotedPath::Interleaved => vec![
+            quoted(bars_at(&[c1])),
+            quoted(trades_of(&["c1"])),
+            quoted(bars_at(&[c2])),
+            quoted_end(trades_of(&["c2"]), None),
+        ],
+    };
+    assert_eq!(delivered, expected);
+}

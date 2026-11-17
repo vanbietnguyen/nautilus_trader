@@ -80,7 +80,8 @@ use deadline::JoinDeadlineTimer;
 use dispatch::{log_error_on_cache_insert, process_engine_bar};
 use futures::{ContinuousFutureRoller, ContinuousFutureSubscriptionState, datetime_to_unix_nanos};
 use handlers::{
-    BAR_AGGREGATOR_PRIORITY, BarBarHandler, BarQuoteHandler, BarTradeHandler, SpreadQuoteHandler,
+    BAR_AGGREGATOR_PRIORITY, BarBarHandler, BarQuoteHandler, BarTradeHandler, JoinedRelease,
+    SpreadQuoteHandler,
 };
 use indexmap::IndexMap;
 #[cfg(feature = "defi")]
@@ -96,10 +97,11 @@ use nautilus_common::{
         RequestCommand, RequestJoin, RequestOptionChainReferencePrice, RequestQuotes,
         RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth, SubscribeCommand,
         SubscribeOptionChain, SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades,
-        UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth, UnsubscribeBookSnapshots,
-        UnsubscribeCommand, UnsubscribeInstrumentStatus, UnsubscribeOptionChain,
-        UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades, ensure_routable_bar_types,
-        ensure_routable_instrument_ids, is_parent_subscription, quote_routing,
+        TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth,
+        UnsubscribeBookSnapshots, UnsubscribeCommand, UnsubscribeInstrumentStatus,
+        UnsubscribeOptionChain, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
+        ensure_routable_bar_types, ensure_routable_instrument_ids, is_parent_subscription,
+        quote_routing,
     },
     msgbus::{
         self, BusPayloadType, ShareableMessageHandler, TypedHandler, TypedIntoHandler,
@@ -143,11 +145,11 @@ use requests::{
     ContinuousFutureSource, RequestBarAggregation, admit_cut_warmup,
     continuous_future_request_from_bars, continuous_future_subscription_from_bars,
     has_continuous_future_params, request_bar_aggregation_from_params, request_params,
-    response_params, sets_cut_warmup,
+    response_params, sets_cut_warmup, sets_quotes,
 };
 use responses::{
-    keep_open_end, log_if_empty_response, parent_request_window, rebind_response_correlation,
-    rebuild_pipeline_response, same_instrument,
+    keep_open_end, log_if_empty_response, parent_request_window, quote_and_trade_runs,
+    rebind_response_correlation, rebuild_pipeline_response, same_instrument,
 };
 use serde_json::Value;
 use spread_quote::SpreadQuoteState;
@@ -233,6 +235,9 @@ pub struct DataEngine {
     request_deadlines: AHashMap<UUID4, UnixNanos>,
     /// The unfinished legs of expired joined requests, each until its own terminal arrives.
     suppressed_legs: AHashSet<UUID4>,
+    /// The release of each joined request whose answer went out in parts (`quotes`): that of
+    /// the whole answer, until its completed part takes it.
+    parted_answer_releases: AHashMap<UUID4, JoinedRelease>,
     /// Envelopes of suppressed legs dropped after their request's expiry.
     late_envelopes: u64,
     join_deadline_timer: Option<Rc<JoinDeadlineTimer>>,
@@ -320,6 +325,7 @@ impl DataEngine {
             interleaved_requests: AHashMap::new(),
             request_deadlines: AHashMap::new(),
             suppressed_legs: AHashSet::new(),
+            parted_answer_releases: AHashMap::new(),
             late_envelopes: 0,
             join_deadline_timer: None,
             option_chain_bootstrapper: None,
@@ -578,6 +584,7 @@ impl DataEngine {
         self.inflight_requests.clear();
         self.request_deadlines.clear();
         self.suppressed_legs.clear();
+        self.parted_answer_releases.clear();
         self.request_pipeline_parent_request.clear();
         self.request_pipeline_n_components.clear();
         self.request_pipeline_parent_request_id.clear();
@@ -2356,6 +2363,14 @@ impl DataEngine {
             return DataResponseEnvelope::terminal(parent_id, failure_reason);
         }
 
+        // The quotes a `quotes` request's catalog legs answered go out with its trades
+        let (quotes, legs) = if parent.is_some_and(sets_quotes) {
+            legs.into_iter()
+                .partition(|leg| matches!(leg, DataResponse::Quotes(_)))
+        } else {
+            (Vec::new(), legs)
+        };
+
         let (parent_start, parent_end) = parent_request_window(parent);
         if self.emit_partitioned_book_responses(parent_id, parent, &legs) {
             return DataResponseEnvelope::terminal(parent_id, failure_reason);
@@ -2379,10 +2394,24 @@ impl DataEngine {
         }
 
         // Client definitions can have a newer ts_init than the requested history
-        if !matches!(parent, Some(RequestCommand::Instrument(_)))
-            && (parent_start.is_some() || parent_end.is_some())
-        {
+        let trim = !matches!(parent, Some(RequestCommand::Instrument(_)))
+            && (parent_start.is_some() || parent_end.is_some());
+        if trim {
             rebuilt.trim_to_bounds();
+        }
+
+        if !quotes.is_empty()
+            && let DataResponse::Trades(trades) = &rebuilt
+        {
+            match self.send_quote_parts(parent_id, parent, trades, quotes, trim) {
+                Ok(last) => rebuilt = DataResponse::Trades(last),
+                Err(e) => {
+                    let mut reasons =
+                        vec![format!("Cannot answer the quotes with the trades: {e}")];
+                    reasons.extend(failure_reason);
+                    return DataResponseEnvelope::terminal(parent_id, Some(reasons.join("; ")));
+                }
+            }
         }
 
         let result = DataResponseEnvelope::new(rebuilt, true, None);
@@ -2391,6 +2420,57 @@ impl DataEngine {
         } else {
             result
         }
+    }
+
+    /// Sends a `quotes` request's answer as typed parts in one time order, each run of quotes or
+    /// trades one part under `parent_id`, and returns its last part: trades, possibly empty,
+    /// which completes the request.
+    ///
+    /// The parts take the ordinary route: trades parts feed the request's aggregators (through
+    /// the interleaved path when the request interleaves); quotes parts reach only its
+    /// non-`LAST` aggregators. A joined request's release is that of the whole answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the quotes cannot be rebuilt or the replay of quotes and trades fails;
+    /// no part is sent then.
+    fn send_quote_parts(
+        &mut self,
+        parent_id: UUID4,
+        parent: Option<&RequestCommand>,
+        trades: &TradesResponse,
+        quotes: Vec<DataResponse>,
+        trim: bool,
+    ) -> anyhow::Result<TradesResponse> {
+        let Some(mut quotes) = rebuild_pipeline_response(parent_id, parent, quotes) else {
+            anyhow::bail!("the quotes of its legs could not be rebuilt");
+        };
+        if trim {
+            quotes.trim_to_bounds();
+        }
+        let DataResponse::Quotes(quotes) = quotes else {
+            anyhow::bail!("its quotes were rebuilt as {}", quotes.kind());
+        };
+
+        let mut parts = quote_and_trade_runs(&quotes, trades)?;
+        let Some(DataResponse::Trades(last)) = parts.pop() else {
+            anyhow::bail!("the replay of quotes and trades did not end with a trades part");
+        };
+
+        if self
+            .request_bar_aggregations
+            .get(&parent_id)
+            .is_some_and(|state| state.cut_warmup)
+        {
+            self.parted_answer_releases
+                .insert(parent_id, JoinedRelease::from_answer(&trades.data));
+        }
+
+        for part in parts {
+            self.process_response_envelope(DataResponseEnvelope::new(part, false, None));
+        }
+
+        Ok(last)
     }
 
     fn emit_partitioned_book_responses(

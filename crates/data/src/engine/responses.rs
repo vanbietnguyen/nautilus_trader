@@ -15,14 +15,16 @@
 
 use std::sync::Arc;
 
-use nautilus_common::messages::data::InstrumentsResponse;
-use nautilus_model::data::BatchView;
+use nautilus_common::messages::data::{InstrumentsResponse, QuotesResponse, TradesResponse};
+use nautilus_model::data::{BatchView, DataBatch, QuoteTick};
 
 use super::{
     BookDeltasResponse, BookType, CustomData, CustomDataResponse, Data, DataEngine, DataResponse,
     Display, FromStr, HasTsInit, InstrumentAny, InstrumentId, NANOSECONDS_IN_DAY, OrderBook,
-    OrderBookDelta, OrderBookDeltas, RecordFlag, RequestCommand, UUID4, UnixNanos, type_name,
+    OrderBookDelta, OrderBookDeltas, RecordFlag, RequestCommand, UUID4, UnixNanos,
+    bar::trades_part, type_name,
 };
+use crate::replay::{DataIterator, ReplayPoll};
 
 impl DataEngine {
     // Replays a day-start snapshot forward to the request's original start: when the first delta
@@ -300,6 +302,72 @@ pub(super) fn keep_open_end(rebuilt: &mut DataResponse) {
     if let DataResponse::Trades(response) = rebuilt {
         response.end = None;
     }
+}
+
+/// Returns `quotes` and `trades` in one time order as typed parts, one per run of one type.
+///
+/// Both go through the replay iterator by `ts_init`, the quotes added first so that a quote comes
+/// before a trade at an equal stamp (the backtest's order). Each part carries its response's
+/// identity and window. The last part is a trades part, empty when the order ends with quotes.
+///
+/// # Errors
+///
+/// Returns an error if the replay iterator fails.
+pub(super) fn quote_and_trade_runs(
+    quotes: &QuotesResponse,
+    trades: &TradesResponse,
+) -> anyhow::Result<Vec<DataResponse>> {
+    let mut replay = DataIterator::new();
+    replay.add_data_batch("quotes", DataBatch::Quote(quotes.data.clone()), true);
+    replay.add_data_batch("trades", DataBatch::Trade(trades.data.clone()), true);
+
+    let mut parts = Vec::new();
+    let mut quote_run = Vec::new();
+    let mut trade_run = Vec::new();
+    loop {
+        match replay.next()? {
+            ReplayPoll::Ready(Data::Quote(quote)) => {
+                if !trade_run.is_empty() {
+                    let run = std::mem::take(&mut trade_run);
+                    parts.push(DataResponse::Trades(trades_part(trades, run)));
+                }
+                quote_run.push(quote);
+            }
+            ReplayPoll::Ready(Data::Trade(trade)) => {
+                if !quote_run.is_empty() {
+                    let run = std::mem::take(&mut quote_run);
+                    parts.push(DataResponse::Quotes(quotes_part(quotes, run)));
+                }
+                trade_run.push(trade);
+            }
+            ReplayPoll::Ready(other) => {
+                anyhow::bail!("The replay of quotes and trades yielded {other:?}")
+            }
+            ReplayPoll::Pending { .. } => {
+                anyhow::bail!("The replay of quotes and trades is pending on static input")
+            }
+            ReplayPoll::Complete => break,
+        }
+    }
+
+    if !quote_run.is_empty() {
+        parts.push(DataResponse::Quotes(quotes_part(quotes, quote_run)));
+    }
+    parts.push(DataResponse::Trades(trades_part(trades, trade_run)));
+    Ok(parts)
+}
+
+fn quotes_part(resp: &QuotesResponse, data: Vec<QuoteTick>) -> QuotesResponse {
+    QuotesResponse::new(
+        resp.correlation_id,
+        resp.client_id,
+        resp.instrument_ids.clone(),
+        data,
+        resp.start,
+        resp.end,
+        resp.ts_init,
+        resp.params.clone(),
+    )
 }
 
 pub(super) fn same_instrument(left: InstrumentId, right: InstrumentId) -> bool {
