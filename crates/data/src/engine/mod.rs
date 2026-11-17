@@ -142,7 +142,7 @@ use option_chain::{
 };
 use requests::{
     AdmittedJoin, ContinuousFutureRequest, ContinuousFutureRequestState, ContinuousFutureSegment,
-    ContinuousFutureSource, RequestBarAggregation, admit_cut_warmup,
+    ContinuousFutureSource, QUOTES_REFUSED, RequestBarAggregation, admit_cut_warmup,
     continuous_future_request_from_bars, continuous_future_subscription_from_bars,
     has_continuous_future_params, request_bar_aggregation_from_params, request_params,
     response_params, sets_cut_warmup, sets_quotes,
@@ -1708,7 +1708,14 @@ impl DataEngine {
             return result;
         }
 
-        let result = self.dispatch_request_to_client(req);
+        // Only a catalog leg answers a `quotes` request's quotes; its client would answer trades
+        let result = if sets_quotes(&req) {
+            Err(anyhow::anyhow!(
+                "{QUOTES_REFUSED}: no catalog is registered, so its plan has no catalog leg"
+            ))
+        } else {
+            self.dispatch_request_to_client(req)
+        };
 
         if result.is_err() {
             self.cleanup_request_bar_aggregators(&request_id);

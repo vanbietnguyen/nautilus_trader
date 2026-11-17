@@ -45,6 +45,7 @@ const DEADLINE: &str = "deadline";
 const SESSION_OPENS: &str = "session_opens";
 const QUOTES: &str = "quotes";
 const CUT_WARMUP_REFUSED: &str = "Cannot admit a `cut_warmup` request";
+pub(super) const QUOTES_REFUSED: &str = "Cannot answer the quotes of a `quotes` request";
 const JOIN_SCHEMA: &str = "tbbo";
 const SESSION_TIME_ZONE: &str = "America/New_York";
 const SESSION_OPEN_TIME: civil::Time = civil::time(18, 0, 0, 0);
@@ -532,6 +533,9 @@ pub(super) fn sets_cut_warmup(req: &RequestCommand) -> bool {
 
 /// Returns whether `req` is a trades request that sets `quotes`: its catalog legs also answer the
 /// instrument's quotes, delivered with its trades in one time order.
+///
+/// A request whose plan cannot carry its quotes (no catalog leg, or a leg its client serves) is
+/// refused.
 pub(super) fn sets_quotes(req: &RequestCommand) -> bool {
     matches!(req, RequestCommand::Trades(_))
         && request_params(req).and_then(|params| params.get_bool(QUOTES)) == Some(true)

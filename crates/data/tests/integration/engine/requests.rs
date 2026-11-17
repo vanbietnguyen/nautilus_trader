@@ -5426,22 +5426,6 @@ fn test_quotes_request_with_incomplete_quote_coverage_fails_with_one_terminal(
     assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
 }
 
-/// Executes a joined `quotes` request over `session_opens` at 2026-11-12 20:00 New York and
-/// returns its ID and its replay tail's.
-#[cfg(feature = "streaming")]
-fn execute_quoted_join(fixture: &JoinFixture, session_opens: &[u64]) -> (UUID4, UUID4) {
-    let mut params = joined_params(fixture.bar_type, NY_2026_11_12_2000, session_opens);
-    params["quotes"] = json!(true);
-    let request = trades_request(vec![fixture.instrument_id], None, fixture.client_id, params);
-    let request_id = *request.request_id();
-    fixture
-        .engine
-        .borrow_mut()
-        .execute_request(request)
-        .unwrap();
-    (request_id, assert_replay_tail(fixture, NY_2026_11_12_1800))
-}
-
 /// Completes the replay tail `tail_id` of a joined request with no trades.
 #[cfg(feature = "streaming")]
 fn complete_empty_tail(fixture: &JoinFixture, tail_id: UUID4) {
@@ -5465,160 +5449,148 @@ fn complete_empty_tail(fixture: &JoinFixture, tail_id: UUID4) {
 }
 
 #[cfg(feature = "streaming")]
+const QUOTES_REFUSED: &str = "Cannot answer the quotes of a `quotes` request";
+
+/// A `quotes` request whose plan cannot carry the instrument's quotes over its whole window.
+#[cfg(feature = "streaming")]
+#[derive(Clone, Copy, Debug)]
+enum Unquotable {
+    /// No catalog is registered: its client would answer it.
+    NoCatalog,
+    /// The catalog holds nothing in the window: one client leg answers it.
+    CatalogOutsideTheWindow,
+    /// It sets `skip_catalog_data`: one client leg answers it.
+    SkipCatalogData,
+    /// It sets a `schema`: its client answers it whole.
+    Schema,
+    /// The catalog covers the window's first run only: a client leg fills the gap.
+    ClientGap,
+}
+
+/// A catalog run outside the window `[1 000, 2 999]` of the refusal test.
+#[cfg(feature = "streaming")]
+const OUTSIDE_THE_WINDOW: [QuotedRun<'static>; 1] = [QuotedRun {
+    interval: (5_000, 5_999),
+    quotes: &[(5_000, "1.0000", "1.0002")],
+    trades: &[(5_100, "t1")],
+}];
+
+#[cfg(feature = "streaming")]
 #[rstest]
-fn test_joined_quotes_request_serves_listed_days_quotes_and_skips_an_unlisted_day(
+#[case::no_catalog(
+    Unquotable::NoCatalog,
+    "no catalog is registered, so its plan has no catalog leg"
+)]
+#[case::catalog_outside_the_window(
+    Unquotable::CatalogOutsideTheWindow,
+    "its plan has no catalog leg; its client leg from 1000 to 2999 carries no quotes"
+)]
+#[case::skip_catalog_data(
+    Unquotable::SkipCatalogData,
+    "its plan has no catalog leg; its client leg from 1000 to 2999 carries no quotes"
+)]
+#[case::schema(
+    Unquotable::Schema,
+    "its `schema` sends it to its client, so its plan has no catalog leg"
+)]
+#[case::client_gap(
+    Unquotable::ClientGap,
+    "its client leg from 2000 to 2999 carries no quotes"
+)]
+fn test_quotes_request_whose_plan_cannot_carry_quotes_is_refused_before_any_dispatch(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
     venue: Venue,
+    #[case] plan: Unquotable,
+    #[case] reason: &str,
 ) {
     let _ = stub_msgbus;
     let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
-    let hour = ONE_HOUR_NS;
-    // The trading day opening 2026-11-10 is not listed: its quotes stop half-way and its rows
-    // are not served; the listed days' quotes are complete
-    let _catalog_dir = register_quoted_catalog(
-        &fixture,
-        "joined-quotes-unlisted-day",
-        &[
-            QuotedRun {
-                interval: (NY_2026_11_09_1800, NY_2026_11_12_1800 - 1),
-                quotes: &[],
-                trades: &[
-                    (NY_2026_11_09_1800 + 2 * hour, "c1"),
-                    (NY_2026_11_10_1800 + 2 * hour, "c2"),
-                    (NY_2026_11_11_1800 + 2 * hour, "c3"),
-                ],
-            },
-            QuotedRun {
-                interval: (NY_2026_11_09_1800, NY_2026_11_10_1800 + hour),
-                quotes: &[
-                    (NY_2026_11_09_1800 + hour, "1.0000", "1.0002"),
-                    (NY_2026_11_10_1800 + hour / 2, "1.0001", "1.0003"),
-                ],
-                trades: &[],
-            },
-            QuotedRun {
-                interval: (NY_2026_11_11_1800, NY_2026_11_12_1800 - 1),
-                quotes: &[(NY_2026_11_11_1800 + hour, "1.0002", "1.0004")],
-                trades: &[],
-            },
-        ],
-    );
-
-    let (request_id, tail_id) = execute_quoted_join(
-        &fixture,
-        &[NY_2026_11_09_1800, NY_2026_11_11_1800, NY_2026_11_12_1800],
-    );
-    let tap = QuotedResponses::install(request_id);
-    complete_empty_tail(&fixture, tail_id);
-
-    let delivered = tap.take();
-    let [first, second, third, last] = &delivered[..] else {
-        panic!("four parts: {delivered:?}");
+    let runs: &[QuotedRun] = match plan {
+        Unquotable::NoCatalog => &[],
+        Unquotable::CatalogOutsideTheWindow => &OUTSIDE_THE_WINDOW,
+        Unquotable::SkipCatalogData | Unquotable::Schema => &COUNTEREXAMPLE,
+        Unquotable::ClientGap => &COUNTEREXAMPLE[..1],
     };
-    assert_eq!(
-        [first, second, third],
-        [
-            &quoted(quotes_at(&[NY_2026_11_09_1800 + hour])),
-            &quoted(trades_of(&["c1"])),
-            &quoted(quotes_at(&[NY_2026_11_11_1800 + hour])),
-        ]
+    let _catalog_dir =
+        (!runs.is_empty()).then(|| register_quoted_catalog(&fixture, "quotes-unquotable", runs));
+    let mut params = quoted_params(&fixture, QuotedBars::Ticks, Some(true));
+    match plan {
+        Unquotable::SkipCatalogData => params["skip_catalog_data"] = json!(true),
+        Unquotable::Schema => params["schema"] = json!("trades"),
+        _ => {}
+    }
+    let request = windowed_trades_request(&fixture, (1_000, 2_999), params);
+
+    let (result, failures) = execute_recording_failures(&mut fixture.engine.borrow_mut(), request);
+
+    let error = result
+        .expect_err("a `quotes` request its plan cannot carry must be refused")
+        .to_string();
+    assert_eq!(error, format!("{QUOTES_REFUSED}: {reason}"));
+    assert_eq!(failures, vec![Some(error)]);
+    assert!(
+        fixture.recorder.borrow().is_empty(),
+        "a refused request reaches no client: {:?}",
+        fixture.recorder.borrow()
     );
-    assert_eq!((&last.part, last.completed), (&trades_of(&["c3"]), true));
-    let reason = last.failure.as_deref().unwrap();
-    assert!(reason.contains("1 missing sessions"), "{reason}");
-    assert!(!reason.contains("quotes"), "{reason}");
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
 }
 
 #[cfg(feature = "streaming")]
 #[rstest]
-fn test_joined_quotes_request_releases_through_the_whole_answer_when_it_ends_with_a_quote(
+fn test_joined_quotes_request_is_refused_naming_its_replay_tail(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
     venue: Venue,
+    #[values(true, false)] with_catalog: bool,
 ) {
     let _ = stub_msgbus;
     let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
-    let id = fixture.instrument_id;
-    let bar_type = fixture.bar_type;
-    let answered_at = NY_2026_11_11_1800 + ONE_HOUR_NS;
-    let _catalog_dir = register_quoted_catalog(
-        &fixture,
-        "joined-quotes-release",
-        &[QuotedRun {
-            interval: (NY_2026_11_11_1800, NY_2026_11_12_1800 - 1),
-            quotes: &[
-                (answered_at - 1, "1.0000", "1.0002"),
-                (answered_at + 1, "1.0001", "1.0003"),
-            ],
-            trades: &[(answered_at, "a1")],
-        }],
+    let hour = ONE_HOUR_NS;
+    let _catalog_dir = with_catalog.then(|| {
+        register_quoted_catalog(
+            &fixture,
+            "joined-quotes-refused",
+            &[QuotedRun {
+                interval: (NY_2026_11_11_1800, NY_2026_11_12_1800 - 1),
+                quotes: &[(NY_2026_11_11_1800 + hour, "1.0000", "1.0002")],
+                trades: &[(NY_2026_11_11_1800 + 2 * hour, "c1")],
+            }],
+        )
+    });
+    let mut params = joined_params(
+        fixture.bar_type,
+        NY_2026_11_12_2000,
+        &[NY_2026_11_11_1800, NY_2026_11_12_1800],
     );
+    params["quotes"] = json!(true);
+    let request = trades_request(vec![fixture.instrument_id], None, client_id, params);
 
-    let (request_id, tail_id) =
-        execute_quoted_join(&fixture, &[NY_2026_11_11_1800, NY_2026_11_12_1800]);
-    fixture
-        .engine
-        .borrow_mut()
-        .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
-            SubscribeBars::new(
-                bar_type,
-                Some(fixture.client_id),
-                None,
-                UUID4::new(),
-                UnixNanos::default(),
-                None,
-                None,
-            ),
-        )));
-    // The answered trade received live later, then a trade after it
-    let live = |ts_event: u64, ts_init: u64, price: &str, trade_id: &str| {
-        Data::Trade(TradeTick::new(
-            id,
-            Price::from(price),
-            Quantity::from(1),
-            AggressorSide::NoAggressor,
-            TradeId::new(trade_id),
-            UnixNanos::from(ts_event),
-            UnixNanos::from(ts_init),
-        ))
+    let (result, failures) = execute_recording_failures(&mut fixture.engine.borrow_mut(), request);
+
+    let tail = format!(
+        "its leg from {NY_2026_11_12_1800} is its client's replay tail, which carries no quotes"
+    );
+    let reason = if with_catalog {
+        tail
+    } else {
+        format!("its plan has no catalog leg; {tail}")
     };
-    for trade in [
-        live(answered_at, NY_2026_11_12_2000, "1.0002", "a1"),
-        live(
-            NY_2026_11_12_2000,
-            NY_2026_11_12_2000 + MS_NS,
-            "1.0005",
-            "h2",
-        ),
-    ] {
-        fixture.engine.borrow_mut().process_data(trade);
-    }
-    let tap = QuotedResponses::install(request_id);
-    complete_empty_tail(&fixture, tail_id);
-
-    assert_eq!(
-        tap.take(),
-        vec![
-            quoted(quotes_at(&[answered_at - 1])),
-            quoted(trades_of(&["a1"])),
-            quoted(quotes_at(&[answered_at + 1])),
-            quoted_end(trades_of(&[]), None),
-        ]
+    let error = result
+        .expect_err("a joined `quotes` request must be refused")
+        .to_string();
+    assert_eq!(error, format!("{QUOTES_REFUSED}: {reason}"));
+    assert_eq!(failures, vec![Some(error)]);
+    assert!(
+        fixture.recorder.borrow().is_empty(),
+        "a refused request reaches no client: {:?}",
+        fixture.recorder.borrow()
     );
-    // The held a1 is in the answer's cut: built once
-    assert_eq!(
-        built_bars(&fixture, bar_type),
-        vec![
-            (Price::from("1.0002"), UnixNanos::from(answered_at)),
-            (
-                Price::from("1.0005"),
-                UnixNanos::from(NY_2026_11_12_2000 + MS_NS)
-            ),
-        ]
-    );
+    assert_eq!(join_timer(&fixture), None);
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
 }
 
 /// How a request of the parameter-absent test is answered.

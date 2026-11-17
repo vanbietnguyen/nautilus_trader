@@ -43,7 +43,9 @@ use ustr::Ustr;
 
 use super::{
     DataEngine,
-    requests::{describe_missing_sessions, request_params, sets_quotes, trading_days},
+    requests::{
+        QUOTES_REFUSED, describe_missing_sessions, request_params, sets_quotes, trading_days,
+    },
 };
 
 const PARAM_SKIP_CATALOG_DATA: &str = "skip_catalog_data";
@@ -426,6 +428,12 @@ impl DataEngine {
         req: RequestCommand,
     ) -> anyhow::Result<()> {
         if request_has_schema(&req) {
+            // The client answers it whole: no catalog leg carries its quotes
+            anyhow::ensure!(
+                !sets_quotes(&req),
+                "{QUOTES_REFUSED}: its `schema` sends it to its client, so its plan has no \
+                 catalog leg"
+            );
             return self.dispatch_request_to_client(req).map(|_| ());
         }
 
@@ -753,6 +761,13 @@ impl DataEngine {
         parent: RequestCommand,
         plan: Vec<RequestLeg>,
     ) -> anyhow::Result<()> {
+        // Refused before any leg is dispatched: a leg without quotes would answer trades alone
+        if sets_quotes(&parent)
+            && let Some(reason) = quotes_plan_refusal(&plan)
+        {
+            anyhow::bail!("{QUOTES_REFUSED}: {reason}");
+        }
+
         let parent_id = *parent.request_id();
 
         if plan.is_empty() {
@@ -1383,6 +1398,43 @@ impl RequestLeg {
 struct JoinPlan {
     legs: Vec<RequestLeg>,
     missing_sessions: Vec<UnixNanos>,
+}
+
+/// Returns why the plan of a `quotes` request cannot carry the instrument's quotes, or `None`
+/// when every leg that answers rows is a catalog leg.
+///
+/// Only a catalog leg answers quotes, so a plan with no catalog leg, or with a leg its client
+/// serves (a gap the catalog does not cover, or the join's replay tail of the current session),
+/// would answer trades alone over part of its window.
+fn quotes_plan_refusal(plan: &[RequestLeg]) -> Option<String> {
+    let mut reasons = Vec::new();
+    if !plan
+        .iter()
+        .any(|leg| matches!(leg, RequestLeg::Catalog { .. }))
+    {
+        reasons.push("its plan has no catalog leg".to_owned());
+    }
+
+    for leg in plan {
+        let RequestLeg::Client(request) = leg else {
+            continue;
+        };
+        let start =
+            request_start(request).map_or_else(UnixNanos::default, datetime_to_unix_nanos_or_zero);
+        if request_params(request).is_some_and(|params| params.contains_key(PARAM_REPLAY_START)) {
+            reasons.push(format!(
+                "its leg from {start} is its client's replay tail, which carries no quotes"
+            ));
+        } else {
+            let end = request_end(request)
+                .map_or_else(UnixNanos::default, datetime_to_unix_nanos_or_zero);
+            reasons.push(format!(
+                "its client leg from {start} to {end} carries no quotes"
+            ));
+        }
+    }
+
+    (!reasons.is_empty()).then(|| reasons.join("; "))
 }
 
 /// Drops the trades or quotes whose `ts_init` falls in one of the `unavailable` spans.
