@@ -399,10 +399,8 @@ fn register_parquet_files(
         ..Default::default()
     };
 
-    let mut listing_options = parquet_options.to_listing_options(
-        &session_ctx.copied_config(),
-        session_ctx.copied_table_options(),
-    );
+    let mut listing_options = parquet_options
+        .to_listing_options(&session_ctx.copied_config(), session_ctx.copied_table_options());
     listing_options.format = Arc::new(CatalogParquetFormat(listing_options.format));
     let table_paths = file_paths
         .into_iter()
@@ -414,12 +412,8 @@ fn register_parquet_files(
             .with_listing_options(listing_options)
             .infer_schema(&state)
     })?;
-    let table = ListingTable::try_new(config)?.with_cache(
-        session_ctx
-            .runtime_env()
-            .cache_manager
-            .get_file_statistic_cache(),
-    );
+    let table = ListingTable::try_new(config)?
+        .with_cache(session_ctx.runtime_env().cache_manager.get_file_statistic_cache());
     let dataframe = session_ctx.read_table(Arc::new(table))?;
 
     validate_catalog_schema(dataframe.schema().as_arrow())?;

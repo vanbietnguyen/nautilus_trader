@@ -470,7 +470,7 @@ impl ParquetDataCatalog {
     ///
     /// Building the stream reads the Parquet footer of every file table with a timestamped name,
     /// one file after another, before the first row: one read per file, which on a remote object
-    /// store is at least one request per file.
+    /// store is at least a HEAD and a footer request per file.
     pub(super) fn query_typed_pages<T>(
         &mut self,
         identifiers: Option<Vec<String>>,
@@ -1169,17 +1169,24 @@ impl ParquetDataCatalog {
 
 // The earliest `ts_init` a file table can hold: the earlier of its filename start and the smallest
 // `ts_init` its Parquet statistics record, since a write may name a start later than its first row.
-// A directory table, a file without a timestamped name and a file whose statistics record no
-// minimum declare no start. A footer that cannot be read keeps the filename start, so the open
-// reports the failure when the merge reaches the file.
+// A directory table and a file without a timestamped name declare no start. Neither does a file
+// whose statistics record no minimum or whose footer cannot be read, as its bound is unknown: it
+// opens before the first row, where an unreadable file reports its failure.
+//
+// Cost: one footer read per file table with a timestamped name, one after another and blocking the
+// caller, all before the first row and whether or not any row is then consumed. Each query starts a
+// new session, so its file metadata cache starts empty. On an object store a read is a HEAD and a
+// footer request, plus the page index that a read into the cache also loads. A file without the
+// statistic or with an unreadable footer opens up front and loses the lazy opening for itself
+// only. Opening the file later reuses the cached footer while the cache (50 MB by default) holds
+// it.
 fn declared_start(opener: &datafusion::TableOpener, path: &str) -> Option<UnixNanos> {
     let (name_start, _) = parse_filename_timestamps(path)?;
     let name_start = UnixNanos::from(name_start);
 
     match opener.min_ts_init(path) {
         Ok(Some(min_ts_init)) => Some(name_start.min(min_ts_init)),
-        Ok(None) => None,
-        Err(_) => Some(name_start),
+        Ok(None) | Err(_) => None,
     }
 }
 

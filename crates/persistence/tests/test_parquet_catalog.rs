@@ -9237,11 +9237,42 @@ fn per_file_session_fails_on_the_pull_that_reaches_an_unreadable_file(#[case] re
         CatalogReader::query_batch_session(&mut catalog, &per_file_quote_query(), Some(1)).unwrap();
     if remove {
         fs::remove_file(&unreadable).unwrap();
+        assert_eq!(next_quotes(&mut session).unwrap().unwrap(), vec![first[0]]);
     }
 
-    assert_eq!(next_quotes(&mut session).unwrap().unwrap(), vec![first[0]]);
+    // A footer unreadable when the query is built declares no start, so its file opens, and
+    // fails, on the first pull; a file removed after its footer was read fails at its start
     assert!(next_quotes(&mut session).is_err());
     assert!(next_quotes(&mut session).unwrap().is_none());
+}
+
+#[rstest]
+fn per_file_session_opens_a_file_whose_footer_was_unreadable_before_the_first_row() {
+    let (directory, mut catalog) = create_temp_catalog();
+    let ordinary = [5, 12].map(create_quote_tick);
+    let overridden = [10, 12, 20].map(create_gbpusd_quote_tick);
+    catalog
+        .write_to_parquet(&ordinary, None, None, None)
+        .unwrap();
+    catalog
+        .write_to_parquet(&overridden, Some(UnixNanos::from(15)), None, None)
+        .unwrap();
+    let expected = read_eager_quotes(&mut catalog);
+    assert_eq!(expected.len(), 5);
+
+    // Named from 15, holding rows from 10, its footer unreadable only while the query is built
+    let path = quote_file_path(&directory, &catalog, 20);
+    let bytes = fs::read(&path).unwrap();
+    fs::write(&path, b"not parquet").unwrap();
+    let mut session =
+        CatalogReader::query_batch_session(&mut catalog, &per_file_quote_query(), Some(1)).unwrap();
+    fs::write(&path, bytes).unwrap();
+    let mut rows = Vec::new();
+    while let Some(page) = next_quotes(&mut session).unwrap() {
+        rows.extend(page);
+    }
+
+    assert_eq!(rows, expected);
 }
 
 #[rstest]
