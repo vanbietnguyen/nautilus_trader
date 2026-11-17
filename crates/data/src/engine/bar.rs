@@ -371,11 +371,12 @@ impl DataEngine {
     /// Answers a trades request that set `interleave` with response parts in live order.
     ///
     /// Trades feed the request aggregators one at a time. A bar a trade completes is delivered
-    /// before that trade, except a `RANGE_INCLUSIVE` bar, which contains its completing trade and
-    /// is delivered after it (the live publication order). Each bar delivery first sends the
-    /// trades gathered since the previous one. The last part of a partial envelope, the trades
-    /// after the last completed bar (possibly none), is sent as a part; a completed envelope ends
-    /// the request through [`Self::finish_interleaved`], with its reason.
+    /// before that trade, except a bar whose chain starts at a `RANGE_INCLUSIVE` bar type (see
+    /// [`follows_completing_trade`]), which is delivered after it (the live publication order).
+    /// Each bar delivery first sends the trades gathered since the previous one. The last part of
+    /// a partial envelope, the trades after the last completed bar (possibly none), is sent as a
+    /// part; a completed envelope ends the request through [`Self::finish_interleaved`], with its
+    /// reason.
     pub(super) fn respond_interleaved_trades(
         &mut self,
         resp: &TradesResponse,
@@ -396,7 +397,7 @@ impl DataEngine {
             let completed = std::mem::take(&mut *bars.borrow_mut());
             let (after, before): (Vec<Bar>, Vec<Bar>) = completed
                 .into_iter()
-                .partition(|bar| bar.bar_type.spec().aggregation == BarAggregation::RangeInclusive);
+                .partition(|bar| follows_completing_trade(bar.bar_type, &state.bar_types));
 
             send_interleaved_bars(resp, &mut pending, before);
             pending.push(*trade);
@@ -1352,6 +1353,37 @@ fn sources_before_dependents(bar_types: &[BarType]) -> Vec<BarType> {
     let mut ordered = bar_types.to_vec();
     ordered.sort_by_cached_key(depth);
     ordered
+}
+
+/// Returns whether a bar of `bar_type` that a trade completes goes out after that trade.
+///
+/// Live, an update-fed `RANGE_INCLUSIVE` bar is published after its completing update, and a
+/// composite is published while the bar it is built from is, whatever its own aggregation. So a
+/// bar follows its trade when the chain of `bar_types` it is built from starts at a
+/// `RANGE_INCLUSIVE` bar type that is not a composite.
+fn follows_completing_trade(bar_type: BarType, bar_types: &[BarType]) -> bool {
+    let mut current = bar_types
+        .iter()
+        .find(|candidate| candidate.standard() == bar_type.standard())
+        .copied()
+        .unwrap_or(bar_type);
+
+    // Bounded by the number of bar types so a cyclic chain cannot loop
+    for _ in 0..bar_types.len() {
+        if !current.is_composite() {
+            break;
+        }
+
+        let Some(source) = bar_types
+            .iter()
+            .find(|candidate| candidate.standard() == current.composite().standard())
+        else {
+            return false;
+        };
+        current = *source;
+    }
+
+    !current.is_composite() && current.spec().aggregation == BarAggregation::RangeInclusive
 }
 
 /// Live data held back for a bar aggregator that is still replaying a historical request.

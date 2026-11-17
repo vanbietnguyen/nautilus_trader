@@ -2245,6 +2245,288 @@ fn test_trades_request_without_interleave_sends_one_response(
     );
 }
 
+/// What a subscriber is given, in order: a trade, with the bar of each watched bar type that the
+/// cache holds at its callback, or a bar.
+#[derive(Clone, Debug, PartialEq)]
+enum OrderedDelivery {
+    Trade(TradeId, Vec<Option<UnixNanos>>),
+    Bar(BarType, UnixNanos),
+}
+
+fn cached_bars(cache: &Rc<RefCell<Cache>>, watched: &[BarType]) -> Vec<Option<UnixNanos>> {
+    watched
+        .iter()
+        .map(|bar_type| cache.borrow().bar(bar_type).map(|bar| bar.ts_event))
+        .collect()
+}
+
+fn order_engine(
+    audusd_sim: CurrencyPair,
+    client_id: ClientId,
+    venue: Venue,
+) -> (DataEngine, Rc<RefCell<Cache>>) {
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        test_clock,
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+    (data_engine, cache)
+}
+
+/// Six trades: with a 10-increment range, the third and the fifth each complete a
+/// `RANGE_INCLUSIVE` bar.
+fn order_tape(instrument_id: InstrumentId) -> Vec<TradeTick> {
+    [
+        ("0.65000", 1_000, "t1"),
+        ("0.65009", 2_000, "t2"),
+        ("0.65011", 3_000, "t3"),
+        ("0.65011", 4_000, "t4"),
+        ("0.65021", 5_000, "t5"),
+        ("0.65022", 6_000, "t6"),
+    ]
+    .into_iter()
+    .map(|(price, ts, trade_id)| {
+        TradeTick::new(
+            instrument_id,
+            Price::from(price),
+            Quantity::from("1000"),
+            AggressorSide::Buy,
+            TradeId::new(trade_id),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        )
+    })
+    .collect()
+}
+
+/// Subscribes `bar_types` live, then processes `tape` live and returns what a subscriber to its
+/// trades and to every bar type, at the default priority as an actor, is given.
+fn live_deliveries(
+    audusd_sim: CurrencyPair,
+    client_id: ClientId,
+    venue: Venue,
+    bar_types: &[BarType],
+    watched: &[BarType],
+) -> Vec<OrderedDelivery> {
+    let instrument_id = audusd_sim.id;
+    let (mut data_engine, cache) = order_engine(audusd_sim, client_id, venue);
+    for bar_type in bar_types {
+        data_engine.execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+            SubscribeBars::new(
+                *bar_type,
+                Some(client_id),
+                Some(venue),
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )));
+    }
+
+    let delivered = Rc::new(RefCell::new(Vec::new()));
+    let trade_delivered = Rc::clone(&delivered);
+    let trade_cache = Rc::clone(&cache);
+    let watched = watched.to_vec();
+    let trade_handler = TypedHandler::from(move |trade: &TradeTick| {
+        let cached = cached_bars(&trade_cache, &watched);
+        trade_delivered
+            .borrow_mut()
+            .push(OrderedDelivery::Trade(trade.trade_id, cached));
+    });
+    let trades_topic = switchboard::get_trades_topic(instrument_id);
+    msgbus::subscribe_trades(trades_topic.into(), trade_handler, None);
+
+    for bar_type in bar_types {
+        let bar_delivered = Rc::clone(&delivered);
+        let bar_handler = TypedHandler::from(move |bar: &Bar| {
+            bar_delivered
+                .borrow_mut()
+                .push(OrderedDelivery::Bar(bar.bar_type, bar.ts_event));
+        });
+        let bars_topic = switchboard::get_bars_topic(bar_type.standard());
+        msgbus::subscribe_bars(bars_topic.into(), bar_handler, None);
+    }
+
+    for trade in order_tape(instrument_id) {
+        data_engine.process_data(Data::Trade(trade));
+    }
+
+    delivered.take()
+}
+
+/// Answers an interleaving trades request for `bar_types` with the same tape and returns what
+/// its requester is given, part by part.
+fn interleaved_deliveries(
+    audusd_sim: CurrencyPair,
+    client_id: ClientId,
+    venue: Venue,
+    bar_types: &[BarType],
+    watched: &[BarType],
+) -> Vec<OrderedDelivery> {
+    let instrument_id = audusd_sim.id;
+    let (mut data_engine, cache) = order_engine(audusd_sim, client_id, venue);
+    let params: Params = serde_json::from_value(json!({
+        "bar_types": bar_types.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "update_subscriptions": false,
+        "interleave": true,
+    }))
+    .unwrap();
+
+    let request_id = UUID4::new();
+    let delivered = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&delivered);
+    let watched = watched.to_vec();
+    let handler = TypedHandler::from(move |envelope: &DataResponseEnvelope| {
+        if let Some(DataResponse::Trades(resp)) = envelope.response() {
+            for trade in resp.data.iter() {
+                let cached = cached_bars(&cache, &watched);
+                recorded
+                    .borrow_mut()
+                    .push(OrderedDelivery::Trade(trade.trade_id, cached));
+            }
+        } else if let Some(DataResponse::Bars(resp)) = envelope.response() {
+            for bar in resp.data.iter() {
+                recorded
+                    .borrow_mut()
+                    .push(OrderedDelivery::Bar(bar.bar_type, bar.ts_event));
+            }
+        }
+    });
+    msgbus::register_response_handler(&request_id, handler);
+
+    data_engine.execute(DataCommand::Request(RequestCommand::Trades(
+        RequestTrades::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::default(),
+            Some(params.clone()),
+        ),
+    )));
+    data_engine.response(DataResponse::Trades(TradesResponse::new(
+        request_id,
+        client_id,
+        instrument_id,
+        order_tape(instrument_id),
+        None,
+        None,
+        UnixNanos::from(6_000),
+        Some(params),
+    )));
+
+    delivered.take()
+}
+
+fn delivered_trades(ids: &[&str]) -> Vec<OrderedDelivery> {
+    ids.iter()
+        .map(|id| OrderedDelivery::Trade(TradeId::new(*id), Vec::new()))
+        .collect()
+}
+
+fn delivered_bar(bar_type: BarType, ts: u64) -> OrderedDelivery {
+    OrderedDelivery::Bar(bar_type.standard(), UnixNanos::from(ts))
+}
+
+#[rstest]
+#[case::one_step(false)]
+#[case::two_steps(true)]
+fn test_interleaved_composite_of_a_range_inclusive_follows_its_source_and_trade_as_live(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] two_steps: bool,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let source = BarType::from(format!("{id}-10-RANGE_INCLUSIVE-LAST-INTERNAL").as_str());
+    let composite =
+        BarType::from(format!("{id}-2-TICK-LAST-INTERNAL@10-RANGE_INCLUSIVE-INTERNAL").as_str());
+    let second = BarType::from(format!("{id}-1-TICK-LAST-INTERNAL@2-TICK-INTERNAL").as_str());
+    let mut bar_types = vec![source, composite];
+    let mut expected = [
+        delivered_trades(&["t1", "t2", "t3"]),
+        vec![delivered_bar(source, 3_000)],
+        delivered_trades(&["t4", "t5"]),
+        vec![
+            delivered_bar(source, 5_000),
+            delivered_bar(composite, 5_000),
+        ],
+    ]
+    .concat();
+    if two_steps {
+        bar_types.push(second);
+        expected.push(delivered_bar(second, 5_000));
+    }
+    expected.extend(delivered_trades(&["t6"]));
+
+    let live = live_deliveries(audusd_sim.clone(), client_id, venue, &bar_types, &[]);
+    let history = interleaved_deliveries(audusd_sim, client_id, venue, &bar_types, &[]);
+
+    assert_eq!(live, expected);
+    assert_eq!(history, live);
+}
+
+#[rstest]
+fn test_interleaved_range_inclusive_composite_of_tick_bars_precedes_its_trade_as_live(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let source = BarType::from(format!("{id}-1-TICK-LAST-INTERNAL").as_str());
+    let composite =
+        BarType::from(format!("{id}-10-RANGE_INCLUSIVE-LAST-INTERNAL@1-TICK-INTERNAL").as_str());
+    let bar_types = [source, composite];
+    let expected = [
+        vec![delivered_bar(source, 1_000)],
+        delivered_trades(&["t1"]),
+        vec![delivered_bar(source, 2_000)],
+        delivered_trades(&["t2"]),
+        vec![
+            delivered_bar(source, 3_000),
+            delivered_bar(composite, 3_000),
+        ],
+        delivered_trades(&["t3"]),
+        vec![delivered_bar(source, 4_000)],
+        delivered_trades(&["t4"]),
+        vec![
+            delivered_bar(source, 5_000),
+            delivered_bar(composite, 5_000),
+        ],
+        delivered_trades(&["t5"]),
+        vec![delivered_bar(source, 6_000)],
+        delivered_trades(&["t6"]),
+    ]
+    .concat();
+
+    let live = live_deliveries(audusd_sim.clone(), client_id, venue, &bar_types, &[]);
+    let history = interleaved_deliveries(audusd_sim, client_id, venue, &bar_types, &[]);
+
+    assert_eq!(live, expected);
+    assert_eq!(history, live);
+}
+
 // Made-up clock times and trading-day opens (civil 18:00 New York) for the join's admission
 const NY_2026_11_08_1800: u64 = 1_794_178_800_000_000_000;
 const NY_2026_11_09_1700: u64 = 1_794_261_600_000_000_000;
