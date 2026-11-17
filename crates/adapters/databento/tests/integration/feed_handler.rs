@@ -935,6 +935,157 @@ async fn test_reconnect_command_resubscribes() {
     server.stop().await;
 }
 
+// Scripts one gateway session that streams a single trade of `size`
+fn script_trade_session(server: &MockLsgServer, size: u32) {
+    server.authenticate();
+    server.expect_subscription();
+    server.start();
+    server.send_record(symbol_mapping_msg(INSTRUMENT_ID, RAW_SYMBOL));
+    server.send_record(trade_msg(INSTRUMENT_ID, 100_000_000_000, size));
+}
+
+async fn recv_trade_size(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DatabentoMessage>,
+) -> Quantity {
+    let msg = recv_msg(rx).await;
+    let DatabentoMessage::Data(Data::Trade(trade)) = msg else {
+        panic!("expected a trade, was {msg:?}");
+    };
+    trade.size
+}
+
+// A retry window of zero minutes is shorter than any session, so a reconnect that started or
+// consumed the window would end the feed
+#[rstest]
+#[tokio::test]
+async fn test_reconnect_commands_around_healthy_session_keep_feed_alive() {
+    let server = MockLsgServer::new(TEST_DATASET).await;
+    let (cmd_tx, mut msg_rx, handler) = create_test_handler_with_config(
+        &server.addr(),
+        TEST_DATASET,
+        &TestHandlerConfig {
+            reconnect_timeout_mins: Some(0),
+            ..Default::default()
+        },
+    );
+    let mut handler = handler.with_success_threshold(Duration::ZERO);
+
+    for size in [50, 25, 10] {
+        script_trade_session(&server, size);
+    }
+
+    let handle = tokio::spawn(async move { handler.run().await });
+
+    cmd_tx
+        .send(HandlerCommand::Subscribe(subscription(dbn::Schema::Trades)))
+        .unwrap();
+    cmd_tx.send(HandlerCommand::Start).unwrap();
+    assert_eq!(recv_trade_size(&mut msg_rx).await, Quantity::from(50));
+
+    cmd_tx.send(HandlerCommand::Reconnect).unwrap();
+    assert_eq!(recv_trade_size(&mut msg_rx).await, Quantity::from(25));
+
+    cmd_tx.send(HandlerCommand::Reconnect).unwrap();
+    assert_eq!(recv_trade_size(&mut msg_rx).await, Quantity::from(10));
+
+    let lines = server.subscription_lines();
+    assert_eq!(lines.len(), 3);
+    assert!(lines.iter().all(|line| line == &lines[0]), "{lines:?}");
+
+    cmd_tx.send(HandlerCommand::Close).unwrap();
+    handle.await.unwrap().unwrap();
+    server.stop().await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_reconnect_commands_in_quick_succession_keep_feed_alive() {
+    let server = MockLsgServer::new(TEST_DATASET).await;
+    let (cmd_tx, mut msg_rx, mut handler) = create_test_handler_with_config(
+        &server.addr(),
+        TEST_DATASET,
+        &TestHandlerConfig {
+            reconnect_timeout_mins: Some(0),
+            ..Default::default()
+        },
+    );
+
+    let sizes = [50, 25, 10, 5];
+    for size in sizes {
+        script_trade_session(&server, size);
+    }
+
+    let handle = tokio::spawn(async move { handler.run().await });
+
+    cmd_tx
+        .send(HandlerCommand::Subscribe(subscription(dbn::Schema::Trades)))
+        .unwrap();
+    cmd_tx.send(HandlerCommand::Start).unwrap();
+    assert_eq!(recv_trade_size(&mut msg_rx).await, Quantity::from(sizes[0]));
+
+    for size in &sizes[1..] {
+        cmd_tx.send(HandlerCommand::Reconnect).unwrap();
+        assert_eq!(recv_trade_size(&mut msg_rx).await, Quantity::from(*size));
+    }
+
+    let lines = server.subscription_lines();
+    assert_eq!(lines.len(), sizes.len());
+    assert!(lines.iter().all(|line| line == &lines[0]), "{lines:?}");
+
+    cmd_tx.send(HandlerCommand::Close).unwrap();
+    handle.await.unwrap().unwrap();
+    server.stop().await;
+}
+
+// A gateway end after a reconnect opens a fresh cycle: with a zero-minute window the handler
+// gives up at that first real error without another connection, as without the reconnect
+#[rstest]
+#[tokio::test]
+async fn test_reconnect_command_then_gateway_end_gives_up_on_the_first_error() {
+    let server = MockLsgServer::new(TEST_DATASET).await;
+    let (cmd_tx, mut msg_rx, mut handler) = create_test_handler_with_config(
+        &server.addr(),
+        TEST_DATASET,
+        &TestHandlerConfig {
+            reconnect_timeout_mins: Some(0),
+            ..Default::default()
+        },
+    );
+
+    script_trade_session(&server, 50);
+    script_trade_session(&server, 25);
+    server.disconnect();
+
+    let handle = tokio::spawn(async move { handler.run().await });
+
+    cmd_tx
+        .send(HandlerCommand::Subscribe(subscription(dbn::Schema::Trades)))
+        .unwrap();
+    cmd_tx.send(HandlerCommand::Start).unwrap();
+    assert_eq!(recv_trade_size(&mut msg_rx).await, Quantity::from(50));
+
+    cmd_tx.send(HandlerCommand::Reconnect).unwrap();
+    assert_eq!(recv_trade_size(&mut msg_rx).await, Quantity::from(25));
+
+    let msg = recv_msg(&mut msg_rx).await;
+    let DatabentoMessage::Error(error) = msg else {
+        panic!("expected the give-up error, was {msg:?}");
+    };
+    assert_eq!(
+        error.to_string(),
+        "Reconnection timeout after 0 minutes: Session ended by gateway"
+    );
+
+    let result = tokio::time::timeout(RECV_TIMEOUT, handle)
+        .await
+        .expect("handler should give up")
+        .unwrap();
+    assert_eq!(result.unwrap_err().to_string(), "Session ended by gateway");
+    assert_eq!(server.subscription_lines().len(), 2);
+
+    server.stop().await;
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_system_msg_subscription_ack() {

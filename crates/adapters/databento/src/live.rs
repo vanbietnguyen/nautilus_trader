@@ -86,8 +86,9 @@ pub enum HandlerCommand {
     Subscribe(Subscription),
     SetPricePrecision(Symbol, u8),
     Start,
-    /// Ends a running session so the handler reconnects and resubscribes through its
-    /// backoff loop (an operator socket reconnect). Ignored before `Start` and during backoff.
+    /// Ends a running session as a successful one, so the handler reconnects at once with a fresh
+    /// reconnection cycle and resubscribes (an operator socket reconnect). Ignored before `Start`
+    /// and during backoff.
     Reconnect,
     Close,
 }
@@ -583,7 +584,8 @@ impl DatabentoFeedHandler {
     /// Runs a single session, handling connection, subscriptions, and data streaming.
     ///
     /// Returns `Ok(bool)` where the bool indicates if the session ran successfully
-    /// for a meaningful duration (true) or was intentionally closed (false).
+    /// for a meaningful duration or was ended by an operator reconnect (true), or was
+    /// intentionally closed (false).
     ///
     /// # Errors
     ///
@@ -797,7 +799,7 @@ impl DatabentoFeedHandler {
                     Some(HandlerCommand::Reconnect) => {
                         log::info!("Reconnect requested, ending session");
                         client.close().await?;
-                        anyhow::bail!("Reconnect requested");
+                        return Ok(true);
                     }
                     Some(HandlerCommand::Close) => {
                         self.send_close_msg();
