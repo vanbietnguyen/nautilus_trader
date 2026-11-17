@@ -19,6 +19,7 @@ use anyhow::Context;
 use indexmap::IndexMap;
 use jiff::tz::TimeZone;
 use nautilus_common::{
+    cache::Cache,
     messages::data::{
         BarsResponse, DataResponseEnvelope, SubscribeBars, SubscribeCommand, TradesResponse,
     },
@@ -223,13 +224,12 @@ impl DataEngine {
 
             let handler: Box<dyn FnMut(Bar)> = Box::new(move |bar: Bar| {
                 // Request-generated bars are delivered only through the cache, or as response
-                // parts when the request interleaves.
-                if let Err(e) = cache.as_ref().borrow_mut().add_bar_historical(bar) {
-                    log_error_on_cache_insert(&e);
-                }
-
+                // parts when the request interleaves, each part's bars entering the cache as it
+                // is delivered.
                 if let Some(interleaved_bars) = &interleaved_bars {
                     interleaved_bars.borrow_mut().push(bar);
+                } else if let Err(e) = cache.as_ref().borrow_mut().add_bar_historical(bar) {
+                    log_error_on_cache_insert(&e);
                 }
 
                 for aggregator in &downstream {
@@ -373,10 +373,11 @@ impl DataEngine {
     /// Trades feed the request aggregators one at a time. A bar a trade completes is delivered
     /// before that trade, except a bar whose chain starts at a `RANGE_INCLUSIVE` bar type (see
     /// [`follows_completing_trade`]), which is delivered after it (the live publication order).
-    /// Each bar delivery first sends the trades gathered since the previous one. The last part of
-    /// a partial envelope, the trades after the last completed bar (possibly none), is sent as a
-    /// part; a completed envelope ends the request through [`Self::finish_interleaved`], with its
-    /// reason.
+    /// Each bar delivery first sends the trades gathered since the previous one, and each bar
+    /// enters the cache only as its part is sent, so a trade's handler finds in the cache the
+    /// bars live publication has cached by that trade. The last part of a partial envelope, the
+    /// trades after the last completed bar (possibly none), is sent as a part; a completed
+    /// envelope ends the request through [`Self::finish_interleaved`], with its reason.
     pub(super) fn respond_interleaved_trades(
         &mut self,
         resp: &TradesResponse,
@@ -399,9 +400,9 @@ impl DataEngine {
                 .into_iter()
                 .partition(|bar| follows_completing_trade(bar.bar_type, &state.bar_types));
 
-            send_interleaved_bars(resp, &mut pending, before);
+            send_interleaved_bars(&self.cache, resp, &mut pending, before);
             pending.push(*trade);
-            send_interleaved_bars(resp, &mut pending, after);
+            send_interleaved_bars(&self.cache, resp, &mut pending, after);
         }
 
         if envelope.completed() {
@@ -431,9 +432,9 @@ impl DataEngine {
     /// Takes the request's entry, cleans up its aggregators (a joined request's builders
     /// releasing through the answer's cut and floor), and delivers the bars that clean-up
     /// completed: with the answer's identity, or with the dispatched client's and the request's
-    /// window when there is no answer and a client was resolved (none otherwise). Then sends
-    /// exactly one terminal, the answer's last trades part when there is one, carrying `failure`
-    /// when there is a reason.
+    /// window when there is no answer and a client was resolved (none otherwise, and they do not
+    /// enter the cache). Then sends exactly one terminal, the answer's last trades part when
+    /// there is one, carrying `failure` when there is a reason.
     pub(super) fn finish_interleaved(
         &mut self,
         request_id: UUID4,
@@ -455,7 +456,7 @@ impl DataEngine {
             ..
         }) = closing
         {
-            send_interleaved_bars(resp, &mut pending, remaining);
+            send_interleaved_bars(&self.cache, resp, &mut pending, remaining);
             DataResponseEnvelope::new(
                 DataResponse::Trades(trades_part(resp, pending)),
                 true,
@@ -466,6 +467,7 @@ impl DataEngine {
             if let Some(client_id) = interleaved.client_id {
                 let ts_init = self.clock.borrow().timestamp_ns();
                 send_bars_parts(
+                    &self.cache,
                     request_id,
                     client_id,
                     (interleaved.start, interleaved.end),
@@ -1504,7 +1506,12 @@ pub(super) fn trades_part(resp: &TradesResponse, data: Vec<TradeTick>) -> Trades
 
 /// Sends the trades gathered in `pending`, then `bars` as one bars part per bar type in
 /// completion order. Sends nothing when `bars` is empty.
-fn send_interleaved_bars(resp: &TradesResponse, pending: &mut Vec<TradeTick>, bars: Vec<Bar>) {
+fn send_interleaved_bars(
+    cache: &Rc<RefCell<Cache>>,
+    resp: &TradesResponse,
+    pending: &mut Vec<TradeTick>,
+    bars: Vec<Bar>,
+) {
     if bars.is_empty() {
         return;
     }
@@ -1515,6 +1522,7 @@ fn send_interleaved_bars(resp: &TradesResponse, pending: &mut Vec<TradeTick>, ba
     }
 
     send_bars_parts(
+        cache,
         resp.correlation_id,
         resp.client_id,
         (resp.start, resp.end),
@@ -1525,8 +1533,9 @@ fn send_interleaved_bars(resp: &TradesResponse, pending: &mut Vec<TradeTick>, ba
 }
 
 /// Sends `bars` as one bars part per bar type in completion order, each carrying the request's
-/// identity and window.
+/// identity and window. A part's bars enter the cache just before it is sent.
 fn send_bars_parts(
+    cache: &Rc<RefCell<Cache>>,
     correlation_id: UUID4,
     client_id: ClientId,
     (start, end): (Option<UnixNanos>, Option<UnixNanos>),
@@ -1540,6 +1549,12 @@ fn send_bars_parts(
     }
 
     for (bar_type, data) in bars_by_type {
+        for bar in &data {
+            if let Err(e) = cache.as_ref().borrow_mut().add_bar_historical(*bar) {
+                log_error_on_cache_insert(&e);
+            }
+        }
+
         let bars = BarsResponse::new(
             correlation_id,
             client_id,

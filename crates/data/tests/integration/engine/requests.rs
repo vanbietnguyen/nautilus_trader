@@ -2527,6 +2527,43 @@ fn test_interleaved_range_inclusive_composite_of_tick_bars_precedes_its_trade_as
     assert_eq!(history, live);
 }
 
+#[rstest]
+fn test_interleaved_trade_handler_finds_in_the_cache_only_the_bars_live_has_cached(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let range_inclusive = BarType::from(format!("{id}-10-RANGE_INCLUSIVE-LAST-INTERNAL").as_str());
+    let range = BarType::from(format!("{id}-10-RANGE-LAST-INTERNAL").as_str());
+    let bar_types = [range_inclusive, range];
+    let trade = |trade_id: &str, cached: [Option<u64>; 2]| {
+        let cached = cached.iter().map(|ts| ts.map(UnixNanos::from)).collect();
+        OrderedDelivery::Trade(TradeId::new(trade_id), cached)
+    };
+    // t3 completes a bar of each type: neither is in the cache for t1 and t2
+    let expected = vec![
+        trade("t1", [None, None]),
+        trade("t2", [None, None]),
+        delivered_bar(range, 3_000),
+        trade("t3", [None, Some(3_000)]),
+        delivered_bar(range_inclusive, 3_000),
+        trade("t4", [Some(3_000), Some(3_000)]),
+        trade("t5", [Some(3_000), Some(3_000)]),
+        delivered_bar(range_inclusive, 5_000),
+        delivered_bar(range, 6_000),
+        trade("t6", [Some(5_000), Some(6_000)]),
+    ];
+
+    let live = live_deliveries(audusd_sim.clone(), client_id, venue, &bar_types, &bar_types);
+    let history = interleaved_deliveries(audusd_sim, client_id, venue, &bar_types, &bar_types);
+
+    assert_eq!(live, expected);
+    assert_eq!(history, live);
+}
+
 // Made-up clock times and trading-day opens (civil 18:00 New York) for the join's admission
 const NY_2026_11_08_1800: u64 = 1_794_178_800_000_000_000;
 const NY_2026_11_09_1700: u64 = 1_794_261_600_000_000_000;
