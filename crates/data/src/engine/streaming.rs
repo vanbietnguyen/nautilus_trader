@@ -44,8 +44,10 @@ use ustr::Ustr;
 use super::{
     DataEngine,
     requests::{
-        QUOTES_REFUSED, describe_missing_sessions, request_params, sets_quotes, trading_days,
+        AdmittedJoin, QUOTES_REFUSED, describe_missing_sessions, has_continuous_future_params,
+        request_params, sets_quotes, trading_days,
     },
+    time_range::has_time_range_pipeline_params,
 };
 
 const PARAM_SKIP_CATALOG_DATA: &str = "skip_catalog_data";
@@ -428,12 +430,6 @@ impl DataEngine {
         req: RequestCommand,
     ) -> anyhow::Result<()> {
         if request_has_schema(&req) {
-            // The client answers it whole: no catalog leg carries its quotes
-            anyhow::ensure!(
-                !sets_quotes(&req),
-                "{QUOTES_REFUSED}: its `schema` sends it to its client, so its plan has no \
-                 catalog leg"
-            );
             return self.dispatch_request_to_client(req).map(|_| ());
         }
 
@@ -454,15 +450,27 @@ impl DataEngine {
             return self.dispatch_request_to_client(req).map(|_| ());
         };
 
+        let plan = self.plan_date_range_request(&req, &key)?;
+        self.dispatch_request_plan(req, plan)
+    }
+
+    /// Returns the plan of a date-range request for the one identifier `key`: one catalog leg
+    /// from the first catalog that covers part of the window (unless `skip_catalog_data`), plus
+    /// one client leg per interval it misses when a client resolves.
+    fn plan_date_range_request(
+        &mut self,
+        req: &RequestCommand,
+        key: &RequestCatalogKey,
+    ) -> anyhow::Result<Vec<RequestLeg>> {
         let now_ns = self.clock.borrow().timestamp_ns();
         let now_dt = now_ns.to_datetime_utc();
-        let query_past_data = request_params(&req)
+        let query_past_data = request_params(req)
             .and_then(|p| p.get(PARAM_SUBSCRIPTION_NAME))
             .is_none();
 
         let (start_dt, end_dt) = bound_request_dates(
-            request_start(&req),
-            request_end(&req),
+            request_start(req),
+            request_end(req),
             now_dt,
             query_past_data,
         );
@@ -479,7 +487,7 @@ impl DataEngine {
         // selected and read for the snapshot replay; client gaps keep the original window.
         // The parent request keeps its original start, so the merged response trims back to it.
         let (catalog_start_dt, catalog_start_ns) = if matches!(req, RequestCommand::BookDeltas(_))
-            && request_params(&req)
+            && request_params(req)
                 .and_then(|p| p.get_bool(PARAM_FROM_DAY_START))
                 .unwrap_or(true)
         {
@@ -491,7 +499,7 @@ impl DataEngine {
 
         let query_interval = vec![(start_ns.as_u64(), end_ns.as_u64())];
         let mut missing_intervals = query_interval.clone();
-        let coverage = self.catalog_coverage(&key, catalog_start_ns.as_u64(), end_ns.as_u64())?;
+        let coverage = self.catalog_coverage(key, catalog_start_ns.as_u64(), end_ns.as_u64())?;
 
         let winning_catalog = if let Some(CatalogCoverage {
             catalog: name,
@@ -508,7 +516,7 @@ impl DataEngine {
                         .expect("selected catalog is registered"),
                     start_ns.as_u64(),
                     end_ns.as_u64(),
-                    &key,
+                    key,
                 )?
             };
 
@@ -517,7 +525,7 @@ impl DataEngine {
             None
         };
 
-        let skip_catalog_data = request_params(&req)
+        let skip_catalog_data = request_params(req)
             .and_then(|p| p.get_bool(PARAM_SKIP_CATALOG_DATA))
             .unwrap_or(false);
 
@@ -542,7 +550,7 @@ impl DataEngine {
 
         if !skip_catalog_data && let Some(catalog) = winning_catalog {
             let request =
-                with_dates_for_pipeline(&req, Some(catalog_start_dt), Some(end_dt), now_ns);
+                with_dates_for_pipeline(req, Some(catalog_start_dt), Some(end_dt), now_ns);
             plan.push(RequestLeg::Catalog {
                 request,
                 catalog,
@@ -553,11 +561,11 @@ impl DataEngine {
         for (start, end) in missing_intervals {
             let start = UnixNanos::from(start).to_datetime_utc();
             let end = UnixNanos::from(end).to_datetime_utc();
-            let request = with_dates_for_pipeline(&req, Some(start), Some(end), now_ns);
+            let request = with_dates_for_pipeline(req, Some(start), Some(end), now_ns);
             plan.push(RequestLeg::Client(request));
         }
 
-        self.dispatch_request_plan(req, plan)
+        Ok(plan)
     }
 
     fn dispatch_batch_catalog_request(&mut self, parent: RequestCommand) -> anyhow::Result<()> {
@@ -756,18 +764,142 @@ impl DataEngine {
         })
     }
 
+    /// Executes a trades request that carries `quotes`: admitted on its whole route and plan
+    /// ([`Self::admit_quotes`]), then its aggregators are prepared and its plan is dispatched
+    /// through the request pipeline. `join` is the request's admitted `cut_warmup`, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request is refused, its aggregators cannot be prepared, or its
+    /// plan cannot be dispatched; nothing of a refused request was dispatched.
+    pub(super) fn execute_quotes_request(
+        &mut self,
+        req: RequestCommand,
+        join: Option<&AdmittedJoin>,
+    ) -> anyhow::Result<()> {
+        let plan = self.admit_quotes(&req, join)?;
+        let request_id = *req.request_id();
+        self.prepare_request_bar_aggregators(&req)?;
+        let result = self.dispatch_request_plan(req, plan);
+        if result.is_err() {
+            self.cleanup_request_bar_aggregators(&request_id);
+        }
+        result
+    }
+
+    /// Returns the plan of a trades request that carries `quotes` when every leg of it carries
+    /// the instrument's quotes, before anything of the request is dispatched.
+    ///
+    /// It sees the request's whole route in the engine's routing order: its client, the
+    /// pipeline it is a leg of, the pipeline it nests itself in, its join, its catalogs, its
+    /// `schema`, its instruments, and then the legs of its plan. Only a catalog leg answers
+    /// quotes, so the one admitted shape is a single-instrument date-range request whose plan
+    /// is one catalog leg over the whole window, from the catalog that won on trades coverage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `quotes` is not a boolean.
+    /// - Its client is external (this engine would answer nothing).
+    /// - It is a leg of a `RequestJoin` (whose rebuilt answer holds one data type).
+    /// - It sets continuous-future or time-range pipeline params (the pipeline answers child
+    ///   requests, not one time order).
+    /// - Its plan has no catalog leg (no catalog registered, a `schema`, `skip_catalog_data`,
+    ///   no catalog covering any of the window) or a leg its client serves (a gap the catalog
+    ///   does not cover, or a joined request's replay tail, which every join plans).
+    /// - It does not name exactly one instrument (a batch).
+    /// - Its plan cannot be made.
+    ///
+    /// The error names the first such reason on the route, or every such leg of the plan.
+    fn admit_quotes(
+        &mut self,
+        req: &RequestCommand,
+        join: Option<&AdmittedJoin>,
+    ) -> anyhow::Result<Vec<RequestLeg>> {
+        let RequestCommand::Trades(cmd) = req else {
+            anyhow::bail!("{QUOTES_REFUSED}: only a trades request can set `quotes`");
+        };
+        anyhow::ensure!(
+            sets_quotes(req),
+            "{QUOTES_REFUSED}: `quotes` must be a boolean"
+        );
+
+        if let Some(client_id) = req.client_id()
+            && self.is_external_client(*client_id)
+        {
+            anyhow::bail!(
+                "{QUOTES_REFUSED}: its client {client_id} is external, so this engine answers \
+                 nothing"
+            );
+        }
+
+        if let Some(&(pipeline_id, _)) = self
+            .request_pipeline_parent_request_id
+            .get(req.request_id())
+        {
+            let join_id = self
+                .parent_join_request_id
+                .get(&pipeline_id)
+                .copied()
+                .unwrap_or(pipeline_id);
+            anyhow::bail!(
+                "{QUOTES_REFUSED}: it is a leg of the request join {join_id}, whose answer is \
+                 rebuilt as one data type"
+            );
+        }
+
+        let params = request_params(req);
+        if has_continuous_future_params(params) {
+            anyhow::bail!(
+                "{QUOTES_REFUSED}: its continuous-future params nest it in a continuous-future \
+                 pipeline, which answers bars only"
+            );
+        }
+
+        let plan = if let Some(join) = join {
+            self.plan_join(req, &join.session_opens)?.legs
+        } else {
+            if has_time_range_pipeline_params(params) {
+                anyhow::bail!(
+                    "{QUOTES_REFUSED}: its `time_range_generator` nests it in a time-range \
+                     pipeline, which answers each child window apart"
+                );
+            }
+            if !self.catalogs_registered() {
+                anyhow::bail!(
+                    "{QUOTES_REFUSED}: no catalog is registered, so its plan has no catalog leg"
+                );
+            }
+            if request_has_schema(req) {
+                anyhow::bail!(
+                    "{QUOTES_REFUSED}: its `schema` sends it to its client, so its plan has no \
+                     catalog leg"
+                );
+            }
+            if cmd.instrument_ids.len() != 1 {
+                anyhow::bail!(
+                    "{QUOTES_REFUSED}: it must name exactly one instrument (batches are \
+                     refused), received {}",
+                    cmd.instrument_ids.len(),
+                );
+            }
+            let Some(key) = request_identifier(req) else {
+                anyhow::bail!("{QUOTES_REFUSED}: its plan has no catalog leg");
+            };
+            self.plan_date_range_request(req, &key)?
+        };
+
+        if let Some(reason) = quotes_plan_refusal(&plan) {
+            anyhow::bail!("{QUOTES_REFUSED}: {reason}");
+        }
+        Ok(plan)
+    }
+
     fn dispatch_request_plan(
         &mut self,
         parent: RequestCommand,
         plan: Vec<RequestLeg>,
     ) -> anyhow::Result<()> {
-        // Refused before any leg is dispatched: a leg without quotes would answer trades alone
-        if sets_quotes(&parent)
-            && let Some(reason) = quotes_plan_refusal(&plan)
-        {
-            anyhow::bail!("{QUOTES_REFUSED}: {reason}");
-        }
-
         let parent_id = *parent.request_id();
 
         if plan.is_empty() {

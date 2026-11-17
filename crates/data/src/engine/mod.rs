@@ -140,9 +140,11 @@ use nautilus_model::{
 use option_chain::{
     OptionChainBootstrapper, OptionChainGreeksBootstrap, PendingOptionChainRequest,
 };
+#[cfg(not(feature = "streaming"))]
+use requests::QUOTES_REFUSED;
 use requests::{
     AdmittedJoin, ContinuousFutureRequest, ContinuousFutureRequestState, ContinuousFutureSegment,
-    ContinuousFutureSource, QUOTES_REFUSED, RequestBarAggregation, admit_cut_warmup,
+    ContinuousFutureSource, RequestBarAggregation, admit_cut_warmup, carries_quotes,
     continuous_future_request_from_bars, continuous_future_subscription_from_bars,
     has_continuous_future_params, request_bar_aggregation_from_params, request_params,
     response_params, sets_cut_warmup, sets_quotes,
@@ -1659,6 +1661,17 @@ impl DataEngine {
         #[cfg(feature = "streaming")]
         self.validate_catalog_update(&req)?;
 
+        // A `quotes` request is admitted on its whole route and plan before any of it runs
+        if carries_quotes(&req) {
+            #[cfg(feature = "streaming")]
+            return self.execute_quotes_request(req, join.as_ref());
+            #[cfg(not(feature = "streaming"))]
+            anyhow::bail!(
+                "{QUOTES_REFUSED}: this build has no catalogs (no `streaming` feature), so its \
+                 plan has no catalog leg"
+            );
+        }
+
         // Skip requests for external clients
         if let Some(cid) = req.client_id()
             && self.is_external_client(*cid)
@@ -1708,14 +1721,7 @@ impl DataEngine {
             return result;
         }
 
-        // Only a catalog leg answers a `quotes` request's quotes; its client would answer trades
-        let result = if sets_quotes(&req) {
-            Err(anyhow::anyhow!(
-                "{QUOTES_REFUSED}: no catalog is registered, so its plan has no catalog leg"
-            ))
-        } else {
-            self.dispatch_request_to_client(req)
-        };
+        let result = self.dispatch_request_to_client(req);
 
         if result.is_err() {
             self.cleanup_request_bar_aggregators(&request_id);

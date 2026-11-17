@@ -5593,6 +5593,179 @@ fn test_joined_quotes_request_is_refused_naming_its_replay_tail(
     assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
 }
 
+/// A shape of `quotes` request no catalog leg can serve whole, refused on its route.
+#[cfg(feature = "streaming")]
+#[derive(Clone, Copy, Debug)]
+enum UnservedShape {
+    /// Its `quotes` is not a boolean.
+    NotBoolean,
+    /// It names two instruments, the second with no catalog coverage.
+    Batch,
+    /// It sets a time-range pipeline with no child window.
+    EmptyTimeRange,
+    /// It sets a time-range pipeline with child windows.
+    TimeRange,
+    /// It sets continuous-future params.
+    ContinuousFuture,
+    /// Its client is external.
+    ExternalClient,
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+#[case::not_boolean(UnservedShape::NotBoolean, "`quotes` must be a boolean")]
+#[case::batch(
+    UnservedShape::Batch,
+    "it must name exactly one instrument (batches are refused), received 2"
+)]
+#[case::empty_time_range(
+    UnservedShape::EmptyTimeRange,
+    "its `time_range_generator` nests it in a time-range pipeline, which answers each child \
+     window apart"
+)]
+#[case::time_range(
+    UnservedShape::TimeRange,
+    "its `time_range_generator` nests it in a time-range pipeline, which answers each child \
+     window apart"
+)]
+#[case::continuous_future(
+    UnservedShape::ContinuousFuture,
+    "its continuous-future params nest it in a continuous-future pipeline, which answers bars \
+     only"
+)]
+#[case::external_client(
+    UnservedShape::ExternalClient,
+    "its client SIM is external, so this engine answers nothing"
+)]
+fn test_quotes_request_of_an_unserved_shape_is_refused_before_any_dispatch(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] shape: UnservedShape,
+    #[case] reason: &str,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let _catalog_dir = register_quoted_catalog(&fixture, "quotes-unserved", &COUNTEREXAMPLE);
+    let mut params = quoted_params(&fixture, QuotedBars::Ticks, Some(true));
+    let mut instrument_ids = vec![fixture.instrument_id];
+    match shape {
+        UnservedShape::NotBoolean => params["quotes"] = json!("true"),
+        UnservedShape::Batch => instrument_ids.push(InstrumentId::from("GBP/USD.SIM")),
+        UnservedShape::EmptyTimeRange => {
+            params["time_range_generator"] = json!("");
+            params["durations_seconds"] = json!([]);
+        }
+        UnservedShape::TimeRange => {
+            params["time_range_generator"] = json!("");
+            params["durations_seconds"] = json!([1]);
+        }
+        UnservedShape::ContinuousFuture => params["continuous_future_transitions"] = json!([]),
+        UnservedShape::ExternalClient => {
+            let engine = fixture.engine.borrow();
+            engine
+                .cache()
+                .borrow_mut()
+                .add_external_data_client(client_id);
+        }
+    }
+    let request = RequestCommand::Trades(RequestTrades::new(
+        instrument_ids,
+        Some(UnixNanos::from(1_000).to_datetime_utc()),
+        Some(UnixNanos::from(2_999).to_datetime_utc()),
+        None,
+        Some(client_id),
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(serde_json::from_value(params).unwrap()),
+    ));
+    let tap = QuotedResponses::install(*request.request_id());
+
+    let result = fixture.engine.borrow_mut().execute_request(request);
+
+    let error = result
+        .expect_err("a `quotes` request of an unserved shape must be refused")
+        .to_string();
+    assert_eq!(error, format!("{QUOTES_REFUSED}: {reason}"));
+    assert_eq!(
+        tap.take(),
+        vec![quoted_end(QuotedPart::Nothing, Some(&error))],
+        "one terminal and nothing else"
+    );
+    assert!(
+        fixture.recorder.borrow().is_empty(),
+        "a refused request reaches no client: {:?}",
+        fixture.recorder.borrow()
+    );
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+    assert_eq!(fixture.engine.borrow().time_range_pipeline_count(), 0);
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_quotes_leg_of_a_request_join_is_refused_before_dispatch_naming_the_join(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let _catalog_dir = register_quoted_catalog(&fixture, "quotes-join-leg", &COUNTEREXAMPLE);
+    let (leg_id, join_id) = (UUID4::new(), UUID4::new());
+    let join = RequestJoin::new(
+        vec![leg_id],
+        Some(UnixNanos::from(1_000).to_datetime_utc()),
+        Some(UnixNanos::from(2_999).to_datetime_utc()),
+        join_id,
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    let join_tap = QuotedResponses::install(join_id);
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(RequestCommand::Join(join))
+        .unwrap();
+    let params = quoted_params(&fixture, QuotedBars::None, Some(true));
+    let leg = RequestCommand::Trades(RequestTrades::new(
+        vec![fixture.instrument_id],
+        Some(UnixNanos::from(1_000).to_datetime_utc()),
+        Some(UnixNanos::from(2_999).to_datetime_utc()),
+        None,
+        Some(client_id),
+        leg_id,
+        UnixNanos::default(),
+        Some(serde_json::from_value(params).unwrap()),
+    ));
+
+    let result = fixture.engine.borrow_mut().execute_request(leg);
+
+    let error = result
+        .expect_err("a `quotes` leg of a request join must be refused")
+        .to_string();
+    assert_eq!(
+        error,
+        format!(
+            "{QUOTES_REFUSED}: it is a leg of the request join {join_id}, whose answer is \
+             rebuilt as one data type"
+        )
+    );
+    assert_eq!(
+        join_tap.take(),
+        vec![quoted_end(QuotedPart::Nothing, Some(&error))],
+        "the join ends with the leg's reason, once"
+    );
+    assert!(
+        fixture.recorder.borrow().is_empty(),
+        "a refused leg reaches no client: {:?}",
+        fixture.recorder.borrow()
+    );
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+}
+
 /// How a request of the parameter-absent test is answered.
 #[cfg(feature = "streaming")]
 #[derive(Clone, Copy, Debug)]

@@ -534,11 +534,21 @@ pub(super) fn sets_cut_warmup(req: &RequestCommand) -> bool {
 /// Returns whether `req` is a trades request that sets `quotes`: its catalog legs also answer the
 /// instrument's quotes, delivered with its trades in one time order.
 ///
-/// A request whose plan cannot carry its quotes (no catalog leg, or a leg its client serves) is
-/// refused.
+/// Only an admitted request reaches its legs: one that cannot carry its quotes is refused first
+/// (see [`carries_quotes`]).
 pub(super) fn sets_quotes(req: &RequestCommand) -> bool {
     matches!(req, RequestCommand::Trades(_))
         && request_params(req).and_then(|params| params.get_bool(QUOTES)) == Some(true)
+}
+
+/// Returns whether `req` is a trades request whose `quotes` param is present and not `false`
+/// (set, or not a boolean): the engine admits it on its whole route and plan before anything of
+/// it runs, and refuses it by name when it cannot carry its quotes.
+pub(super) fn carries_quotes(req: &RequestCommand) -> bool {
+    matches!(req, RequestCommand::Trades(_))
+        && request_params(req)
+            .and_then(|params| params.get(QUOTES))
+            .is_some_and(|value| value.as_bool() != Some(false))
 }
 
 /// Returns the trading days from the one opening at `first` up to `end` (exclusive), each as its
