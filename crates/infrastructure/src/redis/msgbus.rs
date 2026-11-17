@@ -1625,6 +1625,81 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stream_messages_from_beginning_reads_backlog_in_bounded_pages_then_tail() {
+        let backlog_len = 2 * STREAM_READ_BATCH_SIZE + 1;
+        let stream_keys = vec!["stream-0".to_string(), "stream-1".to_string()];
+        let fake = FakeRedisStreams::start(&stream_keys, backlog_len).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BusMessage>(100);
+        let stream_signal = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(stream_messages_from(
+            tx,
+            fake.config(),
+            stream_keys.clone(),
+            StreamStart::Beginning,
+            Arc::clone(&stream_signal),
+        ));
+
+        let mut received: [Vec<String>; 2] = Default::default();
+        receive_stream_payloads(&mut rx, &stream_keys, &mut received, 2 * backlog_len).await;
+        // Appended only once the whole backlog was received
+        fake.append(backlog_len + 1, "tail");
+        receive_stream_payloads(&mut rx, &stream_keys, &mut received, 2 * backlog_len + 2).await;
+        rx.close();
+        stream_signal.store(true, Ordering::Relaxed);
+        handle.await.unwrap().unwrap();
+
+        let expected: Vec<String> = (1..=backlog_len)
+            .map(|i| i.to_string())
+            .chain(std::iter::once("tail".to_string()))
+            .collect();
+        assert_eq!(received, [expected.clone(), expected]);
+        let reads = fake.reads.lock().unwrap();
+        assert!(
+            reads
+                .iter()
+                .all(|read| read.count == Some(STREAM_READ_BATCH_SIZE))
+        );
+        let expected_pages = [
+            ("0".to_string(), STREAM_READ_BATCH_SIZE),
+            (
+                format!("{STREAM_READ_BATCH_SIZE}-0"),
+                STREAM_READ_BATCH_SIZE,
+            ),
+            (format!("{}-0", 2 * STREAM_READ_BATCH_SIZE), 1),
+            (format!("{backlog_len}-0"), 1),
+        ];
+
+        for stream in 0..stream_keys.len() {
+            let pages: Vec<_> = reads
+                .iter()
+                .filter(|read| read.replied[stream] > 0)
+                .map(|read| (read.ids[stream].clone(), read.replied[stream]))
+                .collect();
+            assert_eq!(pages, expected_pages);
+        }
+    }
+
+    async fn receive_stream_payloads(
+        rx: &mut tokio::sync::mpsc::Receiver<BusMessage>,
+        stream_keys: &[String],
+        received: &mut [Vec<String>; 2],
+        total: usize,
+    ) {
+        while received.iter().map(Vec::len).sum::<usize>() < total {
+            let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the entries should arrive")
+                .expect("the stream task should keep the channel open");
+            let stream = stream_keys
+                .iter()
+                .position(|key| msg.topic == key.as_str())
+                .expect("every entry comes from one of the read streams");
+            received[stream].push(String::from_utf8(msg.payload.to_vec()).unwrap());
+        }
+    }
+
     #[tokio::test]
     async fn test_wait_for_retry_delay_returns_false_when_signaled() {
         let stream_signal = Arc::new(AtomicBool::new(true));
@@ -1856,6 +1931,158 @@ mod tests {
                 ..Default::default()
             }
         }
+    }
+
+    /// The entries of each stream of a [`FakeRedisStreams`], as `(n, payload)` of the entry `<n>-0`.
+    type FakeStreams = Vec<Vec<(usize, String)>>;
+
+    /// One `XREAD` a [`FakeRedisStreams`] answered: its `COUNT`, the ID it read after in each
+    /// stream, and how many entries of each stream the reply carried.
+    struct FakeStreamRead {
+        count: Option<usize>,
+        ids: Vec<String>,
+        replied: Vec<usize>,
+    }
+
+    /// A loopback RESP server standing in for Redis, which holds streams of entries `<n>-0`
+    /// carrying the stream key as topic and `n` as payload, answers `XREAD` as Redis does, and
+    /// records each read.
+    struct FakeRedisStreams {
+        port: u16,
+        streams: Arc<std::sync::Mutex<FakeStreams>>,
+        reads: Arc<std::sync::Mutex<Vec<FakeStreamRead>>>,
+    }
+
+    impl FakeRedisStreams {
+        async fn start(stream_keys: &[String], backlog_len: usize) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let backlog: Vec<_> = (1..=backlog_len).map(|n| (n, n.to_string())).collect();
+            let streams = Arc::new(std::sync::Mutex::new(vec![backlog; stream_keys.len()]));
+            let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (keys, streams_clone, reads_clone) = (
+                stream_keys.to_vec(),
+                Arc::clone(&streams),
+                Arc::clone(&reads),
+            );
+
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    let (keys, streams, reads) = (
+                        keys.clone(),
+                        Arc::clone(&streams_clone),
+                        Arc::clone(&reads_clone),
+                    );
+
+                    tokio::spawn(async move {
+                        let (read, mut write) = socket.into_split();
+                        let mut reader = tokio::io::BufReader::new(read);
+
+                        while let Some(command) = read_resp_command(&mut reader).await {
+                            let reply = match command[0].to_ascii_uppercase().as_slice() {
+                                b"INFO" => {
+                                    let info = "redis_version:8.0.0\r\n";
+                                    format!("${}\r\n{info}\r\n", info.len())
+                                }
+                                b"XREAD" => {
+                                    let reply = xread_reply(&command, &keys, &streams, &reads);
+                                    if reply.is_none() {
+                                        // An empty blocking read times out with a nil reply
+                                        tokio::time::sleep(Duration::from_millis(10)).await;
+                                    }
+                                    reply.unwrap_or_else(|| "*-1\r\n".to_string())
+                                }
+                                _ => "+OK\r\n".to_string(),
+                            };
+
+                            if write.write_all(reply.as_bytes()).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+
+            Self {
+                port,
+                streams,
+                reads,
+            }
+        }
+
+        fn append(&self, n: usize, payload: &str) {
+            for stream in self.streams.lock().unwrap().iter_mut() {
+                stream.push((n, payload.to_string()));
+            }
+        }
+
+        fn config(&self) -> RedisMessageBusConfig {
+            RedisMessageBusConfig {
+                port: Some(self.port),
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Answers `XREAD [BLOCK ms] [COUNT n] STREAMS keys... ids...` with each stream's entries after
+    /// its ID, at most `COUNT` of each, recording the read; `None` when no stream has any.
+    fn xread_reply(
+        command: &[Vec<u8>],
+        keys: &[String],
+        streams: &std::sync::Mutex<FakeStreams>,
+        reads: &std::sync::Mutex<Vec<FakeStreamRead>>,
+    ) -> Option<String> {
+        use std::fmt::Write;
+
+        let args: Vec<String> = command
+            .iter()
+            .map(|arg| String::from_utf8(arg.clone()).unwrap())
+            .collect();
+        let count = args
+            .iter()
+            .position(|arg| arg.eq_ignore_ascii_case("COUNT"))
+            .map(|at| args[at + 1].parse::<usize>().unwrap());
+        let at = args
+            .iter()
+            .position(|arg| arg.eq_ignore_ascii_case("STREAMS"))
+            .unwrap();
+        let (read_keys, ids) = args[at + 1..].split_at((args.len() - at - 1) / 2);
+        let bulk = |value: &str| format!("${}\r\n{value}\r\n", value.len());
+        let streams = streams.lock().unwrap();
+        let mut replied = vec![0; keys.len()];
+        let mut reply = String::new();
+
+        for (key, id) in read_keys.iter().zip(ids) {
+            let stream = keys.iter().position(|known| known == key).unwrap();
+            let after: usize = id.split('-').next().unwrap().parse().unwrap();
+            let entries: Vec<_> = streams[stream]
+                .iter()
+                .filter(|(n, _)| *n > after)
+                .take(count.unwrap_or(usize::MAX))
+                .collect();
+            if entries.is_empty() {
+                continue;
+            }
+            replied[stream] = entries.len();
+            write!(reply, "*2\r\n{}*{}\r\n", bulk(key), entries.len()).unwrap();
+            for (n, payload) in entries {
+                let fields = [bulk("topic"), bulk(key), bulk("payload"), bulk(payload)];
+                write!(
+                    reply,
+                    "*2\r\n{}*4\r\n{}",
+                    bulk(&format!("{n}-0")),
+                    fields.concat()
+                )
+                .unwrap();
+            }
+        }
+        let streams_replied = replied.iter().filter(|&&len| len > 0).count();
+        reads.lock().unwrap().push(FakeStreamRead {
+            count,
+            ids: ids.to_vec(),
+            replied,
+        });
+        (streams_replied > 0).then(|| format!("*{streams_replied}\r\n{reply}"))
     }
 
     async fn read_resp_command(
@@ -2278,6 +2505,23 @@ mod serial_tests {
             .unwrap();
         });
 
+        let mut received: [Vec<String>; 2] = Default::default();
+        let mut receive_until = async |total: usize| {
+            while received.iter().map(Vec::len).sum::<usize>() < total {
+                let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("the backlog and the live entries should arrive")
+                    .expect("the stream task should keep the channel open");
+                let stream = topics
+                    .iter()
+                    .position(|topic| msg.topic == *topic)
+                    .expect("every entry comes from one of the read streams");
+                received[stream].push(String::from_utf8(msg.payload.to_vec()).unwrap());
+            }
+        };
+        receive_until(2 * backlog_len).await;
+
+        // Appended only once the whole backlog was received, so a tail read takes them
         let future_id = (get_atomic_clock_realtime().get_time_ms() + 1_000_000).to_string();
         for (stream_key, topic) in stream_keys.iter().zip(topics) {
             let _: () = con
@@ -2289,24 +2533,7 @@ mod serial_tests {
                 .await
                 .unwrap();
         }
-
-        let mut received: [Vec<String>; 2] = Default::default();
-        let mut live_count = 0;
-        while live_count < 2 {
-            let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-                .await
-                .expect("the backlog and the live entries should arrive")
-                .expect("the stream task should keep the channel open");
-            let stream = topics
-                .iter()
-                .position(|topic| msg.topic == *topic)
-                .expect("every entry comes from one of the read streams");
-            let payload = String::from_utf8(msg.payload.to_vec()).unwrap();
-            if payload == "live" {
-                live_count += 1;
-            }
-            received[stream].push(payload);
-        }
+        receive_until(2 * backlog_len + 2).await;
 
         rx.close();
         stream_signal.store(true, Ordering::Relaxed);
