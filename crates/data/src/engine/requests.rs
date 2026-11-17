@@ -535,7 +535,8 @@ pub(super) fn sets_cut_warmup(req: &RequestCommand) -> bool {
 /// instrument's quotes, delivered with its trades in one time order.
 ///
 /// Only an admitted request reaches its legs: one that cannot carry its quotes is refused first
-/// (see [`carries_quotes`]).
+/// (see [`carries_quotes`]). What callers get, and every refusal, is documented on
+/// `DataActor::request_trades` (`nautilus_common::actor`).
 pub(super) fn sets_quotes(req: &RequestCommand) -> bool {
     matches!(req, RequestCommand::Trades(_))
         && request_params(req).and_then(|params| params.get_bool(QUOTES)) == Some(true)

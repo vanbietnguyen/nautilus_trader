@@ -3109,6 +3109,36 @@ pub trait DataActor {
 
     /// Request historical [`TradeTick`] data for the given `instrument_ids`.
     ///
+    /// With `params["quotes"] = true` the data engine also answers the instrument's
+    /// [`QuoteTick`]s from the catalog that holds its trades, merged with the trades in one time
+    /// order: by `ts_init`, a quote before a trade at an equal stamp. The answer arrives as typed
+    /// parts under the request's ID, one per run of quotes or of trades, each before the next
+    /// (`on_historical_quotes`, `on_historical_trades`); the last part is a trades part, empty
+    /// when the order ends with quotes, and it completes the request. Bars the request builds
+    /// come from its trades parts (quotes reach only its non-`LAST` bar types). Without the
+    /// parameter, or with `false`, the request is answered as before.
+    ///
+    /// Each part is one envelope through the engine's response route and one handler call, and
+    /// the parts number the runs of quotes plus the runs of trades: about twice the runs of
+    /// trades, so a window whose quotes and trades alternate tick by tick sends about two parts
+    /// per trade. The engine builds every part before it sends the first, holding about twice
+    /// the window's quote and trade rows at that point. Part counts, wall time and memory of a
+    /// real session are unmeasured.
+    ///
+    /// The engine refuses such a request before dispatching anything, with one terminal
+    /// envelope whose failure reason names why, when: `quotes` is not a boolean; the client is
+    /// external; the request is a leg of a `RequestJoin`; it sets continuous-future or
+    /// time-range pipeline parameters; it sets `cut_warmup` (the replay of the current session
+    /// carries no quotes); no catalog is registered (or the engine is built without
+    /// `streaming`), or it sets `schema` or `skip_catalog_data`, or no catalog covers any of its
+    /// window; a client would serve part of its window (a gap in the catalog's trade file
+    /// intervals while a client resolves); or it names more than one instrument. Once admitted,
+    /// a gap in the catalog's quote file intervals over the window fails the request with one
+    /// terminal envelope naming the gap. Coverage is the catalog's file intervals, not the rows
+    /// they hold, so the files must be written with intervals covering the whole window. A gap
+    /// in the trade file intervals with no client to resolve is answered as an ordinary trades
+    /// request answers it: without those trades and without a reason.
+    ///
     /// # Errors
     ///
     /// Returns an error if input parameters are invalid.

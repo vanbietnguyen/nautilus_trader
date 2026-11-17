@@ -361,7 +361,7 @@ impl DataEngine {
 
         if completed {
             let joined = match resp {
-                DataResponse::Trades(r) => self.answer_release(&state, correlation_id, &r.data),
+                DataResponse::Trades(r) => joined_release(&state, &r.data),
                 _ => None,
             };
             self.release_request_bar_aggregators(&correlation_id, joined);
@@ -408,7 +408,7 @@ impl DataEngine {
                 resp,
                 pending,
                 sub_correlation_id: envelope.sub_correlation_id(),
-                joined: self.answer_release(state, request_id, &resp.data),
+                joined: joined_release(state, &resp.data),
             };
             let failure = envelope.failure_reason().map(str::to_owned);
             self.finish_interleaved(request_id, failure, Some(closing));
@@ -481,18 +481,6 @@ impl DataEngine {
             None => terminal,
         };
         msgbus::send_response_envelope(&terminal);
-    }
-
-    /// Returns the release of a joined request's completed answer (none outside a join): that of
-    /// the whole answer when it went out in parts, otherwise that of `answered`.
-    fn answer_release(
-        &mut self,
-        state: &RequestBarAggregation,
-        request_id: UUID4,
-        answered: &[TradeTick],
-    ) -> Option<JoinedRelease> {
-        let parted = self.parted_answer_releases.remove(&request_id);
-        parted.or_else(|| joined_release(state, answered))
     }
 
     pub(super) fn update_request_bar_aggregators_from_quote(

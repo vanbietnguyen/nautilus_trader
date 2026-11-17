@@ -80,8 +80,7 @@ use deadline::JoinDeadlineTimer;
 use dispatch::{log_error_on_cache_insert, process_engine_bar};
 use futures::{ContinuousFutureRoller, ContinuousFutureSubscriptionState, datetime_to_unix_nanos};
 use handlers::{
-    BAR_AGGREGATOR_PRIORITY, BarBarHandler, BarQuoteHandler, BarTradeHandler, JoinedRelease,
-    SpreadQuoteHandler,
+    BAR_AGGREGATOR_PRIORITY, BarBarHandler, BarQuoteHandler, BarTradeHandler, SpreadQuoteHandler,
 };
 use indexmap::IndexMap;
 #[cfg(feature = "defi")]
@@ -237,9 +236,6 @@ pub struct DataEngine {
     request_deadlines: AHashMap<UUID4, UnixNanos>,
     /// The unfinished legs of expired joined requests, each until its own terminal arrives.
     suppressed_legs: AHashSet<UUID4>,
-    /// The release of each joined request whose answer went out in parts (`quotes`): that of
-    /// the whole answer, until its completed part takes it.
-    parted_answer_releases: AHashMap<UUID4, JoinedRelease>,
     /// Envelopes of suppressed legs dropped after their request's expiry.
     late_envelopes: u64,
     join_deadline_timer: Option<Rc<JoinDeadlineTimer>>,
@@ -327,7 +323,6 @@ impl DataEngine {
             interleaved_requests: AHashMap::new(),
             request_deadlines: AHashMap::new(),
             suppressed_legs: AHashSet::new(),
-            parted_answer_releases: AHashMap::new(),
             late_envelopes: 0,
             join_deadline_timer: None,
             option_chain_bootstrapper: None,
@@ -586,7 +581,6 @@ impl DataEngine {
         self.inflight_requests.clear();
         self.request_deadlines.clear();
         self.suppressed_legs.clear();
-        self.parted_answer_releases.clear();
         self.request_pipeline_parent_request.clear();
         self.request_pipeline_n_components.clear();
         self.request_pipeline_parent_request_id.clear();
@@ -2441,7 +2435,17 @@ impl DataEngine {
     ///
     /// The parts take the ordinary route: trades parts feed the request's aggregators (through
     /// the interleaved path when the request interleaves); quotes parts reach only its
-    /// non-`LAST` aggregators. A joined request's release is that of the whole answer.
+    /// non-`LAST` aggregators.
+    ///
+    /// Memory, per request (the parts are new buffers, not views of the answer): the catalog
+    /// leg's query holds the window's quotes in their own buffer beside its trades until the
+    /// pipeline completes; the rebuild and the trim keep views of the leg's buffers (one leg;
+    /// a sorted copy only if its rows come unsorted) and the replay shares them; then
+    /// [`quote_and_trade_runs`] copies every quote and trade once more into its parts, and every
+    /// part exists before the first is sent. The peak is therefore about twice the window's
+    /// quote and trade rows, plus per part a response with a clone of the request's params
+    /// (and, for a quotes part, of its instrument IDs). The window is the caller's: nothing
+    /// here bounds it to one session.
     ///
     /// # Errors
     ///
@@ -2469,15 +2473,6 @@ impl DataEngine {
         let Some(DataResponse::Trades(last)) = parts.pop() else {
             anyhow::bail!("the replay of quotes and trades did not end with a trades part");
         };
-
-        if self
-            .request_bar_aggregations
-            .get(&parent_id)
-            .is_some_and(|state| state.cut_warmup)
-        {
-            self.parted_answer_releases
-                .insert(parent_id, JoinedRelease::from_answer(&trades.data));
-        }
 
         for part in parts {
             self.process_response_envelope(DataResponseEnvelope::new(part, false, None));
