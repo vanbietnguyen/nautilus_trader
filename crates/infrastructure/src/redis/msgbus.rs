@@ -74,6 +74,14 @@ const HEARTBEAT_TOPIC: &str = "health:heartbeat";
 const TRIM_BUFFER_SECS: u64 = 60;
 const PUBLISH_BATCH_SIZE: usize = 1_000;
 
+/// Most entries one stream read takes from each stream (the `COUNT` of each `XREAD`).
+///
+/// A backlog read from [`StreamStart::Beginning`] or an old [`StreamStart::After`] ID then arrives
+/// over several replies, so the bounded stream channel holds back the reads instead of one reply
+/// carrying the whole retained backlog. The value follows [`PUBLISH_BATCH_SIZE`] in this file, the
+/// most messages one publish write sends.
+const STREAM_READ_BATCH_SIZE: usize = 1_000;
+
 type RedisStreamBulk = Vec<HashMap<String, Vec<HashMap<String, redis::Value>>>>;
 
 /// Configuration for a Redis-backed message bus backing.
@@ -782,7 +790,7 @@ pub async fn stream_messages_from(
         .map(|&key| (key.to_string(), initial_id.clone()))
         .collect();
 
-    let opts = StreamReadOptions::default().block(100);
+    let opts = stream_read_options();
 
     'outer: loop {
         if stream_signal.load(Ordering::Relaxed) {
@@ -850,6 +858,14 @@ pub async fn stream_messages_from(
 
     log_task_stopped(MSGBUS_STREAM);
     Ok(())
+}
+
+/// Returns the options of each stream read: wait at most 100 ms for new entries and take at most
+/// [`STREAM_READ_BATCH_SIZE`] entries from each stream.
+fn stream_read_options() -> StreamReadOptions {
+    StreamReadOptions::default()
+        .block(100)
+        .count(STREAM_READ_BATCH_SIZE)
 }
 
 async fn connect_stream_connection(
@@ -1594,6 +1610,21 @@ mod tests {
         assert!((before..=clock.get_time_ms()).contains(&initial_id));
     }
 
+    #[rstest]
+    fn test_stream_read_options_count_entries_and_keep_block() {
+        let args = redis::ToRedisArgs::to_redis_args(&stream_read_options());
+
+        assert_eq!(
+            args,
+            vec![
+                b"BLOCK".to_vec(),
+                b"100".to_vec(),
+                b"COUNT".to_vec(),
+                STREAM_READ_BATCH_SIZE.to_string().into_bytes(),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn test_wait_for_retry_delay_returns_false_when_signaled() {
         let stream_signal = Arc::new(AtomicBool::new(true));
@@ -2202,6 +2233,94 @@ mod serial_tests {
         let received = read_backlog_then_live(&mut con, StreamStart::Now).await;
 
         assert_eq!(received, vec![("live".to_string(), Bytes::from("new"))]);
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stream_messages_from_beginning_pages_backlog_of_each_stream(
+        #[future] redis_connection: ConnectionManager,
+    ) {
+        let mut con = redis_connection.await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BusMessage>(100);
+        let suffix = UUID4::new();
+        let stream_keys = vec![
+            format!("test:stream:paged:{suffix}:0"),
+            format!("test:stream:paged:{suffix}:1"),
+        ];
+        let topics = ["paged-0", "paged-1"];
+        let backlog_len = 2 * STREAM_READ_BATCH_SIZE + 1;
+        let stream_signal = Arc::new(AtomicBool::new(false));
+        let stream_signal_clone = Arc::clone(&stream_signal);
+
+        for (stream_key, topic) in stream_keys.iter().zip(topics) {
+            let mut pipe = redis::pipe();
+            for i in 1..=backlog_len {
+                pipe.xadd(
+                    stream_key,
+                    format!("{i}-0"),
+                    &[("topic", topic.to_string()), ("payload", i.to_string())],
+                )
+                .ignore();
+            }
+            let _: () = pipe.query_async(&mut con).await.unwrap();
+        }
+
+        let external_streams = stream_keys.clone();
+        let handle = tokio::spawn(async move {
+            stream_messages_from(
+                tx,
+                RedisMessageBusConfig::default(),
+                external_streams,
+                StreamStart::Beginning,
+                stream_signal_clone,
+            )
+            .await
+            .unwrap();
+        });
+
+        let future_id = (get_atomic_clock_realtime().get_time_ms() + 1_000_000).to_string();
+        for (stream_key, topic) in stream_keys.iter().zip(topics) {
+            let _: () = con
+                .xadd(
+                    stream_key,
+                    &future_id,
+                    &[("topic", topic), ("payload", "live")],
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut received: [Vec<String>; 2] = Default::default();
+        let mut live_count = 0;
+        while live_count < 2 {
+            let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the backlog and the live entries should arrive")
+                .expect("the stream task should keep the channel open");
+            let stream = topics
+                .iter()
+                .position(|topic| msg.topic == *topic)
+                .expect("every entry comes from one of the read streams");
+            let payload = String::from_utf8(msg.payload.to_vec()).unwrap();
+            if payload == "live" {
+                live_count += 1;
+            }
+            received[stream].push(payload);
+        }
+
+        rx.close();
+        stream_signal.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+        for stream_key in &stream_keys {
+            let _: usize = con.del(stream_key).await.unwrap();
+        }
+
+        let expected: Vec<String> = (1..=backlog_len)
+            .map(|i| i.to_string())
+            .chain(std::iter::once("live".to_string()))
+            .collect();
+        assert_eq!(received[0], expected);
+        assert_eq!(received[1], expected);
     }
 
     #[rstest]
