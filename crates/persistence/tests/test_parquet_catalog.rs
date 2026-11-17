@@ -8966,29 +8966,201 @@ fn per_file_session_merges_identifiers_and_keeps_equal_timestamps_together() {
     assert!(next_quotes(&mut session).unwrap().is_none());
 }
 
+fn create_gbpusd_quote_tick(ts_init: u64) -> QuoteTick {
+    QuoteTick::new(
+        InstrumentId::from("GBP/USD.SIM"),
+        Price::from("1.25001"),
+        Price::from("1.25003"),
+        Quantity::from("200"),
+        Quantity::from("300"),
+        UnixNanos::from(ts_init),
+        UnixNanos::from(ts_init),
+    )
+}
+
+fn read_per_file_quotes(catalog: &mut ParquetDataCatalog) -> anyhow::Result<Vec<QuoteTick>> {
+    let mut session =
+        CatalogReader::query_batch_session(catalog, &per_file_quote_query(), Some(1))?;
+    let mut rows = Vec::new();
+    while let Some(page) = next_quotes(&mut session)? {
+        rows.extend(page);
+    }
+    Ok(rows)
+}
+
+// The eager per-file merge this streaming replaced: every file read whole, then ordered by
+// `ts_init` with equal stamps kept in file order
+fn read_eager_quotes(catalog: &mut ParquetDataCatalog) -> Vec<QuoteTick> {
+    catalog
+        .query::<QuoteTick>(None, None, None, None, None, false)
+        .unwrap()
+}
+
 #[rstest]
-fn per_file_session_rejects_rows_before_an_overridden_filename_start() {
+fn per_file_session_reads_rows_before_an_overridden_filename_start() {
     let (_directory, mut catalog) = create_temp_catalog();
     let rows = [10, 20].map(create_quote_tick);
     catalog
         .write_to_parquet(&rows, Some(UnixNanos::from(15)), None, None)
         .unwrap();
 
+    assert_eq!(read_per_file_quotes(&mut catalog).unwrap(), rows.to_vec());
+    assert_eq!(read_eager_quotes(&mut catalog), rows.to_vec());
+
+    // Directory tables declare no start, so the default query reads the file as before
+    let query = CatalogQuery::new(NautilusDataType::QuoteTick);
+    let mut session = CatalogReader::query_batch_session(&mut catalog, &query, None).unwrap();
+    assert_eq!(next_quotes(&mut session).unwrap().unwrap(), rows.to_vec());
+}
+
+#[rstest]
+fn per_file_session_merges_an_overridden_file_with_an_overlapping_file_in_eager_order() {
+    let (_directory, mut catalog) = create_temp_catalog();
+    let ordinary = [5, 12, 18, 25].map(create_quote_tick);
+    let overridden = [10, 12, 20].map(create_gbpusd_quote_tick);
+    catalog
+        .write_to_parquet(&ordinary, None, None, None)
+        .unwrap();
+    catalog
+        .write_to_parquet(&overridden, Some(UnixNanos::from(15)), None, None)
+        .unwrap();
+
+    let expected = vec![
+        ordinary[0],
+        overridden[0],
+        ordinary[1],
+        overridden[1],
+        ordinary[2],
+        overridden[2],
+        ordinary[3],
+    ];
+    assert_eq!(read_eager_quotes(&mut catalog), expected);
+    assert_eq!(read_per_file_quotes(&mut catalog).unwrap(), expected);
+}
+
+#[rstest]
+fn per_file_session_breaks_equal_stamps_across_an_overridden_file_in_eager_order() {
+    let (_directory, mut catalog) = create_temp_catalog();
+    let overridden = [10, 30].map(create_quote_tick);
+    let ordinary = [25, 30, 40].map(create_gbpusd_quote_tick);
+    catalog
+        .write_to_parquet(&overridden, Some(UnixNanos::from(20)), None, None)
+        .unwrap();
+    catalog
+        .write_to_parquet(&ordinary, None, None, None)
+        .unwrap();
+
+    // The overridden file lists first, so it wins the tie at 30
+    let expected = vec![
+        overridden[0],
+        ordinary[0],
+        overridden[1],
+        ordinary[1],
+        ordinary[2],
+    ];
+    assert_eq!(read_eager_quotes(&mut catalog), expected);
+    assert_eq!(read_per_file_quotes(&mut catalog).unwrap(), expected);
+}
+
+#[rstest]
+fn per_file_session_opens_a_file_without_ts_init_statistics_before_the_first_row() {
+    use parquet::file::{
+        properties::{EnabledStatistics, WriterProperties},
+        reader::{FileReader, SerializedFileReader},
+    };
+
+    let (directory, mut catalog) = create_temp_catalog();
+    let ordinary = [create_quote_tick(20)];
+    catalog
+        .write_to_parquet(&ordinary, None, None, None)
+        .unwrap();
+
+    // Named from 25, holding rows from 10, with no statistics to declare an earlier start
+    let unstated = [10, 30].map(create_quote_tick);
+    let path = quote_file_path(&directory, &catalog, 20).with_file_name(timestamps_to_filename(
+        UnixNanos::from(25),
+        UnixNanos::from(30),
+    ));
+    let batch = QuoteTick::encode_batch(&QuoteTick::chunk_metadata(&unstated), &unstated).unwrap();
+    let properties = WriterProperties::builder()
+        .set_statistics_enabled(EnabledStatistics::None)
+        .build();
+    let mut writer = parquet::arrow::ArrowWriter::try_new(
+        fs::File::create(&path).unwrap(),
+        batch.schema(),
+        Some(properties),
+    )
+    .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let reader = SerializedFileReader::new(fs::File::open(&path).unwrap()).unwrap();
+    let row_group = reader.metadata().row_group(0);
+    assert!(
+        (0..row_group.num_columns())
+            .map(|index| row_group.column(index))
+            .find(|column| column.column_path().string() == "ts_init")
+            .unwrap()
+            .statistics()
+            .is_none()
+    );
+
+    let expected = vec![unstated[0], ordinary[0], unstated[1]];
+    assert_eq!(read_eager_quotes(&mut catalog), expected);
+    assert_eq!(read_per_file_quotes(&mut catalog).unwrap(), expected);
+}
+
+// Replaces a written file's bytes with a file of other rows after the query read its footer
+fn replace_quote_file(path: &std::path::Path, rows: &[QuoteTick]) {
+    let (other_directory, other_catalog) = create_temp_catalog();
+    other_catalog
+        .write_to_parquet(rows, None, None, None)
+        .unwrap();
+    let other = quote_file_path(&other_directory, &other_catalog, rows[0].ts_init.as_u64());
+    fs::write(path, fs::read(other).unwrap()).unwrap();
+}
+
+#[rstest]
+fn per_file_session_keeps_a_filename_start_earlier_than_the_statistics() {
+    let (directory, mut catalog) = create_temp_catalog();
+    catalog
+        .write_to_parquet(
+            &[30, 40].map(create_quote_tick),
+            Some(UnixNanos::from(5)),
+            None,
+            None,
+        )
+        .unwrap();
+
     let mut session =
         CatalogReader::query_batch_session(&mut catalog, &per_file_quote_query(), None).unwrap();
+    let rows = [10, 20, 25].map(create_quote_tick);
+    replace_quote_file(&quote_file_path(&directory, &catalog, 30), &rows);
+
+    assert_eq!(next_quotes(&mut session).unwrap().unwrap(), rows.to_vec());
+}
+
+#[rstest]
+fn per_file_session_rejects_a_first_row_before_the_start_its_statistics_declared() {
+    let (directory, mut catalog) = create_temp_catalog();
+    catalog
+        .write_to_parquet(&[30, 40].map(create_quote_tick), None, None, None)
+        .unwrap();
+
+    let mut session =
+        CatalogReader::query_batch_session(&mut catalog, &per_file_quote_query(), None).unwrap();
+    replace_quote_file(
+        &quote_file_path(&directory, &catalog, 30),
+        &[10, 20, 25].map(create_quote_tick),
+    );
     let error = next_quotes(&mut session).unwrap_err();
 
     assert!(
         error
             .to_string()
-            .ends_with("returned ts_init 10 before its declared start 15"),
+            .ends_with("returned ts_init 10 before its declared start 30"),
         "{error}"
     );
-
-    // Directory tables declare no start, so the default query still reads the file
-    let query = CatalogQuery::new(NautilusDataType::QuoteTick);
-    let mut session = CatalogReader::query_batch_session(&mut catalog, &query, None).unwrap();
-    assert_eq!(next_quotes(&mut session).unwrap().unwrap(), rows.to_vec());
 }
 
 #[rstest]

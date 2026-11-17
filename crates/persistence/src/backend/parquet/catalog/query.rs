@@ -465,6 +465,12 @@ impl ParquetDataCatalog {
         Ok(all_records)
     }
 
+    /// Streams the matching rows of every file in `ts_init` order, opening each file table only
+    /// once the merge reaches its declared start.
+    ///
+    /// Building the stream reads the Parquet footer of every file table with a timestamped name,
+    /// one file after another, before the first row: one read per file, which on a remote object
+    /// store is at least one request per file.
     pub(super) fn query_typed_pages<T>(
         &mut self,
         identifiers: Option<Vec<String>>,
@@ -491,10 +497,7 @@ impl ParquetDataCatalog {
         let opener = self.session.table_opener();
         let mut sources = Vec::with_capacity(tables.len());
         for table in tables {
-            // A file table opens when the merge reaches its filename start; a directory table
-            // (or a file without a timestamped name) opens before the first row
-            let first_ts =
-                parse_filename_timestamps(&table.path).map(|(ts, _)| UnixNanos::from(ts));
+            let first_ts = declared_start(&opener, &table.path);
             let sql = build_query(&table.name, start, end, where_clause);
             let opener = opener.clone();
             let label = table.path.clone();
@@ -1161,6 +1164,22 @@ impl ParquetDataCatalog {
         filtered_paths.retain(|file_path| query_intersects_filename(file_path, start_u64, end_u64));
 
         Ok(filtered_paths)
+    }
+}
+
+// The earliest `ts_init` a file table can hold: the earlier of its filename start and the smallest
+// `ts_init` its Parquet statistics record, since a write may name a start later than its first row.
+// A directory table, a file without a timestamped name and a file whose statistics record no
+// minimum declare no start. A footer that cannot be read keeps the filename start, so the open
+// reports the failure when the merge reaches the file.
+fn declared_start(opener: &datafusion::TableOpener, path: &str) -> Option<UnixNanos> {
+    let (name_start, _) = parse_filename_timestamps(path)?;
+    let name_start = UnixNanos::from(name_start);
+
+    match opener.min_ts_init(path) {
+        Ok(Some(min_ts_init)) => Some(name_start.min(min_ts_init)),
+        Ok(None) => None,
+        Err(_) => Some(name_start),
     }
 }
 

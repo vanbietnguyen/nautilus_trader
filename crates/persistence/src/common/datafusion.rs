@@ -27,7 +27,8 @@ use datafusion::{
     arrow::{
         array::{
             Array, ArrayRef, BinaryViewArray, FixedSizeBinaryBuilder, FixedSizeListArray,
-            ListArray, StringArray, StringViewArray, UInt32Array, new_empty_array, new_null_array,
+            ListArray, StringArray, StringViewArray, TimestampNanosecondArray, UInt32Array,
+            new_empty_array, new_null_array,
         },
         buffer::{OffsetBuffer, ScalarBuffer},
         compute::{cast, concat, take_record_batch},
@@ -42,7 +43,7 @@ use datafusion::{
             FileFormat, FileMeta, file_compression_type::FileCompressionType, options::ReadOptions,
         },
         listing::{ListingTable, ListingTableConfig, ListingTableUrl},
-        physical_plan::{FileScanConfig, FileSource},
+        physical_plan::{FileScanConfig, FileSource, parquet::metadata::DFParquetMetadata},
         table_schema::TableSchema,
     },
     error::{DataFusionError, Result},
@@ -54,7 +55,8 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use nautilus_common::live::{block_on_nautilus_with, get_runtime};
 use nautilus_core::UnixNanos;
 use nautilus_serialization::arrow::{KEY_IDENTIFIER, StringColumnRef};
-use object_store::{ObjectMeta, ObjectStore};
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
+use parquet::arrow::{arrow_reader::statistics::StatisticsConverter, parquet_to_arrow_schema};
 use tokio::{
     sync::mpsc::{self, Receiver},
     task::JoinHandle,
@@ -300,6 +302,57 @@ impl TableOpener {
             _registration: registration,
         })
     }
+
+    /// Returns the smallest `ts_init` that the Parquet statistics of the file at `file_path`
+    /// record, or `None` when the file has no row group or a row group records no minimum.
+    ///
+    /// Reads the file's footer through this opener's session: its object store, its metadata
+    /// size hint and its file metadata cache, where opening the file later finds the footer.
+    pub(crate) fn min_ts_init(&self, file_path: &str) -> anyhow::Result<Option<UnixNanos>> {
+        let url = ListingTableUrl::parse(file_path)?;
+        let runtime_env = self.session_ctx.runtime_env();
+        let store = runtime_env.object_store(url.object_store())?;
+        let metadata_size_hint = self
+            .session_ctx
+            .copied_table_options()
+            .parquet
+            .global
+            .metadata_size_hint;
+        let cache = runtime_env.cache_manager.get_file_metadata_cache();
+
+        let metadata = block_on_nautilus_with(|| async {
+            let object = store.head(url.prefix()).await?;
+            let metadata = DFParquetMetadata::new(store.as_ref(), &object)
+                .with_metadata_size_hint(metadata_size_hint)
+                .with_file_metadata_cache(Some(cache))
+                .fetch_metadata()
+                .await?;
+            Ok::<_, anyhow::Error>(metadata)
+        })?;
+
+        let file_metadata = metadata.file_metadata();
+        let schema = parquet_to_arrow_schema(
+            file_metadata.schema_descr(),
+            file_metadata.key_value_metadata(),
+        )?;
+        let converter =
+            StatisticsConverter::try_new("ts_init", &schema, file_metadata.schema_descr())?;
+        let mins = converter.row_group_mins(metadata.row_groups().iter())?;
+        let Some(mins) = mins.as_any().downcast_ref::<TimestampNanosecondArray>() else {
+            return Ok(None);
+        };
+
+        if mins.null_count() > 0 {
+            return Ok(None);
+        }
+
+        Ok(mins
+            .values()
+            .iter()
+            .min()
+            .and_then(|&min| u64::try_from(min).ok())
+            .map(UnixNanos::from))
+    }
 }
 
 /// A blocking stream over one registered table, deregistering the table when dropped.
@@ -346,8 +399,10 @@ fn register_parquet_files(
         ..Default::default()
     };
 
-    let mut listing_options = parquet_options
-        .to_listing_options(&session_ctx.copied_config(), session_ctx.copied_table_options());
+    let mut listing_options = parquet_options.to_listing_options(
+        &session_ctx.copied_config(),
+        session_ctx.copied_table_options(),
+    );
     listing_options.format = Arc::new(CatalogParquetFormat(listing_options.format));
     let table_paths = file_paths
         .into_iter()
@@ -359,8 +414,12 @@ fn register_parquet_files(
             .with_listing_options(listing_options)
             .infer_schema(&state)
     })?;
-    let table = ListingTable::try_new(config)?
-        .with_cache(session_ctx.runtime_env().cache_manager.get_file_statistic_cache());
+    let table = ListingTable::try_new(config)?.with_cache(
+        session_ctx
+            .runtime_env()
+            .cache_manager
+            .get_file_statistic_cache(),
+    );
     let dataframe = session_ctx.read_table(Arc::new(table))?;
 
     validate_catalog_schema(dataframe.schema().as_arrow())?;
