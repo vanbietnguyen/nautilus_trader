@@ -5067,11 +5067,13 @@ fn quoted_end(part: QuotedPart, failure: Option<&str>) -> QuotedDelivery {
     }
 }
 
-/// Records every response envelope the bus delivers for one request, terminals included.
+/// Records every response envelope the bus delivers for one request, terminals included: what
+/// each carried, and each whole envelope serialized.
 #[cfg(feature = "streaming")]
 struct QuotedTap {
     request_id: UUID4,
     delivered: RefCell<Vec<QuotedDelivery>>,
+    envelopes: RefCell<Vec<Value>>,
 }
 
 #[cfg(feature = "streaming")]
@@ -5084,6 +5086,7 @@ impl BusTap for QuotedTap {
         let Some(envelope) = message.downcast_ref::<DataResponseEnvelope>() else {
             return;
         };
+
         if *correlation_id != self.request_id {
             return;
         }
@@ -5107,6 +5110,9 @@ impl BusTap for QuotedTap {
             completed: envelope.completed(),
             failure: envelope.failure_reason().map(str::to_owned),
         });
+        self.envelopes
+            .borrow_mut()
+            .push(serde_json::to_value(envelope).unwrap());
     }
 }
 
@@ -5120,6 +5126,7 @@ impl QuotedResponses {
         let tap = Rc::new(QuotedTap {
             request_id,
             delivered: RefCell::new(Vec::new()),
+            envelopes: RefCell::new(Vec::new()),
         });
         msgbus::set_bus_tap(Rc::clone(&tap) as Rc<dyn BusTap>);
         Self(tap)
@@ -5127,6 +5134,10 @@ impl QuotedResponses {
 
     fn take(&self) -> Vec<QuotedDelivery> {
         self.0.delivered.take()
+    }
+
+    fn take_envelopes(&self) -> Vec<Value> {
+        self.0.envelopes.take()
     }
 }
 
@@ -5170,6 +5181,7 @@ fn register_quoted_catalog(
 ) -> CatalogTempDir {
     let catalog_dir = CatalogTempDir::new(label);
     let catalog = ParquetDataCatalog::new(catalog_dir.path(), None, None, None, None);
+
     for run in runs {
         let (start, end) = (
             Some(UnixNanos::from(run.interval.0)),
@@ -5180,15 +5192,18 @@ fn register_quoted_catalog(
             .iter()
             .map(|(ts, bid, ask)| make_quote(fixture.instrument_id, bid, ask, *ts))
             .collect();
+
         if !quotes.is_empty() {
             catalog.write_to_parquet(&quotes, start, end, None).unwrap();
         }
+
         // Each print is at the ask of the quote in force before it
         let trades: Vec<_> = run
             .trades
             .iter()
             .map(|(ts, id)| unsided_trade(fixture.instrument_id, *ts, "1.0002", id))
             .collect();
+
         if !trades.is_empty() {
             catalog.write_to_parquet(&trades, start, end, None).unwrap();
         }
@@ -5271,6 +5286,7 @@ fn quoted_params(fixture: &JoinFixture, bars: QuotedBars, quotes: Option<bool>) 
             "interleave": true,
         }),
     };
+
     if let Some(quotes) = quotes {
         params["quotes"] = json!(quotes);
     }
@@ -5391,6 +5407,7 @@ fn test_quotes_request_with_incomplete_quote_coverage_fails_with_one_terminal(
 ) {
     let _ = stub_msgbus;
     let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+
     // The trades cover the window; the quotes miss 2 000 to 2 099 between their runs
     let _catalog_dir = register_quoted_catalog(
         &fixture,
@@ -5650,6 +5667,7 @@ fn test_quotes_request_of_an_unserved_shape_is_refused_before_any_dispatch(
     let _catalog_dir = register_quoted_catalog(&fixture, "quotes-unserved", &COUNTEREXAMPLE);
     let mut params = quoted_params(&fixture, QuotedBars::Ticks, Some(true));
     let mut instrument_ids = vec![fixture.instrument_id];
+
     match shape {
         UnservedShape::NotBoolean => params["quotes"] = json!("true"),
         UnservedShape::Batch => instrument_ids.push(InstrumentId::from("GBP/USD.SIM")),
@@ -5802,48 +5820,105 @@ fn test_trades_request_without_quotes_answers_as_before_from_a_catalog_holding_q
         }],
     );
 
-    let delivered = match path {
-        UnquotedPath::Ordinary | UnquotedPath::Interleaved => {
-            let bars = match path {
-                UnquotedPath::Ordinary => QuotedBars::None,
-                _ => QuotedBars::InterleavedTicks,
-            };
-            let params = quoted_params(&fixture, bars, quotes);
-            let window = (NY_2026_11_11_1800, NY_2026_11_12_1800 - 1);
-            run_quoted(&fixture, windowed_trades_request(&fixture, window, params))
-        }
+    let window = (NY_2026_11_11_1800, NY_2026_11_12_1800 - 1);
+    let mut params = match path {
+        UnquotedPath::Ordinary => quoted_params(&fixture, QuotedBars::None, quotes),
+        UnquotedPath::Interleaved => quoted_params(&fixture, QuotedBars::InterleavedTicks, quotes),
         UnquotedPath::Joined => {
             let mut params = joined_params(
                 fixture.bar_type,
                 NY_2026_11_12_2000,
                 &[NY_2026_11_11_1800, NY_2026_11_12_1800],
             );
+
             if let Some(quotes) = quotes {
                 params["quotes"] = json!(quotes);
             }
-            let request = trades_request(vec![fixture.instrument_id], None, client_id, params);
-            let tap = QuotedResponses::install(*request.request_id());
-            fixture
-                .engine
-                .borrow_mut()
-                .execute_request(request)
-                .unwrap();
-            let tail_id = assert_replay_tail(&fixture, NY_2026_11_12_1800);
-            complete_empty_tail(&fixture, tail_id);
-            tap.take()
+            params
         }
     };
+    let request = match path {
+        UnquotedPath::Joined => {
+            trades_request(vec![fixture.instrument_id], None, client_id, params.clone())
+        }
+        _ => windowed_trades_request(&fixture, window, params.clone()),
+    };
+    let request_id = *request.request_id();
+    let tap = QuotedResponses::install(request_id);
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
 
+    if matches!(path, UnquotedPath::Joined) {
+        let tail_id = assert_replay_tail(&fixture, NY_2026_11_12_1800);
+        complete_empty_tail(&fixture, tail_id);
+    }
+    let envelopes = tap.take_envelopes();
+
+    // Each part is an ordinary catalog leg's whole answer: its rows as written, the request's
+    // window and params (plus the leg's `update_catalog`), and the clock's time as `ts_init`
+    params["update_catalog"] = json!(false);
+    let params: Params = serde_json::from_value(params).unwrap();
+    let start = Some(UnixNanos::from(window.0));
+    let end = match path {
+        UnquotedPath::Joined => None,
+        _ => Some(UnixNanos::from(window.1)),
+    };
+    let now = UnixNanos::from(NY_2026_11_12_2000);
+    let trades = |rows: &[(u64, &str)]| {
+        let data: Vec<_> = rows
+            .iter()
+            .map(|(ts, id)| unsided_trade(fixture.instrument_id, *ts, "1.0002", id))
+            .collect();
+        DataResponse::Trades(TradesResponse::new(
+            request_id,
+            client_id,
+            fixture.instrument_id,
+            data,
+            start,
+            end,
+            now,
+            Some(params.clone()),
+        ))
+    };
+    let tick_bar = |ts: u64| {
+        let price = Price::from("1.0002");
+        let bar = Bar::new(
+            fixture.bar_type,
+            price,
+            price,
+            price,
+            price,
+            Quantity::from(1),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        );
+        DataResponse::Bars(BarsResponse::new(
+            request_id,
+            client_id,
+            fixture.bar_type,
+            vec![bar],
+            start,
+            end,
+            now,
+            Some(params.clone()),
+        ))
+    };
+    let envelope = |response: DataResponse, completed: bool| {
+        serde_json::to_value(DataResponseEnvelope::new(response, completed, None)).unwrap()
+    };
     let expected = match path {
         UnquotedPath::Ordinary | UnquotedPath::Joined => {
-            vec![quoted_end(trades_of(&["c1", "c2"]), None)]
+            vec![envelope(trades(&[(c1, "c1"), (c2, "c2")]), true)]
         }
         UnquotedPath::Interleaved => vec![
-            quoted(bars_at(&[c1])),
-            quoted(trades_of(&["c1"])),
-            quoted(bars_at(&[c2])),
-            quoted_end(trades_of(&["c2"]), None),
+            envelope(tick_bar(c1), false),
+            envelope(trades(&[(c1, "c1")]), false),
+            envelope(tick_bar(c2), false),
+            envelope(trades(&[(c2, "c2")]), true),
         ],
     };
-    assert_eq!(delivered, expected);
+    assert_eq!(envelopes, expected);
 }

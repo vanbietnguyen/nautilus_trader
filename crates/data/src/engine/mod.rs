@@ -2403,6 +2403,7 @@ impl DataEngine {
         // Client definitions can have a newer ts_init than the requested history
         let trim = !matches!(parent, Some(RequestCommand::Instrument(_)))
             && (parent_start.is_some() || parent_end.is_some());
+
         if trim {
             rebuilt.trim_to_bounds();
         }
@@ -2435,7 +2436,10 @@ impl DataEngine {
     ///
     /// The parts take the ordinary route: trades parts feed the request's aggregators (through
     /// the interleaved path when the request interleaves); quotes parts reach only its
-    /// non-`LAST` aggregators.
+    /// non-`LAST` aggregators. Each part is one envelope through the response route and one
+    /// handler call, and the parts number the runs of quotes plus the runs of trades: about
+    /// twice the runs of trades, so a window whose quotes and trades alternate tick by tick
+    /// sends about two parts per trade.
     ///
     /// Memory, per request (the parts are new buffers, not views of the answer): the catalog
     /// leg's query holds the window's quotes in their own buffer beside its trades until the
@@ -2445,7 +2449,8 @@ impl DataEngine {
     /// part exists before the first is sent. The peak is therefore about twice the window's
     /// quote and trade rows, plus per part a response with a clone of the request's params
     /// (and, for a quotes part, of its instrument IDs). The window is the caller's: nothing
-    /// here bounds it to one session.
+    /// here bounds it to one session. Part counts, wall time and memory of a real session are
+    /// unmeasured.
     ///
     /// # Errors
     ///
@@ -2462,9 +2467,11 @@ impl DataEngine {
         let Some(mut quotes) = rebuild_pipeline_response(parent_id, parent, quotes) else {
             anyhow::bail!("the quotes of its legs could not be rebuilt");
         };
+
         if trim {
             quotes.trim_to_bounds();
         }
+
         let DataResponse::Quotes(quotes) = quotes else {
             anyhow::bail!("its quotes were rebuilt as {}", quotes.kind());
         };

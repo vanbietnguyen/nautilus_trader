@@ -112,6 +112,7 @@ pub fn instrument_definitions_match(a: &InstrumentAny, b: &InstrumentAny) -> boo
 
 #[cfg(test)]
 mod tests {
+    use nautilus_core::UnixNanos;
     use rstest::rstest;
     use rust_decimal_macros::dec;
 
@@ -204,8 +205,8 @@ mod tests {
     #[rstest]
     #[case::restamped(
         |pair: &mut CurrencyPair| {
-            pair.ts_event = nautilus_core::UnixNanos::from(1);
-            pair.ts_init = nautilus_core::UnixNanos::from(1);
+            pair.ts_event = UnixNanos::from(1);
+            pair.ts_init = UnixNanos::from(1);
         },
         true
     )]

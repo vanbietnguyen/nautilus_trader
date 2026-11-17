@@ -324,6 +324,7 @@ pub(super) fn quote_and_trade_runs(
     let mut parts = Vec::new();
     let mut quote_run = Vec::new();
     let mut trade_run = Vec::new();
+
     loop {
         match replay.next()? {
             ReplayPoll::Ready(Data::Quote(quote)) => {
@@ -353,6 +354,7 @@ pub(super) fn quote_and_trade_runs(
     if !quote_run.is_empty() {
         parts.push(DataResponse::Quotes(quotes_part(quotes, quote_run)));
     }
+
     parts.push(DataResponse::Trades(trades_part(trades, trade_run)));
     Ok(parts)
 }

@@ -799,7 +799,7 @@ impl DataEngine {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - `quotes` is not a boolean.
+    /// - The `quotes` param is not a boolean.
     /// - Its client is external (this engine would answer nothing).
     /// - It is a leg of a `RequestJoin` (whose rebuilt answer holds one data type).
     /// - It sets continuous-future or time-range pipeline params (the pipeline answers child
@@ -819,6 +819,7 @@ impl DataEngine {
         let RequestCommand::Trades(cmd) = req else {
             anyhow::bail!("{QUOTES_REFUSED}: only a trades request can set `quotes`");
         };
+
         anyhow::ensure!(
             sets_quotes(req),
             "{QUOTES_REFUSED}: `quotes` must be a boolean"
@@ -865,17 +866,20 @@ impl DataEngine {
                      pipeline, which answers each child window apart"
                 );
             }
+
             if !self.catalogs_registered() {
                 anyhow::bail!(
                     "{QUOTES_REFUSED}: no catalog is registered, so its plan has no catalog leg"
                 );
             }
+
             if request_has_schema(req) {
                 anyhow::bail!(
                     "{QUOTES_REFUSED}: its `schema` sends it to its client, so its plan has no \
                      catalog leg"
                 );
             }
+
             if cmd.instrument_ids.len() != 1 {
                 anyhow::bail!(
                     "{QUOTES_REFUSED}: it must name exactly one instrument (batches are \
@@ -892,6 +896,7 @@ impl DataEngine {
         if let Some(reason) = quotes_plan_refusal(&plan) {
             anyhow::bail!("{QUOTES_REFUSED}: {reason}");
         }
+
         Ok(plan)
     }
 
@@ -961,13 +966,16 @@ impl DataEngine {
                                 }
                                 _ => None,
                             };
+
                             drop_rows_of_unavailable_days(&mut response, &unavailable);
+
                             // The leg's quotes go into its slot first; its trades complete it
                             if let Some(quotes) = quotes {
                                 self.response_envelope(DataResponseEnvelope::new(
                                     quotes, false, None,
                                 ));
                             }
+
                             self.response(response);
                             Ok(())
                         })
