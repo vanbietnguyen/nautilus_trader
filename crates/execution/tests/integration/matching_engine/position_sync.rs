@@ -672,6 +672,188 @@ fn test_parent_caps_ouo_peer_update_of_native_bracket_child_only(
     assert_eq!(stop.quantity(), Quantity::from(stop_quantity));
 }
 
+// Reduce-only OUO peers SELL 5 against a long 5, their parent having filled 5. The stop fills 1,
+// then the target fills 3 of the 4 it was resized to, leaving 1. A native bracket parent keeps
+// the stop with its fill plus that 1, so it can still execute 1; any other parent, or one purged
+// from the cache, gives the stop the target's leaves as upstream does, which its fill already
+// reaches, so it is cancelled and leaves the engine.
+#[rstest]
+#[case::bracket_pair(false, false, &["Updated 2"], Some("1"))]
+#[case::parent_on_another_instrument(true, false, &["Canceled"], None)]
+#[case::parent_not_cached(false, true, &["Canceled"], None)]
+fn test_parent_keeps_partially_filled_ouo_peer_of_native_bracket_child_only(
+    #[case] parent_on_another_instrument: bool,
+    #[case] parent_purged: bool,
+    #[case] stop_events: &[&str],
+    #[case] stop_leaves: Option<&str>,
+    #[values(false, true)] deferred: bool,
+) {
+    let instrument =
+        InstrumentAny::FuturesContract(futures_contract_es(Some(UnixNanos::default()), None));
+    let entry = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::from("ENTRY"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("5"))
+        .submit(true)
+        .build();
+    let account_id = entry.account_id().unwrap();
+    let (mut engine, cache, handler) = bracket_margin_engine(
+        &instrument,
+        account_id,
+        OmsType::Netting,
+        BookType::L1_MBP,
+        engine_config(),
+    );
+    residual_quote(&mut engine, &instrument, "100.00", "10", 1);
+    submit_orders(&mut engine, account_id, vec![entry]);
+
+    let stop_id = ClientOrderId::from("STOP");
+    let target_id = ClientOrderId::from("TARGET");
+    let parent_id = ClientOrderId::from("PARENT");
+    let parent_instrument = if parent_on_another_instrument {
+        let mut other = futures_contract_es(Some(UnixNanos::default()), None);
+        other.id = InstrumentId::from("NQZ21.GLBX");
+        other.raw_symbol = Symbol::from("NQZ21");
+        InstrumentAny::FuturesContract(other)
+    } else {
+        instrument.clone()
+    };
+    let mut parent = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(parent_instrument.id())
+        .client_order_id(parent_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("5"))
+        .contingency_type(ContingencyType::Oto)
+        .linked_order_ids(vec![stop_id, target_id])
+        .submit(true)
+        .build();
+    parent
+        .apply(TestOrderEventStubs::accepted(
+            &parent,
+            account_id,
+            VenueOrderId::from("PARENT"),
+        ))
+        .unwrap();
+    let fill = TestOrderEventStubs::filled(
+        &parent,
+        &parent_instrument,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(account_id),
+    );
+    parent.apply(fill).unwrap();
+    assert_eq!(parent.filled_qty(), Quantity::from("5"));
+    cache_order(&cache, &parent);
+
+    let stop = OrderTestBuilder::new(OrderType::StopLimit)
+        .instrument_id(instrument.id())
+        .client_order_id(stop_id)
+        .parent_order_id(parent_id)
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("5"))
+        .trigger_price(Price::from("95.00"))
+        .price(Price::from("95.00"))
+        .reduce_only(true)
+        .contingency_type(ContingencyType::Ouo)
+        .linked_order_ids(vec![target_id])
+        .submit(true)
+        .build();
+    let target = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(target_id)
+        .parent_order_id(parent_id)
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("5"))
+        .price(Price::from("110.00"))
+        .reduce_only(true)
+        .contingency_type(ContingencyType::Ouo)
+        .linked_order_ids(vec![stop_id])
+        .submit(true)
+        .build();
+    submit_orders(&mut engine, account_id, vec![stop, target]);
+
+    if parent_purged {
+        // A closed parent can be purged while its children rest, e.g. by an explicit purge
+        cache.borrow_mut().purge_order(parent_id, false).unwrap();
+        assert!(cache.borrow().order(&parent_id).is_none());
+    }
+    run_with_dispatch(&mut engine, deferred, |engine| {
+        residual_quote(engine, &instrument, "95.00", "1", 2);
+    });
+
+    // Move the triggered stop-limit above the target so the next quote fills only the target
+    let modify = ModifyOrder::new(
+        TraderId::test_default(),
+        None,
+        StrategyId::test_default(),
+        instrument.id(),
+        stop_id,
+        None,
+        None,
+        Some(Price::from("120.00")),
+        None,
+        UUID4::new(),
+        UnixNanos::from(3),
+        None,
+        None,
+    );
+    run_with_dispatch(&mut engine, deferred, |engine| {
+        engine.process_modify(&modify, account_id);
+    });
+    {
+        let cache = cache.borrow();
+        assert_eq!(
+            cache.order(&stop_id).unwrap().filled_qty(),
+            Quantity::from("1")
+        );
+        assert_eq!(
+            cache.order(&target_id).unwrap().quantity(),
+            Quantity::from("4")
+        );
+    }
+    clear_order_event_handler_messages(&handler);
+    run_with_dispatch(&mut engine, deferred, |engine| {
+        residual_quote(engine, &instrument, "110.00", "3", 4);
+    });
+
+    let events: Vec<_> = get_order_event_handler_messages(&handler)
+        .iter()
+        .filter(|event| event.client_order_id() == stop_id)
+        .map(|event| match event {
+            OrderEventAny::Updated(update) => format!("Updated {}", update.quantity),
+            other => format!("{:?}", other.event_type()),
+        })
+        .collect();
+    assert_eq!(events, stop_events);
+    let cache = cache.borrow();
+    assert_eq!(
+        cache.order(&target_id).unwrap().filled_qty(),
+        Quantity::from("3")
+    );
+    let position_id = cache.position_id(&ClientOrderId::from("ENTRY")).unwrap();
+    assert_eq!(
+        cache.position(position_id).unwrap().quantity,
+        Quantity::from("1")
+    );
+    let stop = cache.order(&stop_id).unwrap();
+    assert_eq!(stop.filled_qty(), Quantity::from("1"));
+    assert_eq!(engine.order_exists(stop_id), stop_leaves.is_some());
+
+    // What a later execution of the stop can take: its leaves while the engine holds it
+    if let Some(leaves) = stop_leaves {
+        assert_eq!(stop.status(), OrderStatus::PartiallyFilled);
+        assert_eq!(stop.leaves_qty(), Quantity::from(leaves));
+    } else {
+        assert_eq!(stop.status(), OrderStatus::Canceled);
+    }
+}
+
 fn residual_bracket(
     instrument: &InstrumentAny,
     prefix: &str,
