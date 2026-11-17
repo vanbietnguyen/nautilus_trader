@@ -6512,6 +6512,9 @@ impl OrderMatchingEngine {
                 && order.instrument_id() == child.instrument_id()
                 && order.strategy_id() == child.strategy_id()
                 && order.order_side() == child.order_side()
+                && self
+                    .contingent_parent(&child)
+                    .is_none_or(|parent| Self::is_native_bracket_pair(&parent, &child))
             {
                 // OUO updates take total quantity; a partially filled peer still owns its fills.
                 self.engine_filled_qty(&child)
