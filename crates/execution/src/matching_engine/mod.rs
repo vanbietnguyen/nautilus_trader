@@ -6032,7 +6032,15 @@ impl OrderMatchingEngine {
     ) -> anyhow::Result<Option<Quantity>> {
         if self.config.use_reduce_only && order.is_reduce_only() {
             let remaining = self.position_quantity_remaining(order, position)?;
-            return Ok(Some(self.parent_capped_leaves(order, remaining)));
+            // Only a native bracket child shares its parent's fills with its siblings
+            let is_bracket_child = self
+                .contingent_parent(order)
+                .is_some_and(|parent| Self::is_native_bracket_pair(&parent, order));
+
+            if is_bracket_child {
+                return Ok(Some(self.parent_capped_leaves(order, remaining)));
+            }
+            return Ok(Some(remaining));
         }
 
         Ok(None)
@@ -6694,24 +6702,30 @@ impl OrderMatchingEngine {
         Ok(())
     }
 
-    fn parent_capped_leaves(&self, order: &OrderAny, leaves: Quantity) -> Quantity {
-        let parent = if self.config.support_contingent_orders {
-            order
-                .parent_order_id()
-                .and_then(|id| self.order_snapshot(id))
-        } else {
-            None
-        };
+    fn contingent_parent(&self, order: &OrderAny) -> Option<OrderAny> {
+        if !self.config.support_contingent_orders {
+            return None;
+        }
 
-        parent.map_or(leaves, |parent| {
+        order
+            .parent_order_id()
+            .and_then(|id| self.order_snapshot(id))
+    }
+
+    // An exit of the same strategy on the parent's instrument, closing what the parent opened
+    fn is_native_bracket_pair(parent: &OrderAny, order: &OrderAny) -> bool {
+        parent.instrument_id() == order.instrument_id()
+            && parent.strategy_id() == order.strategy_id()
+            && parent.order_side() != order.order_side()
+    }
+
+    fn parent_capped_leaves(&self, order: &OrderAny, leaves: Quantity) -> Quantity {
+        self.contingent_parent(order).map_or(leaves, |parent| {
             let mut remaining = self
                 .engine_filled_qty(&parent)
                 .saturating_sub(self.engine_filled_qty(order));
 
-            if parent.instrument_id() == order.instrument_id()
-                && parent.strategy_id() == order.strategy_id()
-                && parent.order_side() != order.order_side()
-            {
+            if Self::is_native_bracket_pair(&parent, order) {
                 let cache = self.cache.borrow();
                 for id in cache.iter_client_order_ids(
                     None,

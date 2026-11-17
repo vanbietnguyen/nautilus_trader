@@ -431,6 +431,117 @@ fn test_parent_residual_counts_both_partially_filled_children_once(
     assert!(engine.order_exists(ClientOrderId::from("B-TARGET")));
 }
 
+// A reduce-only SELL 5 against a long 5, its parent having filled 1 of 2. Only a native bracket
+// parent (same instrument and strategy, opposite side) caps the execution at its fills.
+#[rstest]
+#[case::bracket_pair(false, OrderSide::Buy, false, "1")]
+#[case::parent_on_another_instrument(true, OrderSide::Buy, false, "5")]
+#[case::parent_on_the_same_side(false, OrderSide::Sell, false, "5")]
+#[case::parent_of_another_strategy(false, OrderSide::Buy, true, "5")]
+fn test_parent_caps_reduce_only_execution_of_native_bracket_child_only(
+    #[case] parent_on_another_instrument: bool,
+    #[case] parent_side: OrderSide,
+    #[case] parent_of_another_strategy: bool,
+    #[case] exit_filled: &str,
+) {
+    let instrument =
+        InstrumentAny::FuturesContract(futures_contract_es(Some(UnixNanos::default()), None));
+    let entry = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::from("ENTRY"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("5"))
+        .submit(true)
+        .build();
+    let account_id = entry.account_id().unwrap();
+    let (mut engine, cache, handler) = bracket_margin_engine(
+        &instrument,
+        account_id,
+        OmsType::Netting,
+        BookType::L1_MBP,
+        engine_config(),
+    );
+    residual_quote(&mut engine, &instrument, "100.00", "10", 1);
+    submit_orders(&mut engine, account_id, vec![entry]);
+
+    let parent_instrument = if parent_on_another_instrument {
+        let mut other = futures_contract_es(Some(UnixNanos::default()), None);
+        other.id = InstrumentId::from("NQZ21.GLBX");
+        other.raw_symbol = Symbol::from("NQZ21");
+        InstrumentAny::FuturesContract(other)
+    } else {
+        instrument.clone()
+    };
+    let strategy_id = if parent_of_another_strategy {
+        StrategyId::from("S-002")
+    } else {
+        StrategyId::test_default()
+    };
+    let mut parent = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(parent_instrument.id())
+        .strategy_id(strategy_id)
+        .client_order_id(ClientOrderId::from("PARENT"))
+        .side(parent_side)
+        .quantity(Quantity::from("2"))
+        .contingency_type(ContingencyType::Oto)
+        .linked_order_ids(vec![ClientOrderId::from("EXIT")])
+        .submit(true)
+        .build();
+    let venue_order_id = VenueOrderId::from("PARENT");
+    parent
+        .apply(TestOrderEventStubs::accepted(
+            &parent,
+            account_id,
+            venue_order_id,
+        ))
+        .unwrap();
+    let fill = TestOrderEventStubs::filled(
+        &parent,
+        &parent_instrument,
+        None,
+        None,
+        None,
+        Some(Quantity::from("1")),
+        None,
+        None,
+        None,
+        Some(account_id),
+    );
+    parent.apply(fill).unwrap();
+    assert_eq!(parent.filled_qty(), Quantity::from("1"));
+    cache_order(&cache, &parent);
+
+    let exit = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::from("EXIT"))
+        .parent_order_id(parent.client_order_id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("5"))
+        .reduce_only(true)
+        .submit(true)
+        .build();
+    clear_order_event_handler_messages(&handler);
+    submit_orders(&mut engine, account_id, vec![exit]);
+
+    let exit_fills = get_order_event_handler_messages(&handler)
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some((fill.client_order_id, fill.last_qty)),
+            _ => None,
+        })
+        .fold(Quantity::zero(0), |filled, (id, quantity)| {
+            assert_eq!(id, ClientOrderId::from("EXIT"));
+            filled + quantity
+        });
+    assert_eq!(exit_fills, Quantity::from(exit_filled));
+    let cache = cache.borrow();
+    let position_id = cache.position_id(&ClientOrderId::from("ENTRY")).unwrap();
+    assert_eq!(
+        cache.position(position_id).unwrap().quantity,
+        Quantity::from("5") - Quantity::from(exit_filled)
+    );
+}
+
 fn residual_bracket(
     instrument: &InstrumentAny,
     prefix: &str,
