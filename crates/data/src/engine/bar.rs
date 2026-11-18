@@ -21,8 +21,8 @@ use nautilus_common::{
     cache::Cache,
     clock::{Clock, VirtualClock},
     messages::data::{
-        BarsResponse, DataResponseEnvelope, QuotesResponse, ReleaseKeptBars, SubscribeBars,
-        SubscribeCommand, TradesResponse,
+        BarsResponse, DataResponseEnvelope, QuotesResponse, ReleaseKeptBars, RequestQuotes,
+        RequestTrades, SubscribeBars, SubscribeCommand, TradesResponse,
     },
     msgbus::{self, MStr, Topic, TypedHandler},
 };
@@ -460,6 +460,9 @@ impl DataEngine {
     ///
     /// Returns an error if the request sets `update_subscriptions` and:
     /// - It sets continuous-future params: a continuous future's builders end with its request.
+    /// - It is a trades or a quotes request naming several instruments (a batch): the builders
+    ///   of its instruments would share one replay, its catalog legs driving that replay through
+    ///   the window one instrument after another, and one hand-over of their held records.
     /// - A bar type it asks is built from another bar (a composite): a kept builder is handed
     ///   over to its subscription alone or with builders that share nothing. The error names the
     ///   first.
@@ -484,6 +487,16 @@ impl DataEngine {
         let Ok(Some(state)) = request_bar_aggregation_from_params(Some(params)) else {
             return Ok(());
         };
+        if let RequestCommand::Trades(RequestTrades { instrument_ids, .. })
+        | RequestCommand::Quotes(RequestQuotes { instrument_ids, .. }) = req
+            && instrument_ids.len() != 1
+        {
+            anyhow::bail!(
+                "{KEPT_REFUSED}: it must name exactly one instrument (batches are refused, as \
+                 their builders would share one replay), received {}",
+                instrument_ids.len(),
+            );
+        }
         if let Some(bar_type) = state
             .bar_types
             .iter()

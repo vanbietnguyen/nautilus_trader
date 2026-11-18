@@ -13684,6 +13684,132 @@ fn test_kept_bars_request_is_refused_by_name(
     assert!(fixture.client_commands(0).is_empty());
 }
 
+/// Executes at 12:00:00 a trades request (or, with `quotes`, a quotes request) for AUD/USD.SIM
+/// and GBP/USD.SIM, added to the cache, over 10:00 to 10:07:59.999999999, asking 5-MINUTE bars
+/// of both (`BID` bars on a quotes request), kept by request or not, that does not interleave.
+fn execute_batch_request(
+    fixture: &mut KeptFixture,
+    quotes: bool,
+    kept: bool,
+) -> anyhow::Result<()> {
+    let gbpusd = gbpusd_sim();
+    let (aud, gbp) = (fixture.instrument_id, gbpusd.id);
+    fixture
+        .cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(gbpusd))
+        .unwrap();
+    let price_type = if quotes { "BID" } else { "LAST" };
+    let bar_types: Vec<String> = [aud, gbp]
+        .iter()
+        .map(|id| format!("{id}-5-MINUTE-{price_type}-INTERNAL"))
+        .collect();
+    let params = Some(params_from_json(json!({
+        "bar_types": bar_types,
+        "update_subscriptions": kept,
+    })));
+    let at = |ns: u64| Some(UnixNanos::from(ns).to_datetime_utc());
+    let (start, end) = (at(monday("10:00:00")), at(monday("10:08:00") - 1));
+    let (client_id, now) = (Some(fixture.client_id), UnixNanos::from(monday("12:00:00")));
+    let request = if quotes {
+        RequestCommand::Quotes(RequestQuotes::new(
+            vec![aud, gbp],
+            start,
+            end,
+            None,
+            client_id,
+            UUID4::new(),
+            now,
+            params,
+        ))
+    } else {
+        RequestCommand::Trades(RequestTrades::new(
+            vec![aud, gbp],
+            start,
+            end,
+            None,
+            client_id,
+            UUID4::new(),
+            now,
+            params,
+        ))
+    };
+    fixture.engine.execute_request(request)
+}
+
+/// The review's example: at 12:00:00 a plain kept trades request for AUD/USD.SIM and
+/// GBP/USD.SIM over 10:00 to 10:08 asking the 5-MINUTE-LAST bars of both, whose builders would
+/// share one replay and one hand-over, is refused by name before dispatch; so is a kept quotes
+/// batch asking their BID bars. Nothing of it is made: a kept AUD/USD.SIM request over the same
+/// window is then admitted and dispatched.
+#[rstest]
+#[case::trades(false)]
+#[case::quotes(true)]
+fn test_kept_batch_request_is_refused_by_name_and_makes_nothing(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] quotes: bool,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[]);
+
+    let error = execute_batch_request(&mut fixture, quotes, true)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        error.contains("it must name exactly one instrument (batches are refused")
+            && error.contains("received 2"),
+        "{error}"
+    );
+    assert!(fixture.client_commands(0).is_empty());
+
+    let spec = KeptSpec {
+        plain: true,
+        quotes,
+        ..kept_window(monday("10:00:00"), monday("10:08:00"))
+    };
+    let price_type = if quotes { "BID" } else { "LAST" };
+    let five =
+        BarType::from(format!("{}-5-MINUTE-{price_type}-INTERNAL", fixture.instrument_id).as_str());
+    let result = fixture.request(&[five], spec);
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(fixture.client_commands(0).len(), 1);
+}
+
+/// A batch request with bar types that does not keep its builders is untouched by the kept
+/// refusal: it is dispatched to its client as one request naming both instruments.
+#[rstest]
+#[case::trades(false)]
+#[case::quotes(true)]
+fn test_batch_request_not_kept_is_dispatched_naming_both_instruments(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] quotes: bool,
+) {
+    let _ = stub_msgbus;
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[]);
+    let both = vec![fixture.instrument_id, gbpusd_sim().id];
+
+    let result = execute_batch_request(&mut fixture, quotes, false);
+
+    assert!(result.is_ok(), "{result:?}");
+    match fixture.client_commands(0).as_slice() {
+        [DataCommand::Request(RequestCommand::Trades(request))] if !quotes => {
+            assert_eq!(request.instrument_ids, both);
+        }
+        [DataCommand::Request(RequestCommand::Quotes(request))] if quotes => {
+            assert_eq!(request.instrument_ids, both);
+        }
+        commands => panic!("{commands:?}"),
+    }
+}
+
 /// The third read's sequence, by a real actor A: at 12:00:00 its R1 asks 5-MINUTE bars kept by
 /// request over 10:00 to 10:07:59.999999999; at 12:00:01 A subscribes 5-MINUTE, held back while
 /// R1 runs; at 12:00:02 A, its only subscriber, unsubscribes it or is disposed. A still holds R1,
