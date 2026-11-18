@@ -22,7 +22,10 @@ pub mod stream_fields;
 
 use std::{fmt::Write as _, time::Duration};
 
-use nautilus_common::{logging::log_task_awaiting, msgbus::MessageBusConfig};
+use nautilus_common::{
+    logging::{log_task_aborted, log_task_awaiting},
+    msgbus::MessageBusConfig,
+};
 use nautilus_core::{UUID4, string::semver::SemVer};
 use nautilus_model::identifiers::TraderId;
 use redis::RedisError;
@@ -50,20 +53,37 @@ pub(crate) fn get_index_key(key: &str) -> anyhow::Result<&str> {
     anyhow::bail!("Invalid index key format: {key}")
 }
 
-async fn await_handle(handle: Option<tokio::task::JoinHandle<()>>, task_name: &str) {
-    if let Some(handle) = handle {
-        log_task_awaiting(task_name);
+/// Waits for the task of `handle` until `deadline`, then aborts it and waits for its abort, so the
+/// task has ended when this returns. Returns whether it was aborted.
+async fn await_handle(
+    handle: Option<tokio::task::JoinHandle<()>>,
+    task_name: &str,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let Some(mut handle) = handle else {
+        return false;
+    };
+    log_task_awaiting(task_name);
 
-        let timeout = Duration::from_secs(2);
-        match tokio::time::timeout(timeout, handle).await {
-            Ok(result) => {
-                if let Err(e) = result {
-                    log::error!("Error awaiting task '{task_name}': {e:?}");
-                }
+    match tokio::time::timeout_at(deadline, &mut handle).await {
+        Ok(result) => {
+            if let Err(e) = result {
+                log::error!("Error awaiting task '{task_name}': {e:?}");
             }
-            Err(_) => {
-                log::warn!("Timeout {timeout:?} awaiting task '{task_name}'");
+            false
+        }
+        Err(_) => {
+            log::warn!("Task '{task_name}' still running at the close's deadline, aborting it");
+            handle.abort();
+
+            // An aborted task ends at its next await
+            if let Err(e) = handle.await
+                && !e.is_cancelled()
+            {
+                log::error!("Error awaiting task '{task_name}': {e:?}");
             }
+            log_task_aborted(task_name);
+            true
         }
     }
 }

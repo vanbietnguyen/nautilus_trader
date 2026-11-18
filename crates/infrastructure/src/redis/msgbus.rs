@@ -44,8 +44,10 @@
 //! [`MessageBusBacking::stop_read`] stops the stream task alone: publications are still written.
 //!
 //! Handles are stored as `Option<JoinHandle>` for idempotent shutdown via
-//! `close_async()`. The synchronous `close()` uses `block_in_place` to
-//! bridge into the async shutdown path and must be called from outside any
+//! `close_async()`, which waits for the tasks together for at most 5 seconds from its call, the
+//! publish task writing what is pending meanwhile, aborts any task still running, and logs once
+//! how many entries the backing wrote, discarded and left uncertain. The synchronous `close()` uses
+//! `block_in_place` to bridge into the async shutdown path and must be called from outside any
 //! `current_thread` Tokio runtime.
 //!
 //! # Stream entries
@@ -318,6 +320,9 @@ pub struct RedisMessageBusBacking {
     pub_handle: Option<tokio::task::JoinHandle<()>>,
     stream_rx: Option<tokio::sync::mpsc::Receiver<BusMessage>>,
     stream_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Ends (`recv` returns `None`) once the stream task and every read task it started have
+    /// ended.
+    read_tasks: Option<tokio::sync::mpsc::Receiver<()>>,
     stream_signal: Arc<AtomicBool>,
     heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
     heartbeat_signal: Arc<AtomicBool>,
@@ -378,19 +383,21 @@ impl RedisMessageBusBacking {
 
         // Conditionally create stream task and channel if external streams configured
         let stream_signal = Arc::new(AtomicBool::new(false));
-        let (stream_rx, stream_handle) = if external_streams.is_empty() {
-            (None, None)
+        let (stream_rx, stream_handle, read_tasks) = if external_streams.is_empty() {
+            (None, None, None)
         } else {
             let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<BusMessage>(100_000);
+            let (stream_task, read_tasks) = stream_task(
+                stream_tx,
+                backing,
+                external_streams,
+                Arc::clone(&stream_signal),
+                read_streams,
+            );
             (
                 Some(stream_rx),
-                Some(get_runtime().spawn(read_streams_until_stopped(
-                    stream_tx,
-                    backing,
-                    external_streams,
-                    Arc::clone(&stream_signal),
-                    read_streams,
-                ))),
+                Some(get_runtime().spawn(stream_task)),
+                Some(read_tasks),
             )
         };
 
@@ -421,6 +428,7 @@ impl RedisMessageBusBacking {
             pub_handle,
             stream_rx,
             stream_handle,
+            read_tasks,
             stream_signal,
             heartbeat_handle,
             heartbeat_signal,
@@ -465,20 +473,9 @@ impl MessageBusBacking for RedisMessageBusBacking {
         }
     }
 
-    /// Closes the message bus backing.
+    /// Closes the message bus backing through [`Self::close_async`], blocking until it returns.
     fn close(&mut self) {
         log::debug!("Closing");
-
-        self.stream_signal.store(true, Ordering::Relaxed);
-        self.heartbeat_signal.store(true, Ordering::Relaxed);
-
-        if !self.pub_tx.is_closed() {
-            let msg = BusMessage::new_close();
-
-            if let Err(e) = self.pub_tx.send(msg) {
-                log::warn!("Failed to send close message: {e:?}");
-            }
-        }
 
         // Keep close sync for now to avoid async trait method
         tokio::task::block_in_place(|| {
@@ -516,12 +513,61 @@ impl RedisMessageBusBacking {
         }
     }
 
+    /// Closes the message bus backing: stops the stream read and the heartbeat, has the publish
+    /// task write what is pending, and waits for these tasks together until [`CLOSE_DEADLINE`]
+    /// from this call, then aborts each task still running and waits for its abort, so no task of
+    /// the backing runs when this returns. Then logs once how many entries the backing wrote,
+    /// discarded and left uncertain in its life, at warning level when any was discarded or is
+    /// uncertain. A second call does nothing.
     pub async fn close_async(&mut self) {
-        await_handle(self.pub_handle.take(), MSGBUS_PUBLISH).await;
-        await_handle(self.stream_handle.take(), MSGBUS_STREAM).await;
-        await_handle(self.heartbeat_handle.take(), MSGBUS_HEARTBEAT).await;
+        let deadline = tokio::time::Instant::now() + CLOSE_DEADLINE;
+        let Some(pub_handle) = self.pub_handle.take() else {
+            return;
+        };
+
+        self.stream_signal.store(true, Ordering::Relaxed);
+        self.heartbeat_signal.store(true, Ordering::Relaxed);
+
+        if !self.pub_tx.is_closed()
+            && let Err(e) = self.pub_tx.send(BusMessage::new_close())
+        {
+            log::warn!("Failed to send close message: {e:?}");
+        }
+
+        let (stream_handle, read_tasks) = (self.stream_handle.take(), self.read_tasks.take());
+        let stream = async move {
+            await_handle(stream_handle, MSGBUS_STREAM, deadline).await;
+
+            // Its read tasks end with it, aborted or not
+            if let Some(mut read_tasks) = read_tasks {
+                read_tasks.recv().await;
+            }
+        };
+        let (publish_aborted, (), _) = tokio::join!(
+            await_handle(Some(pub_handle), MSGBUS_PUBLISH, deadline),
+            stream,
+            await_handle(self.heartbeat_handle.take(), MSGBUS_HEARTBEAT, deadline),
+        );
+
+        let counts = self.pub_tx.closed_counts();
+        let line = if publish_aborted {
+            format!("Closed the stream at the close's deadline of {CLOSE_DEADLINE:?}: {counts}")
+        } else {
+            format!("Closed the stream: {counts}")
+        };
+
+        if counts.discarded == 0 && counts.uncertain == 0 {
+            log::info!("{line}");
+        } else {
+            log::warn!("{line}");
+        }
     }
 }
+
+/// Longest the close of a backing waits, from its call, for its tasks together: the publish task
+/// writing what is pending, the stream read and the heartbeat. A task still running then is
+/// aborted. Provisional until measured.
+const CLOSE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Gives the source of each entry one backing writes.
 ///
@@ -636,6 +682,28 @@ struct PendingEntries {
     discarded: usize,
     /// Set by the close message, after which nothing more is admitted.
     closing: bool,
+    /// What the publish task has counted in its state, kept here so the close reads it whether
+    /// the task ended or was aborted.
+    counts: StreamCounts,
+}
+
+/// How many entries the publish task wrote in its life, discarded (certainly not written) and
+/// left uncertain (may have been written), as its state counts them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StreamCounts {
+    written: usize,
+    discarded: usize,
+    uncertain: usize,
+}
+
+impl Display for StreamCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} written, {} discarded, {} uncertain",
+            self.written, self.discarded, self.uncertain
+        )
+    }
 }
 
 impl PendingEntries {
@@ -753,6 +821,18 @@ impl PublishSender {
     /// Returns whether the publish task has ended.
     fn is_closed(&self) -> bool {
         self.wake.is_closed()
+    }
+
+    /// Returns the publish task's counts once it has ended, with what it left pending: the
+    /// messages it never took into a batch, or dropped at admission and did not count, as
+    /// discarded, and those of the batch it was writing as uncertain.
+    fn closed_counts(&self) -> StreamCounts {
+        let pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        StreamCounts {
+            written: pending.counts.written,
+            discarded: pending.counts.discarded + pending.discarded + pending.buffer.len(),
+            uncertain: pending.counts.uncertain + pending.batch_len,
+        }
     }
 }
 
@@ -1003,15 +1083,19 @@ impl StreamWriter {
         })
     }
 
-    /// Waits for `attempt` to end, then drains the remaining messages with a single attempt.
+    /// Waits for `attempt` to end, then drains the remaining messages with a single attempt per
+    /// batch, and stops at the first batch Redis refuses: what is behind it is left pending, for
+    /// the close to count as discarded.
     async fn close(
         &mut self,
         attempt: Option<BoxFuture<'static, PublishAttempt>>,
     ) -> anyhow::Result<()> {
         self.take_admitted();
 
-        if let Some(attempt) = attempt {
-            self.finish(attempt.await);
+        if let Some(attempt) = attempt
+            && let AttemptEnd::Refused(_) = self.finish(attempt.await)
+        {
+            return Ok(());
         }
 
         while self.has_pending() {
@@ -1019,11 +1103,13 @@ impl StreamWriter {
                 break;
             };
 
-            if let AttemptEnd::Failed(_) = self.finish(attempt.await) {
-                anyhow::bail!(
+            match self.finish(attempt.await) {
+                AttemptEnd::Next => {}
+                AttemptEnd::Refused(_) => break,
+                AttemptEnd::Failed(_) => anyhow::bail!(
                     "Failed to publish buffered messages before closing ({} unpublished)",
                     self.pending()
-                );
+                ),
             }
         }
 
@@ -1114,8 +1200,7 @@ impl StreamWriter {
         }
 
         let abandoned = self.clear_batch();
-        self.state.uncertain += abandoned;
-        self.state.change(StreamLink::Degraded);
+        self.count_uncertain(abandoned);
 
         log::warn!(
             "Abandoned a batch of {abandoned} stream entries pending for {MAX_PENDING_AGE:?}, which may have been written ({})",
@@ -1126,6 +1211,13 @@ impl StreamWriter {
 
     fn discard(&mut self, count: usize) {
         self.state.discarded += count;
+        self.entries().counts.discarded += count;
+        self.state.change(StreamLink::Degraded);
+    }
+
+    fn count_uncertain(&mut self, count: usize) {
+        self.state.uncertain += count;
+        self.entries().counts.uncertain += count;
         self.state.change(StreamLink::Degraded);
     }
 
@@ -1208,7 +1300,8 @@ impl StreamWriter {
         match result {
             Some(Ok(())) => {
                 self.con = Some(con);
-                self.clear_batch();
+                let written = self.clear_batch();
+                self.entries().counts.written += written;
                 self.write_error_count = 0;
                 self.write_fault = None;
                 self.state.last_success = Some(get_atomic_clock_realtime().get_time_ns());
@@ -1241,8 +1334,7 @@ impl StreamWriter {
                         self.state
                     )
                 } else {
-                    self.state.uncertain += dropped;
-                    self.state.change(StreamLink::Degraded);
+                    self.count_uncertain(dropped);
                     format!(
                         "Dropped a batch of {dropped} stream entries whose transaction failed, which may have been written in part ({}): {e}",
                         self.state
@@ -1586,13 +1678,68 @@ pub async fn stream_messages_from(
     Ok(())
 }
 
+/// Returns the backing's stream task, [`read_streams_until_stopped`] with `read`, and a receiver
+/// that ends (`recv` returns `None`) once that task and every read task it started have ended, so
+/// a close that aborts the stream task can wait for its read task's abort too.
+fn stream_task<F, Fut>(
+    tx: tokio::sync::mpsc::Sender<BusMessage>,
+    config: RedisMessageBusConfig,
+    stream_keys: Vec<String>,
+    stream_signal: Arc<AtomicBool>,
+    mut read: F,
+) -> (
+    impl Future<Output = ()> + Send + 'static,
+    tokio::sync::mpsc::Receiver<()>,
+)
+where
+    F: FnMut(
+            tokio::sync::mpsc::Sender<BusMessage>,
+            RedisMessageBusConfig,
+            Vec<String>,
+            StreamPositions,
+            Arc<AtomicBool>,
+        ) -> Fut
+        + Send
+        + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    // Nothing is sent: each read task holds a sender until it ends, aborted or not
+    let (running, read_tasks) = tokio::sync::mpsc::channel(1);
+    let task = read_streams_until_stopped(
+        tx,
+        config,
+        stream_keys,
+        stream_signal,
+        move |tx, config, stream_keys, positions, stream_signal| {
+            let running: tokio::sync::mpsc::Sender<()> = running.clone();
+            let read = read(tx, config, stream_keys, positions, stream_signal);
+            async move {
+                let _running = running;
+                read.await;
+            }
+        },
+    );
+    (task, read_tasks)
+}
+
+/// A read task [`read_streams_until_stopped`] started, aborted when it is dropped, so it ends with
+/// the task that started it.
+struct ReadTask(tokio::task::JoinHandle<()>);
+
+impl Drop for ReadTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Reads `stream_keys` from the current time on, as the backing's stream task: starts a task with
 /// `read` ([`read_streams`]) and starts it again, on the same channel and after the last entries
 /// sent, whenever it ends without `stream_signal` set while the receiver of `tx` is held.
 ///
 /// The current time is taken once, when this starts. Each such end is logged once at error level
 /// with the task's name, and the next task starts [`MAX_PUBLISH_RETRY_DELAY`] later. `tx` is held
-/// here throughout, so the receiver sees no end before the stop.
+/// here throughout, so the receiver sees no end before the stop. The task started is aborted
+/// with this one.
 async fn read_streams_until_stopped<F, Fut>(
     tx: tokio::sync::mpsc::Sender<BusMessage>,
     config: RedisMessageBusConfig,
@@ -1619,7 +1766,8 @@ async fn read_streams_until_stopped<F, Fut>(
             Arc::clone(&positions),
             Arc::clone(&stream_signal),
         );
-        let ended = tokio::spawn(task).await;
+        let mut read_task = ReadTask(tokio::spawn(task));
+        let ended = (&mut read_task.0).await;
 
         if stream_signal.load(Ordering::Relaxed) || tx.is_closed() {
             break;
@@ -5112,6 +5260,330 @@ mod tests {
         assert_eq!(fake.written.lock().unwrap().len(), 1);
     }
 
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_backing_close_writes_what_is_pending_and_logs_its_counts_once() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let writer = FakeRedis::start("unused").await;
+        writer.accept_writes.store(true, Ordering::SeqCst);
+        let stream_keys = vec!["trader-PUBLISHER-007:stream".to_string()];
+        let reader = FakeRedisStreams::start(&stream_keys, 0).await;
+        let config = MessageBusConfig {
+            stream_per_topic: true,
+            heartbeat_interval_secs: Some(60),
+            buffer_interval_ms: Some(10_000),
+            external_streams: Some(stream_keys),
+            ..Default::default()
+        };
+        let (mut backing, read_tasks) =
+            backing_on_this_runtime(writer.config(), reader.config(), config);
+        // The first heartbeat and three publications wait for the 10 s buffer interval
+        drive_until(
+            || {
+                writer.connections.lock().unwrap().len() == 1
+                    && !reader.reads.lock().unwrap().is_empty()
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        for _ in 0..3 {
+            backing.publish(fake_bus_message());
+        }
+        let pending = backing.pub_tx.pending.lock().unwrap().buffer.len();
+        let tasks = backing_tasks(&backing);
+
+        let took = close_on_clock(&mut backing).await;
+        backing.close_async().await;
+
+        let logs = thread_logs();
+        assert_eq!(pending, 4);
+        assert!(took.is_some_and(|took| took < CLOSE_DEADLINE), "{took:?}");
+        assert_eq!(writer.written_len(), 4);
+        assert!(tasks.iter().all(tokio::task::AbortHandle::is_finished));
+        assert_eq!(Arc::strong_count(&read_tasks), 1, "a read task is left");
+        assert_eq!(
+            close_lines(&logs),
+            [(
+                log::Level::Info,
+                "Closed the stream: 4 written, 0 discarded, 0 uncertain".to_string()
+            )]
+        );
+        assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_backing_close_aborts_its_tasks_at_the_deadline_when_redis_never_answers_a_write()
+    {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let writer = FakeRedis::start("unused").await;
+        writer.accept_writes.store(true, Ordering::SeqCst);
+        let stream_keys = vec!["trader-PUBLISHER-007:stream".to_string()];
+        let reader = FakeRedisStreams::start(&stream_keys, 0).await;
+        let config = MessageBusConfig {
+            stream_per_topic: true,
+            heartbeat_interval_secs: Some(60),
+            external_streams: Some(stream_keys),
+            ..Default::default()
+        };
+        let (mut backing, read_tasks) =
+            backing_on_this_runtime(writer.config(), reader.config(), config);
+        drive_until(
+            || writer.written_len() == 1 && !reader.reads.lock().unwrap().is_empty(),
+            Duration::from_secs(5),
+        )
+        .await;
+        writer.stall_writes.store(true, Ordering::SeqCst);
+        backing.publish(fake_bus_message());
+        drive_until(
+            || writer.attempted.lock().unwrap().len() == 2,
+            Duration::from_secs(5),
+        )
+        .await;
+        // The write's own bound then ends 1 s before the close's deadline, and its retry is cut
+        drive(Duration::from_secs(1)).await;
+        backing.publish(fake_bus_message());
+        backing.publish(fake_bus_message());
+        let tasks = backing_tasks(&backing);
+
+        let took = close_on_clock(&mut backing).await;
+
+        let logs = thread_logs();
+        assert_eq!(took, Some(CLOSE_DEADLINE));
+        assert!(tasks.iter().all(tokio::task::AbortHandle::is_finished));
+        assert_eq!(Arc::strong_count(&read_tasks), 1, "a read task is left");
+        assert_eq!(writer.written_len(), 1);
+        assert_eq!(
+            close_lines(&logs),
+            [(
+                log::Level::Warn,
+                "Closed the stream at the close's deadline of 5s: 1 written, 2 discarded, 1 uncertain"
+                    .to_string()
+            )]
+        );
+        assert_eq!(aborted_tasks(&logs), [MSGBUS_PUBLISH]);
+        assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_backing_close_ends_a_read_redis_never_answers_within_the_deadline() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let writer = FakeRedis::start("unused").await;
+        writer.accept_writes.store(true, Ordering::SeqCst);
+        let stream_keys = vec!["trader-PUBLISHER-007:stream".to_string()];
+        let reader = FakeRedisStreams::start(&stream_keys, 0).await;
+        reader.silent_reads.store(1, Ordering::SeqCst);
+        let config = MessageBusConfig {
+            external_streams: Some(stream_keys),
+            ..Default::default()
+        };
+        let (mut backing, read_tasks) =
+            backing_on_this_runtime(writer.config(), reader.config(), config);
+        // The first read is held, sent with the clock still since, so its own bound of 5.1 s ends
+        // after the close's deadline
+        settle_until(|| reader.silent_read_at.lock().unwrap().is_some()).await;
+        let tasks = backing_tasks(&backing);
+
+        let took = close_on_clock(&mut backing).await;
+
+        let logs = thread_logs();
+        assert_eq!(took, Some(CLOSE_DEADLINE));
+        assert!(tasks.iter().all(tokio::task::AbortHandle::is_finished));
+        assert_eq!(Arc::strong_count(&read_tasks), 1, "a read task is left");
+        assert_eq!(
+            close_lines(&logs),
+            [(
+                log::Level::Info,
+                "Closed the stream: 0 written, 0 discarded, 0 uncertain".to_string()
+            )]
+        );
+        assert_eq!(aborted_tasks(&logs), [MSGBUS_STREAM]);
+        assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_backing_close_stops_its_drain_at_the_first_batch_redis_refuses() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let writer =
+            FakeRedis::start("OOM command not allowed when used memory > 'maxmemory'.").await;
+        let config = MessageBusConfig {
+            stream_per_topic: false,
+            buffer_interval_ms: Some(10_000),
+            ..Default::default()
+        };
+        let (mut backing, _) = backing_on_this_runtime(writer.config(), writer.config(), config);
+        drive_until(
+            || writer.connections.lock().unwrap().len() == 1,
+            Duration::from_secs(5),
+        )
+        .await;
+        // Three batches wait for the 10 s buffer interval
+        for _ in 0..3 * PUBLISH_BATCH_SIZE {
+            backing.publish(fake_bus_message());
+        }
+
+        let took = close_on_clock(&mut backing).await;
+
+        let logs = thread_logs();
+        assert!(took.is_some_and(|took| took < CLOSE_DEADLINE), "{took:?}");
+        assert_eq!(writer.aborted.load(Ordering::SeqCst), 1);
+        assert_eq!(writer.connections.lock().unwrap().len(), 1);
+        assert_eq!(writer.attempted.lock().unwrap().len(), PUBLISH_BATCH_SIZE);
+        assert_eq!(
+            close_lines(&logs),
+            [(
+                log::Level::Warn,
+                "Closed the stream: 0 written, 3000 discarded, 0 uncertain".to_string()
+            )]
+        );
+        assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    /// Returns a backing for trader `TESTER-007` with `config` as `new` makes it, its tasks spawned
+    /// on this runtime: the publish task writing to `writer`, the stream task, when `config` names
+    /// external streams, reading them from `reader`, and the heartbeat task when `config` sets its
+    /// interval. Each read task holds a clone of the `Arc` returned with the backing.
+    fn backing_on_this_runtime(
+        writer: RedisMessageBusConfig,
+        reader: RedisMessageBusConfig,
+        config: MessageBusConfig,
+    ) -> (RedisMessageBusBacking, Arc<()>) {
+        let trader_id = TraderId::from("TESTER-007");
+        let instance_id = UUID4::new();
+        let sources = StreamSources::new(trader_id, instance_id, &config);
+        let stream_keys = config.external_streams.clone().unwrap_or_default();
+        let heartbeat_interval_secs = config.heartbeat_interval_secs;
+        let (pub_tx, pub_rx) = publish_channel();
+        let pub_handle = tokio::spawn(async move {
+            if let Err(e) = publish_messages(pub_rx, trader_id, instance_id, config, writer).await {
+                log_task_error(MSGBUS_PUBLISH, &e);
+            }
+        });
+
+        let stream_signal = Arc::new(AtomicBool::new(false));
+        let read_tasks = Arc::new(());
+        let (stream_rx, stream_handle, read_tasks_ended) = if stream_keys.is_empty() {
+            (None, None, None)
+        } else {
+            let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<BusMessage>(100);
+            let running = Arc::clone(&read_tasks);
+            let (task, ended) = stream_task(
+                stream_tx,
+                reader,
+                stream_keys,
+                Arc::clone(&stream_signal),
+                move |tx, config, stream_keys, positions, signal| {
+                    let running = Arc::clone(&running);
+                    // Dropped with the task's future, aborted or not
+                    async move {
+                        read_streams(tx, config, stream_keys, positions, signal).await;
+                        drop(running);
+                    }
+                },
+            );
+            (Some(stream_rx), Some(tokio::spawn(task)), Some(ended))
+        };
+
+        let heartbeat_signal = Arc::new(AtomicBool::new(false));
+        let heartbeat_handle = heartbeat_interval_secs.map(|interval| {
+            tokio::spawn(run_heartbeat(
+                interval,
+                Arc::clone(&heartbeat_signal),
+                pub_tx.clone(),
+                sources.clone(),
+            ))
+        });
+
+        let backing = RedisMessageBusBacking {
+            trader_id,
+            instance_id,
+            pub_tx,
+            pub_handle: Some(pub_handle),
+            stream_rx,
+            stream_handle,
+            read_tasks: read_tasks_ended,
+            stream_signal,
+            heartbeat_handle,
+            heartbeat_signal,
+            sources,
+        };
+        (backing, read_tasks)
+    }
+
+    /// The tasks of `backing`, to tell whether each has ended after the close takes them.
+    fn backing_tasks(backing: &RedisMessageBusBacking) -> Vec<tokio::task::AbortHandle> {
+        [
+            &backing.pub_handle,
+            &backing.stream_handle,
+            &backing.heartbeat_handle,
+        ]
+        .into_iter()
+        .flatten()
+        .map(tokio::task::JoinHandle::abort_handle)
+        .collect()
+    }
+
+    /// Closes `backing`, moving the clock on as [`drive`] does until the close's deadline and then
+    /// holding it still until the close returns, so a close that ends at its deadline ends exactly
+    /// there. Returns how long the close took on the clock, or `None` when it had not returned 5 s
+    /// of real time after the deadline.
+    async fn close_on_clock(backing: &mut RedisMessageBusBacking) -> Option<Duration> {
+        let started = tokio::time::Instant::now();
+        let deadline = started + CLOSE_DEADLINE;
+        let took = Cell::new(None);
+        let close = async {
+            backing.close_async().await;
+            took.set(Some(started.elapsed()));
+        };
+        let clock = async {
+            run_sockets().await;
+
+            while took.get().is_none() && tokio::time::Instant::now() < deadline {
+                let step = CLOCK_STEP.min(deadline - tokio::time::Instant::now());
+                tokio::time::advance(step).await;
+                run_sockets().await;
+            }
+            let held_since = std::time::Instant::now(); // dst-ok: test timer; uses real time by design
+
+            while took.get().is_none() && held_since.elapsed() < Duration::from_secs(5) {
+                tokio::task::yield_now().await;
+            }
+        };
+
+        tokio::select! {
+            biased;
+            () = close => {}
+            () = clock => {}
+        }
+        took.get()
+    }
+
+    /// The close's count lines in `logs`.
+    fn close_lines(logs: &[(log::Level, String)]) -> Vec<(log::Level, String)> {
+        logs.iter()
+            .filter(|(_, line)| line.starts_with("Closed the stream"))
+            .cloned()
+            .collect()
+    }
+
+    /// The tasks the close aborted, as its lines in `logs` name them.
+    fn aborted_tasks(logs: &[(log::Level, String)]) -> Vec<String> {
+        logs.iter()
+            .filter_map(|(_, line)| {
+                let rest = line.strip_prefix("Task '")?;
+                let (task, rest) = rest.split_once('\'')?;
+                (rest == " still running at the close's deadline, aborting it")
+                    .then(|| task.to_string())
+            })
+            .collect()
+    }
+
     /// Spawns `stream_messages_from` on `stream_keys` of `fake`, starting after `start`.
     fn start_reader(
         fake: &FakeRedisStreams,
@@ -5319,6 +5791,7 @@ mod tests {
             pub_handle: None,
             stream_rx: Some(stream_rx),
             stream_handle: None,
+            read_tasks: None,
             stream_signal: Arc::new(AtomicBool::new(false)),
             heartbeat_handle: None,
             heartbeat_signal: Arc::new(AtomicBool::new(false)),
@@ -5400,6 +5873,7 @@ mod tests {
             pub_handle: None,
             stream_rx: None,
             stream_handle: None,
+            read_tasks: None,
             stream_signal: Arc::new(AtomicBool::new(false)),
             heartbeat_handle: None,
             heartbeat_signal: Arc::new(AtomicBool::new(false)),
@@ -5639,7 +6113,7 @@ mod tests {
         })
     }
 
-    /// The lines of every thread at warning level or above.
+    /// The lines of every thread [`ThreadLogs`] captures.
     fn every_thread_logs() -> Vec<(log::Level, String)> {
         THREAD_LOGS
             .0
@@ -5650,13 +6124,16 @@ mod tests {
             .collect()
     }
 
-    /// The warning and error lines of every thread. A test on a current-thread runtime runs the
-    /// publish task and the fake Redis on its own thread, so it reads the lines of that thread.
+    /// The warning and error lines of every thread, and the information lines of this module (the
+    /// close's count line). A test on a current-thread runtime runs the publish task and the fake
+    /// Redis on its own thread, so it reads the lines of that thread.
     struct ThreadLogs(std::sync::Mutex<Vec<(std::thread::ThreadId, log::Level, String)>>);
 
     impl log::Log for ThreadLogs {
         fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
             metadata.level() <= log::Level::Warn
+                || (metadata.level() == log::Level::Info
+                    && Some(metadata.target()) == module_path!().strip_suffix("::tests"))
         }
 
         fn log(&self, record: &log::Record<'_>) {
@@ -5678,7 +6155,7 @@ mod tests {
     fn capture_logs() {
         THREAD_LOGS_INSTALL.call_once(|| {
             log::set_logger(&THREAD_LOGS).expect("no other logger in these tests");
-            log::set_max_level(log::LevelFilter::Warn);
+            log::set_max_level(log::LevelFilter::Info);
         });
     }
 
