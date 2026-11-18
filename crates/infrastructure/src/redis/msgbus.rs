@@ -24,14 +24,15 @@
 //!
 //! Admission never waits on Redis or on the publish task's housekeeping, which holds the pending
 //! messages for a bounded step at a time, so a Redis failure never holds up a publisher. What is
-//! pending is bounded by count at admission and by age from admission, whether or not the publish
-//! task runs, and beyond either bound the oldest messages not yet sent are dropped; their numbers
-//! show the hole. The task retries a failed connect or write within a second, waits as long after
-//! a batch Redis refuses, on a fresh connection when the server cannot serve now, never ends on a
-//! write error, logs transport and availability trouble at warning level, with one record at each
-//! change of the stream between connected and degraded (a write marks it connected only when no
-//! message was dropped at admission since the last write), and logs a broken invariant at error
-//! level once per change (see `publish_messages`).
+//! pending is bounded by count at admission and by age from admission, or for an entry the message
+//! bus numbered from the reservation of its number, whether or not the publish task runs, and
+//! beyond either bound the oldest messages not yet sent are dropped; their numbers show the hole.
+//! The task retries a failed connect or write within a second, waits as long after a batch Redis
+//! refuses, on a fresh connection when the server cannot serve now, never ends on a write error,
+//! logs transport and availability trouble at warning level, with one record at each change of the
+//! stream between connected and degraded (a write marks it connected only when no message was
+//! dropped at admission since the last write), and logs a broken invariant at error level once per
+//! change (see `publish_messages`).
 //!
 //! The stream task reads its streams the same way: it connects again within a second after a
 //! failed connect or read, never ends on one, logs transport and availability trouble at warning
@@ -318,6 +319,7 @@ pub struct RedisMessageBusBacking {
     heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
     heartbeat_signal: Arc<AtomicBool>,
     sources: StreamSources,
+    reserved_at: Mutex<ReservationTimes>,
 }
 
 impl Debug for RedisMessageBusBacking {
@@ -421,6 +423,7 @@ impl RedisMessageBusBacking {
             heartbeat_handle,
             heartbeat_signal,
             sources,
+            reserved_at: Mutex::default(),
         })
     }
 }
@@ -433,13 +436,37 @@ impl MessageBusBacking for RedisMessageBusBacking {
 
     /// Reserves the source of the next entry written for `topic`: this backing's trader ID and
     /// instance ID, the key the entry is written on, and the next number of that key.
+    ///
+    /// The entry's age runs from this call.
     fn reserve_source(&self, topic: Ustr) -> anyhow::Result<Option<BusMessageSource>> {
-        self.sources.reserve(topic).map(Some)
+        let mut reserved_at = self
+            .reserved_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let source = self.sources.reserve(topic)?;
+        reserved_at.stamp(&source, tokio::time::Instant::now());
+        Ok(Some(source))
     }
 
     /// Queues a serialized bus message for external publication.
+    ///
+    /// A message numbered by [`Self::reserve_source`] is aged from its reservation, and dropped and
+    /// counted as discarded when it is past [`MAX_PENDING_AGE`] or its reservation is gone.
     fn publish(&self, message: BusMessage) {
-        if let Err(e) = self.pub_tx.send(message) {
+        let now = tokio::time::Instant::now();
+        let sent = match message.source {
+            Some(source) => {
+                let reserved_at = self
+                    .reserved_at
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take(&source, now);
+                self.pub_tx.send_from(message, reserved_at, now)
+            }
+            None => self.pub_tx.send_from(message, Some(now), now),
+        };
+
+        if let Err(e) = sent {
             log::error!("Failed to send message: {e}");
         }
     }
@@ -557,6 +584,71 @@ impl StreamSources {
     }
 }
 
+/// When each number [`RedisMessageBusBacking::reserve_source`] gave and no published entry has yet
+/// taken was reserved, by key in number order, so an entry's age runs from its reservation.
+///
+/// A reservation leaves when its entry is published, when an entry numbered after it on its key is
+/// published first (its entry was not encoded or was dropped while held, a hole), or once it is
+/// past [`MAX_PENDING_AGE`] at any later reservation or publication, whose entry is then dropped if
+/// it still arrives. So it holds at most the reservations of the last [`MAX_PENDING_AGE`] whose
+/// entries have not arrived, and a key with none has no place in it.
+#[derive(Debug, Default)]
+struct ReservationTimes(AHashMap<Ustr, VecDeque<(u64, tokio::time::Instant)>>);
+
+impl ReservationTimes {
+    fn stamp(&mut self, source: &BusMessageSource, now: tokio::time::Instant) {
+        self.prune(now);
+        self.0
+            .entry(source.stream)
+            .or_default()
+            .push_back((source.sequence, now));
+    }
+
+    /// Takes when `source` was reserved, removing the earlier reservations of its key; `None` when
+    /// its reservation is gone.
+    fn take(
+        &mut self,
+        source: &BusMessageSource,
+        now: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
+        self.prune(now);
+        let times = self.0.get_mut(&source.stream)?;
+
+        while times
+            .front()
+            .is_some_and(|&(sequence, _)| sequence < source.sequence)
+        {
+            times.pop_front();
+        }
+        let reserved_at = times
+            .front()
+            .filter(|&&(sequence, _)| sequence == source.sequence)
+            .map(|&(_, reserved_at)| reserved_at);
+
+        if reserved_at.is_some() {
+            times.pop_front();
+        }
+
+        if times.is_empty() {
+            self.0.remove(&source.stream);
+        }
+        reserved_at
+    }
+
+    /// Removes every reservation past [`MAX_PENDING_AGE`] at `now`, and each key left with none.
+    fn prune(&mut self, now: tokio::time::Instant) {
+        self.0.retain(|_, times| {
+            while times
+                .front()
+                .is_some_and(|&(_, reserved_at)| reserved_at + MAX_PENDING_AGE <= now)
+            {
+                times.pop_front();
+            }
+            !times.is_empty()
+        });
+    }
+}
+
 /// Returns the key an entry of `topic` is written on: `stream_key`, or with one stream per topic,
 /// `<stream_key>:<topic>`.
 fn stream_entry_key<'a>(stream_key: &'a str, stream_per_topic: bool, topic: &str) -> Cow<'a, str> {
@@ -575,11 +667,14 @@ fn stream_entry_key<'a>(stream_key: &'a str, stream_per_topic: bool, topic: &str
 /// are measured: about 115 s of entries at 865 per second, and no bound on memory.
 const MAX_PENDING_ENTRIES: usize = 100_000;
 
-/// Longest a message stays pending, from its admission (the publish call), on the monotonic clock.
+/// Longest a message stays pending, from its admission (the publish call), or for an entry the
+/// message bus numbered from the reservation of its number, on the monotonic clock.
 ///
-/// An older message not yet sent is dropped and counted as discarded. A batch being written whose
-/// oldest message reaches it is abandoned whole, without another attempt, and counted as
-/// uncertain. Provisional until measured.
+/// An older message not yet sent is dropped and counted as discarded, at admission when it arrives
+/// older. Expiry takes the oldest admitted first, so an entry admitted behind younger entries of
+/// other keys stays past it until they expire, by less than the time from its reservation to its
+/// admission. A batch being written whose oldest message reaches it is abandoned whole, without
+/// another attempt, and counted as uncertain. Provisional until measured.
 const MAX_PENDING_AGE: Duration = Duration::from_secs(180);
 
 /// Longest wait of the publish task between two connect or write attempts, and of the stream task
@@ -610,16 +705,26 @@ struct PendingEntries {
 }
 
 impl PendingEntries {
-    /// Admits `message` at `now`, taking out the oldest messages not yet taken into a batch beyond
-    /// [`MAX_PENDING_ENTRIES`] with the batch being written, and returns them for the caller to
-    /// destroy once it no longer holds these entries.
+    /// Admits `message` at `now`, aged from `accepted`, taking out the oldest messages not yet
+    /// taken into a batch beyond [`MAX_PENDING_ENTRIES`] with the batch being written, and returns
+    /// them for the caller to destroy once it no longer holds these entries. A message without
+    /// `accepted`, or past [`MAX_PENDING_AGE`] from it, is taken out instead.
     ///
     /// Each admission adds one message, so at most one is taken out.
-    fn admit(&mut self, message: BusMessage, now: tokio::time::Instant) -> Vec<PendingMessage> {
-        self.buffer.push_back(PendingMessage {
-            accepted: now,
-            message,
-        });
+    fn admit(
+        &mut self,
+        message: BusMessage,
+        accepted: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> Vec<PendingMessage> {
+        let Some(accepted) = accepted.filter(|&accepted| now < accepted + MAX_PENDING_AGE) else {
+            self.discarded += 1;
+            return vec![PendingMessage {
+                accepted: now,
+                message,
+            }];
+        };
+        self.buffer.push_back(PendingMessage { accepted, message });
 
         let excess = (self.buffer.len() + self.batch_len)
             .saturating_sub(MAX_PENDING_ENTRIES)
@@ -683,7 +788,22 @@ impl PublishSender {
     fn send(&self, message: BusMessage) -> Result<(), tokio::sync::mpsc::error::SendError<()>> {
         // Its age runs from the call, not from when the lock is free
         let now = tokio::time::Instant::now();
+        self.send_from(message, Some(now), now)
+    }
 
+    /// Admits `message` at `now`, its age running from `accepted`, as [`Self::send`] does; one
+    /// without `accepted`, or past [`MAX_PENDING_AGE`] from it, is dropped and counted as
+    /// discarded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, and admits nothing, if the publish task has ended.
+    fn send_from(
+        &self,
+        message: BusMessage,
+        accepted: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<()>> {
         if self.wake.is_closed() {
             return Err(tokio::sync::mpsc::error::SendError(()));
         }
@@ -697,7 +817,7 @@ impl PublishSender {
             } else if pending.closing {
                 Vec::new()
             } else {
-                pending.admit(message, now)
+                pending.admit(message, accepted, now)
             }
         };
         // Destroyed with the lock released
@@ -2927,19 +3047,14 @@ mod tests {
             fake.config(),
         )
         .unwrap();
-        let topic = Ustr::from("data.quotes.A");
-        let numbered = |sequence: u64| {
+        // Numbered by the backing, which ages an entry from its reservation
+        let numbered = || {
             let mut message = fake_bus_message();
-            message.source = Some(BusMessageSource {
-                publisher_id: backing.trader_id,
-                instance_id: backing.instance_id,
-                stream: topic,
-                sequence,
-            });
+            message.source = backing.reserve_source(message.topic).unwrap();
             message
         };
 
-        backing.publish(numbered(1));
+        backing.publish(numbered());
         wait_until(
             || fake.aborted.load(Ordering::SeqCst) > 0,
             Duration::from_secs(5),
@@ -2947,7 +3062,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         let closed_after_the_error = backing.is_closed();
         fake.accept_writes.store(true, Ordering::SeqCst);
-        backing.publish(numbered(2));
+        backing.publish(numbered());
         wait_until(|| fake.written().len() == 1, Duration::from_secs(5));
         let closed_after_the_write = backing.is_closed();
         backing.close();
@@ -3829,6 +3944,134 @@ mod tests {
         let depths: Vec<Option<u64>> = fake.written().iter().map(nesting_depth).collect();
         assert_eq!(fake.written_sequences(), expected_sequences);
         assert_eq!(depths, expected_depths);
+    }
+
+    // Number 1's encoding publishes 100,001 entries on its key, numbered 2 to 100,002 and held
+    // behind it: one past the hold's bound for each of the last two, which drop 2 and 3
+    #[rstest]
+    fn test_way_out_drops_the_oldest_held_entries_beyond_the_hold_and_warns_once() {
+        capture_logs();
+        let fake = get_runtime().block_on(FakeRedis::start("unused"));
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        let config = MessageBusConfig {
+            stream_per_topic: false,
+            ..Default::default()
+        };
+        install_way_out(&fake, UUID4::new(), config);
+
+        publish_any("data.custom".into(), &NestingData::wide(100_001));
+        wait_until(|| fake.written_len() >= 100_000, Duration::from_secs(120));
+        close_way_out();
+
+        let written = fake.written();
+        let warnings: Vec<String> = thread_logs()
+            .into_iter()
+            .filter(|(level, _)| *level == log::Level::Warn)
+            .map(|(_, line)| line)
+            .collect();
+        assert_eq!(
+            fake.written_sequences(),
+            std::iter::once(1).chain(4..=100_002).collect::<Vec<u64>>()
+        );
+        assert_eq!(nesting_depth(&written[0]), Some(1));
+        assert!(
+            written[1..]
+                .iter()
+                .all(|xadd| nesting_depth(xadd) == Some(0))
+        );
+        assert_eq!(
+            warnings,
+            [
+                "Dropped 2 publications held while a publication on 'data.custom' was encoded, beyond 100000 held; their numbers are holes"
+            ]
+        );
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_backing_drops_an_entry_reserved_past_the_age_bound_when_it_arrives() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let fake = FakeRedis::start("unused").await;
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        let (backing, handle) = backing_publishing_to(&fake, false);
+
+        let late = numbered_by(&backing, "data.quotes.A");
+        drive(Duration::from_secs(181)).await;
+        backing.publish(late);
+        backing.publish(numbered_by(&backing, "data.quotes.A"));
+        drive_until(|| fake.written_len() >= 1, Duration::from_secs(5)).await;
+        backing.pub_tx.send(BusMessage::new_close()).unwrap();
+        settle_until(|| handle.is_finished()).await;
+        let result = handle.await.unwrap();
+
+        let logs = thread_logs();
+        assert!(result.is_ok());
+        assert_eq!(fake.written_sequences(), [2]);
+        assert_eq!(
+            fake.write_records(&logs),
+            [("degraded".to_string(), false, 1, 0)]
+        );
+        assert!(backing.reserved_at.lock().unwrap().0.is_empty());
+    }
+
+    // An encoding that fails publishes nothing, so its number's reservation never meets its entry
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_backing_forgets_the_reservation_of_an_entry_never_published() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let fake = FakeRedis::start("unused").await;
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        let (backing, handle) = backing_publishing_to(&fake, true);
+        let reservations = |backing: &RedisMessageBusBacking| {
+            let reserved_at = backing.reserved_at.lock().unwrap();
+            let mut keys: Vec<(String, usize)> = reserved_at
+                .0
+                .iter()
+                .map(|(key, times)| (key.to_string(), times.len()))
+                .collect();
+            keys.sort();
+            keys
+        };
+
+        // Passed over by the next number of its key
+        drop(numbered_by(&backing, "data.quotes.A"));
+        let after_failed = reservations(&backing);
+        backing.publish(numbered_by(&backing, "data.quotes.A"));
+        let after_next = reservations(&backing);
+
+        // The last of its key, gone once past the age bound
+        drop(numbered_by(&backing, "data.quotes.A"));
+        drive(Duration::from_secs(180)).await;
+        let other = numbered_by(&backing, "data.quotes.B");
+        let after_bound = reservations(&backing);
+        backing.publish(other);
+        drive_until(|| fake.written_len() == 2, Duration::from_secs(5)).await;
+        backing.pub_tx.send(BusMessage::new_close()).unwrap();
+        settle_until(|| handle.is_finished()).await;
+        let result = handle.await.unwrap();
+
+        let keys: Vec<String> = fake.written().iter().map(|xadd| xadd.key.clone()).collect();
+        assert!(result.is_ok());
+        assert_eq!(
+            after_failed,
+            [("trader-TESTER-007:stream:data.quotes.A".to_string(), 1)]
+        );
+        assert!(after_next.is_empty(), "{after_next:?}");
+        assert_eq!(
+            after_bound,
+            [("trader-TESTER-007:stream:data.quotes.B".to_string(), 1)]
+        );
+        assert!(reservations(&backing).is_empty());
+        assert_eq!(fake.written_sequences(), [2, 1]);
+        assert_eq!(
+            keys,
+            [
+                "trader-TESTER-007:stream:data.quotes.A",
+                "trader-TESTER-007:stream:data.quotes.B",
+            ]
+        );
     }
 
     #[rstest]
@@ -4883,18 +5126,32 @@ mod tests {
         }
     }
 
-    /// Custom data whose JSON encoding first publishes, on `data.custom`, the same data one depth
-    /// less, then fails when `fails` is set.
+    /// Custom data whose JSON encoding first publishes, on `data.custom`, `publications` times the
+    /// same data one depth less, then fails when `fails` is set.
     #[derive(Debug)]
     struct NestingData {
         depth: u64,
         fails: bool,
+        publications: u64,
     }
 
     impl NestingData {
         fn custom(depth: u64, fails: bool) -> CustomData {
+            Self::data(depth, fails, 1)
+        }
+
+        /// Data of depth 1 that publishes `publications` data of depth 0 while it is encoded.
+        fn wide(publications: u64) -> CustomData {
+            Self::data(1, false, publications)
+        }
+
+        fn data(depth: u64, fails: bool, publications: u64) -> CustomData {
             CustomData::new(
-                Arc::new(Self { depth, fails }),
+                Arc::new(Self {
+                    depth,
+                    fails,
+                    publications,
+                }),
                 DataType::new("NestingData", None, None),
             )
         }
@@ -4921,7 +5178,9 @@ mod tests {
 
         fn to_json(&self) -> anyhow::Result<String> {
             if let Some(depth) = self.depth.checked_sub(1) {
-                publish_any("data.custom".into(), &Self::custom(depth, false));
+                for _ in 0..self.publications {
+                    publish_any("data.custom".into(), &Self::custom(depth, false));
+                }
             }
             anyhow::ensure!(!self.fails, "NestingData has no JSON form");
             Ok(json!({ "depth": self.depth }).to_string())
@@ -4931,6 +5190,7 @@ mod tests {
             Arc::new(Self {
                 depth: self.depth,
                 fails: self.fails,
+                publications: self.publications,
             })
         }
 
@@ -4964,6 +5224,7 @@ mod tests {
                 UUID4::new(),
                 &MessageBusConfig::default(),
             ),
+            reserved_at: Mutex::default(),
         }
     }
 
@@ -5008,6 +5269,48 @@ mod tests {
             )
             .await
         })
+    }
+
+    /// Returns a backing for trader `TESTER-007` whose publish task, spawned on this runtime,
+    /// writes to `fake`, with a key per topic when `stream_per_topic`.
+    fn backing_publishing_to(
+        fake: &FakeRedis,
+        stream_per_topic: bool,
+    ) -> (
+        RedisMessageBusBacking,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let (pub_tx, rx) = publish_channel();
+        let handle = spawn_publisher(fake, rx, stream_per_topic, None);
+        let trader_id = TraderId::from("TESTER-007");
+        let instance_id = UUID4::new();
+        let config = MessageBusConfig {
+            stream_per_topic,
+            ..Default::default()
+        };
+        let backing = RedisMessageBusBacking {
+            trader_id,
+            instance_id,
+            pub_tx,
+            pub_handle: None,
+            stream_rx: None,
+            stream_handle: None,
+            stream_signal: Arc::new(AtomicBool::new(false)),
+            heartbeat_handle: None,
+            heartbeat_signal: Arc::new(AtomicBool::new(false)),
+            sources: StreamSources::new(trader_id, instance_id, &config),
+            reserved_at: Mutex::default(),
+        };
+        (backing, handle)
+    }
+
+    /// Returns a message on `topic` numbered by `backing`, as the message bus numbers it before
+    /// encoding it.
+    fn numbered_by(backing: &RedisMessageBusBacking, topic: &str) -> BusMessage {
+        let mut message = fake_bus_message();
+        message.topic = Ustr::from(topic);
+        message.source = backing.reserve_source(message.topic).unwrap();
+        message
     }
 
     /// Returns `count` messages numbered from 1 as the way out numbers them on one key.
