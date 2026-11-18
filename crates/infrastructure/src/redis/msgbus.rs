@@ -861,7 +861,8 @@ impl PublishSender {
 ///
 /// Returns an error if:
 /// - The configured `autotrim_maxlen` does not fit in `usize`.
-/// - The pending messages cannot be written with one more attempt when the task closes.
+/// - The pending messages cannot be written with one more attempt when the task closes, for a
+///   broken invariant.
 async fn publish_messages(
     rx: PublishReceiver,
     trader_id: TraderId,
@@ -939,7 +940,7 @@ async fn publish_messages(
 
                 match writer.finish(ended) {
                     AttemptEnd::Next => {}
-                    AttemptEnd::Refused(retry_delay) | AttemptEnd::Failed(retry_delay) => {
+                    AttemptEnd::Refused(retry_delay) | AttemptEnd::Failed(retry_delay, _) => {
                         retry_pending = true;
                         retry_timer
                             .as_mut()
@@ -1007,8 +1008,9 @@ enum AttemptEnd {
     /// Redis refused the batch, which was dropped; the next write waits this delay, on a fresh
     /// connection when the server could not serve.
     Refused(Duration),
-    /// The attempt failed and is tried again after this delay.
-    Failed(Duration),
+    /// The attempt failed, for transport or availability trouble or a broken invariant, and is
+    /// tried again after this delay.
+    Failed(Duration, StreamFault),
 }
 
 /// A message admitted for the publish task, and when it was admitted.
@@ -1084,8 +1086,10 @@ impl StreamWriter {
     }
 
     /// Waits for `attempt` to end, then drains the remaining messages with a single attempt per
-    /// batch, and stops at the first batch Redis refuses: what is behind it is left pending, for
-    /// the close to count as discarded.
+    /// batch, and stops at the first batch Redis refuses or whose attempt fails: what is behind it
+    /// is left pending, for the close to count as discarded. A failed attempt is logged at warning
+    /// level for transport or availability trouble, and returned as the error for a broken
+    /// invariant.
     async fn close(
         &mut self,
         attempt: Option<BoxFuture<'static, PublishAttempt>>,
@@ -1106,10 +1110,20 @@ impl StreamWriter {
             match self.finish(attempt.await) {
                 AttemptEnd::Next => {}
                 AttemptEnd::Refused(_) => break,
-                AttemptEnd::Failed(_) => anyhow::bail!(
-                    "Failed to publish buffered messages before closing ({} unpublished)",
-                    self.pending()
-                ),
+                AttemptEnd::Failed(_, fault) => {
+                    let line = format!(
+                        "Failed to publish buffered messages before closing ({} unpublished)",
+                        self.pending()
+                    );
+
+                    // A Redis away at the close is availability trouble, a warning; a broken
+                    // invariant ends the task with its error
+                    if fault == StreamFault::Broken {
+                        anyhow::bail!(line);
+                    }
+                    log::warn!("{line}");
+                    break;
+                }
             }
         }
 
@@ -1278,7 +1292,7 @@ impl StreamWriter {
                     "Error connecting to publish, retrying in {retry_delay:?} ({}): {e}",
                     self.state
                 );
-                return AttemptEnd::Failed(retry_delay);
+                return AttemptEnd::Failed(retry_delay, StreamFault::Unavailable);
             }
             PublishAttempt::Write {
                 con,
@@ -1350,7 +1364,7 @@ impl StreamWriter {
                     self.state
                 );
                 report_stream_fault(&e, &mut self.write_fault, &line);
-                AttemptEnd::Failed(retry_delay)
+                AttemptEnd::Failed(retry_delay, stream_fault(&e))
             }
             None => {
                 let retry_delay = self.fail();
@@ -1358,7 +1372,7 @@ impl StreamWriter {
                     "No reply publishing to stream within {MAX_PUBLISH_ATTEMPT:?}, retrying in {retry_delay:?} ({})",
                     self.state
                 );
-                AttemptEnd::Failed(retry_delay)
+                AttemptEnd::Failed(retry_delay, StreamFault::Unavailable)
             }
         }
     }
@@ -3348,13 +3362,17 @@ mod tests {
         let (tx, handle) = start_publisher(&fake);
         let messages = numbered_messages(2);
 
+        let mut clock = TaskClock::writing();
+
         tx.send(messages[0].clone()).unwrap();
         settle_until(|| fake.aborted.load(Ordering::SeqCst) > 0).await;
-        drive(Duration::from_secs(100)).await;
+        clock.drive(Duration::from_secs(100)).await;
         tx.send(messages[1].clone()).unwrap();
-        drive(Duration::from_secs(81)).await;
+        clock.drive(Duration::from_secs(81)).await;
         fake.accept_writes.store(true, Ordering::SeqCst);
-        drive_until(|| fake.written_len() == 1, Duration::from_secs(5)).await;
+        clock
+            .drive_until(|| fake.written_len() == 1, Duration::from_secs(5))
+            .await;
         tx.send(BusMessage::new_close()).unwrap();
         settle_until(|| handle.is_finished()).await;
         let result = handle.await.unwrap();
@@ -3590,6 +3608,13 @@ mod tests {
         let (tx, handle) = start_publisher(&fake);
         let mut refused_by_ten_seconds = 0;
         let mut connections_by_ten_seconds = 0;
+        // Each refusal costs the connection, so a connection the fake accepted has its batch
+        // refused before the clock moves, unless nothing is pending for it
+        let settled = || {
+            refusals_taken(&fake, &tx)
+                && (fake.aborted.load(Ordering::SeqCst) == fake.connections.lock().unwrap().len()
+                    || tx.pending.lock().unwrap().buffer.is_empty())
+        };
 
         // One entry every 100 ms for 60 s
         for (i, message) in numbered_messages(600).into_iter().enumerate() {
@@ -3598,9 +3623,9 @@ mod tests {
                 connections_by_ten_seconds = fake.connections.lock().unwrap().len();
             }
             tx.send(message).unwrap();
-            drive(Duration::from_millis(100)).await;
+            drive_settled(Duration::from_millis(100), settled).await;
         }
-        drive(Duration::from_secs(2)).await;
+        drive_settled(Duration::from_secs(2), settled).await;
         let refused = fake.aborted.load(Ordering::SeqCst);
         tx.send(BusMessage::new_close()).unwrap();
         settle_until(|| handle.is_finished()).await;
@@ -3696,13 +3721,14 @@ mod tests {
             FakeRedis::start("WRONGTYPE Operation against a key holding the wrong kind of value")
                 .await;
         let (tx, handle) = start_publisher(&fake);
+        let settled = || refusals_taken(&fake, &tx);
 
         // One entry every 100 ms for 10 s
         for message in numbered_messages(100) {
             tx.send(message).unwrap();
-            drive(Duration::from_millis(100)).await;
+            drive_settled(Duration::from_millis(100), settled).await;
         }
-        drive(Duration::from_secs(2)).await;
+        drive_settled(Duration::from_secs(2), settled).await;
         let refused = fake.aborted.load(Ordering::SeqCst);
         tx.send(BusMessage::new_close()).unwrap();
         settle_until(|| handle.is_finished()).await;
@@ -4008,13 +4034,14 @@ mod tests {
         #[case] expected_sequences: &[u64],
     ) {
         capture_logs();
+        let runtime = TestRuntime::start();
         let fake = get_runtime().block_on(FakeRedis::start("unused"));
         fake.accept_writes.store(true, Ordering::SeqCst);
         let config = MessageBusConfig {
             stream_per_topic,
             ..Default::default()
         };
-        install_way_out(&fake, UUID4::new(), config);
+        runtime.install_way_out(&fake, config);
 
         publish_any(outer.into(), &NestingData::nesting(nested).custom());
         publish_quote(nested.into(), &QuoteTick::default());
@@ -4026,20 +4053,21 @@ mod tests {
         assert_eq!(fake.written_sequences(), expected_sequences);
         assert_eq!(topics, [Some(outer.to_string()), Some(nested.to_string())]);
         assert_eq!(nesting_depth(&written[0]), Some(1));
-        assert_eq!(error_lines(&thread_logs()), [refusal_line(outer, nested)]);
+        assert_eq!(error_lines(&runtime.logs()), [refusal_line(outer, nested)]);
     }
 
     // A handler of the refused publication publishes again, still inside the outer encoding
     #[rstest]
     fn test_way_out_refuses_every_publication_made_while_encoding_a_numbered_one() {
         capture_logs();
+        let runtime = TestRuntime::start();
         let fake = get_runtime().block_on(FakeRedis::start("unused"));
         fake.accept_writes.store(true, Ordering::SeqCst);
         let config = MessageBusConfig {
             stream_per_topic: false,
             ..Default::default()
         };
-        install_way_out(&fake, UUID4::new(), config);
+        runtime.install_way_out(&fake, config);
         subscribe_any(
             "data.three.b".into(),
             ShareableMessageHandler::from_any(|_: &dyn std::any::Any| {
@@ -4059,7 +4087,7 @@ mod tests {
         assert_eq!(fake.written_sequences(), [1, 2]);
         assert_eq!(nesting_depth(&fake.written()[0]), Some(1));
         assert_eq!(
-            error_lines(&thread_logs()),
+            error_lines(&runtime.logs()),
             [
                 refusal_line("data.three.a", "data.three.c"),
                 refusal_line("data.three.a", "data.three.b"),
@@ -4072,13 +4100,14 @@ mod tests {
     #[rstest]
     fn test_way_out_ends_the_refusal_with_an_encoding_that_fails() {
         capture_logs();
+        let runtime = TestRuntime::start();
         let fake = get_runtime().block_on(FakeRedis::start("unused"));
         fake.accept_writes.store(true, Ordering::SeqCst);
         let config = MessageBusConfig {
             stream_per_topic: false,
             ..Default::default()
         };
-        install_way_out(&fake, UUID4::new(), config);
+        runtime.install_way_out(&fake, config);
         let nesting = NestingData::nesting("data.failing");
 
         let failing = NestingData {
@@ -4091,7 +4120,7 @@ mod tests {
         wait_until(|| fake.written_len() >= 2, Duration::from_secs(5));
         close_way_out();
 
-        let refusals: Vec<String> = error_lines(&thread_logs())
+        let refusals: Vec<String> = error_lines(&runtime.logs())
             .into_iter()
             .filter(|line| line.starts_with("Refused"))
             .collect();
@@ -4103,13 +4132,14 @@ mod tests {
     #[rstest]
     fn test_way_out_logs_the_first_refusal_of_a_pair_of_topics_only() {
         capture_logs();
+        let runtime = TestRuntime::start();
         let fake = get_runtime().block_on(FakeRedis::start("unused"));
         fake.accept_writes.store(true, Ordering::SeqCst);
         let config = MessageBusConfig {
             stream_per_topic: false,
             ..Default::default()
         };
-        install_way_out(&fake, UUID4::new(), config);
+        runtime.install_way_out(&fake, config);
 
         let many = NestingData {
             publications: 1_000,
@@ -4122,15 +4152,88 @@ mod tests {
 
         assert_eq!(fake.written_sequences(), [1, 2]);
         assert_eq!(
-            error_lines(&thread_logs()),
+            error_lines(&runtime.logs()),
             [refusal_line("data.many", "data.many")]
         );
+    }
+
+    /// Set in the environment of the process
+    /// [`test_way_out_logs_the_refusals_of_64_pairs_of_topics_then_one_line_past_them`] runs
+    /// itself in.
+    const REFUSALS_PROCESS: &str = "NAUTILUS_REDIS_MSGBUS_REFUSALS_PROCESS";
+
+    // The pairs whose refusal was logged are kept for the process, so the test runs itself again
+    // in a process of its own, where no other test has refused a publication
+    #[rstest]
+    fn test_way_out_logs_the_refusals_of_64_pairs_of_topics_then_one_line_past_them() {
+        if std::env::var_os(REFUSALS_PROCESS).is_none() {
+            let (_, module) = module_path!().split_once("::").unwrap();
+            let test = format!(
+                "{module}::test_way_out_logs_the_refusals_of_64_pairs_of_topics_then_one_line_past_them"
+            );
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &test,
+                    "--test-threads=1",
+                    "--skip",
+                    "serial_tests",
+                ])
+                .env(REFUSALS_PROCESS, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(stdout.contains("1 passed"), "{stdout}");
+            return;
+        }
+
+        capture_logs();
+        let runtime = TestRuntime::start();
+        let fake = get_runtime().block_on(FakeRedis::start("unused"));
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        let config = MessageBusConfig {
+            stream_per_topic: false,
+            ..Default::default()
+        };
+        runtime.install_way_out(&fake, config);
+        let nested: Vec<&'static str> = (1..=66)
+            .map(|i| Ustr::from(&format!("data.pairs.{i}")).as_str())
+            .collect();
+        let publish_nesting = |nested: &'static str| {
+            publish_any("data.pairs".into(), &NestingData::nesting(nested).custom());
+        };
+
+        // 64 pairs, the 65th and the 66th, then the 65th and the first again
+        for &topic in &nested {
+            publish_nesting(topic);
+        }
+        publish_nesting(nested[64]);
+        publish_nesting(nested[0]);
+        wait_until(|| fake.written_len() >= 68, Duration::from_secs(5));
+        close_way_out();
+
+        let mut expected: Vec<String> = nested[..64]
+            .iter()
+            .map(|nested| refusal_line("data.pairs", nested))
+            .collect();
+        expected.push(format!(
+            "Refused the publication on '{}' made while a publication on 'data.pairs' was encoded for a numbered stream; past 64 pairs of topics, no later refusal is logged",
+            nested[64]
+        ));
+        assert_eq!(fake.written_len(), 68);
+        assert_eq!(error_lines(&runtime.logs()), expected);
     }
 
     // The heartbeat's first tick is at once, and two more fall within a 2.5 s encoding
     #[rstest]
     fn test_way_out_takes_heartbeats_while_the_message_bus_encodes() {
         capture_logs();
+        let runtime = TestRuntime::start();
         let fake = get_runtime().block_on(FakeRedis::start("unused"));
         fake.accept_writes.store(true, Ordering::SeqCst);
         let config = MessageBusConfig {
@@ -4138,7 +4241,7 @@ mod tests {
             heartbeat_interval_secs: Some(1),
             ..Default::default()
         };
-        install_way_out(&fake, UUID4::new(), config);
+        runtime.install_way_out(&fake, config);
         let is_slow = |xadd: &FakeXadd| xadd.field("topic").as_deref() == Some("data.slow");
 
         wait_until(|| fake.written_len() == 1, Duration::from_secs(5));
@@ -4167,7 +4270,7 @@ mod tests {
             heartbeats,
             (1..=heartbeats.len() as u64).collect::<Vec<u64>>()
         );
-        assert_eq!(error_lines(&thread_logs()), Vec::<String>::new());
+        assert_eq!(error_lines(&runtime.logs()), Vec::<String>::new());
     }
 
     // Reserved at 0 s, its encoding ends and it is admitted at 181 s
@@ -5445,6 +5548,94 @@ mod tests {
         assert_eq!(error_lines(&logs), Vec::<String>::new());
     }
 
+    // Redis goes away after a first write, so the close's drain fails on a closed connection
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_backing_close_warns_when_redis_is_away_at_its_drain() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let writer = FakeRedis::start("unused").await;
+        writer.accept_writes.store(true, Ordering::SeqCst);
+        let config = MessageBusConfig {
+            stream_per_topic: false,
+            buffer_interval_ms: Some(10_000),
+            ..Default::default()
+        };
+        let (mut backing, _) = backing_on_this_runtime(writer.config(), writer.config(), config);
+        backing.publish(fake_bus_message());
+        drive_until(|| writer.written_len() == 1, Duration::from_secs(15)).await;
+        // Three publications wait for the next buffer interval
+        for _ in 0..3 {
+            backing.publish(fake_bus_message());
+        }
+        writer.available.store(false, Ordering::SeqCst);
+
+        let took = close_on_clock(&mut backing).await;
+
+        let logs = thread_logs();
+        assert!(took.is_some_and(|took| took < CLOSE_DEADLINE), "{took:?}");
+        assert_eq!(writer.written_len(), 1);
+        assert!(
+            logs.contains(&(
+                log::Level::Warn,
+                "Failed to publish buffered messages before closing (3 unpublished)".to_string()
+            )),
+            "{logs:?}"
+        );
+        assert_eq!(
+            close_lines(&logs),
+            [(
+                log::Level::Warn,
+                "Closed the stream: 1 written, 0 discarded, 3 uncertain".to_string()
+            )]
+        );
+        assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_backing_close_reports_a_wrong_type_key_once_at_error_level() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let writer =
+            FakeRedis::start("WRONGTYPE Operation against a key holding the wrong kind of value")
+                .await;
+        let config = MessageBusConfig {
+            stream_per_topic: false,
+            buffer_interval_ms: Some(10_000),
+            ..Default::default()
+        };
+        let (mut backing, _) = backing_on_this_runtime(writer.config(), writer.config(), config);
+        drive_until(
+            || writer.connections.lock().unwrap().len() == 1,
+            Duration::from_secs(5),
+        )
+        .await;
+        // Three publications wait for the 10 s buffer interval
+        for _ in 0..3 {
+            backing.publish(fake_bus_message());
+        }
+
+        let took = close_on_clock(&mut backing).await;
+
+        let logs = thread_logs();
+        let errors = error_lines(&logs);
+        assert!(took.is_some_and(|took| took < CLOSE_DEADLINE), "{took:?}");
+        assert_eq!(writer.aborted.load(Ordering::SeqCst), 1);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with("Dropped a batch of 3 stream entries Redis refused"),
+            "{errors:?}"
+        );
+        assert_eq!(
+            close_lines(&logs),
+            [(
+                log::Level::Warn,
+                "Closed the stream: 0 written, 3 discarded, 0 uncertain".to_string()
+            )]
+        );
+    }
+
     /// Returns a backing for trader `TESTER-007` with `config` as `new` makes it, its tasks spawned
     /// on this runtime: the publish task writing to `writer`, the stream task, when `config` names
     /// external streams, reading them from `reader`, and the heartbeat task when `config` sets its
@@ -5664,6 +5855,56 @@ mod tests {
 
     fn close_way_out() {
         get_message_bus().borrow_mut().close().unwrap();
+    }
+
+    /// A multi-thread runtime of one test's own, which records the threads it starts, so the test
+    /// reads the lines its backing's tasks log there beside those of its own thread, and no other
+    /// test's.
+    struct TestRuntime {
+        runtime: tokio::runtime::Runtime,
+        threads: Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>,
+    }
+
+    impl TestRuntime {
+        fn start() -> Self {
+            let threads = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let started = Arc::clone(&threads);
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .on_thread_start(move || started.lock().unwrap().push(std::thread::current().id()))
+                .build()
+                .unwrap();
+            Self { runtime, threads }
+        }
+
+        /// Installs a way out as [`install_way_out`] does, its backing's tasks on this runtime.
+        fn install_way_out(&self, fake: &FakeRedis, config: MessageBusConfig) {
+            let (backing, _) = {
+                let _entered = self.runtime.enter();
+                backing_on_this_runtime(fake.config(), fake.config(), config)
+            };
+            let mut bus = MessageBus::default();
+            bus.set_external_egress(
+                external_egress_from_backing(Box::new(backing)),
+                SerializationEncoding::Json,
+            );
+            set_message_bus(Rc::new(RefCell::new(bus)));
+        }
+
+        /// The lines of the calling thread and of this runtime's threads.
+        fn logs(&self) -> Vec<(log::Level, String)> {
+            let mut threads = self.threads.lock().unwrap().clone();
+            threads.push(std::thread::current().id());
+            THREAD_LOGS
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(logged_on, _, _)| threads.contains(logged_on))
+                .map(|(_, level, line)| (*level, line.clone()))
+                .collect()
+        }
     }
 
     /// Custom data whose JSON encoding always fails.
@@ -5991,6 +6232,31 @@ mod tests {
             tokio::time::advance(CLOCK_STEP).await;
             run_sockets().await;
         }
+    }
+
+    /// Moves the paused clock on by `duration` in steps of [`CLOCK_STEP`], as [`drive`] does, but
+    /// before each step and at the end lets the tasks and their sockets run with the clock still
+    /// until `settled` holds.
+    async fn drive_settled(duration: Duration, mut settled: impl FnMut() -> bool) {
+        let end = tokio::time::Instant::now() + duration;
+
+        loop {
+            settle_until(&mut settled).await;
+            if tokio::time::Instant::now() >= end {
+                return;
+            }
+            tokio::time::advance(CLOCK_STEP).await;
+        }
+    }
+
+    /// Whether the publish task taking what `tx` admits has taken the refusal of every batch it
+    /// sent `fake`, one at least: no batch is being written, and each entry the fake was sent is
+    /// counted discarded.
+    fn refusals_taken(fake: &FakeRedis, tx: &PublishSender) -> bool {
+        let entries = tx.pending.lock().unwrap();
+        fake.aborted.load(Ordering::SeqCst) > 0
+            && entries.batch_len == 0
+            && entries.counts.discarded == fake.attempted.lock().unwrap().len()
     }
 
     /// Moves the paused clock for one stream task reading a [`FakeRedisStreams`], or one publish
@@ -7608,14 +7874,9 @@ mod serial_tests {
         let second_len: usize = con.xlen(&second_key).await.unwrap();
         let _: usize = con.del(&[&first_key, &second_key]).await.unwrap();
 
-        // Seeing `first` on the stream does not show that its acknowledgement reached the
-        // publisher before the interruption, and if it did not, `first` is still buffered.
-        let error = result.unwrap_err().to_string();
-        let unpublished = ["1", "2"].map(|count| {
-            format!("Failed to publish buffered messages before closing ({count} unpublished)")
-        });
+        // An outage at the close is availability trouble, logged at warning level and not returned
         assert_eq!(second_len, 0);
-        assert!(unpublished.contains(&error), "{error}");
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[rstest]

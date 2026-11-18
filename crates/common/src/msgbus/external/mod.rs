@@ -223,9 +223,18 @@ where
 /// a last line saying so, and no later new pair is logged.
 const MAX_LOGGED_REFUSALS: usize = 64;
 
+/// The pairs of topics whose refusal was logged in this process.
+static LOGGED_REFUSALS: Mutex<LoggedRefusals> = Mutex::new(LoggedRefusals {
+    pairs: Vec::new(),
+    past_max: false,
+});
+
 /// The pairs of topics, the publication being encoded and the one refused, whose refusal was
-/// logged in this process.
-static LOGGED_REFUSALS: Mutex<Vec<(Ustr, Ustr)>> = Mutex::new(Vec::new());
+/// logged, at most [`MAX_LOGGED_REFUSALS`], and whether the line past them was logged.
+struct LoggedRefusals {
+    pairs: Vec<(Ustr, Ustr)>,
+    past_max: bool,
+}
 
 thread_local! {
     /// The topic of the publication this thread encodes for a way out that numbered it.
@@ -252,18 +261,23 @@ impl Drop for NumberedEncoding {
 /// Refuses a publication on `topic` made while a publication on `outer` is encoded for a way out
 /// that numbers its entries, logging the first refusal of each pair of topics at error level.
 fn refuse_nested_publication(outer: Ustr, topic: Ustr) {
-    let logged = {
+    let past_max = {
         let mut logged = LOGGED_REFUSALS
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if logged.len() > MAX_LOGGED_REFUSALS || logged.contains(&(outer, topic)) {
+        if logged.past_max || logged.pairs.contains(&(outer, topic)) {
             return;
         }
-        logged.push((outer, topic));
-        logged.len()
+
+        if logged.pairs.len() == MAX_LOGGED_REFUSALS {
+            logged.past_max = true;
+        } else {
+            logged.pairs.push((outer, topic));
+        }
+        logged.past_max
     };
 
-    if logged > MAX_LOGGED_REFUSALS {
+    if past_max {
         log::error!(
             "Refused the publication on '{topic}' made while a publication on '{outer}' was encoded for a numbered stream; past {MAX_LOGGED_REFUSALS} pairs of topics, no later refusal is logged"
         );
