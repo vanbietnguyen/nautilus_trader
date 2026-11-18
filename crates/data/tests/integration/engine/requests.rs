@@ -10119,6 +10119,83 @@ fn test_plain_request_over_a_gap_its_client_answers_empty_fires_the_end_of_cover
     assert_eq!(fixture.ends(), vec![None]);
 }
 
+/// A request for two instruments, AUD/USD over the gap example and GBP/USD wholly covered, with
+/// no client: when it builds bars it fails naming the gap and closes nothing after its last
+/// record, as one for a single instrument does; when it builds none it completes as before.
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_request_for_two_instruments_over_a_gap_no_client_resolves_fails_when_it_builds_bars(
+    audusd_sim: CurrencyPair,
+    gbpusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[values(true, false)] builds_bars: bool,
+) {
+    let _ = stub_msgbus;
+    let (aud, gbp) = (audusd_sim.id, gbpusd_sim.id);
+    let minute = bar_type_of(aud, "1-MINUTE");
+    let mut fixture = PlainFixture::new(
+        vec![
+            InstrumentAny::CurrencyPair(audusd_sim),
+            InstrumentAny::CurrencyPair(gbpusd_sim),
+        ],
+        client_id,
+        venue,
+        without_flat_bars(),
+        gap_ns("12:00:00"),
+        &[minute],
+    );
+    // One catalog: AUD/USD's file ends at 09:59:59.999999999, GBP/USD's covers the window
+    let catalog_dir = CatalogTempDir::new("batch-gap");
+    let catalog = ParquetDataCatalog::new(catalog_dir.path(), None, None, None, None);
+    let aud_trades: Vec<_> = [("09:56:30", "t1"), ("09:57:30", "t2"), ("09:58:30", "t3")]
+        .into_iter()
+        .map(|(time, id)| split_trade(aud, gap_ns(time), id))
+        .collect();
+    let file = |start: u64, end: u64| (Some(UnixNanos::from(start)), Some(UnixNanos::from(end)));
+    let (start, end) = file(gap_ns(GAP_WINDOW.0), gap_ns("10:00:00") - 1);
+    catalog
+        .write_to_parquet(&aud_trades, start, end, None)
+        .unwrap();
+    let (start, end) = file(gap_ns(GAP_WINDOW.0), gap_ns(GAP_WINDOW.1));
+    catalog
+        .write_to_parquet(
+            &[split_trade(gbp, gap_ns("09:57:10"), "g1")],
+            start,
+            end,
+            None,
+        )
+        .unwrap();
+    fixture.engine.register_catalog(Box::new(catalog), None);
+
+    let params = if builds_bars {
+        json!({ "bar_types": [minute.to_string()] })
+    } else {
+        json!({})
+    };
+    let RequestCommand::Trades(mut request) = gap_request(aud, ClientId::new("ABSENT"), params)
+    else {
+        unreachable!("the gap request is a trades request");
+    };
+    request.instrument_ids = vec![aud, gbp];
+    fixture.execute(RequestCommand::Trades(request));
+
+    if builds_bars {
+        // Without the failure the end (10:05) would fire the 09:59 close holding t3
+        assert_eq!(
+            fixture.cached(),
+            vec![vec![(gap_ns("09:57:00"), 1), (gap_ns("09:58:00"), 1)]]
+        );
+        assert_eq!(fixture.ends(), vec![Some(GAP_REASON.to_owned())]);
+    } else {
+        assert_eq!(fixture.ends(), vec![None]);
+    }
+    assert_eq!(fixture.cache.borrow().trade_count(&aud), 3);
+    assert_eq!(fixture.cache.borrow().trade_count(&gbp), 1);
+    assert!(fixture.trades_requests().is_empty());
+}
+
 /// A request that builds no bars, over the same gap with no client, completes as before: the
 /// catalog's records and no failure.
 #[cfg(feature = "streaming")]
@@ -11344,6 +11421,169 @@ fn test_subscription_held_back_during_a_kept_request_gets_its_held_trades_bars_i
             published(three, monday("10:09:00"), 8, &[3, 1]),
             live_trade("h4", &[3, 1]),
             published(five, monday("10:10:00"), 24, &[3, 2]),
+        ]
+    );
+}
+
+/// A kept request ending at 17:00:00.011, the engine clock's time, whose answer holds a trade
+/// stamped exactly then: the same trade, held live for a subscription made while the answer was
+/// in flight, is not fed again at the release, so the 17:05 bar counts it once.
+#[rstest]
+fn test_held_back_subscription_drops_a_held_trade_the_answer_already_holds(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
+    let now = monday("17:00:00.011");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, now, &[five]);
+    let spec = KeptSpec {
+        start: Some(monday("16:55:00")),
+        end: Some(now),
+        ..KeptSpec::default()
+    };
+    let request = fixture.request(&[five], spec).unwrap();
+    fixture.subscribe(five, None);
+    fixture.live(now, 4, "x");
+    fixture.answer(
+        request,
+        &[(monday("16:58:00"), 1, "a1"), (now, 4, "x")],
+        None,
+    );
+    fixture.advance(monday("17:05:00"));
+
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            live_trade("x", &[0]),
+            kept_trade(0, "a1", &[0]),
+            kept_bar(0, five, monday("17:00:00"), 1, &[1]),
+            kept_trade(0, "x", &[1]),
+            Kept::End(0, None),
+            published(five, monday("17:05:00"), 4, &[2]),
+        ]
+    );
+}
+
+/// The command an actor sends to unsubscribe `bar_type` at the fixture's clock.
+fn unsubscribe(fixture: &mut KeptFixture, bar_type: BarType) {
+    let now = fixture.clock.borrow().timestamp_ns();
+    fixture
+        .engine
+        .execute(DataCommand::Unsubscribe(UnsubscribeCommand::Bars(
+            UnsubscribeBars::new(
+                bar_type,
+                Some(fixture.client_id),
+                Some(fixture.venue),
+                UUID4::new(),
+                now,
+                None,
+                None,
+            ),
+        )));
+}
+
+/// A kept bar type unsubscribed while its request is in flight: the request runs to its end, then
+/// its replay is removed, not kept, so the first window can be asked again; no subscription is
+/// released at the client.
+#[rstest]
+fn test_unsubscribing_a_kept_bar_type_while_its_request_runs_removes_the_replay_at_its_end(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
+    let request = fixture
+        .request(&[five], kept_window(monday("10:00:00"), monday("10:08:00")))
+        .unwrap();
+    let sent = fixture.client_commands(0).len();
+    unsubscribe(&mut fixture, five);
+    fixture.answer(
+        request,
+        &[(monday("10:01:00"), 1, "a1"), (monday("10:06:00"), 2, "a2")],
+        None,
+    );
+
+    // The first window again: admitted only because no builder of it is left
+    let started = fixture
+        .request(&[five], kept_window(monday("10:00:00"), monday("10:15:00")))
+        .unwrap();
+    fixture.answer(started, &[(monday("10:12:00"), 4, "c1")], None);
+
+    assert!(
+        !fixture
+            .client_commands(sent)
+            .iter()
+            .any(|command| matches!(command, DataCommand::Unsubscribe(_))),
+        "{:?}",
+        fixture.client_commands(sent)
+    );
+    let mut expected = first_kept_answer(five);
+    expected.extend([kept_trade(1, "c1", &[1]), Kept::End(1, None)]);
+    assert_eq!(fixture.delivered(), expected);
+}
+
+/// The same with a subscription held back on another builder of the request: at the request's
+/// end nothing is handed over; the subscription gets a new builder, started then and fed its
+/// held trades, and the unsubscribed bar type has no builder left.
+#[rstest]
+fn test_unsubscribing_a_kept_bar_type_while_its_request_runs_gives_a_held_back_subscription_a_new_builder(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (three, five) = (bar_type_of(id, "3-MINUTE"), bar_type_of(id, "5-MINUTE"));
+    let mut fixture = KeptFixture::new(
+        audusd_sim,
+        client_id,
+        venue,
+        monday("10:08:00"),
+        &[three, five],
+    );
+    let request = fixture
+        .request(
+            &[three, five],
+            kept_window(monday("10:00:00"), monday("10:02:00")),
+        )
+        .unwrap();
+    fixture.subscribe(three, None);
+    for (ts, size, trade_id) in [
+        ("10:02:00", 2, "h1"),
+        ("10:04:00", 4, "h2"),
+        ("10:07:00", 8, "h3"),
+    ] {
+        fixture.live(monday(ts), size, trade_id);
+    }
+    unsubscribe(&mut fixture, five);
+    fixture.answer(request, &[(monday("10:00:30"), 1, "a1")], None);
+    fixture.advance(monday("10:09:30"));
+    fixture.live(monday("10:09:30"), 16, "h4");
+    fixture.advance(monday("10:10:00"));
+
+    // No 5-MINUTE builder is left to continue: a request from 10:00 starts a new one
+    assert!(
+        fixture
+            .request(&[five], kept_window(monday("10:00:00"), monday("10:15:00")))
+            .is_ok()
+    );
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            live_trade("h1", &[0, 0]),
+            live_trade("h2", &[0, 0]),
+            live_trade("h3", &[0, 0]),
+            kept_trade(0, "a1", &[0, 0]),
+            Kept::End(0, None),
+            published(three, monday("10:09:00"), 14, &[1, 0]),
+            live_trade("h4", &[1, 0]),
         ]
     );
 }

@@ -3193,14 +3193,17 @@ pub trait DataActor {
     /// close, then the aggregator continues on the engine clock with its pending close or
     /// `RANGE` boundary as armed (one at the engine clock's time fires there once, after the
     /// records stamped then); nothing is flushed. Made while the answer is in flight, it is held
-    /// back: its live trades are held and, when the request succeeds, fed to the aggregator as
-    /// the answer's trades are (the closes due before each fire first, their bars still the
+    /// back: its live trades are held and, when the request succeeds, the ones stamped after its
+    /// coverage (the answer holds every trade up to it) are fed to the aggregator as the
+    /// answer's trades are (the closes due before each fire first, their bars still the
     /// answer's), trade by trade across bar types, then the aggregator is taken over as above.
     /// When the request fails or expires instead, the subscription gets a new aggregator,
     /// started then and fed the held trades. A joined request (`cut_warmup`) closes nothing after
     /// its last trade: its held live trades, through the join's cut and floor, move its clock on
     /// before the takeover. [`Self::unsubscribe_bars`] for a bar type kept and not subscribed
-    /// since removes its aggregator.
+    /// since removes its aggregator; made while a request runs it, that request runs to its end,
+    /// and then its aggregators are removed as on a failure: nothing is taken over, and a
+    /// held-back subscription gets a new aggregator.
     ///
     /// With `params["interleave"] = true` and `params["bar_types"]`, the engine answers the
     /// trades together with the bars it builds from them, in the order a subscriber running

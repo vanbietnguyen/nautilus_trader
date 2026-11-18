@@ -679,6 +679,8 @@ impl DataEngine {
             }
         }
 
+        let mut uncovered = None;
+
         for ((start, end), ids) in clients {
             let member = with_request_instrument_ids(&parent, ids);
             let client_id = member.client_id().copied();
@@ -688,6 +690,13 @@ impl DataEngine {
                 .get_client(client_id.as_ref(), venue.as_ref())
                 .is_none()
             {
+                // A request that builds bars fails over the first missed interval, as one for
+                // a single instrument does (see `plan_date_range_request`)
+                if self.builds_bars_on_a_replay(&parent)
+                    && uncovered.is_none_or(|(first, _)| start < first)
+                {
+                    uncovered = Some((start, end));
+                }
                 continue;
             }
 
@@ -696,6 +705,11 @@ impl DataEngine {
             let request = with_dates_for_pipeline(&member, Some(start), Some(end), now_ns);
             plan.push(RequestLeg::Client(request));
         }
+
+        plan.extend(uncovered.map(|(start, end)| RequestLeg::Terminal {
+            request_id: UUID4::new(),
+            reason: uncovered_window_reason(start.into(), end.into(), NO_SOURCE),
+        }));
 
         self.dispatch_request_plan(parent, plan)
     }

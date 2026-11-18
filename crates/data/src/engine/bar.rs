@@ -101,6 +101,9 @@ pub(super) struct RequestReplay {
     /// [`window_not_wholly_known`]), or its answer came as a bare response (see
     /// [`DataEngine::response`]).
     partial: bool,
+    /// Whether a kept builder of it was unsubscribed while its request was in flight (see
+    /// [`DataEngine::unsubscribe_bars`]): the replay is removed when the request ends, not kept.
+    unsubscribed: bool,
 }
 
 /// The completed answer of an interleaving trades request, delivered by
@@ -292,6 +295,7 @@ impl DataEngine {
                 dispatched,
                 partial: false,
                 covered: None,
+                unsubscribed: false,
                 ..replay
             },
             None => RequestReplay {
@@ -306,6 +310,7 @@ impl DataEngine {
                 end: None,
                 dispatched,
                 partial: false,
+                unsubscribed: false,
             },
         };
 
@@ -802,7 +807,8 @@ impl DataEngine {
     ///
     /// A request's own builders stop with it. Builders kept by request (`update_subscriptions`)
     /// stay on their replay after a success (see [`Self::release_kept_builders`]); after
-    /// anything else the replay is removed with them (see [`Self::remove_kept_builders`]). With
+    /// anything else, or when one of them was unsubscribed while the request was in flight, the
+    /// replay is removed with them (see [`Self::remove_kept_builders`]). With
     /// `interleaved`, the entry of an interleaving request holding its undelivered bars, the bars
     /// its held live trades complete go there; the entry still held here goes with the builders,
     /// undelivered: only [`Self::finish_interleaved`], which takes the entry first, delivers its
@@ -825,7 +831,7 @@ impl DataEngine {
             let bars =
                 interleaved.map_or_else(Rc::default, |interleaved| Rc::clone(&interleaved.bars));
             match replay {
-                Some(replay) if succeeded => {
+                Some(replay) if succeeded && !replay.unsubscribed => {
                     self.release_kept_builders(&state, replay, joined, &bars);
                 }
                 replay => self.remove_kept_builders(&state, replay.as_ref()),
@@ -852,8 +858,11 @@ impl DataEngine {
     /// of their own (see [`Self::hand_over_clock`]), each record first advancing the clock as a
     /// record of the answer does, the trades trade by trade across bar types (see
     /// [`Self::release_held_trades_trade_by_trade`]), then any held quotes or bars one builder
-    /// after the other, sources first; the bars they complete still go to the answer. Then
-    /// they are handed over to their subscriptions (see [`Self::hand_over_kept_builders`]).
+    /// after the other, sources first; the bars they complete still go to the answer. A held
+    /// record stamped at or before the replay's coverage is not fed: the answer held every
+    /// record of its window up to then (a joined request's answer certifies no coverage; its
+    /// cut and floor decide instead). Then they are handed over to their subscriptions (see
+    /// [`Self::hand_over_kept_builders`]).
     fn release_kept_builders(
         &mut self,
         state: &RequestBarAggregation,
@@ -871,8 +880,8 @@ impl DataEngine {
 
         if !held_back.is_empty() {
             let clock = self.hand_over_clock(&replay.clock, &held_back);
-            self.release_held_trades_trade_by_trade(state, joined, bars, &clock);
-            self.release_held_records(&held_back, &clock);
+            self.release_held_trades_trade_by_trade(state, joined, replay.covered, bars, &clock);
+            self.release_held_records(&held_back, replay.covered, &clock);
             self.hand_over_kept_builders(&held_back, &clock);
             replay.builders.retain(|key| !held_back.contains(&key.0));
         }
@@ -1052,8 +1061,15 @@ impl DataEngine {
 
     /// Feeds the held live quotes and bars of the kept builders of `bar_types` (in that order,
     /// sources first) to them, one builder after the other, each record after `clock` is readied
-    /// for it (see [`step_clock`]). Their held trades were released trade by trade before.
-    fn release_held_records(&mut self, bar_types: &[BarType], clock: &Rc<RefCell<VirtualClock>>) {
+    /// for it (see [`step_clock`]), except a record stamped at or before `covered`, the answer's
+    /// coverage. Their held trades were released trade by trade before.
+    fn release_held_records(
+        &mut self,
+        bar_types: &[BarType],
+        covered: Option<UnixNanos>,
+        clock: &Rc<RefCell<VirtualClock>>,
+    ) {
+        let owned = |ts_init: UnixNanos| covered.is_some_and(|covered| ts_init <= covered);
         for bar_type in bar_types {
             let key = bar_aggregator_key(*bar_type, None);
             let Some(warmup) = self.bar_aggregator_warmups.remove(&key) else {
@@ -1065,20 +1081,32 @@ impl DataEngine {
 
             match warmup {
                 BarAggregatorWarmup::Quote(buffer) => {
-                    for quote in buffer.release() {
+                    for quote in buffer
+                        .release()
+                        .into_iter()
+                        .filter(|quote| !owned(quote.ts_init))
+                    {
                         step_clock(clock, quote.ts_init);
                         aggregator.borrow_mut().handle_quote(quote);
                     }
                 }
                 BarAggregatorWarmup::Bar(buffer) => {
-                    for bar in buffer.release() {
+                    for bar in buffer
+                        .release()
+                        .into_iter()
+                        .filter(|bar| !owned(bar.ts_init))
+                    {
                         step_clock(clock, bar.ts_init);
                         aggregator.borrow_mut().handle_bar(bar);
                     }
                 }
                 BarAggregatorWarmup::Trade(buffer)
                 | BarAggregatorWarmup::JoinedTrade(buffer, _) => {
-                    for trade in buffer.release() {
+                    for trade in buffer
+                        .release()
+                        .into_iter()
+                        .filter(|trade| !owned(trade.ts_init))
+                    {
                         step_clock(clock, trade.ts_init);
                         aggregator.borrow_mut().handle_trade(trade);
                     }
@@ -1160,15 +1188,26 @@ impl DataEngine {
     /// answer (see [`step_clock`]), at the latest of the builders' copies, so the closes due
     /// before it fire first. The bars fired and the bars one trade completes go to the end of
     /// `bars` (an interleaving request's undelivered bars) by the rule of
-    /// [`Self::respond_interleaved_trades`]: a `RANGE_INCLUSIVE` bar after the others.
+    /// [`Self::respond_interleaved_trades`]: a `RANGE_INCLUSIVE` bar after the others. A copy
+    /// stamped at or before `covered`, the answer's coverage, is not fed: the answer held it.
     fn release_held_trades_trade_by_trade(
         &mut self,
         state: &RequestBarAggregation,
         joined: Option<JoinedRelease>,
+        covered: Option<UnixNanos>,
         bars: &RefCell<Vec<Bar>>,
         clock: &Rc<RefCell<VirtualClock>>,
     ) {
-        let held = self.take_held_trades(&state.bar_types, joined);
+        let mut held = self.take_held_trades(&state.bar_types, joined);
+        if let Some(covered) = covered {
+            for (_, copies) in &mut held {
+                for copy in copies.iter_mut() {
+                    if copy.is_some_and(|trade| trade.ts_init <= covered) {
+                        *copy = None;
+                    }
+                }
+            }
+        }
         let aggregators: Vec<_> = held
             .iter()
             .filter_map(|(bar_type, _)| {
@@ -1562,9 +1601,15 @@ impl DataEngine {
             return;
         }
 
-        // A kept builder a request is still running is left to that request
-        if !self.bar_aggregator_handlers.contains_key(&key) && self.is_replay_driven(&key) {
-            log::warn!("Cannot remove the kept bar aggregator for {bar_type}: a request runs it");
+        // A kept builder a request is still running: that request runs to its end, and then its
+        // replay is removed instead of kept
+        if !self.bar_aggregator_handlers.contains_key(&key)
+            && let Some(replay) = self
+                .request_replays
+                .values_mut()
+                .find(|replay| replay.builders.contains(&key))
+        {
+            replay.unsubscribed = true;
             return;
         }
 
