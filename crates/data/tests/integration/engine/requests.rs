@@ -4548,7 +4548,8 @@ fn test_interleaved_failure_before_any_part_delivers_held_trades_bars_through_th
     assert_eq!(
         tap.take(request_id),
         vec![
-            part(ResponsePart::Bars(request_id, tick, at_ns(&[10, 20]))),
+            part(ResponsePart::Bars(request_id, tick, at_ns(&[10]))),
+            part(ResponsePart::Bars(request_id, tick, at_ns(&[20]))),
             terminal(None, Some("the source stopped")),
         ]
     );
@@ -6840,4 +6841,120 @@ fn test_request_join_naming_a_dispatched_interleave_request_is_refused_and_leave
     assert_eq!(*live_bars.borrow(), at_ns(&[10]));
     assert_eq!(tap.take(leg_id), Vec::new());
     assert_eq!(tap.take(join_id), Vec::new());
+}
+
+#[rstest]
+fn test_interleaved_failure_before_any_part_caches_each_held_trades_bar_just_before_its_part(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let tick = fixture.bar_type;
+    let request_id = execute_interleaved(&fixture, id, &[tick], true);
+    let cache = Rc::clone(fixture.engine.borrow().cache());
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&seen);
+    msgbus::register_response_handler(
+        &request_id,
+        TypedHandler::from(move |envelope: &DataResponseEnvelope| {
+            if let Some(DataResponse::Bars(resp)) = envelope.response() {
+                for bar in resp.data.iter() {
+                    recorded
+                        .borrow_mut()
+                        .push((bar.ts_event, cache.borrow().bar_count(&tick)));
+                }
+            }
+        }),
+    );
+    fixture
+        .engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+            SubscribeBars::new(
+                tick,
+                Some(client_id),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )));
+    for (ts, trade_id) in [(10, "live-1"), (20, "live-2")] {
+        fixture
+            .engine
+            .borrow_mut()
+            .process_data(Data::Trade(make_trade(id, "1.0000", 1, trade_id, ts)));
+    }
+
+    fixture
+        .engine
+        .borrow_mut()
+        .response_envelope(DataResponseEnvelope::terminal(
+            request_id,
+            Some("the source stopped".to_owned()),
+        ));
+
+    // The first bar's handler does not find the second in the cache
+    assert_eq!(
+        *seen.borrow(),
+        vec![(UnixNanos::from(10), 1), (UnixNanos::from(20), 2)]
+    );
+}
+
+/// Whether, between two trades of `delivered`, bars of two types come in another order than
+/// they have in `bar_types`.
+fn completes_two_types_out_of_order(delivered: &[OrderedDelivery], bar_types: &[BarType]) -> bool {
+    delivered
+        .split(|delivery| matches!(delivery, OrderedDelivery::Trade(..)))
+        .any(|run| {
+            let positions: Vec<usize> = run
+                .iter()
+                .filter_map(|delivery| match delivery {
+                    OrderedDelivery::Bar(bar_type, ..) => bar_types
+                        .iter()
+                        .position(|candidate| candidate.standard() == *bar_type),
+                    OrderedDelivery::Trade(..) => None,
+                })
+                .collect();
+            positions.windows(2).any(|pair| pair[0] > pair[1])
+        })
+}
+
+// Each pair is named out of live's order, and one trade of the order tape completes a bar of each:
+// t3 the two `RANGE` bars and the `RANGE` and `VOLUME` bars, t5 the two `RANGE_INCLUSIVE` bars,
+// and the 2-ms bar closes at 4 ms, just before t6 completes a `VOLUME` bar
+#[rstest]
+#[case::two_ranges(&["9-RANGE", "10-RANGE"])]
+#[case::two_ranges_inclusive(&["9-RANGE_INCLUSIVE", "10-RANGE_INCLUSIVE"])]
+#[case::volume_and_range(&["1500-VOLUME", "10-RANGE"])]
+#[case::volume_and_time(&["1500-VOLUME", "2-MILLISECOND"])]
+fn test_interleaved_bars_of_two_types_one_trade_completes_come_in_live_order_whatever_the_request_order(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] specs: &[&str],
+) {
+    let _ = stub_msgbus;
+    let bar_types: Vec<BarType> = specs
+        .iter()
+        .map(|spec| BarType::from(format!("{}-{spec}-LAST-INTERNAL", audusd_sim.id).as_str()))
+        .collect();
+
+    let live = live_deliveries(audusd_sim.clone(), client_id, venue, &bar_types);
+
+    assert!(
+        completes_two_types_out_of_order(&live, &bar_types),
+        "one trade completes bars of both types, which live gives in the other order: {live:?}"
+    );
+    for answer in history_answers() {
+        let history =
+            interleaved_deliveries(audusd_sim.clone(), client_id, venue, &bar_types, answer);
+        assert_eq!(history, live, "{answer:?}");
+    }
 }

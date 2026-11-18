@@ -16,7 +16,6 @@
 use std::fmt::Debug;
 
 use anyhow::Context;
-use indexmap::IndexMap;
 use jiff::tz::TimeZone;
 use nautilus_common::{
     cache::Cache,
@@ -242,12 +241,15 @@ impl DataEngine {
     ) -> anyhow::Result<()> {
         let request_id = *req.request_id();
 
-        let Some(state) = request_bar_aggregation_from_params(request_params(req))? else {
+        let Some(mut state) = request_bar_aggregation_from_params(request_params(req))? else {
             return Ok(());
         };
 
         // The entry exists before the aggregators that deliver into it
         if state.interleave {
+            // Fed in the order live delivers the bars of one trade, so they are produced in it
+            state.bar_types.sort_by_cached_key(live_delivery_order);
+
             let (start, end) = parent_request_window(Some(req));
             let interleaved = InterleavedRequest {
                 start,
@@ -509,8 +511,10 @@ impl DataEngine {
     /// that trade, except a `RANGE_INCLUSIVE` bar, which contains its completing trade and is
     /// delivered after it (the live publication order); a time bar is completed by the first
     /// trade after its close, so it goes out before that trade, as its live timer publishes it.
-    /// Each bar delivery first sends the trades gathered since the previous one; each bar is a
-    /// part of its own, in the order the aggregators produced it, and enters the cache only as
+    /// The aggregators are fed in live's order (see [`live_delivery_order`]), so bars of
+    /// different types one trade completes come in the order live publishes them. Each bar
+    /// delivery first sends the trades gathered since the previous one; each bar is a part of
+    /// its own, in the order the aggregators produced it, and enters the cache only as
     /// its part is sent, so a trade's or a bar's handler finds in the cache the bars live
     /// publication has cached by then. The last part of a partial envelope, the trades after
     /// the last completed bar (possibly none), is sent as a part; a completed envelope ends the
@@ -568,12 +572,12 @@ impl DataEngine {
     ///
     /// Takes the request's entry, cleans up its aggregators (a joined request's builders
     /// releasing through the answer's cut and floor), and delivers the bars that clean-up
-    /// completed: with the answer's identity, each bar a part of its own after the answer's
+    /// completed, each a part of its own in the order the clean-up produced it, entering the
+    /// cache just before its part is sent: with the answer's identity, after the answer's
     /// trades; or, when there is no answer and a client was resolved, with the dispatched
-    /// client's identity and the request's window, one part per bar type, each part's bars
-    /// entering the cache together just before it is sent (none otherwise, and they do not enter
-    /// the cache). Then sends exactly one terminal, the answer's last trades part when there is
-    /// one, carrying `failure` when there is a reason.
+    /// client's identity and the request's window (none otherwise, and they do not enter the
+    /// cache). Then sends exactly one terminal, the answer's last trades part when there is one,
+    /// carrying `failure` when there is a reason.
     pub(super) fn finish_interleaved(
         &mut self,
         request_id: UUID4,
@@ -605,15 +609,17 @@ impl DataEngine {
         } else {
             if let Some(client_id) = interleaved.client_id {
                 let ts_init = self.clock.borrow().timestamp_ns();
-                send_bars_parts(
-                    &self.cache,
-                    request_id,
-                    client_id,
-                    (interleaved.start, interleaved.end),
-                    ts_init,
-                    interleaved.params.as_ref(),
-                    remaining,
-                );
+                for bar in remaining {
+                    send_bar_part(
+                        &self.cache,
+                        request_id,
+                        client_id,
+                        (interleaved.start, interleaved.end),
+                        ts_init,
+                        interleaved.params.as_ref(),
+                        bar,
+                    );
+                }
             }
             DataResponseEnvelope::terminal(request_id, None)
         };
@@ -1508,6 +1514,20 @@ fn why_not_fed_by_trades(bar_type: &BarType, instrument_id: InstrumentId) -> Opt
     }
 }
 
+/// Returns the key that orders the bar types of an interleaving request as live delivers the bars
+/// one trade completes, so its aggregators are fed, and produce their bars, in that order.
+///
+/// Every bar type admitted is fed by the trades (see [`why_not_fed_by_trades`]). A time bar is
+/// published by its timer before the trade is (a test or backtest clock takes timers due at one
+/// instant in name order, `TIME_BAR_<bar type>`). The trades topic's router then calls the other
+/// aggregators at one priority in handler ID order, `BarTradeHandler|<bar type>`: the bar type's
+/// string order (a builder subscribed during a joined warm-up has `JoinedTradeHandler|<bar
+/// type>`, so the order holds among builders subscribed alike). A `RANGE_INCLUSIVE` bar is
+/// published after the trade, its aggregator having been called in that same order.
+fn live_delivery_order(bar_type: &BarType) -> (bool, String) {
+    (!bar_type.spec().is_time_aggregated(), bar_type.to_string())
+}
+
 /// Live data held back for a bar aggregator that is still replaying a historical request.
 #[derive(Debug)]
 pub(super) enum BarAggregatorWarmup {
@@ -1682,43 +1702,6 @@ fn send_bar_part(
         params.cloned(),
     );
     msgbus::send_response_part(&correlation_id, &DataResponse::Bars(part));
-}
-
-/// Sends `bars` as one bars part per bar type in completion order, each carrying the request's
-/// identity and window. A part's bars enter the cache just before it is sent.
-fn send_bars_parts(
-    cache: &Rc<RefCell<Cache>>,
-    correlation_id: UUID4,
-    client_id: ClientId,
-    (start, end): (Option<UnixNanos>, Option<UnixNanos>),
-    ts_init: UnixNanos,
-    params: Option<&Params>,
-    bars: Vec<Bar>,
-) {
-    let mut bars_by_type: IndexMap<BarType, Vec<Bar>> = IndexMap::new();
-    for bar in bars {
-        bars_by_type.entry(bar.bar_type).or_default().push(bar);
-    }
-
-    for (bar_type, data) in bars_by_type {
-        for bar in &data {
-            if let Err(e) = cache.as_ref().borrow_mut().add_bar_historical(*bar) {
-                log_error_on_cache_insert(&e);
-            }
-        }
-
-        let bars = BarsResponse::new(
-            correlation_id,
-            client_id,
-            bar_type,
-            data,
-            start,
-            end,
-            ts_init,
-            params.cloned(),
-        );
-        msgbus::send_response_part(&correlation_id, &DataResponse::Bars(bars));
-    }
 }
 
 #[cfg(test)]
