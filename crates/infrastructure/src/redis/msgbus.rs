@@ -23,6 +23,13 @@
 //! streams. Each background task owns its own Redis connection created on
 //! the Nautilus runtime.
 //!
+//! The publish task reads its channel at all times, so a Redis failure never holds up a
+//! publisher. What it holds pending is bounded by count and age, and beyond either bound the oldest
+//! messages not yet sent are dropped; their numbers show the hole. It retries a failed connect or
+//! write within a second, never ends on a write error, and logs transport trouble at warning
+//! level, with one record at each change of the stream between connected and degraded (see
+//! [`publish_messages`]).
+//!
 //! Handles are stored as `Option<JoinHandle>` for idempotent shutdown via
 //! `close_async()`. The synchronous `close()` uses `block_in_place` to
 //! bridge into the async shutdown path and must be called from outside any
@@ -47,7 +54,7 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
-    fmt::Debug,
+    fmt::{Debug, Display},
     str::FromStr,
     sync::{
         Arc, Mutex, PoisonError,
@@ -58,7 +65,7 @@ use std::{
 
 use ahash::AHashMap;
 use bytes::Bytes;
-use futures::stream::Stream;
+use futures::{future::BoxFuture, stream::Stream};
 use jiff::{Timestamp, tz::Offset};
 use nautilus_common::{
     enums::SerializationEncoding,
@@ -70,7 +77,7 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    UUID4,
+    UUID4, UnixNanos,
     time::{duration_since_unix_epoch, get_atomic_clock_realtime},
 };
 use nautilus_cryptography::providers::install_cryptographic_provider;
@@ -525,20 +532,52 @@ fn stream_entry_key<'a>(stream_key: &'a str, stream_per_topic: bool, topic: &str
     }
 }
 
+/// Most messages the publish task holds pending at once: those it took from its channel and has
+/// not written, the batch being written included.
+///
+/// Beyond it the oldest messages not yet sent are dropped and counted as discarded. Provisional
+/// until the stream's entry rates and sizes are measured: about 115 s of entries at 865 per second,
+/// and no bound on memory.
+const MAX_PENDING_ENTRIES: usize = 100_000;
+
+/// Longest a message stays pending, from when the publish task took it from its channel, on the
+/// monotonic clock.
+///
+/// An older message not yet sent is dropped and counted as discarded. A batch being written whose
+/// oldest message reaches it is abandoned whole, without another attempt, and counted as
+/// uncertain. Provisional until measured.
+const MAX_PENDING_AGE: Duration = Duration::from_secs(180);
+
+/// Longest wait of the publish task between two connect or write attempts.
+///
+/// The stream's rule, not a configuration default: it caps the delay whatever `max_delay` the
+/// [`RedisMessageBusConfig`] gives, so the stream is written again within about a second of Redis
+/// coming back.
+const MAX_PUBLISH_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Longest one connect or write attempt of the publish task takes before it counts as failed.
+/// Provisional until measured.
+const MAX_PUBLISH_ATTEMPT: Duration = Duration::from_secs(5);
+
 /// Publishes messages received on `rx` to Redis streams for the given `trader_id` and `instance_id`, using `config`.
 ///
-/// Buffered messages are written in batches of at most 1,000 per `MULTI`/`EXEC`, and each batch
-/// is only removed once its `EXEC` is acknowledged. On a retryable write error the task keeps
-/// receiving, waits out the stream reader's backoff, and retries the same messages on a fresh
-/// connection, so a batch whose reply was lost can be written twice.
+/// The task takes messages from `rx` from its start, and also while a connect or write is pending.
+/// It holds at most [`MAX_PENDING_ENTRIES`] of them, each for at most [`MAX_PENDING_AGE`], and
+/// beyond either bound drops the oldest not yet sent. Every connection, the first included, is
+/// opened by one bounded attempt at a time, at most [`MAX_PUBLISH_RETRY_DELAY`] after a failed one.
+///
+/// Pending messages are written in batches of at most 1,000 per `MULTI`/`EXEC`. A batch is not
+/// changed until its `EXEC` is acknowledged, and a retry writes the same messages again, so a batch
+/// whose reply was lost can be written twice. A batch Redis refuses with a non-retryable error is
+/// dropped, and a batch past the age bound is abandoned. A write error never ends the task:
+/// transport trouble and dropped messages are logged at warning level, with one record at each
+/// change of the stream between connected and degraded.
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - The backing configuration is missing in `config`.
-/// - Establishing the initial Redis connection fails.
-/// - A Redis write fails with a non-retryable error.
-/// - The buffered messages cannot be written when the task closes.
+/// - The configured `autotrim_maxlen` does not fit in `usize`.
+/// - The pending messages cannot be written with one more attempt when the task closes.
 pub async fn publish_messages(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<BusMessage>,
     trader_id: TraderId,
@@ -548,53 +587,52 @@ pub async fn publish_messages(
 ) -> anyhow::Result<()> {
     log_task_started(MSGBUS_PUBLISH);
 
-    let con = create_redis_connection(MSGBUS_PUBLISH, &backing).await?;
     let stream_key = get_stream_key(trader_id, instance_id, &config);
-
-    // Auto-trimming
-    let autotrim_duration = config
-        .autotrim_mins
-        .filter(|&mins| mins > 0)
-        .map(|mins| Duration::from_secs(u64::from(mins) * 60));
-    let autotrim_maxlen = config
-        .autotrim_maxlen
-        .filter(|&maxlen| maxlen > 0)
-        .map(usize::try_from)
-        .transpose()?;
-
-    let mut writer = StreamWriter {
-        con: Some(con),
-        // Fresh connections fail fast, so this task's backoff governs rather than the
-        // connection manager's retry schedule, and a close is not held up behind it.
-        reconnect_config: RedisMessageBusConfig {
-            number_of_retries: 0,
-            ..backing
-        },
-        stream_key,
-        stream_per_topic: config.stream_per_topic,
-        autotrim_duration,
-        autotrim_maxlen,
-        last_trim_index: HashMap::new(),
-        buffer: VecDeque::new(),
-        write_error_count: 0,
-    };
+    let mut writer = StreamWriter::new(stream_key, &config, backing)?;
 
     // Buffering
     let buffer_interval = Duration::from_millis(u64::from(config.buffer_interval_ms.unwrap_or(0)));
 
     // A sleep used to trigger periodic flushing of the buffer.
-    // When `buffer_interval` is zero we skip using the timer and flush immediately
-    // after every message.
+    // When `buffer_interval` is zero we skip using the timer and write
+    // as soon as messages are pending.
     let flush_timer = tokio::time::sleep(buffer_interval);
     tokio::pin!(flush_timer);
+    let mut flush_due = false;
 
-    // A sleep used to retry the buffer after a retryable write error,
+    // A sleep used to wait out the delay after a failed attempt,
     // only polled while a retry is pending.
     let retry_timer = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(retry_timer);
+    let mut retry_pending = false;
+
+    // A sleep until the oldest pending message reaches the age bound,
+    // only polled while it is armed.
+    let expiry_timer = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(expiry_timer);
+    let mut expiry = None;
+
+    // The connect or write attempt in progress, polled beside the channel
+    let mut attempt: Option<BoxFuture<'static, PublishAttempt>> = None;
 
     loop {
-        let retry_delay = tokio::select! {
+        if !writer.has_pending() {
+            flush_due = false;
+        }
+
+        if attempt.is_none() && !retry_pending {
+            attempt = writer.next_attempt(flush_due || buffer_interval.is_zero());
+        }
+
+        let next_expiry = writer.next_expiry();
+        if next_expiry != expiry {
+            if let Some(deadline) = next_expiry {
+                expiry_timer.as_mut().reset(deadline);
+            }
+            expiry = next_expiry;
+        }
+
+        tokio::select! {
             maybe_msg = rx.recv() => {
                 let Some(msg) = maybe_msg else {
                     log::debug!("Channel hung up");
@@ -606,128 +644,415 @@ pub async fn publish_messages(
                     break;
                 }
 
-                writer.buffer.push_back(msg);
+                writer.accept(msg, tokio::time::Instant::now());
+            }
+            ended = async {
+                match attempt.as_mut() {
+                    Some(attempt) => attempt.await,
+                    None => std::future::pending().await,
+                }
+            }, if attempt.is_some() => {
+                attempt = None;
 
-                // Immediate flush mode, unless a retry is pending
-                if buffer_interval.is_zero() && !writer.is_retrying() {
-                    writer.flush().await?
-                } else {
-                    None
+                if let Some(retry_delay) = writer.finish(ended) {
+                    retry_pending = true;
+                    retry_timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + retry_delay);
                 }
             }
+            () = &mut retry_timer, if retry_pending => retry_pending = false,
             // Only poll the timer when the interval is non-zero. This avoids
             // unnecessarily waking the task when immediate flushing is enabled.
             () = &mut flush_timer, if !buffer_interval.is_zero() => {
-                let retry_delay = if writer.is_retrying() {
-                    None
-                } else {
-                    writer.flush().await?
-                };
+                flush_due = true;
 
                 // Schedule the next tick
                 flush_timer.as_mut().reset(tokio::time::Instant::now() + buffer_interval);
-                retry_delay
             }
-            () = &mut retry_timer, if writer.is_retrying() => writer.flush().await?,
-        };
+            () = &mut expiry_timer, if expiry.is_some() => {
+                // An abandoned batch's attempt is dropped unfinished
+                if writer.expire(tokio::time::Instant::now()) {
+                    attempt = None;
+                }
 
-        if let Some(retry_delay) = retry_delay {
-            retry_timer
-                .as_mut()
-                .reset(tokio::time::Instant::now() + retry_delay);
+                // Armed again for the next oldest message
+                expiry = None;
+            }
         }
     }
 
-    // Drain any remaining messages, with a single attempt
-    if writer.flush().await?.is_some() {
-        anyhow::bail!(
-            "Failed to publish buffered messages before closing ({} unpublished)",
-            writer.buffer.len()
-        );
-    }
+    writer.close(attempt).await?;
 
     log_task_stopped(MSGBUS_PUBLISH);
     Ok(())
 }
 
-/// Holds the publish task's buffer and connection.
+/// Holds the publish task's pending messages, its connection and the stream's state.
 ///
-/// Messages leave the buffer only once their `EXEC` is acknowledged. A retryable write error
-/// drops the connection, so the next attempt opens a fresh one, as the stream reader does.
+/// Messages wait in `buffer` until a write takes up to [`PUBLISH_BATCH_SIZE`] of them from its
+/// front as `batch`, which stays unchanged until it is acknowledged, refused or abandoned, so each
+/// retry writes the same messages with their numbers. A failed attempt drops the connection, so the
+/// next attempt opens a fresh one, as the stream reader does.
 struct StreamWriter {
     con: Option<ConnectionManager>,
     reconnect_config: RedisMessageBusConfig,
+    target: StreamTarget,
+    last_trim_index: HashMap<String, usize>,
+    buffer: VecDeque<PendingMessage>,
+    batch: Vec<PendingMessage>,
+    write_error_count: usize,
+    state: StreamState,
+}
+
+/// A message the publish task took from its channel, and when it took it.
+struct PendingMessage {
+    accepted: tokio::time::Instant,
+    message: BusMessage,
+}
+
+/// The stream keys and trimming the publish task writes with.
+#[derive(Clone)]
+struct StreamTarget {
     stream_key: String,
     stream_per_topic: bool,
     autotrim_duration: Option<Duration>,
     autotrim_maxlen: Option<usize>,
-    last_trim_index: HashMap<String, usize>,
-    buffer: VecDeque<BusMessage>,
-    write_error_count: usize,
+}
+
+/// How one connect or write attempt of the publish task ended.
+enum PublishAttempt {
+    Connect(anyhow::Result<ConnectionManager>),
+    /// A write's connection and trim index, with its result, or `None` when it timed out.
+    Write {
+        con: ConnectionManager,
+        last_trim_index: HashMap<String, usize>,
+        result: Option<redis::RedisResult<()>>,
+    },
 }
 
 impl StreamWriter {
-    /// Returns whether a failed write is waiting to be retried.
-    const fn is_retrying(&self) -> bool {
-        self.write_error_count > 0
+    fn new(
+        stream_key: String,
+        config: &MessageBusConfig,
+        backing: RedisMessageBusConfig,
+    ) -> anyhow::Result<Self> {
+        // Auto-trimming
+        let autotrim_duration = config
+            .autotrim_mins
+            .filter(|&mins| mins > 0)
+            .map(|mins| Duration::from_secs(u64::from(mins) * 60));
+        let autotrim_maxlen = config
+            .autotrim_maxlen
+            .filter(|&maxlen| maxlen > 0)
+            .map(usize::try_from)
+            .transpose()?;
+
+        Ok(Self {
+            con: None,
+            // Every connection, the first included, fails fast, so this task's backoff governs
+            // rather than the connection manager's retry schedule, and a close is not held up
+            // behind it.
+            reconnect_config: RedisMessageBusConfig {
+                number_of_retries: 0,
+                ..backing
+            },
+            target: StreamTarget {
+                stream_key,
+                stream_per_topic: config.stream_per_topic,
+                autotrim_duration,
+                autotrim_maxlen,
+            },
+            last_trim_index: HashMap::new(),
+            buffer: VecDeque::new(),
+            batch: Vec::new(),
+            write_error_count: 0,
+            state: StreamState::default(),
+        })
     }
 
-    /// Writes the buffer in atomic pipelines of at most [`PUBLISH_BATCH_SIZE`] messages, removing
-    /// each batch once it is acknowledged.
-    ///
-    /// Returns the delay before the next attempt when a retryable error left messages buffered.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a write fails with a non-retryable error.
-    async fn flush(&mut self) -> anyhow::Result<Option<Duration>> {
-        while !self.buffer.is_empty() {
-            let mut con = match self.con.take() {
-                Some(con) => con,
-                None => {
-                    match create_redis_connection(MSGBUS_PUBLISH, &self.reconnect_config).await {
-                        Ok(con) => con,
-                        Err(e) => {
-                            log::error!("Error reconnecting to publish: {e:?}");
-                            return Ok(Some(self.next_retry_delay()));
-                        }
-                    }
-                }
+    /// Waits for `attempt` to end, then drains the remaining messages with a single attempt.
+    async fn close(
+        &mut self,
+        attempt: Option<BoxFuture<'static, PublishAttempt>>,
+    ) -> anyhow::Result<()> {
+        if let Some(attempt) = attempt {
+            self.finish(attempt.await);
+        }
+
+        while self.has_pending() {
+            let Some(attempt) = self.next_attempt(true) else {
+                break;
             };
 
-            let count = self.buffer.len().min(PUBLISH_BATCH_SIZE);
-            let result = write_buffer(
-                &mut con,
-                &self.stream_key,
-                self.stream_per_topic,
-                self.autotrim_duration,
-                self.autotrim_maxlen,
-                &mut self.last_trim_index,
-                self.buffer.range(..count),
-            )
-            .await;
-
-            match result {
-                Ok(()) => {
-                    self.buffer.drain(..count);
-                    self.con = Some(con);
-                    self.write_error_count = 0;
-                }
-                Err(e) if is_retryable_write_error(&e) => {
-                    log::error!("Error publishing to stream: {e:?}");
-                    return Ok(Some(self.next_retry_delay()));
-                }
-                Err(e) => anyhow::bail!("Error publishing to stream: {e:?}"),
+            if self.finish(attempt.await).is_some() {
+                anyhow::bail!(
+                    "Failed to publish buffered messages before closing ({} unpublished)",
+                    self.pending()
+                );
             }
         }
 
-        Ok(None)
+        Ok(())
     }
 
-    fn next_retry_delay(&mut self) -> Duration {
-        let retry_delay = stream_retry_delay(&self.reconnect_config, self.write_error_count);
+    fn has_pending(&self) -> bool {
+        !self.batch.is_empty() || !self.buffer.is_empty()
+    }
+
+    fn pending(&self) -> usize {
+        self.batch.len() + self.buffer.len()
+    }
+
+    /// Takes `message` as pending at `now`, dropping the oldest not yet sent beyond
+    /// [`MAX_PENDING_ENTRIES`]; the batch being written keeps its place.
+    fn accept(&mut self, message: BusMessage, now: tokio::time::Instant) {
+        self.buffer.push_back(PendingMessage {
+            accepted: now,
+            message,
+        });
+
+        let excess = self
+            .pending()
+            .saturating_sub(MAX_PENDING_ENTRIES)
+            .min(self.buffer.len());
+
+        if excess > 0 {
+            self.buffer.drain(..excess);
+            self.discard(excess);
+        }
+    }
+
+    /// Returns when the oldest pending message reaches [`MAX_PENDING_AGE`].
+    fn next_expiry(&self) -> Option<tokio::time::Instant> {
+        self.batch
+            .first()
+            .or_else(|| self.buffer.front())
+            .map(|pending| pending.accepted + MAX_PENDING_AGE)
+    }
+
+    /// Drops what is pending past [`MAX_PENDING_AGE`] at `now`: the messages not yet sent, counted
+    /// as discarded, and a batch being written whose oldest message is past it, whole, counted as
+    /// uncertain.
+    ///
+    /// Returns whether the batch was abandoned.
+    fn expire(&mut self, now: tokio::time::Instant) -> bool {
+        let is_expired = |pending: &PendingMessage| pending.accepted + MAX_PENDING_AGE <= now;
+        let expired = self.buffer.iter().take_while(|&p| is_expired(p)).count();
+
+        if expired > 0 {
+            self.buffer.drain(..expired);
+            self.discard(expired);
+        }
+
+        if !self.batch.first().is_some_and(is_expired) {
+            return false;
+        }
+
+        let abandoned = self.batch.len();
+        self.batch.clear();
+        self.state.uncertain += abandoned;
+        self.state.change(StreamLink::Degraded);
+
+        log::warn!(
+            "Abandoned a batch of {abandoned} stream entries pending for {MAX_PENDING_AGE:?}, which may have been written ({})",
+            self.state
+        );
+        true
+    }
+
+    fn discard(&mut self, count: usize) {
+        self.state.discarded += count;
+        self.state.change(StreamLink::Degraded);
+    }
+
+    /// Returns the next attempt: a connection when there is none, then the batch being written,
+    /// or when `write_due` a new batch from the front of the buffer.
+    fn next_attempt(&mut self, write_due: bool) -> Option<BoxFuture<'static, PublishAttempt>> {
+        let Some(con) = self.con.take() else {
+            return Some(Box::pin(connect_attempt(self.reconnect_config.clone())));
+        };
+
+        if self.batch.is_empty() && write_due {
+            let count = self.buffer.len().min(PUBLISH_BATCH_SIZE);
+            self.batch.extend(self.buffer.drain(..count));
+        }
+
+        if self.batch.is_empty() {
+            self.con = Some(con);
+            return None;
+        }
+
+        let messages = self.batch.iter().map(|p| p.message.clone()).collect();
+        let last_trim_index = std::mem::take(&mut self.last_trim_index);
+        Some(Box::pin(write_attempt(
+            con,
+            self.target.clone(),
+            last_trim_index,
+            messages,
+        )))
+    }
+
+    /// Takes how an attempt ended.
+    ///
+    /// Returns the delay before the next attempt after a failure that is retried.
+    fn finish(&mut self, attempt: PublishAttempt) -> Option<Duration> {
+        let (con, last_trim_index, result) = match attempt {
+            PublishAttempt::Connect(Ok(con)) => {
+                self.con = Some(con);
+                return None;
+            }
+            PublishAttempt::Connect(Err(e)) => {
+                let retry_delay = self.fail();
+                log::warn!(
+                    "Error connecting to publish, retrying in {retry_delay:?} ({}): {e}",
+                    self.state
+                );
+                return Some(retry_delay);
+            }
+            PublishAttempt::Write {
+                con,
+                last_trim_index,
+                result,
+            } => (con, last_trim_index, result),
+        };
+        self.last_trim_index = last_trim_index;
+
+        match result {
+            Some(Ok(())) => {
+                self.con = Some(con);
+                self.batch.clear();
+                self.write_error_count = 0;
+                self.state.last_write = Some(get_atomic_clock_realtime().get_time_ns());
+                self.state.change(StreamLink::Connected);
+                None
+            }
+            // Redis will not take this batch, so it is dropped and its numbers show the hole
+            Some(Err(e)) if !is_retryable_write_error(&e) => {
+                let refused = self.batch.len();
+                self.batch.clear();
+                self.discard(refused);
+
+                log::warn!(
+                    "Dropped a batch of {refused} stream entries Redis refused ({}): {e}",
+                    self.state
+                );
+                None
+            }
+            Some(Err(e)) => {
+                let retry_delay = self.fail();
+                log::warn!(
+                    "Error publishing to stream, retrying in {retry_delay:?} ({}): {e}",
+                    self.state
+                );
+                Some(retry_delay)
+            }
+            None => {
+                let retry_delay = self.fail();
+                log::warn!(
+                    "No reply publishing to stream within {MAX_PUBLISH_ATTEMPT:?}, retrying in {retry_delay:?} ({})",
+                    self.state
+                );
+                Some(retry_delay)
+            }
+        }
+    }
+
+    /// Marks the stream degraded after a failed attempt and returns the delay before the next.
+    fn fail(&mut self) -> Duration {
+        self.state.change(StreamLink::Degraded);
+        let retry_delay = stream_retry_delay(&self.reconnect_config, self.write_error_count)
+            .min(MAX_PUBLISH_RETRY_DELAY);
         self.write_error_count = self.write_error_count.saturating_add(1);
         retry_delay
+    }
+}
+
+/// Whether the publish task's stream is being written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamLink {
+    Connected,
+    Degraded,
+}
+
+/// The publish task's account of its stream: connected or degraded and since when, the last
+/// acknowledged write, and how many entries it dropped as discarded or abandoned as uncertain.
+#[derive(Debug, Default)]
+struct StreamState {
+    link: Option<StreamLink>,
+    since: UnixNanos,
+    last_write: Option<UnixNanos>,
+    discarded: usize,
+    uncertain: usize,
+}
+
+impl StreamState {
+    /// Moves to `link`, logging one record when it changes.
+    fn change(&mut self, link: StreamLink) {
+        if self.link == Some(link) {
+            return;
+        }
+        self.link = Some(link);
+        self.since = get_atomic_clock_realtime().get_time_ns();
+
+        log::warn!("Stream {self}");
+    }
+}
+
+impl Display for StreamState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let link = match self.link {
+            Some(StreamLink::Connected) => "connected",
+            Some(StreamLink::Degraded) => "degraded",
+            None => "starting",
+        };
+        let last_write = self
+            .last_write
+            .map_or_else(|| "none".to_string(), |at| at.to_rfc3339());
+        write!(
+            f,
+            "{link} since {}, last write {last_write}, {} discarded, {} uncertain",
+            self.since.to_rfc3339(),
+            self.discarded,
+            self.uncertain
+        )
+    }
+}
+
+/// Opens a connection for the publish task, failing after [`MAX_PUBLISH_ATTEMPT`].
+async fn connect_attempt(config: RedisMessageBusConfig) -> PublishAttempt {
+    let connect = create_redis_connection(MSGBUS_PUBLISH, &config);
+    let result = tokio::time::timeout(MAX_PUBLISH_ATTEMPT, connect)
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "No connection within {MAX_PUBLISH_ATTEMPT:?}"
+            ))
+        });
+    PublishAttempt::Connect(result)
+}
+
+/// Writes `messages` as one batch on `con`, failing after [`MAX_PUBLISH_ATTEMPT`].
+async fn write_attempt(
+    mut con: ConnectionManager,
+    target: StreamTarget,
+    mut last_trim_index: HashMap<String, usize>,
+    messages: Vec<BusMessage>,
+) -> PublishAttempt {
+    let write = write_buffer(
+        &mut con,
+        &target.stream_key,
+        target.stream_per_topic,
+        target.autotrim_duration,
+        target.autotrim_maxlen,
+        &mut last_trim_index,
+        messages.iter(),
+    );
+    let result = tokio::time::timeout(MAX_PUBLISH_ATTEMPT, write).await.ok();
+    PublishAttempt::Write {
+        con,
+        last_trim_index,
+        result,
     }
 }
 
@@ -1955,37 +2280,332 @@ mod tests {
     }
 
     #[rstest]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_publish_messages_returns_transaction_aborted_by_unrecoverable_error() {
-        let fake = FakeRedis::start("ERR syntax error").await;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BusMessage>();
-        let backing = fake.config();
+    #[tokio::test]
+    async fn test_publish_messages_drops_a_batch_redis_refuses_and_writes_the_next() {
+        capture_logs();
+        let fake =
+            FakeRedis::start("OOM command not allowed when used memory > 'maxmemory'.").await;
+        let (tx, handle) = start_publisher(&fake);
+        let messages = numbered_messages(3);
 
-        let handle = tokio::spawn(async move {
-            publish_messages(
-                rx,
-                TraderId::from("tester-001"),
-                UUID4::new(),
-                MessageBusConfig::default(),
-                backing,
-            )
-            .await
-        });
+        tx.send(messages[0].clone()).unwrap();
+        wait_until_async(
+            || {
+                let aborted = Arc::clone(&fake.aborted);
+                async move { aborted.load(Ordering::SeqCst) > 0 }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        tx.send(messages[1].clone()).unwrap();
+        tx.send(messages[2].clone()).unwrap();
+        wait_until_async(
+            || {
+                let written = Arc::clone(&fake.written);
+                async move { written.lock().unwrap().len() == 2 }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        let finished_before_close = handle.is_finished();
+        tx.send(BusMessage::new_close()).unwrap();
+        let result = handle.await.unwrap();
 
-        tx.send(fake_bus_message()).unwrap();
-
-        let result = tokio::time::timeout(Duration::from_secs(5), handle)
-            .await
-            .expect("an unrecoverable aborted transaction should end the task")
-            .unwrap();
-
+        let logs = thread_logs();
+        assert!(!finished_before_close);
+        assert!(result.is_ok());
         assert_eq!(fake.aborted.load(Ordering::SeqCst), 1);
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Error publishing to stream")
+        assert_eq!(fake.written_sequences(), [2, 3]);
+        assert_eq!(
+            state_records(&logs),
+            [
+                ("degraded".to_string(), false, 1, 0),
+                ("connected".to_string(), true, 1, 0),
+            ]
         );
+        assert!(logs.iter().any(|(level, line)| *level == log::Level::Warn
+            && line.starts_with("Dropped a batch of 1 stream entries Redis refused")
+            && line.contains("OOM")));
+        assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    #[rstest]
+    fn test_way_out_never_reports_closed_after_a_write_error() {
+        let fake = get_runtime().block_on(FakeRedis::start(
+            "OOM command not allowed when used memory > 'maxmemory'.",
+        ));
+        let config = MessageBusConfig {
+            stream_per_topic: false,
+            ..Default::default()
+        };
+        let mut backing = RedisMessageBusBacking::new(
+            TraderId::from("TESTER-007"),
+            UUID4::new(),
+            config,
+            fake.config(),
+        )
+        .unwrap();
+        let topic = Ustr::from("data.quotes.A");
+        let numbered = |sequence: u64| {
+            let mut message = fake_bus_message();
+            message.source = Some(BusMessageSource {
+                publisher_id: backing.trader_id,
+                instance_id: backing.instance_id,
+                stream: topic,
+                sequence,
+            });
+            message
+        };
+
+        backing.publish(numbered(1));
+        wait_until(
+            || fake.aborted.load(Ordering::SeqCst) > 0,
+            Duration::from_secs(5),
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let closed_after_the_error = backing.is_closed();
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        backing.publish(numbered(2));
+        wait_until(|| fake.written().len() == 1, Duration::from_secs(5));
+        let closed_after_the_write = backing.is_closed();
+        backing.close();
+
+        assert!(!closed_after_the_error);
+        assert!(!closed_after_the_write);
+        assert_eq!(fake.written_sequences(), [2]);
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_publish_messages_retries_within_a_second_through_a_ten_minute_outage() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let fake = FakeRedis::start("unused").await;
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        let (tx, handle) = start_publisher(&fake);
+        let messages = numbered_messages(3);
+
+        tx.send(messages[0].clone()).unwrap();
+        settle_until(|| fake.written_len() == 1).await;
+        fake.available.store(false, Ordering::SeqCst);
+        let outage_start = tokio::time::Instant::now();
+        tx.send(messages[1].clone()).unwrap();
+        drive(Duration::from_secs(540)).await;
+        tx.send(messages[2].clone()).unwrap();
+        drive(Duration::from_secs(60)).await;
+        let returned_at = tokio::time::Instant::now();
+        fake.available.store(true, Ordering::SeqCst);
+        drive_until(|| fake.written_len() == 2, Duration::from_secs(5)).await;
+        tx.send(BusMessage::new_close()).unwrap();
+        settle_until(|| handle.is_finished()).await;
+        let result = handle.await.unwrap();
+
+        let logs = thread_logs();
+        let attempts: Vec<tokio::time::Instant> = fake
+            .connections
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|&at| at >= outage_start && at <= returned_at)
+            .collect();
+        let longest_wait = attempts
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .max()
+            .unwrap();
+        let first_write = fake
+            .commits
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .find(|&at| at >= returned_at)
+            .unwrap();
+        assert!(result.is_ok());
+        assert!(attempts.len() >= 500, "{} attempts", attempts.len());
+        assert!(attempts[0] - outage_start <= MAX_PUBLISH_RETRY_DELAY + 2 * CLOCK_STEP);
+        assert!(
+            returned_at - *attempts.last().unwrap() <= MAX_PUBLISH_RETRY_DELAY + 2 * CLOCK_STEP
+        );
+        assert!(
+            longest_wait <= MAX_PUBLISH_RETRY_DELAY + 2 * CLOCK_STEP,
+            "{longest_wait:?}"
+        );
+        assert!(first_write - returned_at <= MAX_PUBLISH_RETRY_DELAY + 2 * CLOCK_STEP);
+        assert_eq!(fake.written_sequences(), [1, 3]);
+        assert_eq!(
+            state_records(&logs),
+            [
+                ("connected".to_string(), true, 0, 0),
+                ("degraded".to_string(), true, 0, 0),
+                ("connected".to_string(), true, 0, 1),
+            ]
+        );
+        assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_publish_messages_writes_from_the_first_entry_when_redis_is_absent_at_start() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let fake = FakeRedis::start("unused").await;
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        fake.available.store(false, Ordering::SeqCst);
+        let (tx, handle) = start_publisher(&fake);
+
+        for message in numbered_messages(3) {
+            tx.send(message).unwrap();
+        }
+        drive(Duration::from_secs(30)).await;
+        let written_while_absent = fake.written().len();
+        let finished_while_absent = handle.is_finished();
+        let returned_at = tokio::time::Instant::now();
+        fake.available.store(true, Ordering::SeqCst);
+        drive_until(|| fake.written_len() == 3, Duration::from_secs(5)).await;
+        tx.send(BusMessage::new_close()).unwrap();
+        settle_until(|| handle.is_finished()).await;
+        let result = handle.await.unwrap();
+
+        let logs = thread_logs();
+        let first_write = fake.commits.lock().unwrap()[0];
+        assert!(result.is_ok());
+        assert_eq!(written_while_absent, 0);
+        assert!(!finished_while_absent);
+        assert!(first_write - returned_at <= MAX_PUBLISH_RETRY_DELAY + 2 * CLOCK_STEP);
+        assert_eq!(fake.written_sequences(), [1, 2, 3]);
+        assert_eq!(
+            state_records(&logs),
+            [
+                ("degraded".to_string(), false, 0, 0),
+                ("connected".to_string(), true, 0, 0),
+            ]
+        );
+        assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_publish_messages_drops_an_entry_pending_past_the_age_bound() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let fake = FakeRedis::start("unused").await;
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        fake.available.store(false, Ordering::SeqCst);
+        let (tx, handle) = start_publisher(&fake);
+        let messages = numbered_messages(2);
+
+        tx.send(messages[0].clone()).unwrap();
+        drive(Duration::from_secs(181)).await;
+        tx.send(messages[1].clone()).unwrap();
+        fake.available.store(true, Ordering::SeqCst);
+        drive_until(|| fake.written_len() == 1, Duration::from_secs(5)).await;
+        tx.send(BusMessage::new_close()).unwrap();
+        settle_until(|| handle.is_finished()).await;
+        let result = handle.await.unwrap();
+
+        let logs = thread_logs();
+        assert!(result.is_ok());
+        assert_eq!(fake.written_sequences(), [2]);
+        assert_eq!(
+            state_records(&logs),
+            [
+                ("degraded".to_string(), false, 0, 0),
+                ("connected".to_string(), true, 1, 0),
+            ]
+        );
+        assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_publish_messages_drops_the_oldest_unsent_beyond_the_count_bound() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let fake = FakeRedis::start("unused").await;
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        fake.stall_writes.store(true, Ordering::SeqCst);
+        let (tx, handle) = start_publisher(&fake);
+        let messages = numbered_messages(MAX_PENDING_ENTRIES + 1);
+
+        tx.send(messages[0].clone()).unwrap();
+        settle_until(|| !fake.attempted.lock().unwrap().is_empty()).await;
+        for message in &messages[1..] {
+            tx.send(message.clone()).unwrap();
+        }
+        // The drop is taken with the last message
+        settle_until(|| !state_records(&thread_logs()).is_empty()).await;
+        fake.stall_writes.store(false, Ordering::SeqCst);
+        drive_until(|| fake.written_len() > 0, MAX_PUBLISH_ATTEMPT * 2).await;
+        settle_until(|| fake.written_len() == MAX_PENDING_ENTRIES).await;
+        tx.send(BusMessage::new_close()).unwrap();
+        settle_until(|| handle.is_finished()).await;
+        let result = handle.await.unwrap();
+
+        let logs = thread_logs();
+        let expected: Vec<u64> = std::iter::once(1)
+            .chain(3..=u64::try_from(MAX_PENDING_ENTRIES + 1).unwrap())
+            .collect();
+        assert!(result.is_ok());
+        assert_eq!(fake.written_sequences(), expected);
+        assert_eq!(
+            state_records(&logs),
+            [
+                ("degraded".to_string(), false, 1, 0),
+                ("connected".to_string(), true, 1, 0),
+            ]
+        );
+        assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_publish_messages_abandons_a_batch_being_written_at_the_age_bound() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let fake = FakeRedis::start("LOADING Redis is loading the dataset in memory").await;
+        let (tx, handle) = start_publisher(&fake);
+        let messages = numbered_messages(2);
+
+        tx.send(messages[0].clone()).unwrap();
+        settle_until(|| fake.aborted.load(Ordering::SeqCst) > 0).await;
+        drive(Duration::from_secs(100)).await;
+        tx.send(messages[1].clone()).unwrap();
+        drive(Duration::from_secs(81)).await;
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        drive_until(|| fake.written_len() == 1, Duration::from_secs(5)).await;
+        tx.send(BusMessage::new_close()).unwrap();
+        settle_until(|| handle.is_finished()).await;
+        let result = handle.await.unwrap();
+
+        let logs = thread_logs();
+        let first_attempts: Vec<u64> = fake
+            .attempted
+            .lock()
+            .unwrap()
+            .iter()
+            .map(FakeXadd::sequence)
+            .filter(|&sequence| sequence == 1)
+            .collect();
+        assert!(result.is_ok());
+        assert!(
+            first_attempts.len() >= 100,
+            "{} attempts",
+            first_attempts.len()
+        );
+        assert_eq!(fake.written_sequences(), [2]);
+        assert_eq!(
+            state_records(&logs),
+            [
+                ("degraded".to_string(), false, 0, 0),
+                ("connected".to_string(), true, 0, 1),
+            ]
+        );
+        assert!(logs.iter().any(|(level, line)| *level == log::Level::Warn
+            && line.starts_with("Abandoned a batch of 1 stream entries")));
+        assert_eq!(error_lines(&logs), Vec::<String>::new());
     }
 
     #[rstest]
@@ -2505,103 +3125,320 @@ mod tests {
         )
     }
 
+    /// Spawns `publish_messages` for trader `TESTER-007` on one key against `fake`.
+    fn start_publisher(
+        fake: &FakeRedis,
+    ) -> (
+        tokio::sync::mpsc::UnboundedSender<BusMessage>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BusMessage>();
+        let config = MessageBusConfig {
+            stream_per_topic: false,
+            ..Default::default()
+        };
+        let backing = fake.config();
+        let handle = tokio::spawn(async move {
+            publish_messages(
+                rx,
+                TraderId::from("TESTER-007"),
+                UUID4::new(),
+                config,
+                backing,
+            )
+            .await
+        });
+        (tx, handle)
+    }
+
+    /// Returns `count` messages numbered from 1 as the way out numbers them on one key.
+    fn numbered_messages(count: usize) -> Vec<BusMessage> {
+        let sources = StreamSources::new(
+            TraderId::from("TESTER-007"),
+            UUID4::new(),
+            &MessageBusConfig {
+                stream_per_topic: false,
+                ..Default::default()
+            },
+        );
+        (0..count)
+            .map(|_| {
+                let mut message = fake_bus_message();
+                message.source = Some(sources.reserve(message.topic).unwrap());
+                message
+            })
+            .collect()
+    }
+
+    /// How far [`drive`] moves the paused clock at a time.
+    const CLOCK_STEP: Duration = Duration::from_millis(50);
+
+    /// Holds tokio's auto-advance off while it lives, through a blocking task in flight, so a
+    /// paused clock moves only by [`drive`] and the loopback sockets run without a timer firing
+    /// between a request and its reply.
+    struct ManualClock {
+        _release: std::sync::mpsc::Sender<()>,
+    }
+
+    impl ManualClock {
+        fn hold() -> Self {
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            tokio::task::spawn_blocking(move || released.recv());
+            Self { _release: release }
+        }
+    }
+
+    /// Lets the tasks and their sockets run with the clock still.
+    async fn run_sockets() {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Lets the tasks and their sockets run with the clock still until `done` holds, failing
+    /// after 30 s of real time.
+    async fn settle_until(mut done: impl FnMut() -> bool) {
+        let start = std::time::Instant::now(); // dst-ok: test timer; uses real time by design
+
+        while !done() {
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "Timeout settling"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Moves the paused clock on by `duration` in steps of [`CLOCK_STEP`], letting the tasks and
+    /// their sockets run after each step.
+    async fn drive(duration: Duration) {
+        let end = tokio::time::Instant::now() + duration;
+
+        while tokio::time::Instant::now() < end {
+            tokio::time::advance(CLOCK_STEP).await;
+            run_sockets().await;
+        }
+    }
+
+    /// Moves the paused clock on as [`drive`] does until `done` holds, failing after `limit`.
+    async fn drive_until(mut done: impl FnMut() -> bool, limit: Duration) {
+        let end = tokio::time::Instant::now() + limit;
+        run_sockets().await;
+
+        while !done() {
+            assert!(
+                tokio::time::Instant::now() < end,
+                "Not done within {limit:?}"
+            );
+            tokio::time::advance(CLOCK_STEP).await;
+            run_sockets().await;
+        }
+    }
+
+    /// The warning and error lines of every thread. A test on a current-thread runtime runs the
+    /// publish task and the fake Redis on its own thread, so it reads the lines of that thread.
+    struct ThreadLogs(std::sync::Mutex<Vec<(std::thread::ThreadId, log::Level, String)>>);
+
+    impl log::Log for ThreadLogs {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                self.0.lock().unwrap().push((
+                    std::thread::current().id(),
+                    record.level(),
+                    record.args().to_string(),
+                ));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    static THREAD_LOGS: ThreadLogs = ThreadLogs(std::sync::Mutex::new(Vec::new()));
+    static THREAD_LOGS_INSTALL: std::sync::Once = std::sync::Once::new();
+
+    fn capture_logs() {
+        THREAD_LOGS_INSTALL.call_once(|| {
+            log::set_logger(&THREAD_LOGS).expect("no other logger in these tests");
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+    }
+
+    fn thread_logs() -> Vec<(log::Level, String)> {
+        let thread = std::thread::current().id();
+        THREAD_LOGS
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(logged_on, _, _)| *logged_on == thread)
+            .map(|(_, level, line)| (*level, line.clone()))
+            .collect()
+    }
+
+    fn error_lines(logs: &[(log::Level, String)]) -> Vec<String> {
+        logs.iter()
+            .filter(|(level, _)| *level == log::Level::Error)
+            .map(|(_, line)| line.clone())
+            .collect()
+    }
+
+    /// Returns each state record of the stream, all at warning level, as its state, whether it
+    /// names a last write, and its discarded and uncertain counts.
+    fn state_records(logs: &[(log::Level, String)]) -> Vec<(String, bool, usize, usize)> {
+        logs.iter()
+            .filter(|(_, line)| line.starts_with("Stream "))
+            .map(|(level, line)| {
+                assert_eq!(*level, log::Level::Warn, "{line}");
+                let (head, values) = line.split_once(", last write ").unwrap();
+                let link = head.split(' ').nth(1).unwrap().to_string();
+                let [last_write, discarded, uncertain] =
+                    values.split(", ").collect::<Vec<_>>().try_into().unwrap();
+                (
+                    link,
+                    last_write != "none",
+                    discarded
+                        .strip_suffix(" discarded")
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                    uncertain
+                        .strip_suffix(" uncertain")
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                )
+            })
+            .collect()
+    }
+
     /// A loopback RESP server standing in for Redis, which answers every queued `XADD` with
     /// `queued_error` until `accept_writes` is set, so each `EXEC` aborts with `EXECABORT`. It
     /// records every `XADD` it receives in `attempted`, and those of committed transactions in
-    /// `written`.
+    /// `written`, with the time of each commit in `commits` and of each accepted connection in
+    /// `connections`. While `available` is unset it closes each connection at once, and while
+    /// `stall_writes` is set it leaves each `EXEC` unanswered and uncommitted.
+    #[derive(Clone)]
     struct FakeRedis {
         port: u16,
         accept_writes: Arc<AtomicBool>,
+        available: Arc<AtomicBool>,
+        stall_writes: Arc<AtomicBool>,
         aborted: Arc<AtomicUsize>,
         committed: Arc<AtomicUsize>,
         attempted: Arc<std::sync::Mutex<Vec<FakeXadd>>>,
         written: Arc<std::sync::Mutex<Vec<FakeXadd>>>,
+        commits: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+        connections: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
     }
 
     impl FakeRedis {
         async fn start(queued_error: &'static str) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let accept_writes = Arc::new(AtomicBool::new(false));
-            let aborted = Arc::new(AtomicUsize::new(0));
-            let committed = Arc::new(AtomicUsize::new(0));
-            let attempted = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let written = Arc::new(std::sync::Mutex::new(Vec::new()));
-
-            let accept_writes_clone = Arc::clone(&accept_writes);
-            let aborted_clone = Arc::clone(&aborted);
-            let committed_clone = Arc::clone(&committed);
-            let attempted_clone = Arc::clone(&attempted);
-            let written_clone = Arc::clone(&written);
+            let fake = Self {
+                port: listener.local_addr().unwrap().port(),
+                accept_writes: Arc::new(AtomicBool::new(false)),
+                available: Arc::new(AtomicBool::new(true)),
+                stall_writes: Arc::new(AtomicBool::new(false)),
+                aborted: Arc::new(AtomicUsize::new(0)),
+                committed: Arc::new(AtomicUsize::new(0)),
+                attempted: Arc::new(std::sync::Mutex::new(Vec::new())),
+                written: Arc::new(std::sync::Mutex::new(Vec::new())),
+                commits: Arc::new(std::sync::Mutex::new(Vec::new())),
+                connections: Arc::new(std::sync::Mutex::new(Vec::new())),
+            };
+            let server = fake.clone();
 
             tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
-                    let accept_writes = Arc::clone(&accept_writes_clone);
-                    let aborted = Arc::clone(&aborted_clone);
-                    let committed = Arc::clone(&committed_clone);
-                    let attempted = Arc::clone(&attempted_clone);
-                    let written = Arc::clone(&written_clone);
+                    server
+                        .connections
+                        .lock()
+                        .unwrap()
+                        .push(tokio::time::Instant::now());
 
-                    tokio::spawn(async move {
-                        let (read, mut write) = socket.into_split();
-                        let mut reader = tokio::io::BufReader::new(read);
-                        let mut queued = 0;
-                        let mut queue_failed = false;
-                        let mut queued_xadds = Vec::new();
+                    if !server.available.load(Ordering::SeqCst) {
+                        continue; // Closing the socket at once fails the client's first command
+                    }
 
-                        while let Some(command) = read_resp_command(&mut reader).await {
-                            if command[0].eq_ignore_ascii_case(b"XADD") {
-                                attempted.lock().unwrap().push(FakeXadd::parse(&command));
-                            }
-
-                            let reply = match command[0].to_ascii_uppercase().as_slice() {
-                                b"INFO" => {
-                                    let info = "redis_version:8.0.0\r\n";
-                                    format!("${}\r\n{info}\r\n", info.len())
-                                }
-                                b"MULTI" => {
-                                    queued = 0;
-                                    queue_failed = false;
-                                    queued_xadds.clear();
-                                    "+OK\r\n".to_string()
-                                }
-                                b"XADD" if accept_writes.load(Ordering::SeqCst) => {
-                                    queued += 1;
-                                    queued_xadds.push(FakeXadd::parse(&command));
-                                    "+QUEUED\r\n".to_string()
-                                }
-                                b"XADD" => {
-                                    queue_failed = true;
-                                    format!("-{queued_error}\r\n")
-                                }
-                                b"EXEC" if queue_failed => {
-                                    aborted.fetch_add(1, Ordering::SeqCst);
-                                    "-EXECABORT Transaction discarded because of previous errors.\r\n"
-                                        .to_string()
-                                }
-                                b"EXEC" => {
-                                    committed.fetch_add(1, Ordering::SeqCst);
-                                    written.lock().unwrap().append(&mut queued_xadds);
-                                    format!("*{queued}\r\n{}", "$3\r\n0-1\r\n".repeat(queued))
-                                }
-                                _ => "+OK\r\n".to_string(),
-                            };
-
-                            if write.write_all(reply.as_bytes()).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
+                    tokio::spawn(server.clone().serve(socket, queued_error));
                 }
             });
 
-            Self {
-                port,
-                accept_writes,
-                aborted,
-                committed,
-                attempted,
-                written,
+            fake
+        }
+
+        async fn serve(self, socket: tokio::net::TcpStream, queued_error: &'static str) {
+            // Each reply leaves at once, not held for the client's acknowledgement of the last
+            socket.set_nodelay(true).unwrap();
+            let (read, mut write) = socket.into_split();
+            let mut reader = tokio::io::BufReader::new(read);
+            let mut queued = 0;
+            let mut queue_failed = false;
+            let mut queued_xadds = Vec::new();
+
+            while let Some(command) = read_resp_command(&mut reader).await {
+                if !self.available.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                if command[0].eq_ignore_ascii_case(b"EXEC")
+                    && !queue_failed
+                    && self.stall_writes.load(Ordering::SeqCst)
+                {
+                    continue;
+                }
+
+                if command[0].eq_ignore_ascii_case(b"XADD") {
+                    self.attempted
+                        .lock()
+                        .unwrap()
+                        .push(FakeXadd::parse(&command));
+                }
+
+                let reply = match command[0].to_ascii_uppercase().as_slice() {
+                    b"INFO" => {
+                        let info = "redis_version:8.0.0\r\n";
+                        format!("${}\r\n{info}\r\n", info.len())
+                    }
+                    b"MULTI" => {
+                        queued = 0;
+                        queue_failed = false;
+                        queued_xadds.clear();
+                        "+OK\r\n".to_string()
+                    }
+                    b"XADD" if self.accept_writes.load(Ordering::SeqCst) => {
+                        queued += 1;
+                        queued_xadds.push(FakeXadd::parse(&command));
+                        "+QUEUED\r\n".to_string()
+                    }
+                    b"XADD" => {
+                        queue_failed = true;
+                        format!("-{queued_error}\r\n")
+                    }
+                    b"EXEC" if queue_failed => {
+                        self.aborted.fetch_add(1, Ordering::SeqCst);
+                        "-EXECABORT Transaction discarded because of previous errors.\r\n"
+                            .to_string()
+                    }
+                    b"EXEC" => {
+                        self.committed.fetch_add(1, Ordering::SeqCst);
+                        self.commits
+                            .lock()
+                            .unwrap()
+                            .push(tokio::time::Instant::now());
+                        self.written.lock().unwrap().append(&mut queued_xadds);
+                        format!("*{queued}\r\n{}", "$3\r\n0-1\r\n".repeat(queued))
+                    }
+                    _ => "+OK\r\n".to_string(),
+                };
+
+                if write.write_all(reply.as_bytes()).await.is_err() {
+                    break;
+                }
             }
         }
 
@@ -2614,6 +3451,14 @@ mod tests {
 
         fn written(&self) -> Vec<FakeXadd> {
             self.written.lock().unwrap().clone()
+        }
+
+        fn written_len(&self) -> usize {
+            self.written.lock().unwrap().len()
+        }
+
+        fn written_sequences(&self) -> Vec<u64> {
+            self.written().iter().map(FakeXadd::sequence).collect()
         }
     }
 
@@ -3646,7 +4491,7 @@ mod serial_tests {
 
     #[rstest]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_publish_messages_returns_unrecoverable_write_error(
+    async fn test_publish_messages_drops_a_batch_with_an_unrecoverable_write_error(
         #[future] redis_connection: ConnectionManager,
     ) {
         let mut con = redis_connection.await;
@@ -3673,20 +4518,22 @@ mod serial_tests {
             .await
         });
 
+        // The write fails with `WRONGTYPE`, which is not retried, so its batch is dropped
         tx.send(test_bus_message("first")).unwrap();
-
-        let result = tokio::time::timeout(Duration::from_secs(5), handle)
-            .await
-            .expect("a non-retryable write error should end the task")
-            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let finished_after_the_error = handle.is_finished();
         let _: usize = con.del(&stream_key).await.unwrap();
 
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Error publishing to stream")
-        );
+        tx.send(test_bus_message("second")).unwrap();
+        wait_for_stream_len(&con, &stream_key, 1).await;
+        let topics = read_stream_topics(&mut con, &stream_key).await;
+        tx.send(BusMessage::new_close()).unwrap();
+        let result = handle.await.unwrap();
+        let _: usize = con.del(&stream_key).await.unwrap();
+
+        assert!(!finished_after_the_error);
+        assert_eq!(topics, ["second"]);
+        assert!(result.is_ok());
     }
 
     #[rstest]
