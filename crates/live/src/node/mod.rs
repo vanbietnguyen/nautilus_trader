@@ -603,6 +603,8 @@ impl LiveNode {
             log::info!("Drained {drained_events} remaining events during shutdown");
         }
 
+        let stop_result = Self::close_external_egress(stop_result);
+
         match (controller_stop_result, stop_result) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(controller_err), Ok(())) => Err(controller_err),
@@ -2000,6 +2002,9 @@ impl LiveNode {
         let stop_result = self.finalize_stop().await;
 
         if let Err(e) = dispatch_result {
+            // A failed callback dispatch ends the loop, nothing is dispatched after the stop
+            let stop_result = Self::close_external_egress(stop_result);
+
             if let Err(stop_err) = stop_result {
                 log::error!("Failed to finalize node after callback failure: {stop_err}");
                 // Python converts the outer display message, so preserve both diagnostics there.
@@ -2020,6 +2025,8 @@ impl LiveNode {
             &mut data_evt_rx,
             &mut data_cmd_rx,
         );
+
+        let stop_result = Self::close_external_egress(stop_result);
 
         log::info!("Event loop stopped");
 
@@ -2387,7 +2394,8 @@ impl LiveNode {
     async fn abort_startup(&mut self, reason: &str) -> anyhow::Result<()> {
         log::info!("{reason}, aborting startup");
         self.handle.set_shutting_down();
-        self.finalize_stop().await
+        let finalize_result = self.finalize_stop().await;
+        Self::close_external_egress(finalize_result)
     }
 
     async fn abort_startup_with_error(
@@ -2447,6 +2455,8 @@ impl LiveNode {
                 log::info!("Drained {drained_events} remaining events during shutdown");
             }
         }
+
+        let finalize_result = Self::close_external_egress(finalize_result);
 
         let mut errors = Vec::new();
 
@@ -2523,7 +2533,7 @@ impl LiveNode {
         log::info!("Trader startup failed, aborting startup");
         self.handle.set_shutting_down();
         let stop_result = self.kernel.stop_trader_after_start_failure();
-        let finalize_result = self.finalize_stop().await;
+        let finalize_result = Self::close_external_egress(self.finalize_stop().await);
 
         match (stop_result, finalize_result) {
             (Ok(()), Ok(())) => Err(start_err),
@@ -2592,11 +2602,6 @@ impl LiveNode {
         let readiness_result = self.await_engines_disconnected(deadline).await;
         let kernel_result = self.kernel.finalize_stop().await;
 
-        // Last, on every path: the clients' and the kernel's last records are on the way out
-        if let Err(e) = msgbus::get_message_bus().borrow_mut().close() {
-            errors.push(format!("failed while closing the message bus: {e}"));
-        }
-
         self.handle.set_stopped();
 
         if !unresolved_submissions.is_empty() {
@@ -2621,6 +2626,22 @@ impl LiveNode {
             Ok(())
         } else {
             anyhow::bail!("{}", errors.join("; "))
+        }
+    }
+
+    /// Closes the message bus way out and adds its error to `stop_result`.
+    ///
+    /// Each caller of `finalize_stop` calls this once, after the last dispatch it makes itself, so
+    /// what the clients sent while they disconnected reaches the way out before it closes.
+    fn close_external_egress(stop_result: anyhow::Result<()>) -> anyhow::Result<()> {
+        let Err(e) = msgbus::get_message_bus().borrow_mut().close() else {
+            return stop_result;
+        };
+        let close_err = format!("failed while closing the message bus: {e}");
+
+        match stop_result {
+            Ok(()) => anyhow::bail!("{close_err}"),
+            Err(stop_err) => anyhow::bail!("{stop_err}; {close_err}"),
         }
     }
 

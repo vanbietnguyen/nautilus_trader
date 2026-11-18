@@ -21,9 +21,10 @@ use nautilus_common::{
         data::UnsubscribeCommand,
         execution::{CancelOrder, QueryOrder},
     },
-    msgbus::stubs::get_any_saving_handler,
+    msgbus::{stubs::get_any_saving_handler, switchboard::get_quotes_topic},
 };
 use nautilus_data::DataClientAdapter;
+use nautilus_model::data::Data;
 #[cfg(feature = "python")]
 use pyo3::{prelude::*, types::PyDict};
 
@@ -843,6 +844,16 @@ const FINALIZE_TOPIC: &str = "data.quotes.FINALIZE";
 /// one data client that publishes while it disconnects, failing its disconnect when
 /// `fail_disconnect` is set.
 fn stop_recording_node(inbound: bool, fail_disconnect: bool) -> (LiveNode, StopSteps) {
+    sending_stop_recording_node(inbound, fail_disconnect, false)
+}
+
+/// The node of [`stop_recording_node`], whose client also sends one quote through the node's data
+/// event sender while it disconnects when `send_on_disconnect` is set.
+fn sending_stop_recording_node(
+    inbound: bool,
+    fail_disconnect: bool,
+    send_on_disconnect: bool,
+) -> (LiveNode, StopSteps) {
     let steps = StopSteps::default();
     let config = LiveNodeConfig {
         msgbus: inbound.then(|| MessageBusConfig {
@@ -868,6 +879,7 @@ fn stop_recording_node(inbound: bool, fail_disconnect: bool) -> (LiveNode, StopS
         steps: steps.clone(),
         connected: true,
         fail_disconnect,
+        send_on_disconnect,
     };
     node.kernel.data_engine.borrow_mut().register_client(
         DataClientAdapter::new(client.client_id(), None, false, false, Box::new(client)),
@@ -894,7 +906,7 @@ async fn test_stop_with_inbound_key_writes_record_published_during_disconnect() 
 async fn test_stop_without_inbound_key_closes_way_out() {
     let (mut node, steps) = stop_recording_node(false, false);
 
-    node.finalize_stop().await.unwrap();
+    LiveNode::close_external_egress(node.finalize_stop().await).unwrap();
     let seen = steps.lock().clone();
     node.dispose();
 
@@ -917,7 +929,7 @@ fn stop_steps() -> Vec<String> {
 async fn test_stop_stops_read_then_disconnects_then_closes_way_out() {
     let (mut node, steps) = stop_recording_node(true, false);
 
-    node.finalize_stop().await.unwrap();
+    LiveNode::close_external_egress(node.finalize_stop().await).unwrap();
     let seen = steps.lock().clone();
     node.dispose();
 
@@ -928,7 +940,7 @@ async fn test_stop_stops_read_then_disconnects_then_closes_way_out() {
 async fn test_stop_closes_way_out_when_disconnect_fails() {
     let (mut node, steps) = stop_recording_node(true, true);
 
-    let error = node.finalize_stop().await.unwrap_err();
+    let error = LiveNode::close_external_egress(node.finalize_stop().await).unwrap_err();
     let seen = steps.lock().clone();
     node.dispose();
 
@@ -945,11 +957,108 @@ async fn test_stop_closes_way_out_when_disconnect_fails() {
 async fn test_dispose_after_stop_closes_way_out_once() {
     let (mut node, steps) = stop_recording_node(true, false);
 
-    node.finalize_stop().await.unwrap();
+    LiveNode::close_external_egress(node.finalize_stop().await).unwrap();
     node.dispose();
     let seen = steps.lock().clone();
 
     assert_eq!(seen, stop_steps());
+}
+
+/// The instrument of the quote the client sends through the node's data event sender.
+const SENT_INSTRUMENT_ID: &str = "SENT.SIM";
+
+/// The quote the client sends through the node's data event sender while it disconnects.
+fn sent_quote() -> QuoteTick {
+    QuoteTick {
+        instrument_id: InstrumentId::from(SENT_INSTRUMENT_ID),
+        ..QuoteTick::default()
+    }
+}
+
+/// The steps of a started node's stop with no inbound key, whose client sent a quote while it
+/// disconnected: its record and the kernel's written, the sent quote written by the final drain,
+/// then the way out closed, once.
+fn sent_stop_steps() -> Vec<String> {
+    vec![
+        "client connected".to_string(),
+        "client disconnected".to_string(),
+        format!("published {DISCONNECT_TOPIC}"),
+        format!("published {FINALIZE_TOPIC}"),
+        format!("published {}", get_quotes_topic(sent_quote().instrument_id)),
+        "closed".to_string(),
+    ]
+}
+
+fn assert_stop_result(result: anyhow::Result<()>, fail_disconnect: bool) {
+    if fail_disconnect {
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("Failed to disconnect data clients: STOP-RECORDING"),
+            "{error}"
+        );
+    } else {
+        result.unwrap();
+    }
+}
+
+#[rstest]
+#[tokio::test(flavor = "current_thread")]
+async fn test_run_writes_record_sent_during_disconnect_before_closing_way_out(
+    #[values(false, true)] fail_disconnect: bool,
+) {
+    let (mut node, steps) = sending_stop_recording_node(false, fail_disconnect, true);
+    let handle = node.handle();
+    let stop = tokio::spawn(async move {
+        while !handle.is_running() {
+            tokio::task::yield_now().await;
+        }
+        handle.stop();
+    });
+
+    let result = node.run().await;
+    stop.await.unwrap();
+    node.dispose();
+    let seen = steps.lock().clone();
+
+    assert_stop_result(result, fail_disconnect);
+    assert_eq!(seen, sent_stop_steps());
+}
+
+#[rstest]
+#[tokio::test(flavor = "current_thread")]
+async fn test_stop_writes_record_sent_during_disconnect_before_closing_way_out(
+    #[values(false, true)] fail_disconnect: bool,
+) {
+    let (mut node, steps) = sending_stop_recording_node(false, fail_disconnect, true);
+    node.start().await.unwrap();
+
+    let result = node.stop().await;
+    node.dispose();
+    let seen = steps.lock().clone();
+
+    assert_stop_result(result, fail_disconnect);
+    assert_eq!(seen, sent_stop_steps());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_start_aborted_after_client_connected_closes_way_out_once() {
+    let (mut node, steps) = stop_recording_node(false, false);
+    node.handle().stop();
+
+    node.start().await.unwrap();
+    node.dispose();
+    let seen = steps.lock().clone();
+
+    assert_eq!(
+        seen,
+        vec![
+            "client connected".to_string(),
+            "client disconnected".to_string(),
+            format!("published {DISCONNECT_TOPIC}"),
+            format!("published {FINALIZE_TOPIC}"),
+            "closed".to_string(),
+        ]
+    );
 }
 
 struct StopRecordingBackingFactory {
@@ -1008,6 +1117,7 @@ struct StopRecordingClient {
     steps: StopSteps,
     connected: bool,
     fail_disconnect: bool,
+    send_on_disconnect: bool,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1046,9 +1156,22 @@ impl DataClient for StopRecordingClient {
         !self.connected
     }
 
+    async fn connect(&mut self) -> anyhow::Result<()> {
+        self.steps.lock().push("client connected".to_string());
+        self.connected = true;
+        Ok(())
+    }
+
     async fn disconnect(&mut self) -> anyhow::Result<()> {
         self.steps.lock().push("client disconnected".to_string());
         msgbus::publish_quote(DISCONNECT_TOPIC.into(), &QuoteTick::default());
+
+        if self.send_on_disconnect {
+            get_data_event_sender()
+                .send(DataEvent::Data(Data::Quote(sent_quote())))
+                .unwrap();
+        }
+
         self.connected = false;
 
         if self.fail_disconnect {
