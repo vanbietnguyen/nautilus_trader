@@ -30,6 +30,11 @@
 //! level, with one record at each change of the stream between connected and degraded (see
 //! [`publish_messages`]).
 //!
+//! The stream task reads its streams the same way: it connects again within a second after a
+//! failed connect or read, never ends on one, logs transport trouble at warning level with one
+//! record at each change between connected and degraded, and goes on after the last entry it sent,
+//! so no entry is delivered twice (see [`stream_messages_from`]).
+//!
 //! Handles are stored as `Option<JoinHandle>` for idempotent shutdown via
 //! `close_async()`. The synchronous `close()` uses `block_in_place` to
 //! bridge into the async shutdown path and must be called from outside any
@@ -548,14 +553,16 @@ const MAX_PENDING_ENTRIES: usize = 100_000;
 /// uncertain. Provisional until measured.
 const MAX_PENDING_AGE: Duration = Duration::from_secs(180);
 
-/// Longest wait of the publish task between two connect or write attempts.
+/// Longest wait of the publish task between two connect or write attempts, and of the stream task
+/// between two connect or read attempts.
 ///
 /// The stream's rule, not a configuration default: it caps the delay whatever `max_delay` the
-/// [`RedisMessageBusConfig`] gives, so the stream is written again within about a second of Redis
-/// coming back.
+/// [`RedisMessageBusConfig`] gives, so the stream is written and read again within about a second
+/// of Redis coming back.
 const MAX_PUBLISH_RETRY_DELAY: Duration = Duration::from_secs(1);
 
-/// Longest one connect or write attempt of the publish task takes before it counts as failed.
+/// Longest one connect or write attempt of the publish task, or connect attempt of the stream task,
+/// takes before it counts as failed.
 /// Provisional until measured.
 const MAX_PUBLISH_ATTEMPT: Duration = Duration::from_secs(5);
 
@@ -767,7 +774,7 @@ impl StreamWriter {
             buffer: VecDeque::new(),
             batch: Vec::new(),
             write_error_count: 0,
-            state: StreamState::default(),
+            state: StreamState::new("write"),
         })
     }
 
@@ -923,7 +930,7 @@ impl StreamWriter {
                 self.con = Some(con);
                 self.batch.clear();
                 self.write_error_count = 0;
-                self.state.last_write = Some(get_atomic_clock_realtime().get_time_ns());
+                self.state.last_success = Some(get_atomic_clock_realtime().get_time_ns());
                 self.state.change(StreamLink::Connected);
                 None
             }
@@ -968,25 +975,39 @@ impl StreamWriter {
     }
 }
 
-/// Whether the publish task's stream is being written.
+/// Whether the publish task's stream is being written, or the stream task's streams read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StreamLink {
     Connected,
     Degraded,
 }
 
-/// The publish task's account of its stream: connected or degraded and since when, the last
-/// acknowledged write, and how many entries it dropped as discarded or abandoned as uncertain.
-#[derive(Debug, Default)]
+/// A task's account of its stream: connected or degraded and since when, its last success (an
+/// acknowledged write of the publish task, a read of the stream task), and how many entries the
+/// publish task dropped as discarded or abandoned as uncertain.
+#[derive(Debug)]
 struct StreamState {
+    /// What the task does on the stream, `write` or `read`, as its record names its last success.
+    activity: &'static str,
     link: Option<StreamLink>,
     since: UnixNanos,
-    last_write: Option<UnixNanos>,
+    last_success: Option<UnixNanos>,
     discarded: usize,
     uncertain: usize,
 }
 
 impl StreamState {
+    fn new(activity: &'static str) -> Self {
+        Self {
+            activity,
+            link: None,
+            since: UnixNanos::default(),
+            last_success: None,
+            discarded: 0,
+            uncertain: 0,
+        }
+    }
+
     /// Moves to `link`, logging one record when it changes.
     fn change(&mut self, link: StreamLink) {
         if self.link == Some(link) {
@@ -1006,13 +1027,14 @@ impl Display for StreamState {
             Some(StreamLink::Degraded) => "degraded",
             None => "starting",
         };
-        let last_write = self
-            .last_write
+        let last_success = self
+            .last_success
             .map_or_else(|| "none".to_string(), |at| at.to_rfc3339());
         write!(
             f,
-            "{link} since {}, last write {last_write}, {} discarded, {} uncertain",
+            "{link} since {}, last {} {last_success}, {} discarded, {} uncertain",
             self.since.to_rfc3339(),
+            self.activity,
             self.discarded,
             self.uncertain
         )
@@ -1187,9 +1209,7 @@ fn initial_stream_id(start: &StreamStart) -> String {
 ///
 /// # Errors
 ///
-/// Returns an error if:
-/// - Establishing the Redis connection fails before the terminate signal is received.
-/// - A Redis read operation returns a non-retryable error.
+/// Never returns an error; see [`stream_messages_from`].
 pub async fn stream_messages(
     tx: tokio::sync::mpsc::Sender<BusMessage>,
     config: RedisMessageBusConfig,
@@ -1203,13 +1223,21 @@ pub async fn stream_messages(
 /// provided `tx` channel.
 ///
 /// One read loop delivers the entries already held after `start` and then tails new entries,
-/// so the hand-over from history to live loses and repeats nothing.
+/// so the hand-over from history to live loses and repeats nothing. Each stream's position is
+/// taken from `start` when the first connection opens and kept across connections, so after a
+/// reconnect the read goes on after the last entry it sent: no entry is sent twice, and none Redis
+/// still holds is skipped.
+///
+/// Every connection, the first included, is opened by one attempt of at most
+/// [`MAX_PUBLISH_ATTEMPT`] at a time, at most [`MAX_PUBLISH_RETRY_DELAY`] after a failed connect
+/// or read. A failed connect or read never ends the task: it is logged at warning level, with one
+/// record at each change of the read between connected and degraded. An entry that cannot be
+/// decoded is logged at error level with its key and ID, and skipped. The task ends when
+/// `stream_signal` is set or the receiver of `tx` is dropped.
 ///
 /// # Errors
 ///
-/// Returns an error if:
-/// - Establishing the Redis connection fails before the terminate signal is received.
-/// - A Redis read operation returns a non-retryable error.
+/// Never returns an error.
 pub async fn stream_messages_from(
     tx: tokio::sync::mpsc::Sender<BusMessage>,
     config: RedisMessageBusConfig,
@@ -1219,12 +1247,15 @@ pub async fn stream_messages_from(
 ) -> anyhow::Result<()> {
     log_task_started(MSGBUS_STREAM);
 
-    let Some(mut con) = connect_stream_connection(&config, &stream_signal).await? else {
-        log_task_stopped(MSGBUS_STREAM);
-        return Ok(());
+    // Every connection, the first included, fails fast, so this task's backoff governs rather
+    // than the connection manager's retry schedule
+    let config = RedisMessageBusConfig {
+        number_of_retries: 0,
+        ..config
     };
-
+    let mut con: Option<ConnectionManager> = None;
     let mut read_error_count = 0;
+    let mut state = StreamState::new("read");
 
     let stream_keys = &stream_keys
         .iter()
@@ -1233,12 +1264,8 @@ pub async fn stream_messages_from(
 
     log::debug!("Listening to streams: [{}]", stream_keys.join(", "));
 
-    let initial_id = initial_stream_id(&start);
-
-    let mut last_ids: HashMap<String, String> = stream_keys
-        .iter()
-        .map(|&key| (key.to_string(), initial_id.clone()))
-        .collect();
+    // The ID each stream is read after, set when the first connection opens
+    let mut last_ids: Option<HashMap<String, String>> = None;
 
     let opts = stream_read_options();
 
@@ -1248,18 +1275,44 @@ pub async fn stream_messages_from(
             break;
         }
 
-        let ids: Vec<String> = stream_keys
-            .iter()
-            .map(|&key| last_ids[key].clone())
-            .collect();
+        let Some(active) = con.as_mut() else {
+            match connect_stream_connection(&config, &stream_signal).await {
+                Ok(Some(connected)) => con = Some(connected),
+                Ok(None) => break,
+                Err(e) => {
+                    let retry_delay = fail_stream_read(&mut state, &config, &mut read_error_count);
+                    log::warn!(
+                        "Error connecting to stream, retrying in {retry_delay:?} ({state}): {e}"
+                    );
+
+                    if !wait_for_retry_delay(retry_delay, &stream_signal).await {
+                        break;
+                    }
+                }
+            }
+            continue;
+        };
+
+        let cursor = last_ids.get_or_insert_with(|| {
+            let initial_id = initial_stream_id(&start);
+            stream_keys
+                .iter()
+                .map(|&key| (key.to_string(), initial_id.clone()))
+                .collect()
+        });
+
+        let ids: Vec<String> = stream_keys.iter().map(|&key| cursor[key].clone()).collect();
         let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
 
-        let result: Result<RedisStreamBulk, _> =
-            con.xread_options(&[&stream_keys], &[&id_refs], &opts).await;
+        let result: Result<RedisStreamBulk, _> = active
+            .xread_options(&[&stream_keys], &[&id_refs], &opts)
+            .await;
 
         match result {
             Ok(stream_bulk) => {
                 read_error_count = 0;
+                state.last_success = Some(get_atomic_clock_realtime().get_time_ns());
+                state.change(StreamLink::Connected);
 
                 if stream_bulk.is_empty() {
                     // Timeout occurred: no messages received
@@ -1270,7 +1323,7 @@ pub async fn stream_messages_from(
                     for (stream_key, stream_msgs) in entry {
                         for stream_msg in stream_msgs {
                             for (id, array) in stream_msg {
-                                last_ids.insert(stream_key.clone(), id.clone());
+                                cursor.insert(stream_key.clone(), id.clone());
 
                                 match decode_stream_entry(stream_key, array) {
                                     Ok(msg) => {
@@ -1280,7 +1333,9 @@ pub async fn stream_messages_from(
                                         }
                                     }
                                     Err(e) => {
-                                        log::error!("{e:?}");
+                                        log::error!(
+                                            "Error decoding stream entry {id} of {stream_key}: {e:?}"
+                                        );
                                     }
                                 }
                             }
@@ -1289,25 +1344,33 @@ pub async fn stream_messages_from(
                 }
             }
             Err(e) => {
-                if !is_retryable_stream_error(&e) {
-                    anyhow::bail!("Error reading from stream: {e:?}");
-                }
+                // The next read opens a fresh connection, as the publish task's next write does
+                con = None;
+                let retry_delay = fail_stream_read(&mut state, &config, &mut read_error_count);
+                log::warn!("Error reading from stream, retrying in {retry_delay:?} ({state}): {e}");
 
-                log::error!("Error reading from stream: {e:?}");
-
-                let Some(reconnected) =
-                    reconnect_stream_connection(&config, &stream_signal, &mut read_error_count)
-                        .await?
-                else {
+                if !wait_for_retry_delay(retry_delay, &stream_signal).await {
                     break;
-                };
-                con = reconnected;
+                }
             }
         }
     }
 
     log_task_stopped(MSGBUS_STREAM);
     Ok(())
+}
+
+/// Marks the stream read degraded after a failed connect or read and returns the delay before the
+/// next attempt, at most [`MAX_PUBLISH_RETRY_DELAY`].
+fn fail_stream_read(
+    state: &mut StreamState,
+    config: &RedisMessageBusConfig,
+    read_error_count: &mut usize,
+) -> Duration {
+    state.change(StreamLink::Degraded);
+    let retry_delay = stream_retry_delay(config, *read_error_count).min(MAX_PUBLISH_RETRY_DELAY);
+    *read_error_count = read_error_count.saturating_add(1);
+    retry_delay
 }
 
 /// Returns the options of each stream read: wait at most 100 ms for new entries and take at most
@@ -1318,42 +1381,30 @@ fn stream_read_options() -> StreamReadOptions {
         .count(STREAM_READ_BATCH_SIZE)
 }
 
+/// Opens a connection for the stream task, failing after [`MAX_PUBLISH_ATTEMPT`], or returns `None`
+/// once `stream_signal` is set.
 async fn connect_stream_connection(
     config: &RedisMessageBusConfig,
     stream_signal: &Arc<AtomicBool>,
 ) -> anyhow::Result<Option<ConnectionManager>> {
-    let connect = create_redis_connection(MSGBUS_STREAM, config);
+    let connect = tokio::time::timeout(
+        MAX_PUBLISH_ATTEMPT,
+        create_redis_connection(MSGBUS_STREAM, config),
+    );
     let terminate = wait_for_stream_signal(stream_signal);
 
     tokio::pin!(connect);
     tokio::pin!(terminate);
 
     tokio::select! {
-        result = &mut connect => result.map(Some),
+        result = &mut connect => result
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "No connection within {MAX_PUBLISH_ATTEMPT:?}"
+                ))
+            })
+            .map(Some),
         () = &mut terminate => Ok(None),
-    }
-}
-
-async fn reconnect_stream_connection(
-    config: &RedisMessageBusConfig,
-    stream_signal: &Arc<AtomicBool>,
-    read_error_count: &mut usize,
-) -> anyhow::Result<Option<ConnectionManager>> {
-    loop {
-        let retry_delay = stream_retry_delay(config, *read_error_count);
-        *read_error_count = (*read_error_count).saturating_add(1);
-
-        if !wait_for_retry_delay(retry_delay, stream_signal).await {
-            return Ok(None);
-        }
-
-        match connect_stream_connection(config, stream_signal).await {
-            Ok(Some(con)) => return Ok(Some(con)),
-            Ok(None) => return Ok(None),
-            Err(e) => {
-                log::error!("Error reconnecting to stream: {e:?}");
-            }
-        }
     }
 }
 
@@ -3036,6 +3087,364 @@ mod tests {
         assert_eq!(sources, expected);
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn test_stream_messages_read_on_after_a_read_error_redis_does_not_retry() {
+        capture_logs();
+        let stream_keys = vec!["stream-0".to_string()];
+        let fake = FakeRedisStreams::start(&stream_keys, 1).await;
+        let (mut rx, stream_signal, handle) =
+            start_reader(&fake, &stream_keys, StreamStart::Beginning);
+
+        let first = receive_payload(&mut rx).await;
+        fake.wrong_type_reads.store(1, Ordering::SeqCst);
+        wait_until_async(
+            || {
+                let wrong_type_reads = Arc::clone(&fake.wrong_type_reads);
+                async move { wrong_type_reads.load(Ordering::SeqCst) == 0 }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        fake.append(2, "2");
+        let second = receive_payload(&mut rx).await;
+        let finished_after_the_error = handle.is_finished();
+        stream_signal.store(true, Ordering::Relaxed);
+        let result = handle.await.unwrap();
+
+        let logs = thread_logs();
+        assert!(result.is_ok());
+        assert!(!finished_after_the_error);
+        assert_eq!([first, second], ["1", "2"]);
+        assert_eq!(
+            state_records(&logs),
+            [
+                ("connected".to_string(), true, 0, 0),
+                ("degraded".to_string(), true, 0, 0),
+                ("connected".to_string(), true, 0, 0),
+            ]
+        );
+        assert_read_records(&logs);
+        assert!(logs.iter().any(|(level, line)| *level == log::Level::Warn
+            && line.starts_with("Error reading from stream")
+            && line.contains("WRONGTYPE")));
+        assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_messages_connect_again_within_a_second_through_a_ten_minute_outage() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let stream_keys = vec!["stream-0".to_string()];
+        let fake = FakeRedisStreams::start(&stream_keys, 1).await;
+        let (mut rx, stream_signal, handle) =
+            start_reader(&fake, &stream_keys, StreamStart::Beginning);
+        let mut received = Vec::new();
+
+        drive_until(
+            || take_received(&mut rx, &mut received) == 1,
+            Duration::from_secs(5),
+        )
+        .await;
+        fake.available.store(false, Ordering::SeqCst);
+        let outage_start = tokio::time::Instant::now();
+        drive(Duration::from_secs(600)).await;
+        fake.append(2, "2");
+        let returned_at = tokio::time::Instant::now();
+        fake.available.store(true, Ordering::SeqCst);
+        drive_until(
+            || take_received(&mut rx, &mut received) == 2,
+            Duration::from_secs(5),
+        )
+        .await;
+        let delivered_at = tokio::time::Instant::now();
+        let finished_before_the_stop = handle.is_finished();
+        stream_signal.store(true, Ordering::Relaxed);
+        drive_until(|| handle.is_finished(), Duration::from_secs(5)).await;
+        let result = handle.await.unwrap();
+
+        let logs = thread_logs();
+        let attempts: Vec<tokio::time::Instant> = fake
+            .connections
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|&at| at >= outage_start && at <= returned_at)
+            .collect();
+        let longest_wait = attempts
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .max()
+            .unwrap();
+        assert!(result.is_ok());
+        assert!(!finished_before_the_stop);
+        assert!(attempts.len() >= 500, "{} attempts", attempts.len());
+        assert!(attempts[0] - outage_start <= MAX_PUBLISH_RETRY_DELAY + 2 * CLOCK_STEP);
+        assert!(
+            returned_at - *attempts.last().unwrap() <= MAX_PUBLISH_RETRY_DELAY + 2 * CLOCK_STEP
+        );
+        assert!(
+            longest_wait <= MAX_PUBLISH_RETRY_DELAY + 2 * CLOCK_STEP,
+            "{longest_wait:?}"
+        );
+        assert!(delivered_at - returned_at <= MAX_PUBLISH_RETRY_DELAY + 2 * CLOCK_STEP);
+        assert_eq!(received, stream_payloads(&stream_keys, &["1", "2"]));
+        assert_eq!(
+            state_records(&logs),
+            [
+                ("connected".to_string(), true, 0, 0),
+                ("degraded".to_string(), true, 0, 0),
+                ("connected".to_string(), true, 0, 0),
+            ]
+        );
+        assert_read_records(&logs);
+        assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_messages_deliver_in_order_when_redis_is_absent_at_start() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let stream_keys = vec!["stream-0".to_string()];
+        let fake = FakeRedisStreams::start(&stream_keys, 0).await;
+        fake.available.store(false, Ordering::SeqCst);
+        let (mut rx, stream_signal, handle) =
+            start_reader(&fake, &stream_keys, StreamStart::Beginning);
+        let mut received = Vec::new();
+
+        drive(Duration::from_secs(30)).await;
+        let received_while_absent = take_received(&mut rx, &mut received);
+        let finished_while_absent = handle.is_finished();
+        for n in 1..=3 {
+            fake.append(n, &n.to_string());
+        }
+        let returned_at = tokio::time::Instant::now();
+        fake.available.store(true, Ordering::SeqCst);
+        drive_until(
+            || take_received(&mut rx, &mut received) == 3,
+            Duration::from_secs(5),
+        )
+        .await;
+        let delivered_at = tokio::time::Instant::now();
+        stream_signal.store(true, Ordering::Relaxed);
+        drive_until(|| handle.is_finished(), Duration::from_secs(5)).await;
+        let result = handle.await.unwrap();
+
+        let logs = thread_logs();
+        assert!(result.is_ok());
+        assert_eq!(received_while_absent, 0);
+        assert!(!finished_while_absent);
+        assert!(delivered_at - returned_at <= MAX_PUBLISH_RETRY_DELAY + 2 * CLOCK_STEP);
+        assert_eq!(received, stream_payloads(&stream_keys, &["1", "2", "3"]));
+        assert_eq!(
+            state_records(&logs),
+            [
+                ("degraded".to_string(), false, 0, 0),
+                ("connected".to_string(), true, 0, 0),
+            ]
+        );
+        assert_read_records(&logs);
+        assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_messages_deliver_only_the_entry_written_during_an_outage_after_it() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let stream_keys = vec!["stream-0".to_string(), "stream-1".to_string()];
+        let fake = FakeRedisStreams::start(&stream_keys, 2).await;
+        let (mut rx, stream_signal, handle) =
+            start_reader(&fake, &stream_keys, StreamStart::Beginning);
+        let mut received = Vec::new();
+
+        drive_until(
+            || take_received(&mut rx, &mut received) == 4,
+            Duration::from_secs(5),
+        )
+        .await;
+        fake.available.store(false, Ordering::SeqCst);
+        drive(Duration::from_secs(3)).await;
+        fake.append(3, "3");
+        fake.available.store(true, Ordering::SeqCst);
+        drive_until(
+            || take_received(&mut rx, &mut received) >= 6,
+            Duration::from_secs(5),
+        )
+        .await;
+        // Long enough for any entry delivered again to arrive
+        drive(Duration::from_secs(2)).await;
+        take_received(&mut rx, &mut received);
+        stream_signal.store(true, Ordering::Relaxed);
+        drive_until(|| handle.is_finished(), Duration::from_secs(5)).await;
+        let result = handle.await.unwrap();
+
+        let logs = thread_logs();
+        let per_stream: Vec<Vec<&str>> = stream_keys
+            .iter()
+            .map(|key| {
+                received
+                    .iter()
+                    .filter(|(stream, _)| stream == key)
+                    .map(|(_, payload)| payload.as_str())
+                    .collect()
+            })
+            .collect();
+        assert!(result.is_ok());
+        assert_eq!(per_stream, [["1", "2", "3"], ["1", "2", "3"]]);
+        assert_eq!(
+            state_records(&logs),
+            [
+                ("connected".to_string(), true, 0, 0),
+                ("degraded".to_string(), true, 0, 0),
+                ("connected".to_string(), true, 0, 0),
+            ]
+        );
+        assert_read_records(&logs);
+        assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_stream_messages_skip_an_entry_that_cannot_be_decoded_and_deliver_the_next() {
+        capture_logs();
+        let stream_keys = vec!["stream-0".to_string()];
+        let fake = FakeRedisStreams::start(&stream_keys, 0).await;
+        fake.append(1, "1");
+        fake.append(2, FAKE_UNDECODABLE);
+        fake.append(3, "3");
+        let (mut rx, stream_signal, handle) =
+            start_reader(&fake, &stream_keys, StreamStart::Beginning);
+
+        let first = receive_payload(&mut rx).await;
+        let second = receive_payload(&mut rx).await;
+        let finished_after_the_entry = handle.is_finished();
+        stream_signal.store(true, Ordering::Relaxed);
+        let result = handle.await.unwrap();
+
+        let logs = thread_logs();
+        let errors = error_lines(&logs);
+        assert!(result.is_ok());
+        assert!(!finished_after_the_entry);
+        assert_eq!([first, second], ["1", "3"]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with("Error decoding stream entry 2-0 of stream-0: ")
+                && errors[0].contains("Error parsing sequence"),
+            "{}",
+            errors[0]
+        );
+        assert_eq!(
+            state_records(&logs),
+            [("connected".to_string(), true, 0, 0)]
+        );
+    }
+
+    #[rstest]
+    fn test_way_out_and_inbound_stay_open_after_a_read_error_redis_does_not_retry() {
+        let stream_keys = vec!["trader-PUBLISHER-007:stream".to_string()];
+        let fake = get_runtime().block_on(FakeRedisStreams::start(&stream_keys, 0));
+        let config = MessageBusConfig {
+            external_streams: Some(stream_keys),
+            ..Default::default()
+        };
+        let mut backing = RedisMessageBusBacking::new(
+            TraderId::from("TESTER-007"),
+            UUID4::new(),
+            config,
+            fake.config(),
+        )
+        .unwrap();
+        let mut stream_rx = backing.get_stream_receiver().unwrap();
+
+        wait_until(
+            || !fake.reads.lock().unwrap().is_empty(),
+            Duration::from_secs(5),
+        );
+        fake.wrong_type_reads.store(1, Ordering::SeqCst);
+        wait_until(
+            || fake.wrong_type_reads.load(Ordering::SeqCst) == 0,
+            Duration::from_secs(5),
+        );
+        let closed_after_the_error = backing.is_closed();
+        // The backing reads from the current time on, so the entry's ID is later
+        let n = usize::try_from(get_atomic_clock_realtime().get_time_ms()).unwrap() + 1_000_000;
+        fake.append(n, "after the error");
+        let message = get_runtime().block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), stream_rx.recv()).await
+        });
+        backing.close();
+
+        assert!(!closed_after_the_error);
+        let message = message
+            .expect("the entry should arrive")
+            .expect("the stream task should keep the inbound side open");
+        assert_eq!(message.payload, Bytes::from("after the error"));
+    }
+
+    /// Spawns `stream_messages_from` on `stream_keys` of `fake`, starting after `start`.
+    fn start_reader(
+        fake: &FakeRedisStreams,
+        stream_keys: &[String],
+        start: StreamStart,
+    ) -> (
+        tokio::sync::mpsc::Receiver<BusMessage>,
+        Arc<AtomicBool>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<BusMessage>(100);
+        let stream_signal = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(stream_messages_from(
+            tx,
+            fake.config(),
+            stream_keys.to_vec(),
+            start,
+            Arc::clone(&stream_signal),
+        ));
+        (rx, stream_signal, handle)
+    }
+
+    async fn receive_payload(rx: &mut tokio::sync::mpsc::Receiver<BusMessage>) -> String {
+        let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the entry should arrive")
+            .expect("the stream task should keep the channel open");
+        String::from_utf8(message.payload.to_vec()).unwrap()
+    }
+
+    /// Takes every message waiting on `rx` into `received` as its key and payload, and returns how
+    /// many were received in all.
+    fn take_received(
+        rx: &mut tokio::sync::mpsc::Receiver<BusMessage>,
+        received: &mut Vec<(String, String)>,
+    ) -> usize {
+        while let Ok(message) = rx.try_recv() {
+            received.push((
+                message.topic.to_string(),
+                String::from_utf8(message.payload.to_vec()).unwrap(),
+            ));
+        }
+        received.len()
+    }
+
+    /// The key and payload of each of `payloads` read from the one stream of `stream_keys`.
+    fn stream_payloads(stream_keys: &[String], payloads: &[&str]) -> Vec<(String, String)> {
+        payloads
+            .iter()
+            .map(|payload| (stream_keys[0].clone(), (*payload).to_string()))
+            .collect()
+    }
+
+    /// Asserts that each state record names the stream task's last read.
+    fn assert_read_records(logs: &[(log::Level, String)]) {
+        for (_, line) in logs.iter().filter(|(_, line)| line.starts_with("Stream ")) {
+            assert!(line.contains(", last read "), "{line}");
+        }
+    }
+
     /// Installs a Redis backing for `fake`, as trader `TESTER-007` with `instance_id`, as this
     /// thread's message bus way out.
     fn install_way_out(fake: &FakeRedis, instance_id: UUID4, config: MessageBusConfig) {
@@ -3287,13 +3696,15 @@ mod tests {
     }
 
     /// Returns each state record of the stream, all at warning level, as its state, whether it
-    /// names a last write, and its discarded and uncertain counts.
+    /// names a last write or read, and its discarded and uncertain counts.
     fn state_records(logs: &[(log::Level, String)]) -> Vec<(String, bool, usize, usize)> {
         logs.iter()
             .filter(|(_, line)| line.starts_with("Stream "))
             .map(|(level, line)| {
                 assert_eq!(*level, log::Level::Warn, "{line}");
-                let (head, values) = line.split_once(", last write ").unwrap();
+                let (head, values) = line.split_once(", last ").unwrap();
+                // The publish task's last write or the stream task's last read
+                let (_, values) = values.split_once(' ').unwrap();
                 let link = head.split(' ').nth(1).unwrap().to_string();
                 let [last_write, discarded, uncertain] =
                     values.split(", ").collect::<Vec<_>>().try_into().unwrap();
@@ -3519,69 +3930,98 @@ mod tests {
         replied: Vec<usize>,
     }
 
+    /// The payload of an entry a [`FakeRedisStreams`] writes with a sequence that is not a number,
+    /// so it cannot be decoded.
+    const FAKE_UNDECODABLE: &str = "undecodable";
+
     /// A loopback RESP server standing in for Redis, which holds streams of entries `<n>-0`
     /// carrying the stream key as topic, `n` as payload and the source of [`FAKE_PUBLISHER_ID`],
     /// [`FAKE_INSTANCE_ID`] and number `n`, answers `XREAD` as Redis does, and records each read.
+    /// It records the time of each accepted connection in `connections`. While `available` is unset
+    /// it closes each connection at once, and while `wrong_type_reads` is above zero it answers
+    /// that many reads with Redis's `WRONGTYPE` error, which the client does not retry.
+    #[derive(Clone)]
     struct FakeRedisStreams {
         port: u16,
         streams: Arc<std::sync::Mutex<FakeStreams>>,
         reads: Arc<std::sync::Mutex<Vec<FakeStreamRead>>>,
+        available: Arc<AtomicBool>,
+        wrong_type_reads: Arc<AtomicUsize>,
+        connections: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
     }
 
     impl FakeRedisStreams {
         async fn start(stream_keys: &[String], backlog_len: usize) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
             let backlog: Vec<_> = (1..=backlog_len).map(|n| (n, n.to_string())).collect();
-            let streams = Arc::new(std::sync::Mutex::new(vec![backlog; stream_keys.len()]));
-            let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let (keys, streams_clone, reads_clone) = (
-                stream_keys.to_vec(),
-                Arc::clone(&streams),
-                Arc::clone(&reads),
-            );
+            let fake = Self {
+                port: listener.local_addr().unwrap().port(),
+                streams: Arc::new(std::sync::Mutex::new(vec![backlog; stream_keys.len()])),
+                reads: Arc::new(std::sync::Mutex::new(Vec::new())),
+                available: Arc::new(AtomicBool::new(true)),
+                wrong_type_reads: Arc::new(AtomicUsize::new(0)),
+                connections: Arc::new(std::sync::Mutex::new(Vec::new())),
+            };
+            let (keys, server) = (stream_keys.to_vec(), fake.clone());
 
             tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
-                    let (keys, streams, reads) = (
-                        keys.clone(),
-                        Arc::clone(&streams_clone),
-                        Arc::clone(&reads_clone),
-                    );
+                    server
+                        .connections
+                        .lock()
+                        .unwrap()
+                        .push(tokio::time::Instant::now());
 
-                    tokio::spawn(async move {
-                        let (read, mut write) = socket.into_split();
-                        let mut reader = tokio::io::BufReader::new(read);
+                    if !server.available.load(Ordering::SeqCst) {
+                        continue; // Closing the socket at once fails the client's first command
+                    }
 
-                        while let Some(command) = read_resp_command(&mut reader).await {
-                            let reply = match command[0].to_ascii_uppercase().as_slice() {
-                                b"INFO" => {
-                                    let info = "redis_version:8.0.0\r\n";
-                                    format!("${}\r\n{info}\r\n", info.len())
-                                }
-                                b"XREAD" => {
-                                    let reply = xread_reply(&command, &keys, &streams, &reads);
-                                    if reply.is_none() {
-                                        // An empty blocking read times out with a nil reply
-                                        tokio::time::sleep(Duration::from_millis(10)).await;
-                                    }
-                                    reply.unwrap_or_else(|| "*-1\r\n".to_string())
-                                }
-                                _ => "+OK\r\n".to_string(),
-                            };
-
-                            if write.write_all(reply.as_bytes()).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
+                    tokio::spawn(server.clone().serve(socket, keys.clone()));
                 }
             });
 
-            Self {
-                port,
-                streams,
-                reads,
+            fake
+        }
+
+        async fn serve(self, socket: tokio::net::TcpStream, keys: Vec<String>) {
+            // Each reply leaves at once, not held for the client's acknowledgement of the last
+            socket.set_nodelay(true).unwrap();
+            let (read, mut write) = socket.into_split();
+            let mut reader = tokio::io::BufReader::new(read);
+
+            while let Some(command) = read_resp_command(&mut reader).await {
+                if !self.available.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let reply = match command[0].to_ascii_uppercase().as_slice() {
+                    b"INFO" => {
+                        let info = "redis_version:8.0.0\r\n";
+                        format!("${}\r\n{info}\r\n", info.len())
+                    }
+                    b"XREAD"
+                        if self
+                            .wrong_type_reads
+                            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                            .is_ok() =>
+                    {
+                        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+                            .to_string()
+                    }
+                    b"XREAD" => {
+                        let reply = xread_reply(&command, &keys, &self.streams, &self.reads);
+                        if reply.is_none() {
+                            // An empty blocking read times out with a nil reply
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        reply.unwrap_or_else(|| "*-1\r\n".to_string())
+                    }
+                    _ => "+OK\r\n".to_string(),
+                };
+
+                if write.write_all(reply.as_bytes()).await.is_err() {
+                    break;
+                }
             }
         }
 
@@ -3641,6 +4081,11 @@ mod tests {
             replied[stream] = entries.len();
             write!(reply, "*2\r\n{}*{}\r\n", bulk(key), entries.len()).unwrap();
             for (n, payload) in entries {
+                let sequence = if payload == FAKE_UNDECODABLE {
+                    "not-a-number".to_string()
+                } else {
+                    n.to_string()
+                };
                 let fields = [
                     bulk("topic"),
                     bulk(key),
@@ -3651,7 +4096,7 @@ mod tests {
                     bulk(INSTANCE_ID_FIELD),
                     bulk(FAKE_INSTANCE_ID),
                     bulk(SEQUENCE_FIELD),
-                    bulk(&n.to_string()),
+                    bulk(&sequence),
                 ];
                 write!(
                     reply,
@@ -4193,36 +4638,52 @@ mod serial_tests {
 
     #[rstest]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_stream_messages_returns_unrecoverable_read_error(
+    async fn test_stream_messages_read_on_after_an_unrecoverable_read_error(
         #[future] redis_connection: ConnectionManager,
     ) {
         let mut con = redis_connection.await;
-        let (tx, _rx) = tokio::sync::mpsc::channel::<BusMessage>(100);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BusMessage>(100);
 
         let suffix = UUID4::new();
         let stream_key = format!("test:stream:wrong-type:{suffix}");
         let external_streams = vec![stream_key.clone()];
         let stream_signal = Arc::new(AtomicBool::new(false));
+        let stream_signal_clone = Arc::clone(&stream_signal);
 
         let _: () = con.set(&stream_key, "not-a-stream").await.unwrap();
 
-        let result = stream_messages(
-            tx,
-            RedisMessageBusConfig::default(),
-            external_streams,
-            stream_signal,
-        )
-        .await;
+        let handle = tokio::spawn(async move {
+            stream_messages(
+                tx,
+                RedisMessageBusConfig::default(),
+                external_streams,
+                stream_signal_clone,
+            )
+            .await
+        });
 
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let finished_on_the_error = handle.is_finished();
+        let _: () = con.del(&stream_key).await.unwrap();
+        let future_id = (get_atomic_clock_realtime().get_time_ms() + 1_000_000).to_string();
+        let _: () = con
+            .xadd(
+                &stream_key,
+                future_id,
+                &[("topic", "live"), ("payload", "after")],
+            )
+            .await
+            .unwrap();
+        let msg = receive_bus_message(&mut rx, Duration::from_secs(5)).await;
+
+        rx.close();
+        stream_signal.store(true, Ordering::Relaxed);
+        let result = handle.await.unwrap();
         let _: () = con.del(&stream_key).await.unwrap();
 
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Error reading from stream")
-        );
+        assert!(!finished_on_the_error);
+        assert!(result.is_ok());
+        assert_eq!(msg.payload, Bytes::from("after"));
     }
 
     #[rstest]
