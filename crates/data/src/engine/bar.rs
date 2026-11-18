@@ -2334,6 +2334,14 @@ impl DataEngine {
         let bar_type = cmd
             .single_bar_type()
             .expect("native engine receives one bar type");
+        // A composite would share the builder by its standard bar type, so its source bars
+        // would build on the kept request's records: refused before anything is set up
+        anyhow::ensure!(
+            !bar_type.is_composite() || !self.is_kept_request_building(bar_type),
+            "Cannot subscribe {bar_type}: a kept request is building {} from another source; \
+             subscribe after it ends",
+            bar_type.standard(),
+        );
         let time_zone = time_zone_from_params(cmd.params.as_ref())?;
         let skip_first_non_full_bar = cmd
             .params
@@ -2522,6 +2530,19 @@ impl DataEngine {
                     .bar_types
                     .iter()
                     .any(|bar_type| bar_aggregator_key(*bar_type, None) == *key)
+        })
+    }
+
+    /// Returns whether a kept request (`update_subscriptions`) that has not ended is building
+    /// the builder of `bar_type`'s standard bar type.
+    fn is_kept_request_building(&self, bar_type: BarType) -> bool {
+        let key = bar_aggregator_key(bar_type, None);
+        self.request_bar_aggregations.values().any(|state| {
+            state.update_subscriptions
+                && state
+                    .bar_types
+                    .iter()
+                    .any(|kept| bar_aggregator_key(*kept, None) == key)
         })
     }
 

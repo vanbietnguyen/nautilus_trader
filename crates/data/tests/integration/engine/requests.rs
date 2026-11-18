@@ -11991,12 +11991,13 @@ fn test_held_back_subscription_drops_a_held_trade_the_answer_already_holds(
 
 /// A kept 5-MINUTE request through 16:59:59.999, given its 16:58 trade; while its answer is
 /// unfinished, a subscription to the same standard bar type built from 1-MINUTE-EXTERNAL bars
-/// reuses the kept builder. A source bar stamped 17:00 (size 8) arriving before the answer's
-/// remaining 16:59 trade is held until the hand-over: the builder takes the 16:59 trade, not
-/// dropping it as older than the source bar, and then the held source bar, so the 17:00 bar,
-/// still open at the answer's end, counts 1 + 2 + 8.
+/// is refused by name, before and after a plain 5-MINUTE subscription that waits on the request:
+/// it would build the request's builder from source bars on top of its trades. Nothing of it
+/// reaches the client, and a source bar stamped 17:00 (size 8) reaches no builder: the answer,
+/// its terminal and the plain subscription's 17:00 bar (1 + 2) are as without it. Once the
+/// request has ended, the same composite subscription is admitted.
 #[rstest]
-fn test_composite_subscription_reusing_a_kept_builder_holds_its_source_bars_until_the_hand_over(
+fn test_composite_subscription_sharing_an_unfinished_kept_builder_is_refused_by_name(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
@@ -12016,7 +12017,24 @@ fn test_composite_subscription_reusing_a_kept_builder_holds_its_source_bars_unti
     };
     let request = fixture.request(&[five], spec).unwrap();
     fixture.answer_part(request, &[(monday("16:58:00"), 1, "a1")]);
-    fixture.subscribe(composite, None);
+    let sent = fixture.client_commands(0).len();
+
+    let before_plain = subscribe_result(&mut fixture, composite).unwrap_err();
+    assert!(fixture.client_commands(sent).is_empty());
+    fixture.subscribe(five, None);
+    let sent = fixture.client_commands(0).len();
+    let after_plain = subscribe_result(&mut fixture, composite).unwrap_err();
+    assert!(fixture.client_commands(sent).is_empty());
+    for error in [before_plain, after_plain] {
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Cannot subscribe {composite}: a kept request is building {five} from another \
+                 source; subscribe after it ends"
+            ),
+        );
+    }
+
     let source_bar = Bar::new(
         composite.composite(),
         Price::from("1.00000"),
@@ -12037,9 +12055,64 @@ fn test_composite_subscription_reusing_a_kept_builder_holds_its_source_bars_unti
             kept_trade(0, "a1", &[0]),
             kept_trade(0, "a2", &[0]),
             Kept::End(0, None),
-            published(five, monday("17:00:00"), 11, &[1]),
+            published(five, monday("17:00:00"), 3, &[1]),
         ]
     );
+    subscribe_result(&mut fixture, composite).unwrap();
+}
+
+/// A kept 5-MINUTE request is unfinished: a subscription to 3-MINUTE built from
+/// 1-MINUTE-EXTERNAL bars shares none of its builders, so it is admitted, its source subscribed
+/// at the client, as without the request.
+#[rstest]
+fn test_composite_subscription_sharing_no_kept_builder_is_admitted(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let five = bar_type_of(id, "5-MINUTE");
+    let composite =
+        BarType::from(format!("{}@1-MINUTE-EXTERNAL", bar_type_of(id, "3-MINUTE")).as_str());
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("17:00:30"), &[five]);
+    let spec = KeptSpec {
+        start: Some(monday("16:55:00")),
+        end: Some(monday("17:00:00") - 1_000_000),
+        ..KeptSpec::default()
+    };
+    let request = fixture.request(&[five], spec).unwrap();
+    fixture.answer_part(request, &[(monday("16:58:00"), 1, "a1")]);
+    let sent = fixture.client_commands(0).len();
+
+    subscribe_result(&mut fixture, composite).unwrap();
+
+    assert!(
+        fixture.client_commands(sent).iter().any(|command| matches!(
+            command,
+            DataCommand::Subscribe(SubscribeCommand::Bars(subscribe))
+                if subscribe.bar_types.as_slice() == [composite.composite()]
+        )),
+        "{:?}",
+        fixture.client_commands(sent)
+    );
+}
+
+/// Executes an actor's subscription to `bar_type` at the fixture's clock; returns its result.
+fn subscribe_result(fixture: &mut KeptFixture, bar_type: BarType) -> anyhow::Result<()> {
+    let now = fixture.clock.borrow().timestamp_ns();
+    fixture
+        .engine
+        .execute_subscribe(SubscribeCommand::Bars(SubscribeBars::new(
+            bar_type,
+            Some(fixture.client_id),
+            Some(fixture.venue),
+            UUID4::new(),
+            now,
+            None,
+            None,
+        )))
 }
 
 /// The command an actor sends to unsubscribe `bar_type` at the fixture's clock.
