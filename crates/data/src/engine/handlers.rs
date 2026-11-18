@@ -160,27 +160,9 @@ impl JoinedSlot {
 }
 
 impl WarmupBuffer<TradeTick> {
-    /// Ends a joined warm-up: feeds the held trades to `aggregator` in arrival order through
-    /// `release`'s cut and floor, logs the counts, and leaves the release in `joined` for the
-    /// live trades after.
-    pub(super) fn release_joined(
-        &self,
-        joined: &JoinedSlot,
-        release: JoinedRelease,
-        aggregator: &mut dyn BarAggregator,
-        bar_type: BarType,
-    ) {
-        for copy in self
-            .release_joined_copies(joined, release, bar_type)
-            .into_iter()
-            .flatten()
-        {
-            aggregator.handle_trade(copy);
-        }
-    }
-
-    /// Ends a joined warm-up like [`Self::release_joined`], but returns the builder's copy of
-    /// each held trade in arrival order, `None` where the cut drops it, for its caller to feed.
+    /// Ends a joined warm-up: returns the builder's copy of each held trade in arrival order
+    /// through `release`'s cut and floor, `None` where the cut drops it, for its caller to feed;
+    /// logs the counts, and leaves the release in `joined` for the live trades after.
     pub(super) fn release_joined_copies(
         &self,
         joined: &JoinedSlot,
@@ -550,12 +532,14 @@ mod tests {
 
     impl HeldBuilder {
         fn release(&self, answered: &[TradeTick]) {
-            self.buffer.release_joined(
+            let copies = self.buffer.release_joined_copies(
                 &self.joined,
                 JoinedRelease::from_answer(answered),
-                self.aggregator.borrow_mut().as_mut(),
                 self.bar_type,
             );
+            for copy in copies.into_iter().flatten() {
+                self.aggregator.borrow_mut().handle_trade(copy);
+            }
         }
 
         /// The `ts_init` of each bar built, in order: a one-tick bar carries its trade's.

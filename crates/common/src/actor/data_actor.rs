@@ -3077,9 +3077,9 @@ pub trait DataActor {
 
     /// Request historical [`QuoteTick`] data for the given `instrument_ids`.
     ///
-    /// With `params["bar_types"]` and without `update_subscriptions`, the engine also builds
-    /// those bars from the quotes and adds them to the cache, as for a trades request (see
-    /// [`Self::request_trades`]): on the request's own clock, each close firing before the first
+    /// With `params["bar_types"]` the engine also builds those bars from the quotes and adds
+    /// them to the cache, as for a trades request (see [`Self::request_trades`], also for
+    /// `update_subscriptions`): on the request's own clock, each close firing before the first
     /// quote after it, and at an answer that completes with no failure reason, with no `limit`
     /// or filter expression and not a bare response, the closes up to `min(end, the engine
     /// clock's time when the request was dispatched)`. A part of its window that no source
@@ -3139,12 +3139,13 @@ pub trait DataActor {
     /// gap, while a gap in its trade file intervals that no client can fill is answered as an
     /// ordinary trades request answers it: the gap holds no trades, its quotes are still
     /// delivered, and the request completes with no failure reason, unless it builds bars
-    /// without `update_subscriptions` (below), when the gap fails it.
+    /// (below), when the gap fails it.
     ///
-    /// With `params["bar_types"]`, and without `interleave` and `update_subscriptions`, the
-    /// engine also builds those bars and adds them to the cache; the requester is given the
-    /// trades as before. The request's aggregators are its own and compute as a subscription's
-    /// do, on a clock of their own that the engine drives as a backtest drives its clock, from
+    /// With `params["bar_types"]`, and without `interleave`, the engine also builds those bars
+    /// and adds them to the cache; the requester is given the trades as before. The request's
+    /// aggregators (its own, or kept with `update_subscriptions`: below) compute as a
+    /// subscription's do, on a clock of their own that the engine drives as a backtest drives
+    /// its clock, from
     /// the request's `start` (its first trade without one). Before each trade, every time bar
     /// close and every `RANGE` daily boundary due strictly before it fires, in time order, so its
     /// bar is in the cache before the trade is fed; a close at a trade's own instant fires after
@@ -3165,9 +3166,37 @@ pub trait DataActor {
     /// empty or not, is a source. A request that names a `limit` or a filter expression
     /// (`filter_expr`), or that its client answers with a bare response (`DataEngine::response`,
     /// which certifies no coverage), completes with no failure reason and closes nothing after
-    /// its last record. With `update_subscriptions` the aggregators work as before: a time bar
-    /// is built at the next trade after its close, the last one when the answer completes, and
-    /// a part of the window that no source covers is not a failure.
+    /// its last record.
+    ///
+    /// With `params["update_subscriptions"] = true` the request's aggregators are kept under
+    /// their bar types and outlive it, so a later request can continue them and a subscription
+    /// to their bar types takes them over. They compute as above, on a clock of their own; such
+    /// a request must give a `start` and name no `limit`. A request none of whose aggregators
+    /// exists starts them, their clock at its `start`. A request whose aggregators are exactly
+    /// those one earlier kept request left, none subscribed and none in use by a request in
+    /// flight, continues them on their clock when its `start` is the next nanosecond after that
+    /// request's coverage (`min(end, the engine clock's time when it was dispatched)`, which
+    /// its completed answer with no failure reason closed through): an open bar, a pending close
+    /// (one at that very nanosecond fires after the records stamped then) and a calendar grid pass
+    /// from one request to the next, and every bar goes to the continuing request's answer. Any
+    /// other such request is refused before dispatch, with one terminal envelope naming the
+    /// case, and changes nothing. A request whose answer fired no close after its last record
+    /// (above) leaves aggregators no request can continue. A request that fails or expires
+    /// removes its aggregators. Between requests nothing drives them and no bar goes anywhere.
+    ///
+    /// A subscription to a kept bar type takes its aggregator over. Made after the answer, the
+    /// closes due before the engine clock's time are published to it, stamped at their own
+    /// close, then the aggregator continues on the engine clock with its pending close or
+    /// `RANGE` boundary as armed (one at the engine clock's time fires there once, after the
+    /// records stamped then); nothing is flushed. Made while the answer is in flight, it is held
+    /// back: its live trades are held and, when the request succeeds, fed to the aggregator as
+    /// the answer's trades are (the closes due before each fire first, their bars still the
+    /// answer's), trade by trade across bar types, then the aggregator is taken over as above.
+    /// When the request fails or expires instead, the subscription gets a new aggregator,
+    /// started then and fed the held trades. A joined request (`cut_warmup`) closes nothing after
+    /// its last trade: its held live trades, through the join's cut and floor, move its clock on
+    /// before the takeover. [`Self::unsubscribe_bars`] for a bar type kept and not subscribed
+    /// since removes its aggregator.
     ///
     /// With `params["interleave"] = true` and `params["bar_types"]`, the engine answers the
     /// trades together with the bars it builds from them, in the order a subscriber running
@@ -3177,8 +3206,8 @@ pub trait DataActor {
     /// trade, except a `RANGE_INCLUSIVE` bar, which contains its completing trade and comes
     /// after it.
     ///
-    /// Without `update_subscriptions`, the request's aggregators are its own and compute as a
-    /// subscription's do, on a clock of their own that the engine drives as a backtest drives
+    /// The request's aggregators (its own, or kept with `update_subscriptions`: above) compute as
+    /// a subscription's do, on a clock of their own that the engine drives as a backtest drives
     /// its clock. It starts at the request's `start` (at its first trade without one), so a
     /// calendar grid such as a 2-DAY bar's is anchored there. Before each trade, every time bar
     /// close and every `RANGE` daily boundary (18:00 `America/New_York` by default) due strictly
@@ -3200,12 +3229,10 @@ pub trait DataActor {
     /// completes but closes nothing after its last record.
     ///
     /// Bars of different types that one trade completes come in the order live publishes them,
-    /// whatever the order of `bar_types`: with `update_subscriptions`, time bars first (their
-    /// timers run before the trade is published; two due at one instant in bar type order, as a
-    /// backtest clock takes them), then the others in the string order of their bar types (the
-    /// trades topic calls their aggregators in handler ID order, `BarTradeHandler|<bar type>`),
-    /// the `RANGE_INCLUSIVE` ones after the trade in that same order (without it, a trade
-    /// completes no time bar). Each bar is a part of its own, in the order the aggregators
+    /// whatever the order of `bar_types`: in the string order of their bar types (the trades
+    /// topic calls their aggregators in handler ID order, `BarTradeHandler|<bar type>`), the
+    /// `RANGE_INCLUSIVE` ones after the trade in that same order (a trade completes no time
+    /// bar). Each bar is a part of its own, in the order the aggregators
     /// produced it, and enters the cache only when its part is delivered, so a handler of a
     /// trade or of a bar finds in the cache exactly the bars delivered before it. Trades enter the cache as for
     /// an ordinary trades request, when the engine receives the envelope holding them, before
@@ -3234,23 +3261,14 @@ pub trait DataActor {
     /// answer with any client gaps, and the history/live join (`cut_warmup`) are served; with
     /// `quotes`, the quotes parts go out in the merged order between the trades and bars parts.
     ///
-    /// Limits: live, the order of a timer and a trade at the same instant is not defined. With
-    /// `update_subscriptions`, a trade stamped exactly at a time bar's close is in that bar
-    /// (left-open intervals) and the bar comes after it. A live builder subscribed during a
+    /// Limits: live, the order of a timer and a trade at the same instant is not defined. A live
+    /// builder subscribed during a
     /// `cut_warmup` warm-up has the handler ID `JoinedTradeHandler|<bar type>`, so live calls
     /// it after every builder subscribed otherwise; the order above holds among builders
-    /// subscribed alike. Bars never delivered do not reach the cache. Bars completed only by
-    /// the request's clean-up after a failure with no answer (with `update_subscriptions`: its
-    /// held live trades, its last time bar) go out with the dispatched client's identity, each
-    /// bar a part of its own, cached just before it is sent.
-    ///
-    /// Still as before (later changes): with `update_subscriptions` the aggregators have no
-    /// clock while the answer is in flight. Time bars, and a `RANGE` bar completed by its daily
-    /// boundary, are built at the next trade after their close, not when the close passes, so
-    /// at the end of the answer history can differ from live, and two time bar types whose
-    /// closes interleave come one type after the other, not in close order; with `quotes`, such
-    /// a bar goes out before that next trade, after the quotes before it. For such a request a
-    /// part of the window that no source covers is not a failure.
+    /// subscribed alike. Bars never delivered do not reach the cache. A failure with no answer
+    /// delivers no bar: its clean-up completes none (a subscription held back on a kept
+    /// aggregator gets its held trades' bars from a new one, above). With `quotes` and
+    /// `update_subscriptions` the same split of a run of quotes applies.
     ///
     /// # Errors
     ///
@@ -3284,9 +3302,9 @@ pub trait DataActor {
 
     /// Request historical [`Bar`] data for the given `bar_types`.
     ///
-    /// With `params["bar_types"]` and without `update_subscriptions`, the engine also builds
-    /// those bars from the requested bars and adds them to the cache, as for a trades request
-    /// (see [`Self::request_trades`]): on the request's own clock, a close at a bar's stamp
+    /// With `params["bar_types"]` the engine also builds those bars from the requested bars and
+    /// adds them to the cache, as for a trades request (see [`Self::request_trades`], also for
+    /// `update_subscriptions`): on the request's own clock, a close at a bar's stamp
     /// firing after that bar, so the bar is in it. A continuous-future request
     /// (`continuous_future_transitions`) runs one such clock across its segments; a segment
     /// change only sets the price adjustment applied to the records fed after it, so a bar open
@@ -3545,6 +3563,9 @@ pub struct DataActorCore {
     indicators: Indicators,
     warning_events: AHashSet<String>, // TODO: TBD
     requests: RefCell<RequestLifecycle>,
+    /// The bar types whose builders this actor kept by request (`update_subscriptions`) and has
+    /// not subscribed since: [`Self::unsubscribe_bars`] removes them.
+    kept_bar_types: RefCell<AHashSet<BarType>>,
     signal_classes: AHashMap<String, String>,
     #[cfg(feature = "defi")]
     block_handlers: AHashMap<MStr<Topic>, Subscription<TypedHandler<Block>>>,
@@ -4447,6 +4468,7 @@ impl DataActorCore {
             indicators: Indicators::default(),
             warning_events: AHashSet::new(),
             requests: RefCell::new(RequestLifecycle::default()),
+            kept_bar_types: RefCell::new(AHashSet::new()),
             signal_classes: AHashMap::new(),
             #[cfg(feature = "defi")]
             block_handlers: AHashMap::new(),
@@ -5399,6 +5421,10 @@ impl DataActorCore {
                 handler.clone(),
                 DataCommand::Subscribe(SubscribeCommand::Bars(member)),
             ) {
+                // This subscription takes over a builder of it the actor kept by request
+                self.kept_bar_types
+                    .borrow_mut()
+                    .remove(&bar_type.standard());
                 acquired.push(*bar_type);
             }
         }
@@ -6220,6 +6246,9 @@ impl DataActorCore {
 
     /// Unsubscribes the actor from bars using each type's retained route.
     ///
+    /// A bar type the actor kept by request (`update_subscriptions`) and has not subscribed
+    /// since is released too: the engine is sent the unsubscribe, and removes its kept builder.
+    ///
     /// # Errors
     ///
     /// Returns an error if the list is empty or spans venues without an explicit client.
@@ -6232,10 +6261,29 @@ impl DataActorCore {
         self.check_registered();
         let bar_types = bar_types.into_bar_types()?;
         ensure_routable_bar_types(&bar_types, client_id.is_some())?;
-        let retained = bar_types
-            .into_iter()
-            .filter_map(|bar_type| self.remove_bar_subscription(bar_type))
-            .collect();
+        let mut retained = Vec::new();
+        for bar_type in bar_types {
+            match self.remove_bar_subscription(bar_type) {
+                Some(command) => retained.push(command),
+                None if self
+                    .kept_bar_types
+                    .borrow_mut()
+                    .remove(&bar_type.standard()) =>
+                {
+                    let command = UnsubscribeBars::new(
+                        bar_type,
+                        client_id,
+                        Some(bar_type.instrument_id().venue),
+                        UUID4::new(),
+                        self.timestamp_ns(),
+                        None,
+                        None,
+                    );
+                    self.send_data_cmd(DataCommand::Unsubscribe(UnsubscribeCommand::Bars(command)));
+                }
+                None => {}
+            }
+        }
         self.release_subscriptions(retained);
         Ok(())
     }
@@ -6705,6 +6753,7 @@ impl DataActorCore {
         check_timestamps(now, start, end)?;
 
         let request_id = UUID4::new();
+        let kept = kept_bar_types(params.as_ref());
         let command = RequestCommand::Quotes(RequestQuotes {
             instrument_ids,
             start,
@@ -6719,6 +6768,7 @@ impl DataActorCore {
         self.register_request_handler(command.request_id(), handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
+        self.kept_bar_types.borrow_mut().extend(kept);
 
         Ok(request_id)
     }
@@ -6752,6 +6802,7 @@ impl DataActorCore {
         check_timestamps(now, start, end)?;
 
         let request_id = UUID4::new();
+        let kept = kept_bar_types(params.as_ref());
         let command = RequestCommand::Trades(RequestTrades {
             instrument_ids,
             start,
@@ -6766,6 +6817,7 @@ impl DataActorCore {
         self.register_request_handler(command.request_id(), handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
+        self.kept_bar_types.borrow_mut().extend(kept);
 
         Ok(request_id)
     }
@@ -6803,6 +6855,7 @@ impl DataActorCore {
         check_timestamps(now, start, end)?;
 
         let request_id = UUID4::new();
+        let kept = kept_bar_types(params.as_ref());
         let command = RequestCommand::Bars(RequestBars {
             bar_types,
             start,
@@ -6817,6 +6870,7 @@ impl DataActorCore {
         self.register_request_handler(command.request_id(), handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
+        self.kept_bar_types.borrow_mut().extend(kept);
 
         Ok(request_id)
     }
@@ -7028,6 +7082,26 @@ impl DataActorNative for DataActorCore {
     fn core_mut(&mut self) -> &mut DataActorCore {
         self
     }
+}
+
+/// Returns the bar types, standard, whose builders a request with `params` keeps: its
+/// `bar_types` when it sets `update_subscriptions`; none otherwise, or for one that does not
+/// parse (the data engine refuses that request).
+fn kept_bar_types(params: Option<&Params>) -> Vec<BarType> {
+    let Some(params) =
+        params.filter(|params| params.get_bool("update_subscriptions") == Some(true))
+    else {
+        return Vec::new();
+    };
+
+    params
+        .get("bar_types")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str()?.parse::<BarType>().ok())
+        .map(|bar_type| bar_type.standard())
+        .collect()
 }
 
 fn check_timestamps(

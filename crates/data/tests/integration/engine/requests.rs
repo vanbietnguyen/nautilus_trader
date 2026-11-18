@@ -622,7 +622,7 @@ fn test_update_subscriptions_request_aggregator_can_be_started_live_after_respon
 
     let request = RequestTrades::new(
         instrument_id,
-        None,
+        Some(UnixNanos::default().to_datetime_utc()),
         None,
         None,
         Some(client_id),
@@ -723,7 +723,7 @@ fn test_update_subscriptions_request_aggregator_can_subscribe_before_response(
 
     let request = RequestTrades::new(
         instrument_id,
-        None,
+        Some(UnixNanos::default().to_datetime_utc()),
         None,
         None,
         Some(client_id),
@@ -833,7 +833,7 @@ fn test_update_subscriptions_request_aggregator_replays_live_quotes_after_respon
     data_engine.execute(DataCommand::Request(RequestCommand::Quotes(
         RequestQuotes::new(
             instrument_id,
-            None,
+            Some(UnixNanos::from(t0 - 300 * SEC).to_datetime_utc()),
             None,
             None,
             Some(client_id),
@@ -939,7 +939,7 @@ fn test_update_subscriptions_request_aggregator_replays_live_trades_after_respon
     data_engine.execute(DataCommand::Request(RequestCommand::Trades(
         RequestTrades::new(
             instrument_id,
-            None,
+            Some(UnixNanos::default().to_datetime_utc()),
             None,
             None,
             Some(client_id),
@@ -1072,7 +1072,7 @@ fn test_update_subscriptions_request_chain_replays_live_quotes_before_dependents
     data_engine.execute(DataCommand::Request(RequestCommand::Quotes(
         RequestQuotes::new(
             instrument_id,
-            None,
+            Some(UnixNanos::from(boundary - 300 * SEC).to_datetime_utc()),
             None,
             None,
             Some(client_id),
@@ -2685,15 +2685,20 @@ fn joined_params(bar_type: BarType, now_ns: u64, session_opens: &[u64]) -> Value
     })
 }
 
+/// A trades request with `params`. A joined request (`session_opens`) starts at its first session
+/// open: its builders are kept by request, which needs a `start`.
 fn trades_request(
     instrument_ids: Vec<InstrumentId>,
     end: Option<u64>,
     client_id: ClientId,
     params: Value,
 ) -> RequestCommand {
+    let start = params["session_opens"][0]
+        .as_u64()
+        .map(|start| UnixNanos::from(start).to_datetime_utc());
     RequestCommand::Trades(RequestTrades::new(
         instrument_ids,
-        None,
+        start,
         end.map(|end| UnixNanos::from(end).to_datetime_utc()),
         None,
         Some(client_id),
@@ -2701,6 +2706,16 @@ fn trades_request(
         UnixNanos::default(),
         Some(serde_json::from_value(params).unwrap()),
     ))
+}
+
+/// `request`, a trades request, with `start` (UNIX nanoseconds): one whose builders are kept by
+/// request (`update_subscriptions`) needs one.
+fn starting_at(request: RequestCommand, start: u64) -> RequestCommand {
+    let RequestCommand::Trades(mut cmd) = request else {
+        panic!("a trades request: {request:?}");
+    };
+    cmd.start = Some(UnixNanos::from(start).to_datetime_utc());
+    RequestCommand::Trades(cmd)
 }
 
 /// Executes `request`; returns its error and the failure reasons of the terminal envelopes the
@@ -3307,7 +3322,8 @@ fn register_join_catalog(
 
 /// Executes a joined request over `session_opens` at `now_ns` with the parent's `start`, checks
 /// its replay tail, answers the tail with `tail` in one part and then completes it, and returns
-/// every answer the requester received.
+/// every answer the requester received. Without a `start` the request starts at its first session
+/// open: its builders are kept by request, which needs one.
 #[cfg(feature = "streaming")]
 fn run_join(
     fixture: &JoinFixture,
@@ -3320,7 +3336,9 @@ fn run_join(
     let request_id = UUID4::new();
     let request = RequestCommand::Trades(RequestTrades::new(
         vec![fixture.instrument_id],
-        start.map(|start| UnixNanos::from(start).to_datetime_utc()),
+        start
+            .or(session_opens.first().copied())
+            .map(|start| UnixNanos::from(start).to_datetime_utc()),
         None,
         None,
         Some(fixture.client_id),
@@ -3750,6 +3768,19 @@ fn run_joined_release_observed(
     answered: Vec<TradeTick>,
     observe: impl FnOnce(UUID4),
 ) {
+    // With no catalog registered the join's answer carries a reason, so it fails and its kept
+    // builders are not handed over; a registered catalog leaves the answer the replay tail's
+    let catalog_dir = CatalogTempDir::new("joined-release");
+    fixture.engine.borrow_mut().register_catalog(
+        Box::new(ParquetDataCatalog::new(
+            catalog_dir.path(),
+            None,
+            None,
+            None,
+            None,
+        )),
+        None,
+    );
     let mut params = joined_params(fixture.bar_type, NY_2026_11_12_2000, &[NY_2026_11_12_1800]);
     params["bar_types"] = json!(
         bar_types
@@ -4074,9 +4105,11 @@ fn test_joined_release_puts_a_floored_trade_on_a_time_bar_boundary_in_the_later_
         .iter()
         .map(|bar| (bar.ts_event, bar.high, bar.close))
         .collect();
+    // Then h2's bar, and the hand-over drives the closes through now (20:00) minus 1 ns: flat
+    // bars each second through 19:59:59
     assert_eq!(
-        bars,
-        vec![
+        bars[..3],
+        [
             (
                 UnixNanos::from(NY_2026_11_12_1800 + second),
                 Price::from("0.65000"),
@@ -4087,7 +4120,21 @@ fn test_joined_release_puts_a_floored_trade_on_a_time_bar_boundary_in_the_later_
                 Price::from("0.65090"),
                 Price::from("0.65090"),
             ),
+            (
+                UnixNanos::from(NY_2026_11_12_1800 + 3 * second),
+                Price::from("0.65020"),
+                Price::from("0.65020"),
+            ),
         ]
+    );
+    assert_eq!(bars.len(), 7_199);
+    assert_eq!(
+        bars.last(),
+        Some(&(
+            UnixNanos::from(NY_2026_11_12_2000 - second),
+            Price::from("0.65020"),
+            Price::from("0.65020"),
+        ))
     );
 }
 
@@ -4186,7 +4233,7 @@ fn test_update_subscriptions_request_without_cut_warmup_releases_without_the_cut
         )
     };
     let params = json!({ "bar_types": [bar_type.to_string()], "update_subscriptions": true });
-    let request = trades_request(vec![id], None, client_id, params.clone());
+    let request = starting_at(trades_request(vec![id], None, client_id, params.clone()), 0);
     let request_id = *request.request_id();
     fixture
         .engine
@@ -4352,6 +4399,12 @@ fn execute_interleaved(
         "interleave": true,
     });
     let request = trades_request(vec![instrument_id], None, fixture.client_id, params);
+    // Kept builders need a `start`; the trades are a few nanoseconds after the epoch
+    let request = if update_subscriptions {
+        starting_at(request, 0)
+    } else {
+        request
+    };
     let request_id = *request.request_id();
     fixture
         .engine
@@ -4540,7 +4593,7 @@ fn test_interleaved_completion_delivers_its_clean_up_bars_then_one_terminal(
 }
 
 #[rstest]
-fn test_interleaved_failure_before_any_part_delivers_held_trades_bars_through_the_dispatched_client(
+fn test_interleaved_failure_before_any_part_gives_held_trades_bars_to_the_subscription_not_the_answer(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
@@ -4551,6 +4604,8 @@ fn test_interleaved_failure_before_any_part_delivers_held_trades_bars_through_th
     let id = fixture.instrument_id;
     let tick = fixture.bar_type;
     let tap = TappedResponses::install();
+    let (handler, published) = get_typed_message_saving_handler::<Bar>(None);
+    msgbus::subscribe_bars(switchboard::get_bars_topic(tick).into(), handler, None);
 
     let request_id = execute_interleaved(&fixture, id, &[tick], true);
     fixture
@@ -4581,13 +4636,19 @@ fn test_interleaved_failure_before_any_part_delivers_held_trades_bars_through_th
             Some("the source stopped".to_owned()),
         ));
 
+    // The failed request's builder is removed: a new one of the subscription takes the held
+    // trades and publishes their bars; the answer is the terminal alone
     assert_eq!(
         tap.take(request_id),
-        vec![
-            part(ResponsePart::Bars(request_id, tick, at_ns(&[10]))),
-            part(ResponsePart::Bars(request_id, tick, at_ns(&[20]))),
-            terminal(None, Some("the source stopped")),
-        ]
+        vec![terminal(None, Some("the source stopped"))]
+    );
+    assert_eq!(
+        published
+            .get_messages()
+            .iter()
+            .map(|bar| bar.ts_event)
+            .collect::<Vec<_>>(),
+        at_ns(&[10, 20])
     );
 }
 
@@ -5057,7 +5118,7 @@ fn test_joined_request_expires_with_its_answered_part_rebuilt_open_and_one_termi
 
 #[cfg(feature = "streaming")]
 #[rstest]
-fn test_joined_request_expiry_releases_the_held_live_trades_through_the_answered_cut_and_floor(
+fn test_joined_request_expiry_gives_a_held_back_subscription_a_new_builder_fed_its_held_trades(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
@@ -5084,7 +5145,7 @@ fn test_joined_request_expiry_releases_the_held_live_trades_through_the_answered
             ),
         )));
     for trade in [
-        // In the answered cut's millisecond: the answer holds it already
+        // In the answered cut's millisecond: the answer holds it, the new builder does not
         release_trade(
             id,
             100 * MS_NS + MS_NS / 2,
@@ -5092,7 +5153,7 @@ fn test_joined_request_expiry_releases_the_held_live_trades_through_the_answered
             "0.65010",
             "overlap",
         ),
-        // Past the cut, received below the answer's last `ts_init`
+        // Received below the held trade before it: the new builder's stale case
         release_trade(id, 101 * MS_NS, 150 * MS_NS, "0.65020", "below-the-floor"),
     ] {
         fixture.engine.borrow_mut().process_data(Data::Trade(trade));
@@ -5116,6 +5177,8 @@ fn test_joined_request_expiry_releases_the_held_live_trades_through_the_answered
             None,
         ));
 
+    // The expiry removes the request's builder; the subscription's new builder takes the held
+    // trades as they were held, with no cut or floor, and the later live trades
     run_timers(move_join_clock(&fixture, JOIN_DEADLINE));
     let later = release_trade(id, 102 * MS_NS, 210 * MS_NS, "0.65030", "later");
     fixture.engine.borrow_mut().process_data(Data::Trade(later));
@@ -5124,7 +5187,7 @@ fn test_joined_request_expiry_releases_the_held_live_trades_through_the_answered
         built_bars(&fixture, bar_type),
         vec![
             at("0.65000", 200 * MS_NS),
-            at("0.65020", 200 * MS_NS),
+            at("0.65010", 205 * MS_NS),
             at("0.65030", 210 * MS_NS),
         ]
     );
@@ -6895,17 +6958,15 @@ fn test_interleaved_failure_before_any_part_caches_each_held_trades_bar_just_bef
     let cache = Rc::clone(fixture.engine.borrow().cache());
     let seen = Rc::new(RefCell::new(Vec::new()));
     let recorded = Rc::clone(&seen);
-    msgbus::register_response_handler(
-        &request_id,
-        TypedHandler::from(move |envelope: &DataResponseEnvelope| {
-            if let Some(DataResponse::Bars(resp)) = envelope.response() {
-                for bar in resp.data.iter() {
-                    recorded
-                        .borrow_mut()
-                        .push((bar.ts_event, cache.borrow().bar_count(&tick)));
-                }
-            }
+    // The failure hands the held trades to a new builder of the subscription, which publishes
+    msgbus::subscribe_bars(
+        switchboard::get_bars_topic(tick).into(),
+        TypedHandler::from(move |bar: &Bar| {
+            recorded
+                .borrow_mut()
+                .push((bar.ts_event, cache.borrow().bar_count(&tick)));
         }),
+        None,
     );
     fixture
         .engine
@@ -7075,7 +7136,9 @@ enum HeldEnd {
 /// Executes an interleaving `update_subscriptions` request for `bar_types`, subscribes them live
 /// while its answer is in flight, the last only before the held trade at `late` (with the others
 /// when `late` is zero), processes the order tape after the answered trades live (its builders
-/// hold them), then ends the request as `end` says; returns the bars its requester is given.
+/// hold them), then ends the request as `end` says; returns the bars its requester is given,
+/// and those published to the subscriptions (after a failure, the new builders' that took over
+/// the held trades), in the order they were given.
 fn released_bars(
     audusd_sim: CurrencyPair,
     client_id: ClientId,
@@ -7093,18 +7156,22 @@ fn released_bars(
         "update_subscriptions": true,
         "interleave": true,
     });
-    let request = trades_request(vec![instrument_id], None, client_id, params.clone());
+    let request = starting_at(
+        trades_request(vec![instrument_id], None, client_id, params.clone()),
+        0,
+    );
     let request_id = *request.request_id();
     data_engine.execute_request(request).unwrap();
     let delivered = Rc::new(RefCell::new(Vec::new()));
     let recorded = Rc::clone(&delivered);
     let watched = bar_types.to_vec();
+    let answer_cache = Rc::clone(&cache);
     msgbus::register_response_handler(
         &request_id,
         TypedHandler::from(move |envelope: &DataResponseEnvelope| {
             if let Some(DataResponse::Bars(resp)) = envelope.response() {
                 for bar in resp.data.iter() {
-                    let cached = cached_bars(&cache, &watched);
+                    let cached = cached_bars(&answer_cache, &watched);
                     recorded.borrow_mut().push(OrderedDelivery::Bar(
                         bar.bar_type,
                         bar.ts_event,
@@ -7114,6 +7181,22 @@ fn released_bars(
             }
         }),
     );
+    for bar_type in bar_types {
+        let recorded = Rc::clone(&delivered);
+        let cache = Rc::clone(&cache);
+        let watched = bar_types.to_vec();
+        let handler = TypedHandler::from(move |bar: &Bar| {
+            let cached = cached_bars(&cache, &watched);
+            recorded
+                .borrow_mut()
+                .push(OrderedDelivery::Bar(bar.bar_type, bar.ts_event, cached));
+        });
+        msgbus::subscribe_bars(
+            switchboard::get_bars_topic(bar_type.standard()).into(),
+            handler,
+            None,
+        );
+    }
 
     let tape = order_tape(instrument_id);
     let answered = match end {
@@ -9812,5 +9895,986 @@ fn test_time_range_child_over_a_gap_no_client_resolves_fails_its_parent(
              window: no catalog file holds it and no client resolves"
                 .to_owned()
         )]
+    );
+}
+
+/// What a kept request's requester and the subscribers are given, in order, each with the
+/// number of bars of every watched bar type the cache holds at its callback: the trades and
+/// bars of the answer of the `n`th request and its end; a live trade on the trades topic; a
+/// bar published to the subscribers of its bar type.
+#[derive(Clone, Debug, PartialEq)]
+enum Kept {
+    Trade(usize, TradeId, Vec<usize>),
+    Bar(usize, BarType, UnixNanos, Quantity, Vec<usize>),
+    End(usize, Option<String>),
+    Live(TradeId, Vec<usize>),
+    Published(BarType, UnixNanos, Quantity, Vec<usize>),
+}
+
+fn kept_trade(request: usize, trade_id: &str, cached: &[usize]) -> Kept {
+    Kept::Trade(request, TradeId::new(trade_id), cached.to_vec())
+}
+
+fn kept_bar(request: usize, bar_type: BarType, ts: u64, volume: u64, cached: &[usize]) -> Kept {
+    Kept::Bar(
+        request,
+        bar_type.standard(),
+        UnixNanos::from(ts),
+        Quantity::from(volume),
+        cached.to_vec(),
+    )
+}
+
+fn live_trade(trade_id: &str, cached: &[usize]) -> Kept {
+    Kept::Live(TradeId::new(trade_id), cached.to_vec())
+}
+
+fn published(bar_type: BarType, ts: u64, volume: u64, cached: &[usize]) -> Kept {
+    Kept::Published(
+        bar_type.standard(),
+        UnixNanos::from(ts),
+        Quantity::from(volume),
+        cached.to_vec(),
+    )
+}
+
+/// An interleaving trades request whose builders are kept by request (`update_subscriptions`).
+#[derive(Clone, Copy, Default)]
+struct KeptSpec {
+    start: Option<u64>,
+    end: Option<u64>,
+    limit: Option<usize>,
+    time_zone: Option<&'static str>,
+}
+
+/// The window from `start` to just before `next`, the next request's start.
+fn kept_window(start: u64, next: u64) -> KeptSpec {
+    KeptSpec {
+        start: Some(start),
+        end: Some(next - 1),
+        ..KeptSpec::default()
+    }
+}
+
+/// An engine without flat bars whose clock reads `now`, with a mock client; what the requesters
+/// of its kept requests and the subscribers of `watched` and of the instrument's trades are
+/// given, in one order.
+struct KeptFixture {
+    engine: DataEngine,
+    clock: Rc<RefCell<VirtualClock>>,
+    recorder: Rc<RefCell<Vec<DataCommand>>>,
+    instrument_id: InstrumentId,
+    client_id: ClientId,
+    venue: Venue,
+    watched: Vec<BarType>,
+    requests: Vec<UUID4>,
+    cache: Rc<RefCell<Cache>>,
+    delivered: Rc<RefCell<Vec<Kept>>>,
+}
+
+impl KeptFixture {
+    fn new(
+        audusd_sim: CurrencyPair,
+        client_id: ClientId,
+        venue: Venue,
+        now: u64,
+        watched: &[BarType],
+    ) -> Self {
+        let instrument_id = audusd_sim.id;
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let _ = clock.borrow_mut().advance_time(UnixNanos::from(now), true);
+        let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+            .unwrap();
+        let mut engine = DataEngine::new(
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+            Rc::clone(&cache),
+            Some(without_flat_bars()),
+        );
+        let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+        register_mock_client(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            Rc::clone(&cache),
+            client_id,
+            venue,
+            None,
+            &recorder,
+            &mut engine,
+        );
+
+        let delivered = Rc::new(RefCell::new(Vec::new()));
+        for bar_type in watched {
+            let recorded = Rc::clone(&delivered);
+            let cache = Rc::clone(&cache);
+            let watched = watched.to_vec();
+            let handler = TypedHandler::from(move |bar: &Bar| {
+                let cached = cached_bars(&cache, &watched);
+                recorded.borrow_mut().push(Kept::Published(
+                    bar.bar_type,
+                    bar.ts_event,
+                    bar.volume,
+                    cached,
+                ));
+            });
+            msgbus::subscribe_bars(
+                switchboard::get_bars_topic(bar_type.standard()).into(),
+                handler,
+                None,
+            );
+        }
+        let recorded = Rc::clone(&delivered);
+        let trades_cache = Rc::clone(&cache);
+        let trades_watched = watched.to_vec();
+        msgbus::subscribe_trades(
+            switchboard::get_trades_topic(instrument_id).into(),
+            TypedHandler::from(move |trade: &TradeTick| {
+                let cached = cached_bars(&trades_cache, &trades_watched);
+                recorded
+                    .borrow_mut()
+                    .push(Kept::Live(trade.trade_id, cached));
+            }),
+            None,
+        );
+
+        Self {
+            engine,
+            clock,
+            recorder,
+            instrument_id,
+            client_id,
+            venue,
+            watched: watched.to_vec(),
+            requests: Vec::new(),
+            cache,
+            delivered,
+        }
+    }
+
+    /// Executes the kept request of `spec` for `bar_types`; returns its index, or the error
+    /// that refused it (also its one terminal).
+    fn request(&mut self, bar_types: &[BarType], spec: KeptSpec) -> Result<usize, String> {
+        let index = self.requests.len();
+        let request_id = UUID4::new();
+        self.requests.push(request_id);
+
+        let mut params = json!({
+            "bar_types": bar_types.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "update_subscriptions": true,
+            "interleave": true,
+        });
+        if let Some(time_zone) = spec.time_zone {
+            params["time_zone"] = json!(time_zone);
+        }
+
+        let recorded = Rc::clone(&self.delivered);
+        let cache = Rc::clone(&self.cache);
+        let watched = self.watched.clone();
+        let handler = TypedHandler::from(move |envelope: &DataResponseEnvelope| {
+            match envelope.response() {
+                Some(DataResponse::Trades(resp)) => {
+                    for trade in resp.data.iter() {
+                        let cached = cached_bars(&cache, &watched);
+                        recorded
+                            .borrow_mut()
+                            .push(Kept::Trade(index, trade.trade_id, cached));
+                    }
+                }
+                Some(DataResponse::Bars(resp)) => {
+                    for bar in resp.data.iter() {
+                        let cached = cached_bars(&cache, &watched);
+                        recorded.borrow_mut().push(Kept::Bar(
+                            index,
+                            bar.bar_type,
+                            bar.ts_event,
+                            bar.volume,
+                            cached,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+
+            if envelope.completed() {
+                let reason = envelope.failure_reason().map(str::to_owned);
+                recorded.borrow_mut().push(Kept::End(index, reason));
+            }
+        });
+        msgbus::register_response_handler(&request_id, handler);
+
+        let at = |ns: Option<u64>| ns.map(|ns| UnixNanos::from(ns).to_datetime_utc());
+        let now = self.clock.borrow().timestamp_ns();
+        self.engine
+            .execute_request(RequestCommand::Trades(RequestTrades::new(
+                self.instrument_id,
+                at(spec.start),
+                at(spec.end),
+                spec.limit.map(|limit| NonZeroUsize::new(limit).unwrap()),
+                Some(self.client_id),
+                request_id,
+                now,
+                Some(serde_json::from_value(params).unwrap()),
+            )))
+            .map(|()| index)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Answers the `request`th request with trades (`ts`, size, trade ID) at one price in one
+    /// completed envelope, with `failure` as its reason.
+    fn answer(&mut self, request: usize, trades: &[(u64, u64, &str)], failure: Option<&str>) {
+        let resp = self.trades_response(request, trades);
+        let envelope = DataResponseEnvelope::new(DataResponse::Trades(resp), true, None);
+        let envelope = match failure {
+            Some(reason) => envelope.with_failure(reason.to_owned()),
+            None => envelope,
+        };
+        self.engine.response_envelope(envelope);
+    }
+
+    fn trades_response(&self, request: usize, trades: &[(u64, u64, &str)]) -> TradesResponse {
+        let trades: Vec<TradeTick> = trades
+            .iter()
+            .map(|(ts, size, trade_id)| {
+                make_trade(self.instrument_id, "1.00000", *size, trade_id, *ts)
+            })
+            .collect();
+        TradesResponse::new(
+            self.requests[request],
+            self.client_id,
+            self.instrument_id,
+            trades,
+            None,
+            None,
+            self.clock.borrow().timestamp_ns(),
+            None,
+        )
+    }
+
+    /// Subscribes `bar_type` as an actor does, with `time_zone` as its parameter.
+    fn subscribe(&mut self, bar_type: BarType, time_zone: Option<&str>) {
+        let params = time_zone
+            .map(|zone| serde_json::from_value::<Params>(json!({ "time_zone": zone })).unwrap());
+        let now = self.clock.borrow().timestamp_ns();
+        self.engine
+            .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+                SubscribeBars::new(
+                    bar_type,
+                    Some(self.client_id),
+                    Some(self.venue),
+                    UUID4::new(),
+                    now,
+                    None,
+                    params,
+                ),
+            )));
+    }
+
+    /// Processes a live trade (`ts`, size, trade ID).
+    fn live(&mut self, ts: u64, size: u64, trade_id: &str) {
+        let trade = make_trade(self.instrument_id, "1.00000", size, trade_id, ts);
+        self.engine.process_data(Data::Trade(trade));
+    }
+
+    /// Moves the engine clock to `to`, running each timer due by then in time order, one at a
+    /// time, as a backtest's event loop runs them.
+    fn advance(&self, to: u64) {
+        loop {
+            let handlers = {
+                let mut clock = self.clock.borrow_mut();
+                let Some(deadline) = clock
+                    .timer_names()
+                    .into_iter()
+                    .filter_map(|name| clock.next_time_ns(name))
+                    .filter(|deadline| deadline.as_u64() <= to)
+                    .min()
+                else {
+                    break;
+                };
+                let events = clock.advance_time(deadline, true);
+                clock.match_handlers(events)
+            };
+            for handler in handlers {
+                handler.callback.call(handler.event);
+            }
+        }
+        let _ = self
+            .clock
+            .borrow_mut()
+            .advance_time(UnixNanos::from(to), true);
+    }
+
+    fn delivered(&self) -> Vec<Kept> {
+        self.delivered.borrow().clone()
+    }
+
+    /// The commands the client received after the first `skip`.
+    fn client_commands(&self, skip: usize) -> Vec<DataCommand> {
+        self.recorder.borrow()[skip..].to_vec()
+    }
+}
+
+/// 2024-01-08, a Monday: New York civil `time` that day.
+fn monday(time: &str) -> u64 {
+    new_york(&format!("2024-01-08T{time}"))
+}
+
+/// A kept 5-MINUTE request from 10:00 to 10:08 minus 1 ns, answered with a1 at 10:01 and a2 at
+/// 10:06: the 10:05 bar closes before a2; a2's bar, closing at 10:10, stays open.
+fn first_kept_request(fixture: &mut KeptFixture, five: BarType) -> usize {
+    let request = fixture
+        .request(&[five], kept_window(monday("10:00:00"), monday("10:08:00")))
+        .unwrap();
+    fixture.answer(
+        request,
+        &[(monday("10:01:00"), 1, "a1"), (monday("10:06:00"), 2, "a2")],
+        None,
+    );
+    request
+}
+
+fn first_kept_answer(five: BarType) -> Vec<Kept> {
+    vec![
+        kept_trade(0, "a1", &[0]),
+        kept_bar(0, five, monday("10:05:00"), 1, &[1]),
+        kept_trade(0, "a2", &[1]),
+        Kept::End(0, None),
+    ]
+}
+
+#[rstest]
+fn test_kept_request_continues_its_replay_with_every_handler_on_the_new_answer(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (five, tick) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "3-TICK"));
+    let mut fixture = KeptFixture::new(
+        audusd_sim,
+        client_id,
+        venue,
+        monday("12:00:00"),
+        &[five, tick],
+    );
+
+    let first = fixture
+        .request(
+            &[five, tick],
+            kept_window(monday("10:00:00"), monday("10:08:00")),
+        )
+        .unwrap();
+    fixture.answer(
+        first,
+        &[(monday("10:01:00"), 1, "a1"), (monday("10:06:00"), 2, "a2")],
+        None,
+    );
+    let second = fixture
+        .request(
+            &[tick, five],
+            kept_window(monday("10:08:00"), monday("10:15:00")),
+        )
+        .unwrap();
+    fixture.answer(
+        second,
+        &[(monday("10:09:00"), 4, "b1"), (monday("10:12:00"), 8, "b2")],
+        None,
+    );
+
+    // b1 completes the tick bar a1 and a2 opened; then the 10:10 close, a2's and b1's, fires
+    // before b2 into the second answer, though no trade of it completes the 5-MINUTE bar
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            kept_trade(0, "a1", &[0, 0]),
+            kept_bar(0, five, monday("10:05:00"), 1, &[1, 0]),
+            kept_trade(0, "a2", &[1, 0]),
+            Kept::End(0, None),
+            kept_bar(1, tick, monday("10:09:00"), 7, &[1, 1]),
+            kept_trade(1, "b1", &[1, 1]),
+            kept_bar(1, five, monday("10:10:00"), 6, &[2, 1]),
+            kept_trade(1, "b2", &[2, 1]),
+            Kept::End(1, None),
+        ]
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Refusal {
+    Gap,
+    Overlap,
+    Earlier,
+    NoStart,
+    Limit,
+    SomeExist,
+}
+
+#[rstest]
+#[case::gap(Refusal::Gap, "leaves a gap after the coverage through")]
+#[case::overlap(Refusal::Overlap, "overlaps the coverage through")]
+#[case::earlier(Refusal::Earlier, "is before the start of the replay that keeps")]
+#[case::no_start(Refusal::NoStart, "it gives no `start`")]
+#[case::limit(Refusal::Limit, "it names a `limit`")]
+#[case::some_exist(Refusal::SomeExist, "has a kept builder and")]
+fn test_kept_request_refused_by_name_leaves_its_replay_as_it_was(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] refusal: Refusal,
+    #[case] reason: &str,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (five, tick) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "3-TICK"));
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
+    first_kept_request(&mut fixture, five);
+    let next = kept_window(monday("10:08:00"), monday("10:15:00"));
+    let (bar_types, spec) = match refusal {
+        Refusal::Gap => (
+            vec![five],
+            kept_window(monday("10:08:00") + 1, monday("10:15:00")),
+        ),
+        Refusal::Overlap => (
+            vec![five],
+            kept_window(monday("10:07:00"), monday("10:15:00")),
+        ),
+        Refusal::Earlier => (
+            vec![five],
+            kept_window(monday("09:59:00"), monday("10:15:00")),
+        ),
+        Refusal::NoStart => (
+            vec![five],
+            KeptSpec {
+                start: None,
+                ..next
+            },
+        ),
+        Refusal::Limit => (
+            vec![five],
+            KeptSpec {
+                limit: Some(10),
+                ..next
+            },
+        ),
+        Refusal::SomeExist => (vec![five, tick], next),
+    };
+
+    let error = fixture.request(&bar_types, spec).unwrap_err();
+    let continued = fixture.request(&[five], next).unwrap();
+    fixture.answer(continued, &[(monday("10:12:00"), 4, "b1")], None);
+
+    assert!(
+        error.starts_with("Cannot keep the bar builders of an `update_subscriptions` request"),
+        "{error}"
+    );
+    assert!(error.contains(reason), "{error}");
+    // The refused request changed nothing: the next one continues a2's open bar
+    let mut expected = first_kept_answer(five);
+    expected.extend([
+        Kept::End(1, Some(error)),
+        kept_bar(2, five, monday("10:10:00"), 2, &[2]),
+        kept_trade(2, "b1", &[2]),
+        Kept::End(2, None),
+    ]);
+    assert_eq!(fixture.delivered(), expected);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Occupied {
+    TwoReplays,
+    NotAllBuilders,
+    Subscribed,
+    InFlight,
+    NoCoverage,
+}
+
+#[rstest]
+#[case::two_replays(Occupied::TwoReplays, "are kept by two replays")]
+#[case::not_all_builders(Occupied::NotAllBuilders, "are not all the builders of the replay")]
+#[case::subscribed(Occupied::Subscribed, "is already running for a subscription")]
+#[case::in_flight(Occupied::InFlight, "is in use by the request")]
+#[case::no_coverage(Occupied::NoCoverage, "fired no end of coverage")]
+fn test_kept_request_refused_by_name_for_builders_it_cannot_continue(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] occupied: Occupied,
+    #[case] reason: &str,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (five, tick) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "3-TICK"));
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
+    let window = kept_window(monday("10:00:00"), monday("10:08:00"));
+    let next = kept_window(monday("10:08:00"), monday("10:15:00"));
+    let a1 = [(monday("10:01:00"), 1, "a1")];
+    let asked = match occupied {
+        Occupied::TwoReplays => {
+            for bar_types in [[five], [tick]] {
+                let request = fixture.request(&bar_types, window).unwrap();
+                fixture.answer(request, &a1, None);
+            }
+            vec![five, tick]
+        }
+        Occupied::NotAllBuilders => {
+            let request = fixture.request(&[five, tick], window).unwrap();
+            fixture.answer(request, &a1, None);
+            vec![five]
+        }
+        Occupied::Subscribed => {
+            let request = fixture.request(&[five], window).unwrap();
+            fixture.answer(request, &a1, None);
+            fixture.subscribe(five, None);
+            vec![five]
+        }
+        Occupied::InFlight => {
+            fixture.request(&[five], window).unwrap();
+            vec![five]
+        }
+        Occupied::NoCoverage => {
+            let request = fixture.request(&[five], window).unwrap();
+            // A bare response certifies no coverage: no end fires, nothing to continue from
+            let resp = fixture.trades_response(request, &a1);
+            fixture.engine.response(DataResponse::Trades(resp));
+            vec![five]
+        }
+    };
+    let ends_before = fixture
+        .delivered()
+        .iter()
+        .filter(|kept| matches!(kept, Kept::End(..)))
+        .count();
+
+    let error = fixture.request(&asked, next).unwrap_err();
+
+    assert!(
+        error.starts_with("Cannot keep the bar builders of an `update_subscriptions` request"),
+        "{error}"
+    );
+    assert!(error.contains(reason), "{error}");
+    let delivered = fixture.delivered();
+    assert_eq!(
+        delivered.last(),
+        Some(&Kept::End(fixture.requests.len() - 1, Some(error)))
+    );
+    assert_eq!(
+        delivered
+            .iter()
+            .filter(|kept| matches!(kept, Kept::End(..)))
+            .count(),
+        ends_before + 1
+    );
+}
+
+/// Runs kept requests for a 3-TICK and a 2-DAY New York bar from Monday 00:00 over `windows`
+/// (each next starts where the one before ended plus 1 ns) at Friday 00:00, answering each
+/// with the trades of its window; returns what is delivered, without the requests' indices and
+/// ends.
+fn run_kept_windows(
+    audusd_sim: CurrencyPair,
+    client_id: ClientId,
+    venue: Venue,
+    windows: &[(u64, u64)],
+) -> Vec<Kept> {
+    let id = audusd_sim.id;
+    let (tick, two_days) = (bar_type_of(id, "3-TICK"), bar_type_of(id, "2-DAY"));
+    let now = new_york("2024-01-12T00:00:00");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, now, &[tick, two_days]);
+    let trades = [
+        (new_york("2024-01-08T10:00:00"), 1, "m1"),
+        (new_york("2024-01-09T09:00:00"), 2, "t1"),
+        (new_york("2024-01-09T15:00:00"), 4, "t2"),
+        (new_york("2024-01-10T09:00:00"), 8, "w1"),
+        (new_york("2024-01-11T09:00:00"), 16, "h1"),
+    ];
+
+    for &(start, next) in windows {
+        let spec = KeptSpec {
+            time_zone: Some("America/New_York"),
+            ..kept_window(start, next)
+        };
+        let request = fixture.request(&[tick, two_days], spec).unwrap();
+        let answered: Vec<_> = trades
+            .iter()
+            .copied()
+            .filter(|(ts, ..)| (start..next).contains(ts))
+            .collect();
+        fixture.answer(request, &answered, None);
+    }
+
+    fixture
+        .delivered()
+        .into_iter()
+        .filter_map(|kept| match kept {
+            Kept::Trade(_, trade_id, cached) => Some(Kept::Trade(0, trade_id, cached)),
+            Kept::Bar(_, bar_type, ts, volume, cached) => {
+                Some(Kept::Bar(0, bar_type, ts, volume, cached))
+            }
+            Kept::End(..) => None,
+            other => Some(other),
+        })
+        .collect()
+}
+
+#[rstest]
+fn test_kept_requests_across_two_windows_build_the_tick_and_two_day_bars_of_one_request(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (tick, two_days) = (bar_type_of(id, "3-TICK"), bar_type_of(id, "2-DAY"));
+    let (monday_open, split, end) = (
+        new_york("2024-01-08T00:00:00"),
+        new_york("2024-01-09T12:00:00"),
+        new_york("2024-01-11T12:00:00"),
+    );
+
+    let one = run_kept_windows(audusd_sim.clone(), client_id, venue, &[(monday_open, end)]);
+    let two = run_kept_windows(
+        audusd_sim,
+        client_id,
+        venue,
+        &[(monday_open, split), (split, end)],
+    );
+
+    // t2 completes the tick bar m1 and t1 opened in the first window; the 2-DAY bar keeps
+    // Monday's grid and closes Wednesday 00:00 with the trades of both windows
+    assert_eq!(two, one);
+    assert_eq!(
+        one,
+        vec![
+            kept_trade(0, "m1", &[0, 0]),
+            kept_trade(0, "t1", &[0, 0]),
+            kept_bar(0, tick, new_york("2024-01-09T15:00:00"), 7, &[1, 0]),
+            kept_trade(0, "t2", &[1, 0]),
+            kept_bar(0, two_days, new_york("2024-01-10T00:00:00"), 7, &[1, 1]),
+            kept_trade(0, "w1", &[1, 1]),
+            kept_trade(0, "h1", &[1, 1]),
+        ]
+    );
+}
+
+#[rstest]
+fn test_failed_kept_request_removes_its_replay_and_the_next_starts_a_new_one(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
+    let window = kept_window(monday("10:00:00"), monday("10:08:00"));
+    let failed = fixture.request(&[five], window).unwrap();
+    fixture.answer(
+        failed,
+        &[(monday("10:01:00"), 1, "a1"), (monday("10:06:00"), 2, "a2")],
+        Some("the source stopped"),
+    );
+
+    // The same window again: admitted only because no builder of it is left
+    let started = fixture
+        .request(&[five], kept_window(monday("10:00:00"), monday("10:15:00")))
+        .unwrap();
+    fixture.answer(
+        started,
+        &[(monday("10:07:00"), 4, "c1"), (monday("10:12:00"), 8, "c2")],
+        None,
+    );
+
+    // A new builder: the 10:10 bar holds c1 alone, not the failed request's a2
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            kept_trade(0, "a1", &[0]),
+            kept_bar(0, five, monday("10:05:00"), 1, &[1]),
+            kept_trade(0, "a2", &[1]),
+            Kept::End(0, Some("the source stopped".to_owned())),
+            kept_trade(1, "c1", &[1]),
+            kept_bar(1, five, monday("10:10:00"), 4, &[2]),
+            kept_trade(1, "c2", &[2]),
+            Kept::End(1, None),
+        ]
+    );
+}
+
+#[rstest]
+fn test_unsubscribing_a_kept_bar_type_never_subscribed_removes_its_builder_and_replay(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
+    first_kept_request(&mut fixture, five);
+    let sent = fixture.client_commands(0).len();
+
+    fixture
+        .engine
+        .execute(DataCommand::Unsubscribe(UnsubscribeCommand::Bars(
+            UnsubscribeBars::new(
+                five,
+                Some(client_id),
+                Some(venue),
+                UUID4::new(),
+                UnixNanos::from(monday("12:00:00")),
+                None,
+                None,
+            ),
+        )));
+    // The first window again: admitted only because no builder of it is left
+    let started = fixture
+        .request(&[five], kept_window(monday("10:00:00"), monday("10:15:00")))
+        .unwrap();
+    fixture.answer(started, &[(monday("10:12:00"), 4, "c1")], None);
+
+    // No subscription of it was released at the client
+    assert!(
+        !fixture
+            .client_commands(sent)
+            .iter()
+            .any(|command| matches!(command, DataCommand::Unsubscribe(_))),
+        "{:?}",
+        fixture.client_commands(sent)
+    );
+    let mut expected = first_kept_answer(five);
+    expected.extend([kept_trade(1, "c1", &[1]), Kept::End(1, None)]);
+    assert_eq!(fixture.delivered(), expected);
+}
+
+#[rstest]
+fn test_engine_stop_and_start_between_kept_requests_leave_the_pending_close_armed(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
+    first_kept_request(&mut fixture, five);
+
+    fixture.engine.stop();
+    fixture.engine.start();
+    let continued = fixture
+        .request(&[five], kept_window(monday("10:08:00"), monday("10:15:00")))
+        .unwrap();
+    fixture.answer(continued, &[(monday("10:12:00"), 4, "b1")], None);
+
+    let mut expected = first_kept_answer(five);
+    expected.extend([
+        kept_bar(1, five, monday("10:10:00"), 2, &[2]),
+        kept_trade(1, "b1", &[2]),
+        Kept::End(1, None),
+    ]);
+    assert_eq!(fixture.delivered(), expected);
+}
+
+#[rstest]
+fn test_subscription_after_a_kept_answer_publishes_the_range_bar_at_the_boundary_before_the_next_trade(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (five, range) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "10-RANGE"));
+    let mut fixture = KeptFixture::new(
+        audusd_sim,
+        client_id,
+        venue,
+        monday("17:00:00"),
+        &[five, range],
+    );
+    // The answer ends at now minus 1 ns; its range bar is open since 16:59:40
+    let request = fixture
+        .request(
+            &[five, range],
+            kept_window(monday("16:50:00"), monday("17:00:00")),
+        )
+        .unwrap();
+    fixture.answer(request, &[(monday("16:59:40"), 1, "t1")], None);
+
+    fixture.subscribe(five, None);
+    fixture.subscribe(range, None);
+    fixture.live(monday("17:00:00"), 2, "t2");
+    fixture.advance(monday("17:00:00"));
+    fixture.advance(monday("17:30:00"));
+    fixture.live(monday("17:30:00"), 4, "t3");
+    fixture.advance(monday("18:00:05"));
+    fixture.live(monday("18:00:05"), 8, "t4");
+
+    // The 17:00 close, at now, fires once on the engine clock, after t2 stamped then; the
+    // range bar the answer opened completes once, at 18:00, before t4
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            kept_trade(0, "t1", &[0, 0]),
+            Kept::End(0, None),
+            live_trade("t2", &[0, 0]),
+            published(five, monday("17:00:00"), 3, &[1, 0]),
+            live_trade("t3", &[1, 0]),
+            published(five, monday("17:35:00"), 4, &[2, 0]),
+            published(range, monday("18:00:00"), 7, &[2, 1]),
+            live_trade("t4", &[2, 1]),
+        ]
+    );
+}
+
+#[rstest]
+fn test_subscription_at_the_range_boundary_builds_nothing_inside_the_call(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let range = bar_type_of(audusd_sim.id, "10-RANGE");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("18:00:00"), &[range]);
+    let request = fixture
+        .request(
+            &[range],
+            kept_window(monday("17:50:00"), monday("18:00:00")),
+        )
+        .unwrap();
+    fixture.answer(request, &[(monday("17:59:40"), 1, "t1")], None);
+
+    fixture.subscribe(range, None);
+    let at_the_call = fixture.delivered();
+    fixture.advance(monday("18:00:00"));
+    fixture.live(monday("18:00:05"), 2, "t2");
+
+    assert_eq!(
+        at_the_call,
+        vec![kept_trade(0, "t1", &[0]), Kept::End(0, None)]
+    );
+    assert_eq!(
+        fixture.delivered()[at_the_call.len()..],
+        [
+            published(range, monday("18:00:00"), 1, &[1]),
+            live_trade("t2", &[1]),
+        ]
+    );
+}
+
+#[rstest]
+fn test_subscription_adopting_a_two_day_bar_kept_across_two_requests_keeps_mondays_grid(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let two_days = bar_type_of(audusd_sim.id, "2-DAY");
+    let new_york_zone = Some("America/New_York");
+    let now = new_york("2024-01-11T18:00:00");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, now, &[two_days]);
+    let windows = [
+        (
+            new_york("2024-01-08T00:00:00"),
+            new_york("2024-01-09T12:00:00"),
+        ),
+        (
+            new_york("2024-01-09T12:00:00"),
+            new_york("2024-01-11T12:00:00"),
+        ),
+    ];
+    let trades = [
+        [(new_york("2024-01-08T10:00:00"), 1, "m1")],
+        [(new_york("2024-01-09T15:00:00"), 2, "t1")],
+    ];
+    for ((start, next), answered) in windows.into_iter().zip(trades) {
+        let spec = KeptSpec {
+            time_zone: new_york_zone,
+            ..kept_window(start, next)
+        };
+        let request = fixture.request(&[two_days], spec).unwrap();
+        fixture.answer(request, &answered, None);
+    }
+
+    fixture.subscribe(two_days, new_york_zone);
+    fixture.live(new_york("2024-01-11T20:00:00"), 4, "h1");
+    fixture.advance(new_york("2024-01-13T00:00:00"));
+
+    // Monday's grid: Wednesday 00:00 (m1, t1) at the second request's end of coverage, then
+    // Friday 00:00 live (h1), not Saturday 00:00 as a grid from Thursday, when it is taken over
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            kept_trade(0, "m1", &[0]),
+            Kept::End(0, None),
+            kept_trade(1, "t1", &[0]),
+            kept_bar(1, two_days, new_york("2024-01-10T00:00:00"), 3, &[1]),
+            Kept::End(1, None),
+            live_trade("h1", &[1]),
+            published(two_days, new_york("2024-01-12T00:00:00"), 4, &[2]),
+        ]
+    );
+}
+
+#[rstest]
+fn test_subscription_held_back_during_a_kept_request_gets_its_held_trades_bars_in_live_order(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (three, five) = (bar_type_of(id, "3-MINUTE"), bar_type_of(id, "5-MINUTE"));
+    let mut fixture = KeptFixture::new(
+        audusd_sim,
+        client_id,
+        venue,
+        monday("10:08:00"),
+        &[three, five],
+    );
+    let request = fixture
+        .request(
+            &[three, five],
+            kept_window(monday("10:00:00"), monday("10:02:00")),
+        )
+        .unwrap();
+    fixture.subscribe(three, None);
+    fixture.subscribe(five, None);
+    for (ts, size, trade_id) in [
+        ("10:02:00", 2, "h1"),
+        ("10:04:00", 4, "h2"),
+        ("10:07:00", 8, "h3"),
+    ] {
+        fixture.live(monday(ts), size, trade_id);
+    }
+    fixture.answer(request, &[(monday("10:00:30"), 1, "a1")], None);
+    fixture.advance(monday("10:09:30"));
+    fixture.live(monday("10:09:30"), 16, "h4");
+    fixture.advance(monday("10:10:00"));
+
+    // The held trades drive the clock as the answer's trades: 10:03 (a1, h1), 10:05 (a1, h1,
+    // h2) and 10:06 (h2) close between them, into the answer; then the subscriptions go live
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            live_trade("h1", &[0, 0]),
+            live_trade("h2", &[0, 0]),
+            live_trade("h3", &[0, 0]),
+            kept_trade(0, "a1", &[0, 0]),
+            kept_bar(0, three, monday("10:03:00"), 3, &[1, 0]),
+            kept_bar(0, five, monday("10:05:00"), 7, &[1, 1]),
+            kept_bar(0, three, monday("10:06:00"), 4, &[2, 1]),
+            Kept::End(0, None),
+            published(three, monday("10:09:00"), 8, &[3, 1]),
+            live_trade("h4", &[3, 1]),
+            published(five, monday("10:10:00"), 24, &[3, 2]),
+        ]
     );
 }

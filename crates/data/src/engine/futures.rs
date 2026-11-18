@@ -43,6 +43,10 @@ impl DataEngine {
             return Ok(());
         };
 
+        self.admit_kept_request(
+            &RequestCommand::Bars(parent.clone()),
+            &continuous_request.request_bar_aggregation,
+        )?;
         self.ensure_continuous_future_target_instrument(&continuous_request);
         self.prepare_request_bar_aggregators_from_state(
             request_id,

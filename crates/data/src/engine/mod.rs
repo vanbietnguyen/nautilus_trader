@@ -234,6 +234,10 @@ pub struct DataEngine {
     /// The replay of each request (for a pipeline, its parent) whose aggregators are its own,
     /// until they are cleaned up.
     request_replays: AHashMap<UUID4, RequestReplay>,
+    /// The replays of builders kept by request (`update_subscriptions`) between their requests,
+    /// each idle until a request continues it, a subscription adopts its builders or the asker
+    /// removes them.
+    kept_replays: Vec<RequestReplay>,
     /// Each joined request's deadline, from its dispatch until its completion or its expiry
     /// claims it.
     request_deadlines: AHashMap<UUID4, UnixNanos>,
@@ -325,6 +329,7 @@ impl DataEngine {
             deferred_bars: Rc::new(RefCell::new(VecDeque::new())),
             interleaved_requests: AHashMap::new(),
             request_replays: AHashMap::new(),
+            kept_replays: Vec::new(),
             request_deadlines: AHashMap::new(),
             suppressed_legs: AHashSet::new(),
             late_envelopes: 0,
@@ -504,7 +509,8 @@ impl DataEngine {
         self.pending_join_requests.len()
     }
 
-    /// Starts all registered data clients and re-arms bar aggregator timers.
+    /// Starts all registered data clients and re-arms bar aggregator timers, except those of
+    /// builders a replay drives (a request's own, or kept by request), whose timers stay armed.
     pub fn start(&mut self) {
         self.is_stopped = false;
 
@@ -515,13 +521,11 @@ impl DataEngine {
             }
         }
 
-        for ((_, request_id), aggregator) in &self.bar_aggregators {
-            // Request-scoped or historical aggregators run on private clocks;
-            // re-arming them here would perturb an in-flight request's timer state
-            let is_subscription = request_id.is_none() && !aggregator.borrow().is_historical();
+        for (key, aggregator) in &self.bar_aggregators {
+            // A replay drives its builders' clock, kept or in flight: their timers stay as armed
             let spec = aggregator.borrow().bar_type().spec();
             let has_timer = spec.is_time_aggregated() || spec.aggregation == BarAggregation::Range;
-            if is_subscription && has_timer {
+            if !self.is_replay_driven(key) && has_timer {
                 aggregator
                     .borrow_mut()
                     .start_timer(Some(Rc::clone(aggregator)));
@@ -536,7 +540,8 @@ impl DataEngine {
         }
     }
 
-    /// Stops all registered data clients and bar aggregator timers.
+    /// Stops all registered data clients and bar aggregator timers, except those of builders a
+    /// replay drives (a request's own, or kept by request), whose timers stay armed.
     ///
     /// Blocks new physical subscriptions until [`Self::start`] or [`Self::reset`].
     /// Data processing, subscription ownership, and unsubscribes remain enabled.
@@ -551,8 +556,11 @@ impl DataEngine {
             }
         }
 
-        for aggregator in self.bar_aggregators.values() {
-            aggregator.borrow_mut().stop();
+        // A replay's builders keep their timers: the replay, not the engine, drives their clock
+        for (key, aggregator) in &self.bar_aggregators {
+            if !self.is_replay_driven(key) {
+                aggregator.borrow_mut().stop();
+            }
         }
 
         for state in self.spread_quote_states.values() {
@@ -583,6 +591,7 @@ impl DataEngine {
         self.request_bar_aggregations.clear();
         self.interleaved_requests.clear();
         self.request_replays.clear();
+        self.kept_replays.clear();
         self.inflight_requests.clear();
         self.request_deadlines.clear();
         self.suppressed_legs.clear();

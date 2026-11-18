@@ -49,6 +49,8 @@ const QUOTES: &str = "quotes";
 const CUT_WARMUP_REFUSED: &str = "Cannot admit a `cut_warmup` request";
 pub(super) const QUOTES_REFUSED: &str = "Cannot answer the quotes of a `quotes` request";
 pub(super) const INTERLEAVE_REFUSED: &str = "Cannot answer an `interleave` request in live order";
+pub(super) const KEPT_REFUSED: &str =
+    "Cannot keep the bar builders of an `update_subscriptions` request";
 const JOIN_SCHEMA: &str = "tbbo";
 const SESSION_TIME_ZONE: &str = "America/New_York";
 const SESSION_OPEN_TIME: civil::Time = civil::time(18, 0, 0, 0);

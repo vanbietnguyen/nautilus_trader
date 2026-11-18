@@ -1308,7 +1308,7 @@ fn test_request_time_bar_boundary_finalizes_sources_before_dependents(
 }
 
 #[rstest]
-#[case::right_open(BarIntervalType::RightOpen, ("100.00000", 1, 10_000_000_000), ("101.00000", 3, 11_000_000_000))]
+#[case::right_open(BarIntervalType::RightOpen, ("102.00000", 3, 10_000_000_000), ("103.00000", 1, 11_000_000_000))]
 #[case::left_open(BarIntervalType::LeftOpen, ("102.00000", 3, 11_000_000_000), ("103.00000", 1, 12_000_000_000))]
 fn test_request_time_bar_boundary_replays_warmup_before_final_close(
     audusd_sim: CurrencyPair,
@@ -1358,7 +1358,7 @@ fn test_request_time_bar_boundary_replays_warmup_before_final_close(
 
     let request = RequestTrades::new(
         instrument_id,
-        None,
+        Some(UnixNanos::from(10_000_000_000).to_datetime_utc()),
         None,
         None,
         Some(client_id),
@@ -1412,7 +1412,7 @@ fn test_request_time_bar_boundary_replays_warmup_before_final_close(
         UnixNanos::from(11_000_000_000),
     );
     assert_eq!(cache.borrow().bar(&bar_type), Some(&historical));
-    assert_eq!(saver.get_messages(), Vec::<Bar>::new());
+    assert_eq!(saver.get_messages(), vec![historical]);
 
     let live = make_trade(instrument_id, "103.00000", 1, "live", 11_750_000_000);
     engine.process_data(Data::Trade(live));
@@ -1438,7 +1438,7 @@ fn test_request_time_bar_boundary_replays_warmup_before_final_close(
     );
     let bars: Vec<_> = cache.borrow().bars(&bar_type).unwrap();
     assert_eq!(bars, vec![expected, historical]);
-    assert_eq!(saver.get_messages(), vec![expected]);
+    assert_eq!(saver.get_messages(), vec![historical, expected]);
 }
 
 #[rstest]
