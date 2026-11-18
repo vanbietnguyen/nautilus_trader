@@ -2435,96 +2435,8 @@ fn interleaved_deliveries(
     delivered.take()
 }
 
-fn delivered_trades(ids: &[&str]) -> Vec<OrderedDelivery> {
-    ids.iter()
-        .map(|id| OrderedDelivery::Trade(TradeId::new(*id), Vec::new()))
-        .collect()
-}
-
 fn delivered_bar(bar_type: BarType, ts: u64) -> OrderedDelivery {
     OrderedDelivery::Bar(bar_type.standard(), UnixNanos::from(ts))
-}
-
-#[rstest]
-#[case::one_step(false)]
-#[case::two_steps(true)]
-fn test_interleaved_composite_of_a_range_inclusive_follows_its_source_and_trade_as_live(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-    #[case] two_steps: bool,
-) {
-    let _ = stub_msgbus;
-    let id = audusd_sim.id;
-    let source = BarType::from(format!("{id}-10-RANGE_INCLUSIVE-LAST-INTERNAL").as_str());
-    let composite =
-        BarType::from(format!("{id}-2-TICK-LAST-INTERNAL@10-RANGE_INCLUSIVE-INTERNAL").as_str());
-    let second = BarType::from(format!("{id}-1-TICK-LAST-INTERNAL@2-TICK-INTERNAL").as_str());
-    let mut bar_types = vec![source, composite];
-    let mut expected = [
-        delivered_trades(&["t1", "t2", "t3"]),
-        vec![delivered_bar(source, 3_000)],
-        delivered_trades(&["t4", "t5"]),
-        vec![
-            delivered_bar(source, 5_000),
-            delivered_bar(composite, 5_000),
-        ],
-    ]
-    .concat();
-    if two_steps {
-        bar_types.push(second);
-        expected.push(delivered_bar(second, 5_000));
-    }
-    expected.extend(delivered_trades(&["t6"]));
-
-    let live = live_deliveries(audusd_sim.clone(), client_id, venue, &bar_types, &[]);
-    let history = interleaved_deliveries(audusd_sim, client_id, venue, &bar_types, &[]);
-
-    assert_eq!(live, expected);
-    assert_eq!(history, live);
-}
-
-#[rstest]
-fn test_interleaved_range_inclusive_composite_of_tick_bars_precedes_its_trade_as_live(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-) {
-    let _ = stub_msgbus;
-    let id = audusd_sim.id;
-    let source = BarType::from(format!("{id}-1-TICK-LAST-INTERNAL").as_str());
-    let composite =
-        BarType::from(format!("{id}-10-RANGE_INCLUSIVE-LAST-INTERNAL@1-TICK-INTERNAL").as_str());
-    let bar_types = [source, composite];
-    let expected = [
-        vec![delivered_bar(source, 1_000)],
-        delivered_trades(&["t1"]),
-        vec![delivered_bar(source, 2_000)],
-        delivered_trades(&["t2"]),
-        vec![
-            delivered_bar(source, 3_000),
-            delivered_bar(composite, 3_000),
-        ],
-        delivered_trades(&["t3"]),
-        vec![delivered_bar(source, 4_000)],
-        delivered_trades(&["t4"]),
-        vec![
-            delivered_bar(source, 5_000),
-            delivered_bar(composite, 5_000),
-        ],
-        delivered_trades(&["t5"]),
-        vec![delivered_bar(source, 6_000)],
-        delivered_trades(&["t6"]),
-    ]
-    .concat();
-
-    let live = live_deliveries(audusd_sim.clone(), client_id, venue, &bar_types, &[]);
-    let history = interleaved_deliveries(audusd_sim, client_id, venue, &bar_types, &[]);
-
-    assert_eq!(live, expected);
-    assert_eq!(history, live);
 }
 
 #[rstest]
@@ -6240,4 +6152,299 @@ fn test_trades_request_without_quotes_answers_as_before_from_a_catalog_holding_q
         ],
     };
     assert_eq!(envelopes, expected);
+}
+
+const INTERLEAVE_REFUSED: &str = "Cannot answer an `interleave` request in live order";
+
+/// A shape of an `interleave` request whose bars cannot be given in live order.
+#[cfg(feature = "streaming")]
+#[derive(Clone, Copy, Debug)]
+enum UninterleavedShape {
+    /// Its `interleave` is not a boolean.
+    NotBoolean,
+    /// It is a quotes request.
+    QuotesRequest,
+    /// It is a bars request.
+    BarsRequest,
+    /// Its client is external.
+    ExternalClient,
+    /// It sets continuous-future params.
+    ContinuousFuture,
+    /// It sets a time-range pipeline with no child window.
+    EmptyTimeRange,
+    /// It sets a time-range pipeline with child windows.
+    TimeRange,
+    /// It names two instruments.
+    Batch,
+    /// A bar type is built from a trade-fed bar type.
+    Composite,
+    /// A bar type is built from a composite (two steps from the trades).
+    CompositeTwoDeep,
+    /// A time bar type is built from a trade-fed bar type.
+    TimeComposite,
+    /// A bar type is built from quotes.
+    QuoteFed,
+    /// A bar type is built from quotes, and the request carries `quotes`.
+    QuoteFedWithQuotes,
+    /// A bar type is of another instrument.
+    OtherInstrument,
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+#[case::not_boolean(UninterleavedShape::NotBoolean, "`interleave` must be a boolean")]
+#[case::quotes_request(
+    UninterleavedShape::QuotesRequest,
+    "only a trades request can set `interleave`"
+)]
+#[case::bars_request(
+    UninterleavedShape::BarsRequest,
+    "only a trades request can set `interleave`"
+)]
+#[case::external_client(
+    UninterleavedShape::ExternalClient,
+    "its client SIM is external, so this engine answers nothing"
+)]
+#[case::continuous_future(
+    UninterleavedShape::ContinuousFuture,
+    "its continuous-future params nest it in a continuous-future pipeline, which answers bars \
+     only"
+)]
+#[case::empty_time_range(
+    UninterleavedShape::EmptyTimeRange,
+    "its `time_range_generator` nests it in a time-range pipeline, whose windows feed its bars \
+     apart from the trades it is given"
+)]
+#[case::time_range(
+    UninterleavedShape::TimeRange,
+    "its `time_range_generator` nests it in a time-range pipeline, whose windows feed its bars \
+     apart from the trades it is given"
+)]
+#[case::batch(
+    UninterleavedShape::Batch,
+    "it must name exactly one instrument (batches are refused), received 2"
+)]
+#[case::composite(
+    UninterleavedShape::Composite,
+    "its bar type AUD/USD.SIM-2-TICK-LAST-INTERNAL@10-RANGE_INCLUSIVE-INTERNAL is not built from \
+     its trades: it is a composite, built from other bars"
+)]
+#[case::composite_two_deep(
+    UninterleavedShape::CompositeTwoDeep,
+    "its bar type AUD/USD.SIM-1-TICK-LAST-INTERNAL@2-TICK-INTERNAL is not built from its trades: \
+     it is a composite, built from other bars"
+)]
+#[case::time_composite(
+    UninterleavedShape::TimeComposite,
+    "its bar type AUD/USD.SIM-1-SECOND-LAST-INTERNAL@10-RANGE_INCLUSIVE-INTERNAL is not built \
+     from its trades: it is a composite, built from other bars"
+)]
+#[case::quote_fed(
+    UninterleavedShape::QuoteFed,
+    "its bar type AUD/USD.SIM-1-TICK-BID-INTERNAL is not built from its trades: it is built from \
+     quotes"
+)]
+#[case::quote_fed_with_quotes(
+    UninterleavedShape::QuoteFedWithQuotes,
+    "its bar type AUD/USD.SIM-1-TICK-BID-INTERNAL is not built from its trades: it is built from \
+     quotes"
+)]
+#[case::other_instrument(
+    UninterleavedShape::OtherInstrument,
+    "its bar type GBP/USD.SIM-1-TICK-LAST-INTERNAL is not built from its trades: it is of \
+     another instrument"
+)]
+fn test_interleave_request_of_an_unserved_shape_is_refused_before_any_dispatch(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] shape: UninterleavedShape,
+    #[case] reason: &str,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let _catalog_dir = register_quoted_catalog(&fixture, "interleave-unserved", &COUNTEREXAMPLE);
+    let id = fixture.instrument_id;
+    let tick = fixture.bar_type;
+    let range_inclusive = BarType::from(format!("{id}-10-RANGE_INCLUSIVE-LAST-INTERNAL").as_str());
+    let composite =
+        BarType::from(format!("{id}-2-TICK-LAST-INTERNAL@10-RANGE_INCLUSIVE-INTERNAL").as_str());
+    let bar_types = match shape {
+        UninterleavedShape::Composite => vec![range_inclusive, composite],
+        UninterleavedShape::CompositeTwoDeep => vec![
+            range_inclusive,
+            BarType::from(format!("{id}-1-TICK-LAST-INTERNAL@2-TICK-INTERNAL").as_str()),
+            composite,
+        ],
+        UninterleavedShape::TimeComposite => vec![
+            range_inclusive,
+            BarType::from(
+                format!("{id}-1-SECOND-LAST-INTERNAL@10-RANGE_INCLUSIVE-INTERNAL").as_str(),
+            ),
+        ],
+        UninterleavedShape::QuoteFed | UninterleavedShape::QuoteFedWithQuotes => {
+            vec![
+                tick,
+                BarType::from(format!("{id}-1-TICK-BID-INTERNAL").as_str()),
+            ]
+        }
+        UninterleavedShape::OtherInstrument => {
+            vec![tick, BarType::from("GBP/USD.SIM-1-TICK-LAST-INTERNAL")]
+        }
+        _ => vec![tick],
+    };
+    let mut params = json!({
+        "bar_types": bar_types.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "update_subscriptions": false,
+        "interleave": true,
+    });
+    let mut instrument_ids = vec![id];
+
+    match shape {
+        UninterleavedShape::NotBoolean => params["interleave"] = json!("true"),
+        UninterleavedShape::ExternalClient => {
+            let engine = fixture.engine.borrow();
+            engine
+                .cache()
+                .borrow_mut()
+                .add_external_data_client(client_id);
+        }
+        UninterleavedShape::ContinuousFuture => {
+            params["continuous_future_transitions"] = json!([]);
+        }
+        UninterleavedShape::EmptyTimeRange => {
+            params["time_range_generator"] = json!("");
+            params["durations_seconds"] = json!([]);
+        }
+        UninterleavedShape::TimeRange => {
+            params["time_range_generator"] = json!("");
+            params["durations_seconds"] = json!([1]);
+        }
+        UninterleavedShape::Batch => instrument_ids.push(InstrumentId::from("GBP/USD.SIM")),
+        UninterleavedShape::QuoteFedWithQuotes => params["quotes"] = json!(true),
+        _ => {}
+    }
+    let (start, end) = (
+        Some(UnixNanos::from(1_000).to_datetime_utc()),
+        Some(UnixNanos::from(2_999).to_datetime_utc()),
+    );
+    let params = Some(serde_json::from_value(params).unwrap());
+    let request_id = UUID4::new();
+    let request = match shape {
+        UninterleavedShape::QuotesRequest => RequestCommand::Quotes(RequestQuotes::new(
+            instrument_ids,
+            start,
+            end,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::default(),
+            params,
+        )),
+        UninterleavedShape::BarsRequest => RequestCommand::Bars(RequestBars::new(
+            tick,
+            start,
+            end,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::default(),
+            params,
+        )),
+        _ => RequestCommand::Trades(RequestTrades::new(
+            instrument_ids,
+            start,
+            end,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::default(),
+            params,
+        )),
+    };
+    let tap = TappedResponses::install();
+
+    let result = fixture.engine.borrow_mut().execute_request(request);
+
+    let error = result
+        .expect_err("an `interleave` request of an unserved shape must be refused")
+        .to_string();
+    assert_eq!(error, format!("{INTERLEAVE_REFUSED}: {reason}"));
+    assert_eq!(
+        tap.take(request_id),
+        vec![terminal(None, Some(&error))],
+        "one terminal and nothing else"
+    );
+    assert!(
+        fixture.recorder.borrow().is_empty(),
+        "a refused request reaches no client: {:?}",
+        fixture.recorder.borrow()
+    );
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+    assert_eq!(fixture.engine.borrow().time_range_pipeline_count(), 0);
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_interleave_leg_of_a_request_join_is_refused_before_dispatch_naming_the_join(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let _catalog_dir = register_quoted_catalog(&fixture, "interleave-join-leg", &COUNTEREXAMPLE);
+    let (leg_id, join_id) = (UUID4::new(), UUID4::new());
+    let join = RequestJoin::new(
+        vec![leg_id],
+        Some(UnixNanos::from(1_000).to_datetime_utc()),
+        Some(UnixNanos::from(2_999).to_datetime_utc()),
+        join_id,
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    let join_tap = QuotedResponses::install(join_id);
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(RequestCommand::Join(join))
+        .unwrap();
+    let params = quoted_params(&fixture, QuotedBars::InterleavedTicks, None);
+    let leg = RequestCommand::Trades(RequestTrades::new(
+        vec![fixture.instrument_id],
+        Some(UnixNanos::from(1_000).to_datetime_utc()),
+        Some(UnixNanos::from(2_999).to_datetime_utc()),
+        None,
+        Some(client_id),
+        leg_id,
+        UnixNanos::default(),
+        Some(serde_json::from_value(params).unwrap()),
+    ));
+
+    let result = fixture.engine.borrow_mut().execute_request(leg);
+
+    let error = result
+        .expect_err("an `interleave` leg of a request join must be refused")
+        .to_string();
+    assert_eq!(
+        error,
+        format!(
+            "{INTERLEAVE_REFUSED}: it is a leg of the request join {join_id}, whose answer is \
+             rebuilt as one data type"
+        )
+    );
+    assert_eq!(
+        join_tap.take(),
+        vec![quoted_end(QuotedPart::Nothing, Some(&error))],
+        "the join ends with the leg's reason, once"
+    );
+    assert!(
+        fixture.recorder.borrow().is_empty(),
+        "a refused leg reaches no client: {:?}",
+        fixture.recorder.borrow()
+    );
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
 }

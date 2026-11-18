@@ -28,7 +28,7 @@ use nautilus_common::{
 use nautilus_core::{Params, UUID4, UnixNanos, datetime::get_timezone};
 use nautilus_model::{
     data::{Bar, BarType, QuoteTick, TradeTick},
-    identifiers::ClientId,
+    identifiers::{ClientId, InstrumentId},
 };
 
 use super::{
@@ -42,9 +42,9 @@ use super::{
     ValueImbalanceBarAggregator, ValueRunsBarAggregator, VolumeBarAggregator,
     VolumeImbalanceBarAggregator, VolumeRunsBarAggregator,
     handlers::{JoinedRelease, JoinedSlot, JoinedTradeHandler, WarmupBuffer},
-    log_error_on_cache_insert, process_engine_bar, request_bar_aggregation_from_params,
-    request_params,
-    requests::time_zone_from_params,
+    has_continuous_future_params, has_time_range_pipeline_params, log_error_on_cache_insert,
+    process_engine_bar, request_bar_aggregation_from_params, request_params,
+    requests::{INTERLEAVE, INTERLEAVE_REFUSED, time_zone_from_params},
     responses::parent_request_window,
     switchboard,
 };
@@ -76,6 +76,107 @@ pub(super) struct ClosingPart<'a> {
 }
 
 impl DataEngine {
+    /// Admits a request that sets `interleave`, or refuses it with a reason naming the first
+    /// shape on its route that cannot be answered in live order.
+    ///
+    /// Live order is guaranteed only for bars built directly from the request's own trades, so
+    /// the one admitted shape is a trades request for one instrument whose every bar type its
+    /// trades feed (see [`why_not_fed_by_trades`], the same test that routes a trade to the
+    /// request's aggregators), answered by its client, by a date-range plan or by a join
+    /// (`cut_warmup`): each answer reaches [`Self::respond_interleaved_trades`]. It sees the
+    /// request's route in the engine's routing order: its kind, its client, the pipeline it is
+    /// a leg of, the pipelines its params nest it in, its instruments, then its bar types.
+    /// Without `interleave`, or with it `false`, the request is admitted at once, unread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request sets `interleave` and:
+    /// - The value is not a boolean.
+    /// - It is not a trades request.
+    /// - Its client is external (this engine would answer nothing).
+    /// - It is a leg of a `RequestJoin` (whose answer is rebuilt as one data type).
+    /// - It sets continuous-future or time-range pipeline params (those pipelines feed the
+    ///   aggregators apart from the trades the requester is given).
+    /// - It does not name exactly one instrument (a batch).
+    /// - A bar type it asks is not fed by its trades: a composite (built from other bars),
+    ///   a bar type built from quotes, or one of another instrument. The error names the first.
+    pub(super) fn admit_interleave(&self, req: &RequestCommand) -> anyhow::Result<()> {
+        let Some(value) = request_params(req).and_then(|params| params.get(INTERLEAVE)) else {
+            return Ok(());
+        };
+        match value.as_bool() {
+            Some(true) => {}
+            Some(false) => return Ok(()),
+            None => anyhow::bail!("{INTERLEAVE_REFUSED}: `interleave` must be a boolean"),
+        }
+
+        let RequestCommand::Trades(cmd) = req else {
+            anyhow::bail!("{INTERLEAVE_REFUSED}: only a trades request can set `interleave`");
+        };
+
+        if let Some(client_id) = req.client_id()
+            && self.is_external_client(*client_id)
+        {
+            anyhow::bail!(
+                "{INTERLEAVE_REFUSED}: its client {client_id} is external, so this engine \
+                 answers nothing"
+            );
+        }
+
+        if let Some(&(pipeline_id, _)) = self
+            .request_pipeline_parent_request_id
+            .get(req.request_id())
+        {
+            let join_id = self
+                .parent_join_request_id
+                .get(&pipeline_id)
+                .copied()
+                .unwrap_or(pipeline_id);
+            anyhow::bail!(
+                "{INTERLEAVE_REFUSED}: it is a leg of the request join {join_id}, whose answer \
+                 is rebuilt as one data type"
+            );
+        }
+
+        let params = request_params(req);
+        if has_continuous_future_params(params) {
+            anyhow::bail!(
+                "{INTERLEAVE_REFUSED}: its continuous-future params nest it in a \
+                 continuous-future pipeline, which answers bars only"
+            );
+        }
+
+        if has_time_range_pipeline_params(params) {
+            anyhow::bail!(
+                "{INTERLEAVE_REFUSED}: its `time_range_generator` nests it in a time-range \
+                 pipeline, whose windows feed its bars apart from the trades it is given"
+            );
+        }
+
+        let [instrument_id] = cmd.instrument_ids.as_slice() else {
+            anyhow::bail!(
+                "{INTERLEAVE_REFUSED}: it must name exactly one instrument (batches are \
+                 refused), received {}",
+                cmd.instrument_ids.len(),
+            );
+        };
+
+        let Some(state) = request_bar_aggregation_from_params(params)? else {
+            return Ok(());
+        };
+
+        for bar_type in &state.bar_types {
+            if let Some(reason) = why_not_fed_by_trades(bar_type, *instrument_id) {
+                anyhow::bail!(
+                    "{INTERLEAVE_REFUSED}: its bar type {bar_type} is not built from its \
+                     trades: {reason}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     pub(super) fn prepare_request_bar_aggregators_from_state(
         &mut self,
         request_id: UUID4,
@@ -370,14 +471,15 @@ impl DataEngine {
 
     /// Answers a trades request that set `interleave` with response parts in live order.
     ///
-    /// Trades feed the request aggregators one at a time. A bar a trade completes is delivered
-    /// before that trade, except a bar whose chain starts at a `RANGE_INCLUSIVE` bar type (see
-    /// [`follows_completing_trade`]), which is delivered after it (the live publication order).
-    /// Each bar delivery first sends the trades gathered since the previous one, and each bar
-    /// enters the cache only as its part is sent, so a trade's handler finds in the cache the
-    /// bars live publication has cached by that trade. The last part of a partial envelope, the
-    /// trades after the last completed bar (possibly none), is sent as a part; a completed
-    /// envelope ends the request through [`Self::finish_interleaved`], with its reason.
+    /// Trades feed the request aggregators one at a time; admission leaves only bar types its
+    /// trades feed (see [`Self::admit_interleave`]). A bar a trade completes is delivered before
+    /// that trade, except a `RANGE_INCLUSIVE` bar, which contains its completing trade and is
+    /// delivered after it (the live publication order). Each bar delivery first sends the
+    /// trades gathered since the previous one, and each bar enters the cache only as its part
+    /// is sent, so a trade's handler finds in the cache the bars live publication has cached by
+    /// that trade. The last part of a partial envelope, the trades after the last completed bar
+    /// (possibly none), is sent as a part; a completed envelope ends the request through
+    /// [`Self::finish_interleaved`], with its reason.
     pub(super) fn respond_interleaved_trades(
         &mut self,
         resp: &TradesResponse,
@@ -398,7 +500,7 @@ impl DataEngine {
             let completed = std::mem::take(&mut *bars.borrow_mut());
             let (after, before): (Vec<Bar>, Vec<Bar>) = completed
                 .into_iter()
-                .partition(|bar| follows_completing_trade(bar.bar_type, &state.bar_types));
+                .partition(|bar| bar.bar_type.spec().aggregation == BarAggregation::RangeInclusive);
 
             send_interleaved_bars(&self.cache, resp, &mut pending, before);
             pending.push(*trade);
@@ -517,10 +619,7 @@ impl DataEngine {
         let aggregator_request_id = state.aggregator_request_id(request_id);
 
         for bar_type in &state.bar_types {
-            if bar_type.is_composite()
-                || bar_type.instrument_id() != trade.instrument_id
-                || bar_type.spec().price_type != PriceType::Last
-            {
+            if why_not_fed_by_trades(bar_type, trade.instrument_id).is_some() {
                 continue;
             }
 
@@ -1357,35 +1456,19 @@ fn sources_before_dependents(bar_types: &[BarType]) -> Vec<BarType> {
     ordered
 }
 
-/// Returns whether a bar of `bar_type` that a trade completes goes out after that trade.
-///
-/// Live, an update-fed `RANGE_INCLUSIVE` bar is published after its completing update, and a
-/// composite is published while the bar it is built from is, whatever its own aggregation. So a
-/// bar follows its trade when the chain of `bar_types` it is built from starts at a
-/// `RANGE_INCLUSIVE` bar type that is not a composite.
-fn follows_completing_trade(bar_type: BarType, bar_types: &[BarType]) -> bool {
-    let mut current = bar_types
-        .iter()
-        .find(|candidate| candidate.standard() == bar_type.standard())
-        .copied()
-        .unwrap_or(bar_type);
-
-    // Bounded by the number of bar types so a cyclic chain cannot loop
-    for _ in 0..bar_types.len() {
-        if !current.is_composite() {
-            break;
-        }
-
-        let Some(source) = bar_types
-            .iter()
-            .find(|candidate| candidate.standard() == current.composite().standard())
-        else {
-            return false;
-        };
-        current = *source;
+/// Returns why the request aggregator of `bar_type` is not fed by the trades of `instrument_id`,
+/// or `None` when it is: a trade reaches only the aggregators of bar types that are not
+/// composites, price `LAST` and are of its instrument.
+fn why_not_fed_by_trades(bar_type: &BarType, instrument_id: InstrumentId) -> Option<&'static str> {
+    if bar_type.is_composite() {
+        Some("it is a composite, built from other bars")
+    } else if bar_type.spec().price_type != PriceType::Last {
+        Some("it is built from quotes")
+    } else if bar_type.instrument_id() != instrument_id {
+        Some("it is of another instrument")
+    } else {
+        None
     }
-
-    !current.is_composite() && current.spec().aggregation == BarAggregation::RangeInclusive
 }
 
 /// Live data held back for a bar aggregator that is still replaying a historical request.

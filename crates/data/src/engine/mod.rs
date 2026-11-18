@@ -1654,6 +1654,8 @@ impl DataEngine {
         let join = admit_cut_warmup(&req, || self.clock.borrow().timestamp_ns())?;
         #[cfg(feature = "streaming")]
         self.validate_catalog_update(&req)?;
+        // An `interleave` request is admitted on its whole route before any of it runs
+        self.admit_interleave(&req)?;
 
         // A `quotes` request is admitted on its whole route and plan before any of it runs
         if carries_quotes(&req) {
