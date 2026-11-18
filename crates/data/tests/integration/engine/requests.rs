@@ -2374,9 +2374,10 @@ enum HistoryAnswer {
 
 /// Every way of [`HistoryAnswer`] this build serves.
 fn history_answers() -> Vec<HistoryAnswer> {
-    let mut answers = vec![HistoryAnswer::Client];
     #[cfg(feature = "streaming")]
-    answers.push(HistoryAnswer::Catalog);
+    let answers = vec![HistoryAnswer::Client, HistoryAnswer::Catalog];
+    #[cfg(not(feature = "streaming"))]
+    let answers = vec![HistoryAnswer::Client];
     answers
 }
 
@@ -2425,6 +2426,8 @@ fn interleaved_deliveries(
 
     let tape = order_tape(instrument_id);
     let (first, last) = (tape[0].ts_init, tape[tape.len() - 1].ts_init);
+    #[cfg(not(feature = "streaming"))]
+    let _ = first;
     let request = |start: Option<UnixNanos>, end: Option<UnixNanos>| {
         DataCommand::Request(RequestCommand::Trades(RequestTrades::new(
             instrument_id,
@@ -3232,7 +3235,6 @@ fn test_trades_request_with_cut_warmup_false_takes_the_ordinary_path(
 const NY_2026_11_11_1800: u64 = 1_794_438_000_000_000_000;
 #[cfg(feature = "streaming")]
 const NY_2026_11_12_1800: u64 = 1_794_524_400_000_000_000;
-#[cfg(feature = "streaming")]
 const NY_2026_11_12_2000: u64 = 1_794_531_600_000_000_000;
 #[cfg(feature = "streaming")]
 const NY_2026_10_30_1800_EDT: u64 = 1_793_397_600_000_000_000;
