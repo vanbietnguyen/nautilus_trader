@@ -167,6 +167,8 @@ pub const PAYLOAD_TYPE_REQUEST_COMMAND: &str = "RequestCommand";
 pub const PAYLOAD_TYPE_SUBSCRIBE_COMMAND: &str = "SubscribeCommand";
 /// The canonical `payload_type` tag for `UnsubscribeCommand`.
 pub const PAYLOAD_TYPE_UNSUBSCRIBE_COMMAND: &str = "UnsubscribeCommand";
+/// The canonical `payload_type` tag for `ReleaseKeptBars`.
+pub const PAYLOAD_TYPE_RELEASE_KEPT_BARS: &str = "ReleaseKeptBars";
 #[cfg(feature = "defi")]
 /// The canonical `payload_type` tag for `DefiRequestCommand`.
 pub const PAYLOAD_TYPE_DEFI_REQUEST_COMMAND: &str = "DefiRequestCommand";
@@ -264,6 +266,7 @@ pub(crate) const DEFAULT_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_REQUEST_COMMAND,
     PAYLOAD_TYPE_SUBSCRIBE_COMMAND,
     PAYLOAD_TYPE_UNSUBSCRIBE_COMMAND,
+    PAYLOAD_TYPE_RELEASE_KEPT_BARS,
     #[cfg(feature = "defi")]
     PAYLOAD_TYPE_DEFI_REQUEST_COMMAND,
     #[cfg(feature = "defi")]
@@ -408,6 +411,7 @@ fn extract_data_command_identity(command: &DataCommand) -> Option<UUID4> {
         DataCommand::Request(cmd) => Some(*cmd.request_id()),
         DataCommand::Subscribe(cmd) => Some(cmd.command_id()),
         DataCommand::Unsubscribe(cmd) => Some(cmd.command_id()),
+        DataCommand::ReleaseKeptBars(cmd) => Some(cmd.command_id),
         #[cfg(feature = "defi")]
         DataCommand::DefiRequest(cmd) => Some(*cmd.request_id()),
         #[cfg(feature = "defi")]
@@ -1310,7 +1314,8 @@ pub fn encode_time_event(event: &TimeEvent) -> Result<EncodedPayload, EncodeErro
 /// dispatches by the wrapper's [`std::any::TypeId`] and the inner command category
 /// never reaches a bare-type encoder. The dispatcher unwraps the category, encodes the
 /// serializable inner enum (`RequestCommand`, `SubscribeCommand`, or
-/// `UnsubscribeCommand`), and stamps that category's canonical `payload_type` tag.
+/// `UnsubscribeCommand`) or the `ReleaseKeptBars` struct, and stamps that category's
+/// canonical `payload_type` tag.
 ///
 /// Request IDs, command IDs, and correlation IDs do not have a matching [`IndexKind`]
 /// today, so data commands emit no sidecar indices. Correlation is recovered from the
@@ -1326,6 +1331,7 @@ pub fn encode_data_command(command: &DataCommand) -> Result<EncodedPayload, Enco
         DataCommand::Request(cmd) => encode_data_command_category(cmd, PAYLOAD_TYPE_REQUEST_COMMAND),
         DataCommand::Subscribe(cmd) => encode_data_command_category(cmd, PAYLOAD_TYPE_SUBSCRIBE_COMMAND),
         DataCommand::Unsubscribe(cmd) => encode_data_command_category(cmd, PAYLOAD_TYPE_UNSUBSCRIBE_COMMAND),
+        DataCommand::ReleaseKeptBars(cmd) => encode_data_command_category(cmd, PAYLOAD_TYPE_RELEASE_KEPT_BARS),
         #[cfg(feature = "defi")]
         DataCommand::DefiRequest(cmd) => encode_data_command_category(cmd, PAYLOAD_TYPE_DEFI_REQUEST_COMMAND),
         #[cfg(feature = "defi")]
@@ -1583,8 +1589,8 @@ fn encode_bars_response(response: &BarsResponse) -> Result<EncodedPayload, Encod
 #[cfg(test)]
 mod tests {
     use nautilus_common::messages::data::{
-        RequestCommand, RequestQuotes, SubscribeCommand, SubscribeQuotes, UnsubscribeCommand,
-        UnsubscribeQuotes,
+        ReleaseKeptBars, RequestCommand, RequestQuotes, SubscribeCommand, SubscribeQuotes,
+        UnsubscribeCommand, UnsubscribeQuotes,
     };
     #[cfg(feature = "defi")]
     use nautilus_common::messages::defi::{
@@ -3343,6 +3349,33 @@ mod tests {
     }
 
     #[rstest]
+    fn data_command_release_kept_bars_envelope_stamps_release_kept_bars_payload_type() {
+        let release = make_release_kept_bars();
+        let envelope = DataCommand::ReleaseKeptBars(release.clone());
+        let encoded = encode_data_command(&envelope).expect("encode");
+
+        assert_eq!(
+            encoded.payload_type.expect("override").as_str(),
+            PAYLOAD_TYPE_RELEASE_KEPT_BARS,
+        );
+        assert!(encoded.index_keys.is_empty());
+
+        let decoded: ReleaseKeptBars = rmp_serde::from_slice(&encoded.payload).expect("decode");
+        assert_eq!(decoded, release);
+    }
+
+    #[rstest]
+    fn default_registry_release_kept_bars_identity_dedupes_dispatch_hops() {
+        let registry = default_registry();
+        let release = make_release_kept_bars();
+        let expected = release.command_id;
+
+        let identity = registry.identity_for_any(&DataCommand::ReleaseKeptBars(release));
+
+        assert_eq!(identity, Some(expected));
+    }
+
+    #[rstest]
     fn data_command_registered_under_category_payload_type() {
         // The default registry must dispatch DataCommand through encode_data_command and
         // stamp the inner category tag, not the wrapper sentinel tag.
@@ -3493,6 +3526,10 @@ mod tests {
             Some(correlation_id()),
             None,
         ))
+    }
+
+    fn make_release_kept_bars() -> ReleaseKeptBars {
+        ReleaseKeptBars::new(bar_type(), UUID4::new(), UUID4::new(), UnixNanos::from(200))
     }
 
     #[cfg(feature = "defi")]

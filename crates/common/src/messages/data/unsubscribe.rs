@@ -710,7 +710,7 @@ impl UnsubscribeBars {
 /// engine keeps for it by request (`update_subscriptions`). The engine acts only when that request
 /// is the one that started or last continued the builder's replay; any other release is ignored.
 /// It never releases a subscription.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseKeptBars {
     pub bar_type: BarType,
     pub request_id: UUID4,

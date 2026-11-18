@@ -26,7 +26,7 @@ use bytes::Bytes;
 use indexmap::IndexMap;
 use nautilus_common::{
     messages::{
-        data::{DataResponse, DataResponseEnvelope, QuotesResponse},
+        data::{DataCommand, DataResponse, DataResponseEnvelope, QuotesResponse, ReleaseKeptBars},
         execution::{SubmitOrder, TradingCommand},
     },
     msgbus::{
@@ -42,6 +42,7 @@ use nautilus_event_store::{
     default_registry, noop_halt,
 };
 use nautilus_model::{
+    data::BarType,
     enums::{
         AccountType, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
     },
@@ -887,4 +888,56 @@ fn tap_path_writes_headers_from_data_response_correlation_handler() {
     drop(adapter);
     let writer = Arc::try_unwrap(writer).expect("sole writer reference");
     let _ = writer.close(run_ended_draft()).expect("close writer");
+}
+
+#[rstest]
+fn release_kept_bars_capture_records_one_entry_across_dispatch_hops() {
+    // An actor's release reaches the tap twice, as every queued data command does: at the
+    // data engine's queue endpoint and again at its drained execute endpoint. Each hop must
+    // capture without an error (the kernel tap logs every capture error) and the run must
+    // record the release once, under its own payload tag.
+    let (writer, backend_arc) = writer_with_open_run("run-release-kept-bars", noop_halt());
+    let registry = Arc::new(default_registry());
+    let adapter = BusCaptureAdapter::new(Arc::clone(&writer), registry, noop_halt());
+
+    let release = ReleaseKeptBars::new(
+        BarType::from("ETHUSDT-PERP.BINANCE-5-MINUTE-LAST-INTERNAL"),
+        UUID4::new(),
+        UUID4::new(),
+        UnixNanos::from(300),
+    );
+    let command = DataCommand::ReleaseKeptBars(release.clone());
+
+    let queued = adapter
+        .capture::<DataCommand>(
+            Topic::from(*MessagingSwitchboard::data_engine_queue_execute()),
+            &command,
+            Headers::empty(),
+            release.ts_init,
+        )
+        .expect("queue hop captures without an error");
+    let executed = adapter
+        .capture::<DataCommand>(
+            Topic::from(*MessagingSwitchboard::data_engine_execute()),
+            &command,
+            Headers::empty(),
+            release.ts_init,
+        )
+        .expect("execute hop captures without an error");
+    assert!(queued);
+    assert!(!executed, "the execute hop must dedupe by the command id");
+
+    drop(adapter);
+    let writer = Arc::try_unwrap(writer).expect("sole writer reference");
+    writer.close(run_ended_draft()).expect("close writer");
+    let backend = backend_arc.lock();
+    assert_eq!(
+        backend.high_watermark().unwrap(),
+        2,
+        "one release and RunEnded"
+    );
+    let entry = backend.scan_seq(1).unwrap().unwrap();
+    assert_eq!(entry.payload_type.as_str(), "ReleaseKeptBars");
+    let decoded: ReleaseKeptBars = rmp_serde::from_slice(&entry.payload).unwrap();
+    assert_eq!(decoded, release);
 }
