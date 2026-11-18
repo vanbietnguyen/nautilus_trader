@@ -51,6 +51,11 @@ pub(super) const QUOTES_REFUSED: &str = "Cannot answer the quotes of a `quotes` 
 pub(super) const INTERLEAVE_REFUSED: &str = "Cannot answer an `interleave` request in live order";
 pub(super) const KEPT_REFUSED: &str =
     "Cannot keep the bar builders of an `update_subscriptions` request";
+/// Why a kept request's answer that came as a bare response ends as a failure: it certifies no
+/// coverage, so the request's kept builders are removed, not kept.
+pub(super) const KEPT_ANSWERED_BARE: &str = "A kept request answered without a plan: its answer \
+     came as a bare response, which does not certify that it holds every record of its window, \
+     so its builders are not kept";
 const JOIN_SCHEMA: &str = "tbbo";
 const SESSION_TIME_ZONE: &str = "America/New_York";
 const SESSION_OPEN_TIME: civil::Time = civil::time(18, 0, 0, 0);

@@ -13,7 +13,12 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_model::enums::BarIntervalType;
+use nautilus_common::{
+    actor::{DataActor, DataActorCore, data_actor::DataActorConfig},
+    component::Component,
+    nautilus_actor,
+};
+use nautilus_model::{enums::BarIntervalType, identifiers::ActorId};
 
 use super::*;
 
@@ -10753,6 +10758,8 @@ struct KeptSpec {
     limit: Option<usize>,
     time_zone: Option<&'static str>,
     filter_expr: Option<&'static str>,
+    /// A time-range pipeline of 5-minute children that ask only the instant each starts at.
+    point_data: bool,
     plain: bool,
 }
 
@@ -10879,6 +10886,11 @@ impl KeptFixture {
         if let Some(filter_expr) = spec.filter_expr {
             params["filter_expr"] = json!(filter_expr);
         }
+        if spec.point_data {
+            params["time_range_generator"] = json!("");
+            params["durations_seconds"] = json!([300]);
+            params["point_data"] = json!(true);
+        }
 
         let recorded = Rc::clone(&self.delivered);
         let cache = Rc::clone(&self.cache);
@@ -10942,6 +10954,20 @@ impl KeptFixture {
             None => envelope,
         };
         self.engine.response_envelope(envelope);
+    }
+
+    /// Sends the `request`th request a part of its answer: trades (`ts`, size, trade ID) at one
+    /// price in an envelope that does not complete it.
+    fn answer_part(&mut self, request: usize, trades: &[(u64, u64, &str)]) {
+        let resp = self.trades_response(request, trades);
+        let envelope = DataResponseEnvelope::new(DataResponse::Trades(resp), false, None);
+        self.engine.response_envelope(envelope);
+    }
+
+    /// Ends the `request`th request with a payload-free terminal carrying no failure reason.
+    fn end(&mut self, request: usize) {
+        let terminal = DataResponseEnvelope::terminal(self.requests[request], None);
+        self.engine.response_envelope(terminal);
     }
 
     /// Answers the `request`th request with trades (`ts`, size, trade ID) at one price in a bare
@@ -11046,6 +11072,11 @@ impl KeptFixture {
         self.recorder.borrow()[skip..].to_vec()
     }
 }
+
+/// The failure reason a kept request answered by a bare response ends with.
+const KEPT_ANSWERED_BARE: &str = "A kept request answered without a plan: its answer came as a \
+                                  bare response, which does not certify that it holds every \
+                                  record of its window, so its builders are not kept";
 
 /// 2024-01-08, a Monday: New York civil `time` that day.
 fn monday(time: &str) -> u64 {
@@ -11911,8 +11942,8 @@ fn test_kept_request_naming_a_filter_expression_is_refused_by_name_and_leaves_it
 }
 
 /// A kept request answered by a bare response, which certifies no coverage, ends as a failed one
-/// does: its replay is removed, so the same window can be asked again and starts a new builder
-/// (the 10:10 bar holds c1 alone, not a2).
+/// does, with the reason naming it: its replay is removed, so the same window can be asked again
+/// and starts a new builder (the 10:10 bar holds c1 alone, not a2).
 #[rstest]
 fn test_kept_request_answered_by_a_bare_response_removes_its_replay_and_the_next_starts_a_new_one(
     audusd_sim: CurrencyPair,
@@ -11946,7 +11977,7 @@ fn test_kept_request_answered_by_a_bare_response_removes_its_replay_and_the_next
             kept_trade(0, "a1", &[0]),
             kept_bar(0, five, monday("10:05:00"), 1, &[1]),
             kept_trade(0, "a2", &[1]),
-            Kept::End(0, None),
+            Kept::End(0, Some(KEPT_ANSWERED_BARE.to_owned())),
             kept_trade(1, "c1", &[1]),
             kept_bar(1, five, monday("10:10:00"), 4, &[2]),
             kept_trade(1, "c2", &[2]),
@@ -12007,7 +12038,7 @@ fn test_kept_request_answered_by_a_bare_response_gives_a_held_back_subscription_
             live_trade("h2", &[0, 0]),
             live_trade("h3", &[0, 0]),
             kept_trade(0, "a1", &[0, 0]),
-            Kept::End(0, None),
+            Kept::End(0, Some(KEPT_ANSWERED_BARE.to_owned())),
             published(three, monday("10:09:00"), 14, &[1, 0]),
             live_trade("h4", &[1, 0]),
         ]
@@ -12426,3 +12457,469 @@ fn test_unsubscribing_a_held_back_kept_bar_type_leaves_its_builder_to_the_reques
     // Only the answers' bars entered the cache: none was published
     assert_eq!(fixture.cache.borrow().bar_count(&five), 2);
 }
+
+/// The review's example: a kept request over 16:55 to 18:05 for 5-MINUTE and 10-RANGE bars,
+/// answered at 18:10 by a part holding t1 (3) at 16:59:58 and then a payload-free terminal with
+/// no failure reason. That terminal is a success: the end of coverage fires the 17:00 close and
+/// the 18:00 boundary, and the builders are kept, so a request over the same window is refused
+/// and the next window continues them.
+#[rstest]
+#[case::interleaved(false)]
+#[case::plain(true)]
+fn test_kept_request_ended_by_a_terminal_without_a_reason_fires_its_end_and_keeps_its_builders(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] plain: bool,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (five, range) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "10-RANGE"));
+    let mut fixture = KeptFixture::new(
+        audusd_sim,
+        client_id,
+        venue,
+        monday("18:10:00"),
+        &[five, range],
+    );
+    let window = KeptSpec {
+        plain,
+        ..kept_window(monday("16:55:00"), monday("18:05:00"))
+    };
+    let request = fixture.request(&[five, range], window).unwrap();
+    fixture.answer_part(request, &[(monday("16:59:58"), 3, "t1")]);
+    fixture.end(request);
+
+    let again = fixture.request(&[five, range], window).unwrap_err();
+    let next = KeptSpec {
+        plain,
+        ..kept_window(monday("18:05:00"), monday("18:10:00"))
+    };
+    assert!(fixture.request(&[five, range], next).is_ok());
+
+    assert!(again.contains("overlaps the coverage through"), "{again}");
+    let mut expected = vec![kept_trade(0, "t1", &[0, 0])];
+    if !plain {
+        expected.extend([
+            kept_bar(0, five, monday("17:00:00"), 3, &[1, 0]),
+            kept_bar(0, range, monday("18:00:00"), 3, &[1, 1]),
+        ]);
+    }
+    expected.extend([Kept::End(0, None), Kept::End(1, Some(again))]);
+    assert_eq!(fixture.delivered(), expected);
+    assert_eq!(cached_bars(&fixture.cache, &[five, range]), vec![1, 1]);
+}
+
+/// A kept request naming `point_data` is refused by name before dispatch, as one naming a filter
+/// expression is, and changes nothing: the next request continues the first one's open bar.
+#[rstest]
+fn test_kept_request_naming_point_data_is_refused_by_name_and_leaves_its_replay_as_it_was(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
+    first_kept_request(&mut fixture, five);
+    let next = kept_window(monday("10:08:00"), monday("10:15:00"));
+    let sent = fixture.client_commands(0).len();
+
+    let error = fixture
+        .request(
+            &[five],
+            KeptSpec {
+                point_data: true,
+                plain: true,
+                ..next
+            },
+        )
+        .unwrap_err();
+    assert!(fixture.client_commands(sent).is_empty());
+    let continued = fixture.request(&[five], next).unwrap();
+    fixture.answer(continued, &[(monday("10:12:00"), 4, "b1")], None);
+
+    assert!(
+        error.starts_with("Cannot keep the bar builders of an `update_subscriptions` request"),
+        "{error}"
+    );
+    assert!(error.contains("it names `point_data`"), "{error}");
+    let mut expected = first_kept_answer(five);
+    expected.extend([
+        Kept::End(1, Some(error)),
+        kept_bar(2, five, monday("10:10:00"), 2, &[2]),
+        kept_trade(2, "b1", &[2]),
+        Kept::End(2, None),
+    ]);
+    assert_eq!(fixture.delivered(), expected);
+}
+
+/// The review's example: a request over 10:00 to 10:10 building 5-MINUTE bars through a
+/// time-range pipeline of 5-minute `point_data` children asks only 10:00, 10:05 and 10:10, so its
+/// window is not wholly known: the 10:00 and 10:05 closes fire before the 10:05 and 10:10
+/// records, and its end fires nothing after the last (no 10:10 bar over the unasked 10:05 to
+/// 10:10).
+#[rstest]
+fn test_point_data_request_closes_nothing_after_its_last_record(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let five = bar_type_of(id, "5-MINUTE");
+    let at = |time: &str| utc_ns(&format!("2024-01-08T{time}Z"));
+    let mut fixture = PlainFixture::new(
+        vec![InstrumentAny::CurrencyPair(audusd_sim)],
+        client_id,
+        venue,
+        without_flat_bars(),
+        at("12:00:00"),
+        &[five],
+    );
+    fixture.execute(plain_trades_request(
+        id,
+        client_id,
+        UUID4::new(),
+        (Some(at("10:00:00")), Some(at("10:10:00"))),
+        None,
+        plain_params(
+            &[five],
+            json!({ "time_range_generator": "", "durations_seconds": [300], "point_data": true }),
+        ),
+    ));
+
+    for (child, (time, size)) in [("10:00:00", 1), ("10:05:00", 2), ("10:10:00", 4)]
+        .into_iter()
+        .enumerate()
+    {
+        let request = &fixture.trades_requests()[child];
+        assert_eq!(
+            (request.start, request.end),
+            (timestamp_of(Some(at(time))), timestamp_of(Some(at(time))))
+        );
+        let answer = trades_answer(
+            request.request_id,
+            client_id,
+            id,
+            &[(at(time), "1.00000", size)],
+        );
+        fixture.answer(answer, true, None);
+    }
+
+    assert_eq!(fixture.trades_requests().len(), 3);
+    assert_eq!(
+        fixture.cached(),
+        vec![vec![(at("10:00:00"), 1), (at("10:05:00"), 2)]]
+    );
+    assert_eq!(fixture.ends(), vec![None]);
+}
+
+/// A kept 3-TICK request over 10:00 to 10:05, a subscription held back on it while it ran
+/// holding live trades of 1, 2 and 4 at 10:06, 10:07 and 10:08, fails at 10:10: its answer and
+/// its terminal go out first; then the subscription's new builder, fed the held trades,
+/// publishes their 3-TICK bar (7).
+#[rstest]
+#[case::interleaved(false)]
+#[case::plain(true)]
+fn test_failed_kept_request_sends_its_end_before_its_held_back_subscription_publishes(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] plain: bool,
+) {
+    let _ = stub_msgbus;
+    let tick = bar_type_of(audusd_sim.id, "3-TICK");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("10:10:00"), &[tick]);
+    let spec = KeptSpec {
+        start: Some(monday("10:00:00")),
+        end: Some(monday("10:05:00")),
+        plain,
+        ..KeptSpec::default()
+    };
+    let request = fixture.request(&[tick], spec).unwrap();
+    fixture.subscribe(tick, None);
+    for (ts, size, trade_id) in [
+        ("10:06:00", 1, "h1"),
+        ("10:07:00", 2, "h2"),
+        ("10:08:00", 4, "h3"),
+    ] {
+        fixture.live(monday(ts), size, trade_id);
+    }
+    fixture.answer(
+        request,
+        &[(monday("10:01:00"), 1, "a1")],
+        Some("the client failed"),
+    );
+
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            live_trade("h1", &[0]),
+            live_trade("h2", &[0]),
+            live_trade("h3", &[0]),
+            kept_trade(0, "a1", &[0]),
+            Kept::End(0, Some("the client failed".to_owned())),
+            published(tick, monday("10:08:00"), 7, &[1]),
+        ]
+    );
+}
+
+/// The mirror of the source-first test above: at 10:16 the dependent is subscribed first, then
+/// the source. The kept source is driven with the dependent through its catch-up: its 10:15 bar
+/// (4) goes to the cache and to the dependent, unpublished, so the dependent's 10:15 bar has
+/// volume 7; a request continuing the source alone in between is refused by name, and the
+/// source's own hand-over has nothing due before 10:16. From then on the dependent takes the source's bars from the bus only: its 10:30
+/// bar has the 10:20 and 10:25 bars once.
+#[rstest]
+fn test_kept_dependent_handed_over_first_takes_its_kept_sources_bars_once(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let five = bar_type_of(id, "5-MINUTE");
+    let fifteen = BarType::from(format!("{id}-15-MINUTE-LAST-INTERNAL@5-MINUTE-INTERNAL").as_str());
+    let mut fixture = KeptFixture::new(
+        audusd_sim,
+        client_id,
+        venue,
+        monday("10:16:00"),
+        &[five, fifteen.standard()],
+    );
+    let plain = |spec: KeptSpec| KeptSpec {
+        plain: true,
+        ..spec
+    };
+    let request = fixture
+        .request(
+            &[five, fifteen],
+            plain(kept_window(monday("10:00:00"), monday("10:12:00"))),
+        )
+        .unwrap();
+    fixture.answer(
+        request,
+        &[
+            (monday("10:01:00"), 1, "a1"),
+            (monday("10:06:00"), 2, "a2"),
+            (monday("10:11:00"), 4, "a3"),
+        ],
+        None,
+    );
+
+    fixture.subscribe(fifteen, None);
+    let error = fixture
+        .request(
+            &[five],
+            plain(kept_window(monday("10:12:00"), monday("10:20:00"))),
+        )
+        .unwrap_err();
+    fixture.subscribe(five, None);
+    fixture.live(monday("10:17:00"), 8, "l1");
+    fixture.advance(monday("10:20:00"));
+    fixture.live(monday("10:22:00"), 16, "l2");
+    fixture.advance(monday("10:30:00"));
+
+    assert!(
+        error.contains("was driven past its coverage when a dependent of it was handed over"),
+        "{error}"
+    );
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            kept_trade(0, "a1", &[2, 0]),
+            kept_trade(0, "a2", &[2, 0]),
+            kept_trade(0, "a3", &[2, 0]),
+            Kept::End(0, None),
+            published(fifteen, monday("10:15:00"), 7, &[3, 1]),
+            Kept::End(1, Some(error)),
+            live_trade("l1", &[3, 1]),
+            published(five, monday("10:20:00"), 8, &[4, 1]),
+            live_trade("l2", &[4, 1]),
+            published(five, monday("10:25:00"), 16, &[5, 1]),
+            published(fifteen, monday("10:30:00"), 24, &[5, 2]),
+        ]
+    );
+}
+
+/// The same order on a kept source whose closes are not the dependent's: kept through 10:04 with
+/// trades of 1 and 2 at 10:01 and 10:03, at 10:16 the dependent is subscribed first. The source
+/// is driven through its 10:05, 10:10 and 10:15 closes with it, so the dependent's 10:15 bar has
+/// the source's 10:05 bar (3); the source's own hand-over has nothing due before 10:16, and its
+/// 10:20 bar (8) reaches the dependent once, through the bus.
+#[rstest]
+fn test_kept_dependent_handed_over_first_drives_its_kept_source_through_its_own_closes(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let five = bar_type_of(id, "5-MINUTE");
+    let fifteen = BarType::from(format!("{id}-15-MINUTE-LAST-INTERNAL@5-MINUTE-INTERNAL").as_str());
+    let mut fixture = KeptFixture::new(
+        audusd_sim,
+        client_id,
+        venue,
+        monday("10:16:00"),
+        &[five, fifteen.standard()],
+    );
+    let request = fixture
+        .request(
+            &[five, fifteen],
+            KeptSpec {
+                plain: true,
+                ..kept_window(monday("10:00:00"), monday("10:04:00"))
+            },
+        )
+        .unwrap();
+    fixture.answer(
+        request,
+        &[(monday("10:01:00"), 1, "a1"), (monday("10:03:00"), 2, "a2")],
+        None,
+    );
+
+    fixture.subscribe(fifteen, None);
+    fixture.subscribe(five, None);
+    fixture.live(monday("10:17:00"), 8, "l1");
+    fixture.advance(monday("10:30:00"));
+
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            kept_trade(0, "a1", &[0, 0]),
+            kept_trade(0, "a2", &[0, 0]),
+            Kept::End(0, None),
+            published(fifteen, monday("10:15:00"), 3, &[1, 1]),
+            live_trade("l1", &[1, 1]),
+            published(five, monday("10:20:00"), 8, &[2, 1]),
+            published(fifteen, monday("10:30:00"), 8, &[2, 2]),
+        ]
+    );
+}
+
+/// An actor driven against the engine: it requests 5-MINUTE bars kept by request over 10:00 to
+/// 10:08, answered with no failure reason, so it holds that builder. Disposed, it releases it:
+/// the engine then admits a new kept request over the same window, which a kept builder would
+/// refuse as overlapping its coverage.
+#[rstest]
+fn test_disposed_actor_releases_the_bar_types_it_kept_by_request(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let five = bar_type_of(id, "5-MINUTE");
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let _ = clock
+        .borrow_mut()
+        .advance_time(UnixNanos::from(monday("12:00:00")), true);
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+    let engine = Rc::new(RefCell::new(DataEngine::new(
+        Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+        Rc::clone(&cache),
+        Some(without_flat_bars()),
+    )));
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut engine.borrow_mut(),
+    );
+    let target = Rc::clone(&engine);
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: DataCommand| target.borrow_mut().execute(command)),
+    );
+    let mut actor = KeptRequester {
+        core: DataActorCore::new(DataActorConfig {
+            actor_id: Some(ActorId::from("KEPT-REQUESTER")),
+            ..Default::default()
+        }),
+    };
+    actor
+        .register(
+            TraderId::test_default(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+            Rc::clone(&cache),
+        )
+        .unwrap();
+    let params = || -> Params {
+        params_from_json(json!({
+            "bar_types": [five.to_string()],
+            "update_subscriptions": true,
+        }))
+    };
+    let at = |ns: u64| Some(UnixNanos::from(ns).to_datetime_utc());
+    let (start, end) = (monday("10:00:00"), monday("10:08:00") - 1);
+
+    let request_id = actor
+        .request_trades(
+            id,
+            at(start),
+            at(end),
+            None,
+            Some(client_id),
+            Some(params()),
+        )
+        .unwrap();
+    let answer = TradesResponse::new(
+        request_id,
+        client_id,
+        id,
+        vec![make_trade(id, "1.00000", 1, "a1", monday("10:01:00"))],
+        None,
+        None,
+        monday("12:00:00").into(),
+        None,
+    );
+    engine
+        .borrow_mut()
+        .response_envelope(DataResponseEnvelope::new(
+            DataResponse::Trades(answer),
+            true,
+            None,
+        ));
+    actor.dispose().unwrap();
+
+    let again = engine
+        .borrow_mut()
+        .execute_request(RequestCommand::Trades(RequestTrades::new(
+            id,
+            at(start),
+            at(end),
+            None,
+            Some(client_id),
+            UUID4::new(),
+            monday("12:00:00").into(),
+            Some(params()),
+        )));
+    assert!(again.is_ok(), "{again:?}");
+}
+
+/// An actor that only requests (see
+/// `test_disposed_actor_releases_the_bar_types_it_kept_by_request`).
+#[derive(Debug)]
+struct KeptRequester {
+    core: DataActorCore,
+}
+
+nautilus_actor!(KeptRequester);
+impl DataActor for KeptRequester {}

@@ -67,7 +67,7 @@ use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 pub use bar::BarAggregatorSubscription;
 use bar::{
-    BarAggregationSubscription, BarAggregatorKey, BarAggregatorWarmup, InterleavedRequest,
+    BarAggregationSubscription, BarAggregatorKey, BarAggregatorWarmup, InterleavedRequest, Release,
     RequestReplay, bar_aggregator_key,
 };
 use book::{
@@ -238,6 +238,9 @@ pub struct DataEngine {
     /// each idle until a request continues it, a subscription adopts its builders or the asker
     /// removes them.
     kept_replays: Vec<RequestReplay>,
+    /// What the clean-up of a request whose builders are kept by request left to do for their
+    /// subscriptions (see [`Release`]), until its terminal is out.
+    pending_releases: AHashMap<UUID4, Release>,
     /// Each joined request's deadline, from its dispatch until its completion or its expiry
     /// claims it.
     request_deadlines: AHashMap<UUID4, UnixNanos>,
@@ -334,6 +337,7 @@ impl DataEngine {
             interleaved_requests: AHashMap::new(),
             request_replays: AHashMap::new(),
             kept_replays: Vec::new(),
+            pending_releases: AHashMap::new(),
             request_deadlines: AHashMap::new(),
             suppressed_legs: AHashSet::new(),
             late_envelopes: 0,
@@ -598,6 +602,7 @@ impl DataEngine {
         self.interleaved_requests.clear();
         self.request_replays.clear();
         self.kept_replays.clear();
+        self.pending_releases.clear();
         self.inflight_requests.clear();
         self.request_deadlines.clear();
         self.suppressed_legs.clear();
@@ -2047,8 +2052,9 @@ impl DataEngine {
     /// that they hold every record of the window: a request that builds bars on a replay of its
     /// own, or a time-range or continuous-future pipeline one of whose children is answered this
     /// way, closes nothing after its last record, and its builders kept by request
-    /// (`update_subscriptions`) are removed as on a failure. A leg of a request's plan answered
-    /// this way is a source as any other answer.
+    /// (`update_subscriptions`) are removed as on a failure, its terminal carrying a failure
+    /// reason naming it. A leg of a request's plan answered this way is a source as any other
+    /// answer.
     pub fn response(&mut self, resp: DataResponse) {
         self.mark_bare_response(*resp.correlation_id());
         self.payload_response(resp);
@@ -2204,8 +2210,26 @@ impl DataEngine {
             return;
         }
 
-        self.cleanup_request_bar_aggregators(&request_id);
-        msgbus::send_response_envelope(envelope);
+        // A payload-free terminal with no failure reason is a successful answer with no records
+        let failure = envelope
+            .failure_reason()
+            .map(str::to_owned)
+            .or_else(|| self.kept_bare_answer_failure(request_id));
+        if failure.is_none() {
+            self.end_replay_coverage(request_id);
+        }
+        let release =
+            self.release_request_bar_aggregators(&request_id, None, None, failure.is_none());
+
+        match failure {
+            Some(reason) if envelope.failure_reason().is_none() => {
+                msgbus::send_response_envelope(&envelope.clone().with_failure(reason));
+            }
+            _ => msgbus::send_response_envelope(envelope),
+        }
+
+        // What its kept builders' subscriptions are given comes after its terminal
+        self.finish_release(request_id, release);
     }
 
     fn route_response_payload(&mut self, resp: DataResponse, envelope: &DataResponseEnvelope) {
@@ -2250,7 +2274,16 @@ impl DataEngine {
             return;
         }
 
-        let hand_over = self.process_request_bar_aggregation_response(
+        // A kept request answered bare ends with the reason its builders are not kept
+        let bare_failure = envelope
+            .completed()
+            .then(|| self.kept_bare_answer_failure(*resp.correlation_id()))
+            .flatten()
+            .filter(|_| envelope.failure_reason().is_none());
+        let failed = bare_failure.map(|reason| envelope.clone().with_failure(reason));
+        let envelope = failed.as_ref().unwrap_or(envelope);
+
+        let release = self.process_request_bar_aggregation_response(
             &resp,
             envelope.completed(),
             envelope.failure_reason(),
@@ -2258,10 +2291,8 @@ impl DataEngine {
 
         msgbus::send_response_envelope(envelope);
 
-        // The kept builders it leaves catch up after its terminal
-        if let Some(hand_over) = hand_over {
-            self.hand_over_kept_builders(hand_over);
-        }
+        // What its kept builders' subscriptions are given comes after its terminal
+        self.finish_release(*resp.correlation_id(), release);
     }
 
     fn handle_response_payload(&mut self, resp: &DataResponse) -> bool {
@@ -2309,11 +2340,8 @@ impl DataEngine {
                 }
             }
             DataResponse::OptionChainReferencePrice(r) => {
-                if let Some(hand_over) =
-                    self.process_request_bar_aggregation_response(resp, true, None)
-                {
-                    self.hand_over_kept_builders(hand_over);
-                }
+                let release = self.process_request_bar_aggregation_response(resp, true, None);
+                self.finish_release(correlation_id, release);
                 self.handle_option_chain_reference_price_response(&correlation_id, r);
                 return false;
             }

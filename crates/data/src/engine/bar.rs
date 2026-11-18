@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::fmt::Debug;
+use std::{fmt::Debug, rc::Weak};
 
 use anyhow::Context;
 use jiff::tz::TimeZone;
@@ -45,9 +45,13 @@ use super::{
     handlers::{JoinedRelease, JoinedSlot, JoinedTradeHandler, WarmupBuffer},
     has_continuous_future_params, has_time_range_pipeline_params, log_error_on_cache_insert,
     process_engine_bar, request_bar_aggregation_from_params, request_params,
-    requests::{FILTER_EXPR, INTERLEAVE, INTERLEAVE_REFUSED, KEPT_REFUSED, time_zone_from_params},
+    requests::{
+        FILTER_EXPR, INTERLEAVE, INTERLEAVE_REFUSED, KEPT_ANSWERED_BARE, KEPT_REFUSED,
+        time_zone_from_params,
+    },
     responses::{parent_request_window, quotes_part},
     switchboard,
+    time_range::TIME_RANGE_POINT_DATA,
 };
 
 /// An interleaving request's own state, from before its aggregators start until its bars and its
@@ -100,7 +104,7 @@ pub(super) struct RequestReplay {
     /// The engine clock's time when the request was dispatched: its answer covers no later.
     dispatched: UnixNanos,
     /// Whether its answer may not hold every record of its window, so its end of coverage fires
-    /// nothing: the request named a `limit` or a filter expression (see
+    /// nothing: the request named a `limit`, a filter expression or `point_data` (see
     /// [`window_not_wholly_known`]), or its answer, or a pipeline child's, came as a bare
     /// response (see [`DataEngine::mark_bare_response`]). A kept replay so marked is removed
     /// when its request ends, not kept.
@@ -109,6 +113,9 @@ pub(super) struct RequestReplay {
     /// [`DataEngine::unsubscribe_bars`]), with a subscription held back on it or without: the
     /// request keeps the builder to its end, then the replay is removed, not kept.
     unsubscribed: bool,
+    /// Its kept builders driven past its coverage for a dependent handed over before them (see
+    /// [`DataEngine::adopt_kept_builder`]): no request can continue them.
+    driven_on: Vec<BarAggregatorKey>,
 }
 
 /// Kept builders of one replay handed over to their subscriptions in one engine turn: the
@@ -117,6 +124,7 @@ pub(super) struct RequestReplay {
 /// [`DataEngine::adopt_kept_builder`]). They leave the replay together, on one clock of their own
 /// (see [`DataEngine::hand_over_clock`]), and catch up together, in deadline order (time, then
 /// timer name). A builder adopted in a later turn, by a later subscription, catches up alone.
+#[derive(Debug)]
 #[must_use]
 pub(super) struct HandOver {
     bar_types: Vec<BarType>,
@@ -125,8 +133,33 @@ pub(super) struct HandOver {
     held: Vec<HeldRecord>,
 }
 
+/// What the end of a request whose builders are kept by request leaves to do once its last bars
+/// and its terminal are out (see [`DataEngine::release_request_bar_aggregators`]), so nothing a
+/// subscription is given comes before the answer's own end.
+#[derive(Debug)]
+#[must_use]
+pub(super) enum Release {
+    /// After a success: its kept builders whose subscriptions were held back, to hand over.
+    HandOver(HandOver),
+    /// After anything else: the new builders of its held-back subscriptions, to feed.
+    Restart(Restart),
+}
+
+/// The new builders started for the subscriptions held back on the kept builders of a request
+/// that failed, expired or was cleaned up (see [`DataEngine::remove_kept_builders`]), with the
+/// live records held for them, not fed yet (see [`DataEngine::feed_restarted`]).
+#[derive(Debug)]
+#[must_use]
+pub(super) struct Restart {
+    /// Each builder's copy of each held trade, in the request's order.
+    held_trades: Vec<(BarType, Vec<Option<TradeTick>>)>,
+    /// Each restarted bar type with its held quotes or bars, sources first.
+    restarted: Vec<(BarType, Option<BarAggregatorWarmup>)>,
+}
+
 /// One live record held for kept builders that leave their replay (see
 /// [`DataEngine::take_held_records`]), with its arrival (see [`WarmupBuffer`]).
+#[derive(Debug)]
 enum HeldRecord {
     /// Each builder's copy of one held trade, in the order live gave them the copies.
     Trade(u64, Vec<(BarType, TradeTick)>),
@@ -347,6 +380,7 @@ impl DataEngine {
                 partial: false,
                 covered: None,
                 unsubscribed: false,
+                driven_on: Vec::new(),
                 ..replay
             },
             None => RequestReplay {
@@ -363,6 +397,7 @@ impl DataEngine {
                 dispatched,
                 partial: false,
                 unsubscribed: false,
+                driven_on: Vec::new(),
             },
         };
 
@@ -426,11 +461,13 @@ impl DataEngine {
     ///
     /// Returns an error if the request keeps its builders and: a bar type it asks is already
     /// running for a subscription; a request in flight has claimed one of its builders; it names
-    /// a `limit` or a filter expression; it has no `start`; some of its builders exist and some do
-    /// not; its time zone is not that of an existing builder; the source of an existing builder
-    /// was handed over to its subscription (see [`Self::handed_over_bar_handler`]); one exists
-    /// that no kept replay holds; its builders are kept by two replays, or are not all the
-    /// builders of their replay; that replay's last answer fired no end of coverage; or its
+    /// a `limit`, a filter expression or `point_data` (see [`window_not_wholly_known`]); it has no
+    /// `start`; some of its builders exist and some do not; its time zone is not that of an
+    /// existing builder; the source of an existing builder was handed over to its subscription
+    /// (see [`Self::handed_over_bar_handler`]); one exists that no kept replay holds; its builders
+    /// are kept by two replays, or are not all the builders of their replay; one of them was
+    /// driven past its coverage when a dependent of it was handed over (see
+    /// [`Self::adopt_kept_builder`]); that replay's last answer fired no end of coverage; or its
     /// `start` is before that replay's start, within its coverage, or after the next instant.
     /// Every one is checked before the replay is claimed or a builder touched, so a refusal
     /// leaves the next valid continuation as it would have been.
@@ -479,6 +516,11 @@ impl DataEngine {
             !names_a_filter(req),
             "{KEPT_REFUSED}: it names a filter expression (`filter_expr`), so its answer may hold \
              only some records of its window"
+        );
+        anyhow::ensure!(
+            !names_point_data(req),
+            "{KEPT_REFUSED}: it names `point_data`, so its time-range pipeline asks only single \
+             instants of its window"
         );
         let Some(start) = parent_request_window(Some(req)).0 else {
             anyhow::bail!(
@@ -544,6 +586,13 @@ impl DataEngine {
             "{KEPT_REFUSED}: its bar types are not all the builders of the replay that keeps {}",
             first.0
         );
+        if let Some(driven) = keys.iter().find(|key| replay.driven_on.contains(key)) {
+            anyhow::bail!(
+                "{KEPT_REFUSED}: the kept builder of {} was driven past its coverage when a \
+                 dependent of it was handed over to its subscription",
+                driven.0
+            );
+        }
 
         let Some(covered) = replay.covered else {
             anyhow::bail!(
@@ -749,7 +798,7 @@ impl DataEngine {
     /// [`RequestReplay::partial`]) does not drive it, nor does a joined request's
     /// (`cut_warmup`), whose held live trades drive it on (see
     /// [`Self::release_kept_builders`]).
-    fn end_replay_coverage(&mut self, request_id: UUID4) {
+    pub(super) fn end_replay_coverage(&mut self, request_id: UUID4) {
         let joined = self
             .request_bar_aggregations
             .get(&request_id)
@@ -893,13 +942,42 @@ impl DataEngine {
         }
     }
 
+    /// Ends the request's aggregators on a failure or a clean-up, before its terminal goes out:
+    /// what the end leaves to do (see [`Release`]) waits for that terminal (see
+    /// [`Self::finish_release`]).
     pub(super) fn cleanup_request_bar_aggregators(&mut self, request_id: &UUID4) -> bool {
         let aggregates = self.request_bar_aggregations.contains_key(request_id);
-        if let Some(hand_over) = self.release_request_bar_aggregators(request_id, None, None, false)
-        {
-            self.hand_over_kept_builders(hand_over);
+        if let Some(release) = self.release_request_bar_aggregators(request_id, None, None, false) {
+            self.pending_releases.insert(*request_id, release);
         }
         aggregates
+    }
+
+    /// Does what the end of `request_id` left to do (see [`Release`]), once its last bars and its
+    /// terminal are out: `release`, or what its clean-up left waiting.
+    pub(super) fn finish_release(&mut self, request_id: UUID4, release: Option<Release>) {
+        let pending = self.pending_releases.remove(&request_id);
+        match release.or(pending) {
+            Some(Release::HandOver(hand_over)) => self.hand_over_kept_builders(hand_over),
+            Some(Release::Restart(restart)) => self.feed_restarted(restart),
+            None => {}
+        }
+    }
+
+    /// Returns the failure reason the completed answer of `request_id` ends with when the request
+    /// keeps its builders by request (`update_subscriptions`) and its answer, or a pipeline
+    /// child's, came as a bare response (see [`Self::mark_bare_response`]): its replay is removed,
+    /// not kept, so its requester is told it holds no builder.
+    pub(super) fn kept_bare_answer_failure(&self, request_id: UUID4) -> Option<String> {
+        let kept = self
+            .request_bar_aggregations
+            .get(&request_id)
+            .is_some_and(|state| state.update_subscriptions);
+        let partial = self
+            .request_replays
+            .get(&request_id)
+            .is_some_and(|replay| replay.partial);
+        (kept && partial).then(|| KEPT_ANSWERED_BARE.to_owned())
     }
 
     /// Ends the request's aggregators: on its completed answer with no failure reason
@@ -907,22 +985,24 @@ impl DataEngine {
     ///
     /// A request's own builders stop with it. Builders kept by request (`update_subscriptions`)
     /// stay on their replay after a success (see [`Self::release_kept_builders`]), which returns
-    /// the builders it hands over to their subscriptions, for the caller to hand over once the
-    /// answer's bars and its terminal are out; after anything else, after an answer that may
-    /// not hold every record of its window (a bare response, see [`RequestReplay::partial`]),
-    /// or when one of them was unsubscribed while the request was in flight, the replay is
-    /// removed with them (see [`Self::remove_kept_builders`]). With `interleaved`, the entry of
-    /// an interleaving request holding its undelivered bars, the bars its held live trades
-    /// complete go there; the entry still held here goes with the builders, undelivered: only
-    /// [`Self::finish_interleaved`], which takes the entry first, delivers its bars. A joined
-    /// builder releases its held live trades through its own copy of `joined`.
-    fn release_request_bar_aggregators(
+    /// the builders it hands over to their subscriptions; after anything else, after an answer
+    /// that may not hold every record of its window (a bare response, see
+    /// [`RequestReplay::partial`]), or when one of them was unsubscribed while the request was in
+    /// flight, the replay is removed with them (see [`Self::remove_kept_builders`]), which returns
+    /// the new builders of their held-back subscriptions. Either is returned (see [`Release`]),
+    /// for the caller to do once the answer's bars and its terminal are out (see
+    /// [`Self::finish_release`]). With `interleaved`, the entry of an interleaving request
+    /// holding its undelivered bars, the bars its held live trades complete go there; the entry
+    /// still held here goes with the builders, undelivered: only [`Self::finish_interleaved`],
+    /// which takes the entry first, delivers its bars. A joined builder releases its held live
+    /// trades through its own copy of `joined`.
+    pub(super) fn release_request_bar_aggregators(
         &mut self,
         request_id: &UUID4,
         joined: Option<JoinedRelease>,
         interleaved: Option<&InterleavedRequest>,
         succeeded: bool,
-    ) -> Option<HandOver> {
+    ) -> Option<Release> {
         self.interleaved_requests.remove(request_id);
         let replay = self.request_replays.remove(request_id);
 
@@ -931,13 +1011,12 @@ impl DataEngine {
         if state.update_subscriptions {
             let answer = interleaved.map(|interleaved| Rc::clone(&interleaved.bars));
             return match replay {
-                Some(replay) if succeeded && !replay.partial && !replay.unsubscribed => {
-                    self.release_kept_builders(&state, replay, joined, answer.as_deref())
-                }
-                replay => {
-                    self.remove_kept_builders(&state, replay.as_ref());
-                    None
-                }
+                Some(replay) if succeeded && !replay.partial && !replay.unsubscribed => self
+                    .release_kept_builders(&state, replay, joined, answer.as_deref())
+                    .map(Release::HandOver),
+                replay => self
+                    .remove_kept_builders(&state, replay.as_ref())
+                    .map(Release::Restart),
             };
         }
 
@@ -1013,16 +1092,14 @@ impl DataEngine {
     /// Removes the replay of a kept request that failed, expired or was cleaned up, its builders
     /// stopped and removed: none of them is handed over. A subscription held back on one of them
     /// gets a new builder, started as a plain subscription now (see
-    /// [`Self::restart_held_back_subscription`]) and given the live records held for it, as live
-    /// feeds them: the held trades trade by trade across bar types in the request's order (see
-    /// [`Self::take_held_trades`]), each trade's deferred `RANGE_INCLUSIVE` bars published after
-    /// it; then any held quotes or bars one builder after the other, sources first. A builder the
-    /// replay did not make is left as it is.
+    /// [`Self::restart_held_back_subscription`]); the live records held for it are returned with
+    /// it (see [`Restart`]), to be fed once the request's terminal is out (see
+    /// [`Self::feed_restarted`]). A builder the replay did not make is left as it is.
     fn remove_kept_builders(
         &mut self,
         state: &RequestBarAggregation,
         replay: Option<&RequestReplay>,
-    ) {
+    ) -> Option<Restart> {
         let held_trades = self.take_held_trades(&state.bar_types, None);
         let mut restarted = Vec::new();
 
@@ -1047,6 +1124,21 @@ impl DataEngine {
             }
         }
 
+        (!restarted.is_empty()).then_some(Restart {
+            held_trades,
+            restarted,
+        })
+    }
+
+    /// Feeds the new builders of `restart` (see [`Restart`]) the live records held for them, as
+    /// live feeds them: the held trades trade by trade across bar types in the request's order
+    /// (see [`Self::take_held_trades`]), each trade's deferred `RANGE_INCLUSIVE` bars published
+    /// after it; then any held quotes or bars one builder after the other, sources first.
+    fn feed_restarted(&self, restart: Restart) {
+        let Restart {
+            held_trades,
+            restarted,
+        } = restart;
         let aggregator = |engine: &Self, bar_type: BarType| {
             engine
                 .bar_aggregators
@@ -1170,22 +1262,85 @@ impl DataEngine {
     /// subscription that adopts it, alone (see [`HandOver`]), with the bars held for it since
     /// its source was handed over (see [`Self::handed_over_bar_handler`]); its replay goes with
     /// its last builder.
+    ///
+    /// Its sources still kept in the replay (see [`kept_sources`]) are driven with it through its
+    /// catch-up, on its clock, so the bars it is built from are due in it as in a continuous run:
+    /// each source's bars go to the cache and to the builders driven with it that are built from
+    /// it, and are not published. Then they are idle again on the replay's clock, their next
+    /// deadlines armed there, so each is handed over in its turn from where it stands; driven
+    /// past the replay's coverage, no request can continue them (see
+    /// [`RequestReplay::driven_on`]). Until then a source's bar fired by a close of the builder's
+    /// at its own instant (see [`Self::connect_time_bar_source`]) still goes to the builder this
+    /// way; from the source's hand-over on, its bars reach the builder through the bus.
     fn adopt_kept_builder(&mut self, index: usize, bar_type: BarType) {
         let key = bar_aggregator_key(bar_type, None);
         let replay = &mut self.kept_replays[index];
         let (replay_clock, covered) = (Rc::clone(&replay.clock), replay.covered);
         replay.builders.retain(|kept| *kept != key);
+        let sources = kept_sources(&replay.bar_types, &replay.builders, bar_type);
+        replay.driven_on.extend(
+            sources
+                .iter()
+                .map(|source| bar_aggregator_key(*source, None)),
+        );
         if replay.builders.is_empty() {
             self.kept_replays.swap_remove(index);
         }
 
-        let clock = self.hand_over_clock(&replay_clock, &[bar_type]);
+        let driven: Vec<BarType> = sources.iter().copied().chain([bar_type]).collect();
+        let clock = self.hand_over_clock(&replay_clock, &driven);
+        for source in &sources {
+            let handler = self.driven_source_bar_handler(*source, &driven);
+            if let Some(aggregator) = self.bar_aggregators.get(&bar_aggregator_key(*source, None)) {
+                aggregator.borrow_mut().set_historical_mode(false, handler);
+            }
+        }
+
         let held = self.take_held_records(&[bar_type], None, covered);
         self.hand_over_kept_builders(HandOver {
             bar_types: vec![bar_type],
             clock,
             held,
         });
+
+        for source in &sources {
+            if let Some(aggregator) = self.bar_aggregators.get(&bar_aggregator_key(*source, None)) {
+                let mut aggregator = aggregator.borrow_mut();
+                if has_timer(source) {
+                    let to: Rc<RefCell<dyn Clock>> = Rc::clone(&replay_clock) as _;
+                    aggregator.continue_on_clock(to);
+                }
+            }
+        }
+    }
+
+    /// Returns the output handler of the kept source `source` driven through the catch-up of a
+    /// dependent handed over before it (see [`Self::adopt_kept_builder`]): each bar goes to the
+    /// cache, unpublished, and to each builder of `driven` built from it while that builder lives.
+    fn driven_source_bar_handler(
+        &self,
+        source: BarType,
+        driven: &[BarType],
+    ) -> Box<dyn FnMut(Bar)> {
+        let mut cache = self.engine_bar_handler(source, false);
+        let dependents: Vec<_> = driven
+            .iter()
+            .filter(|dependent| {
+                dependent.is_composite() && dependent.composite().standard() == source.standard()
+            })
+            .filter_map(|dependent| {
+                self.bar_aggregators
+                    .get(&bar_aggregator_key(*dependent, None))
+                    .map(Rc::downgrade)
+            })
+            .collect();
+
+        Box::new(move |bar: Bar| {
+            cache(bar);
+            for dependent in dependents.iter().filter_map(Weak::upgrade) {
+                dependent.borrow_mut().handle_bar(bar);
+            }
+        })
     }
 
     /// Returns the output handler of the kept builder of `bar_type` handed over to its
@@ -1390,15 +1545,14 @@ impl DataEngine {
     /// A `completed` answer ends the request. With no `failure` reason it first drives the
     /// request's replay through the end of its coverage (see [`Self::end_replay_coverage`]),
     /// once: for a pipeline, this is its parent's terminal, after every child answer. Then its
-    /// aggregators are cleaned up; the kept builders that leave for their subscriptions are
-    /// returned, to be handed over once the answer's terminal is out (see
-    /// [`Self::release_kept_builders`]).
+    /// aggregators are cleaned up; what that leaves to do for the subscriptions of kept builders
+    /// is returned, to be done once the answer's terminal is out (see [`Release`]).
     pub(super) fn process_request_bar_aggregation_response(
         &mut self,
         resp: &DataResponse,
         completed: bool,
         failure: Option<&str>,
-    ) -> Option<HandOver> {
+    ) -> Option<Release> {
         let correlation_id = *resp.correlation_id();
 
         let state = self
@@ -1637,7 +1791,7 @@ impl DataEngine {
     }
 
     /// Ends an interleaving request: on its completed answer (`closing`), on a payload-free
-    /// failure, or on expiry.
+    /// answer, or on expiry.
     ///
     /// At a completed answer with no failure reason, first drives the request's replay through
     /// the end of its coverage (see [`Self::end_replay_coverage`]). Then takes the request's
@@ -1648,15 +1802,21 @@ impl DataEngine {
     /// no answer and a client was resolved, with the dispatched client's identity and the
     /// request's window (none otherwise, and they do not enter the cache). Then sends exactly
     /// one terminal, the answer's last trades part when there is one, carrying `failure` when
-    /// there is a reason. Then hands the kept builders whose subscriptions were held back over to
-    /// them (see [`Self::hand_over_kept_builders`]): their catch-up comes after the answer.
+    /// there is a reason (for a kept request answered bare, the reason it was answered so: see
+    /// [`Self::kept_bare_answer_failure`]). Then does what the end left to do for the
+    /// subscriptions of its kept builders (see [`Self::finish_release`]): their catch-up, or the
+    /// bars their new builders' held records complete, comes after the answer.
+    ///
+    /// A payload-free answer with no failure reason ends the request as a successful answer with
+    /// a payload does: it certifies that the request's window holds no more records.
     pub(super) fn finish_interleaved(
         &mut self,
         request_id: UUID4,
         failure: Option<String>,
         closing: Option<ClosingPart<'_>>,
     ) {
-        let succeeded = closing.is_some() && failure.is_none();
+        let failure = failure.or_else(|| self.kept_bare_answer_failure(request_id));
+        let succeeded = failure.is_none();
         if succeeded {
             self.end_replay_coverage(request_id);
         }
@@ -1666,7 +1826,7 @@ impl DataEngine {
             .remove(&request_id)
             .unwrap_or_default();
         let joined = closing.as_ref().and_then(|closing| closing.joined);
-        let hand_over = self.release_request_bar_aggregators(
+        let release = self.release_request_bar_aggregators(
             &request_id,
             joined,
             Some(&interleaved),
@@ -1712,10 +1872,8 @@ impl DataEngine {
         };
         msgbus::send_response_envelope(&terminal);
 
-        // The builders it leaves catch up after the answer's last bars and its terminal
-        if let Some(hand_over) = hand_over {
-            self.hand_over_kept_builders(hand_over);
-        }
+        // What its kept builders' subscriptions are given comes after its last bars and terminal
+        self.finish_release(request_id, release);
     }
 
     pub(super) fn update_request_bar_aggregators_from_quote(
@@ -2683,10 +2841,18 @@ fn live_delivery_order(bar_type: &BarType) -> (bool, String) {
 
 /// Returns whether the window of `req` is not wholly known by the asker's own choice: it names a
 /// `limit`, so its answer may stop before its window ends (only the kinds whose records feed
-/// aggregators are read), or a filter expression (`filter_expr`), so rows of its window are left
-/// out.
+/// aggregators are read), a filter expression (`filter_expr`), so rows of its window are left
+/// out, or `point_data`, so its time-range pipeline asks only single instants of its window.
 fn window_not_wholly_known(req: &RequestCommand) -> bool {
-    names_a_limit(req) || names_a_filter(req)
+    names_a_limit(req) || names_a_filter(req) || names_point_data(req)
+}
+
+/// Returns whether `req` runs a time-range pipeline with `point_data`, whose children ask only
+/// the instant at the start of each of their windows.
+fn names_point_data(req: &RequestCommand) -> bool {
+    let params = request_params(req);
+    has_time_range_pipeline_params(params)
+        && params.and_then(|params| params.get_bool(TIME_RANGE_POINT_DATA)) == Some(true)
 }
 
 /// Returns whether `req` names a non-empty filter expression (`filter_expr`), so its answer may
@@ -2706,6 +2872,32 @@ fn names_a_limit(req: &RequestCommand) -> bool {
         RequestCommand::Bars(cmd) => cmd.limit.is_some(),
         _ => false,
     }
+}
+
+/// Returns the sources of `bar_type` still kept among `builders` of a replay whose request asked
+/// `bar_types`, nearest first: its source when kept, then that source's, and so on.
+fn kept_sources(
+    bar_types: &[BarType],
+    builders: &[BarAggregatorKey],
+    bar_type: BarType,
+) -> Vec<BarType> {
+    let mut sources = Vec::new();
+    let mut dependent = bar_type;
+
+    while dependent.is_composite() {
+        let Some(source) = bar_types
+            .iter()
+            .find(|source| source.standard() == dependent.composite().standard())
+            .copied()
+            .filter(|source| builders.contains(&bar_aggregator_key(*source, None)))
+        else {
+            break;
+        };
+        sources.push(source);
+        dependent = source;
+    }
+
+    sources
 }
 
 /// Returns whether `bar_type`'s builder runs on a clock: a time bar closes, and a `RANGE` bar

@@ -34,7 +34,7 @@ use super::{
 
 pub(super) const TIME_RANGE_GENERATOR: &str = "time_range_generator";
 const TIME_RANGE_DURATIONS_SECONDS: &str = "durations_seconds";
-const TIME_RANGE_POINT_DATA: &str = "point_data";
+pub(super) const TIME_RANGE_POINT_DATA: &str = "point_data";
 /// Why the part of a parent's window after its last child window has no source.
 const PIPELINE_ENDED_SHORT: &str =
     "its time-range pipeline ended before it, its durations having run out";

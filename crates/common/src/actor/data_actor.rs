@@ -3167,18 +3167,21 @@ pub trait DataActor {
     /// resolves, or the part after the last child of a time-range pipeline whose durations run
     /// out before its end. The failure reason names the first such part, the records that
     /// exist are still delivered, and no close fires after the last of them. A client's answer,
-    /// empty or not, is a source. A request that names a `limit` or a filter expression
-    /// (`filter_expr`), or that its client answers with a bare response (`DataEngine::response`,
-    /// which certifies no coverage; for a time-range pipeline, to any of its child requests),
-    /// completes with no failure reason and closes nothing after its last record.
+    /// empty or not, is a source, and so is a completed answer with no records and no failure
+    /// reason. A request that names a `limit`, a filter expression (`filter_expr`) or a
+    /// time-range pipeline's `point_data` (whose children ask single instants), or that its
+    /// client answers with a bare response (`DataEngine::response`, which certifies no coverage;
+    /// for a time-range pipeline, to any of its child requests), closes nothing after its last
+    /// record; it completes with no failure reason, except a kept request answered bare (below).
     ///
     /// With `params["update_subscriptions"] = true` the request's aggregators are kept under
     /// their bar types and outlive it, so a later request can continue them and a subscription
     /// to their bar types takes them over. They compute as above, on a clock of their own; such
-    /// a request must give a `start` and name no `limit` and no filter expression. A request none of whose aggregators
-    /// exists starts them, their clock at its `start`. A request whose aggregators are exactly
-    /// those one earlier kept request left, none subscribed and none in use by a request in
-    /// flight, in the time zone they were made in, none fed from a source already taken over
+    /// a request must give a `start` and name no `limit`, no filter expression and no
+    /// `point_data`. A request none of whose aggregators exists starts them, their clock at its
+    /// `start`. A request whose aggregators are exactly those one earlier kept request left, none
+    /// subscribed and none in use by a request in flight, in the time zone they were made in,
+    /// none fed from a source already taken over and none driven for one taken over before it
     /// (below), continues them on their clock when its `start` is the next nanosecond after that
     /// request's coverage (`min(end, the engine clock's time when it was dispatched)`, which
     /// its completed answer with no failure reason closed through): an open bar, a pending close
@@ -3188,7 +3191,8 @@ pub trait DataActor {
     /// case, and changes nothing. A joined request (`cut_warmup`, below), whose answer fires no
     /// close after its last record, leaves aggregators no request can continue. A request that
     /// fails or expires, or that is answered by a bare response (above), removes its
-    /// aggregators. Between requests nothing drives them and no bar goes anywhere.
+    /// aggregators; one answered bare ends with a failure reason naming it, so its requester holds
+    /// none of them. Between requests nothing drives them and no bar goes anywhere.
     ///
     /// A subscription to a kept bar type takes its aggregator over. Made after the answer, the
     /// closes due before the engine clock's time are published to it, stamped at their own
@@ -3197,7 +3201,10 @@ pub trait DataActor {
     /// records stamped then); nothing is flushed. A later subscription's aggregator catches up
     /// alone. An aggregator built from the bars of a kept one taken over before it gets those
     /// bars still, when it is taken over in turn (its clock readied before each), and from the
-    /// bus from then on. Made while the answer is in flight, a subscription is held back: its
+    /// bus from then on. An aggregator taken over before a kept one it is built from drives that
+    /// one with it through its catch-up: those bars go to it and to the cache, unpublished, and
+    /// to it from the bus once that one is taken over in turn; no request can continue that one
+    /// then. Made while the answer is in flight, a subscription is held back: its
     /// live records are held and, when the request succeeds, the ones stamped after its coverage
     /// (the answer holds every record up to it) are fed to the aggregators as the answer's are
     /// (the closes due before each fire first), in the order they arrived, across bar types
@@ -3205,7 +3212,8 @@ pub trait DataActor {
     /// are published. The aggregators held back are taken over together, as above, after the
     /// answer's last bars and its terminal, so their bars come in close order after them. When
     /// the request fails, expires or is answered by a bare response instead, the subscription
-    /// gets a new aggregator, started then and fed the held trades. A joined request
+    /// gets a new aggregator, started then and fed the held trades after the answer's terminal,
+    /// so their bars come after it. A joined request
     /// (`cut_warmup`) closes nothing after its last trade: its held live trades, through the
     /// join's cut and floor, move its clock on before the takeover. [`Self::unsubscribe_bars`]
     /// for a bar type kept and not subscribed since removes its aggregator; made while a request
@@ -4311,7 +4319,10 @@ impl DataActorCore {
     /// Removes every message bus handler and releases each retained venue subscription.
     ///
     /// Called on disposal so retirement leaves no handler which would resolve an actor that
-    /// deregistration has already removed.
+    /// deregistration has already removed. Each bar type the actor acquired by a kept request
+    /// (`update_subscriptions`) and has not subscribed since is released too, as
+    /// [`Self::unsubscribe_bars`] releases one (see [`KeptBarTypes`]); the claims of its kept
+    /// requests still in flight are dropped with their handlers.
     pub(crate) fn unsubscribe_all(&mut self) {
         let mut commands = Vec::new();
 
@@ -4402,6 +4413,11 @@ impl DataActorCore {
             if let Some(command) = command.into_unsubscribe(UUID4::new(), self.timestamp_ns()) {
                 self.send_data_cmd(command);
             }
+        }
+
+        let kept = std::mem::take(&mut *self.kept_bar_types.borrow_mut());
+        for bar_type in kept.acquired {
+            self.send_data_cmd(kept_unsubscribe(bar_type, None, self.timestamp_ns()));
         }
         #[cfg(feature = "python")]
         self.message_bus.clear();
