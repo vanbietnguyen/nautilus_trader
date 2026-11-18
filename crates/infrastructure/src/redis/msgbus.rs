@@ -31,9 +31,12 @@
 //! broken invariant at error level once per change (see `publish_messages`).
 //!
 //! The stream task reads its streams the same way: it connects again within a second after a
-//! failed connect or read, never ends on one, logs transport trouble at warning level with one
-//! record at each change between connected and degraded, and goes on after the last entry it sent,
-//! so no entry is delivered twice (see [`stream_messages_from`]).
+//! failed connect or read, never ends on one, logs transport and availability trouble at warning
+//! level with one record at each change between connected and degraded, logs a broken invariant at
+//! error level once per change and reads again once a second, and goes on after the last entry it
+//! sent, so no entry is delivered twice (see [`stream_messages_from`]). The backing starts its
+//! stream task again within a second if it ever ends without the stop, after the same last
+//! entries and on the same channel, and starts its reads at the time the task first started.
 //!
 //! Handles are stored as `Option<JoinHandle>` for idempotent shutdown via
 //! `close_async()`. The synchronous `close()` uses `block_in_place` to
@@ -119,6 +122,13 @@ const PUBLISH_BATCH_SIZE: usize = 1_000;
 /// carrying the whole retained backlog. The value follows [`PUBLISH_BATCH_SIZE`] in this file, the
 /// most messages one publish write sends.
 const STREAM_READ_BATCH_SIZE: usize = 1_000;
+
+/// Longest one stream read asks Redis to wait for new entries (the `BLOCK` of each `XREAD`).
+const STREAM_READ_BLOCK: Duration = Duration::from_millis(100);
+
+/// Longest one stream read waits for its reply: its blocking time plus [`MAX_PUBLISH_ATTEMPT`], so a
+/// healthy read, answered when its blocking time ends, is never cut short.
+const MAX_STREAM_READ: Duration = STREAM_READ_BLOCK.saturating_add(MAX_PUBLISH_ATTEMPT);
 
 type RedisStreamBulk = Vec<HashMap<String, Vec<HashMap<String, redis::Value>>>>;
 
@@ -353,22 +363,16 @@ impl RedisMessageBusBacking {
         let (stream_rx, stream_handle) = if external_streams.is_empty() {
             (None, None)
         } else {
-            let stream_signal_clone = Arc::clone(&stream_signal);
             let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<BusMessage>(100_000);
             (
                 Some(stream_rx),
-                Some(get_runtime().spawn(async move {
-                    if let Err(e) = stream_messages(
-                        stream_tx,
-                        backing.clone(),
-                        external_streams,
-                        stream_signal_clone,
-                    )
-                    .await
-                    {
-                        log_task_error(MSGBUS_STREAM, &e);
-                    }
-                })),
+                Some(get_runtime().spawn(read_streams_until_stopped(
+                    stream_tx,
+                    backing,
+                    external_streams,
+                    Arc::clone(&stream_signal),
+                    read_streams,
+                ))),
             )
         };
 
@@ -1395,6 +1399,22 @@ fn initial_stream_id(start: &StreamStart) -> String {
     }
 }
 
+/// The ID each stream is read after, kept outside a stream task so that a task started again goes
+/// on after the last entry the one before it sent.
+type StreamPositions = Arc<Mutex<HashMap<String, String>>>;
+
+/// Returns the positions of `stream_keys` for a read starting at `start`, each after the one ID
+/// `start` gives now.
+fn stream_positions(stream_keys: &[String], start: &StreamStart) -> StreamPositions {
+    let initial_id = initial_stream_id(start);
+    Arc::new(Mutex::new(
+        stream_keys
+            .iter()
+            .map(|key| (key.clone(), initial_id.clone()))
+            .collect(),
+    ))
+}
+
 /// Streams messages from Redis streams and sends them over the provided `tx` channel.
 ///
 /// Reads start from the current time; see [`stream_messages_from`] to read entries already
@@ -1417,16 +1437,22 @@ pub async fn stream_messages(
 ///
 /// One read loop delivers the entries already held after `start` and then tails new entries,
 /// so the hand-over from history to live loses and repeats nothing. Each stream's position is
-/// taken from `start` when the first connection opens and kept across connections, so after a
-/// reconnect the read goes on after the last entry it sent: no entry is sent twice, and none Redis
-/// still holds is skipped.
+/// taken from `start` when the task starts and kept across connections: with [`StreamStart::Now`]
+/// every entry written after the task started is sent, however late its first connection opens,
+/// and after a reconnect the read goes on after the last entry it sent: no entry is sent twice,
+/// and none Redis still holds is skipped.
 ///
 /// Every connection, the first included, is opened by one attempt of at most
-/// [`MAX_PUBLISH_ATTEMPT`] at a time, at most [`MAX_PUBLISH_RETRY_DELAY`] after a failed connect
-/// or read. A failed connect or read never ends the task: it is logged at warning level, with one
-/// record at each change of the read between connected and degraded. An entry that cannot be
-/// decoded is logged at error level with its key and ID, and skipped. The task ends when
-/// `stream_signal` is set or the receiver of `tx` is dropped.
+/// [`MAX_PUBLISH_ATTEMPT`] at a time. A read that gets no reply within its blocking time
+/// ([`STREAM_READ_BLOCK`]) plus [`MAX_PUBLISH_ATTEMPT`] has failed. A failed connect or read never
+/// ends the task. Transport or availability trouble (see `stream_fault`) is logged at warning
+/// level, and the next attempt opens a fresh connection at most [`MAX_PUBLISH_RETRY_DELAY`] later.
+/// A read error that is a broken invariant, such as a key of the wrong type, is logged at error
+/// level once per change, and the read is tried again on its connection
+/// [`MAX_PUBLISH_RETRY_DELAY`] later. Each failed attempt is part of one record at each change of
+/// the read between connected and degraded. An entry that cannot be decoded is logged at error
+/// level with its key and ID, and skipped. The task ends when `stream_signal` is set or the
+/// receiver of `tx` is dropped.
 ///
 /// # Errors
 ///
@@ -1438,6 +1464,70 @@ pub async fn stream_messages_from(
     start: StreamStart,
     stream_signal: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
+    let positions = stream_positions(&stream_keys, &start);
+    read_streams(tx, config, stream_keys, positions, stream_signal).await;
+    Ok(())
+}
+
+/// Reads `stream_keys` from the current time on, as the backing's stream task: starts a task with
+/// `read` ([`read_streams`]) and starts it again, on the same channel and after the last entries
+/// sent, whenever it ends without `stream_signal` set while the receiver of `tx` is held.
+///
+/// The current time is taken once, when this starts. Each such end is logged once at error level
+/// with the task's name, and the next task starts [`MAX_PUBLISH_RETRY_DELAY`] later. `tx` is held
+/// here throughout, so the receiver sees no end before the stop.
+async fn read_streams_until_stopped<F, Fut>(
+    tx: tokio::sync::mpsc::Sender<BusMessage>,
+    config: RedisMessageBusConfig,
+    stream_keys: Vec<String>,
+    stream_signal: Arc<AtomicBool>,
+    mut read: F,
+) where
+    F: FnMut(
+        tokio::sync::mpsc::Sender<BusMessage>,
+        RedisMessageBusConfig,
+        Vec<String>,
+        StreamPositions,
+        Arc<AtomicBool>,
+    ) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let positions = stream_positions(&stream_keys, &StreamStart::Now);
+
+    loop {
+        let task = read(
+            tx.clone(),
+            config.clone(),
+            stream_keys.clone(),
+            Arc::clone(&positions),
+            Arc::clone(&stream_signal),
+        );
+        let ended = tokio::spawn(task).await;
+
+        if stream_signal.load(Ordering::Relaxed) || tx.is_closed() {
+            break;
+        }
+
+        let reason = ended.map_or_else(|e| e.to_string(), |()| "it returned".to_string());
+        log::error!(
+            "Task '{MSGBUS_STREAM}' ended without the stop ({reason}), starting it again in {MAX_PUBLISH_RETRY_DELAY:?}"
+        );
+
+        if !wait_for_retry_delay(MAX_PUBLISH_RETRY_DELAY, &stream_signal).await {
+            break;
+        }
+    }
+}
+
+/// The read loop of [`stream_messages_from`], reading each stream after its entry in `positions`
+/// and moving it on with each entry read.
+async fn read_streams(
+    tx: tokio::sync::mpsc::Sender<BusMessage>,
+    config: RedisMessageBusConfig,
+    stream_keys: Vec<String>,
+    positions: StreamPositions,
+    stream_signal: Arc<AtomicBool>,
+) {
     log_task_started(MSGBUS_STREAM);
 
     // Every connection, the first included, fails fast, so this task's backoff governs rather
@@ -1457,8 +1547,8 @@ pub async fn stream_messages_from(
 
     log::debug!("Listening to streams: [{}]", stream_keys.join(", "));
 
-    // The ID each stream is read after, set when the first connection opens
-    let mut last_ids: Option<HashMap<String, String>> = None;
+    // A broken invariant last reported at error level, until a read succeeds
+    let mut read_fault: Option<String> = None;
 
     let opts = stream_read_options();
 
@@ -1486,24 +1576,10 @@ pub async fn stream_messages_from(
             continue;
         };
 
-        let cursor = last_ids.get_or_insert_with(|| {
-            let initial_id = initial_stream_id(&start);
-            stream_keys
-                .iter()
-                .map(|&key| (key.to_string(), initial_id.clone()))
-                .collect()
-        });
-
-        let ids: Vec<String> = stream_keys.iter().map(|&key| cursor[key].clone()).collect();
-        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-
-        let result: Result<RedisStreamBulk, _> = active
-            .xread_options(&[&stream_keys], &[&id_refs], &opts)
-            .await;
-
-        match result {
+        match read_after_positions(active, stream_keys, &positions, &opts).await {
             Ok(stream_bulk) => {
                 read_error_count = 0;
+                read_fault = None;
                 state.last_success = Some(get_atomic_clock_realtime().get_time_ns());
                 state.change(StreamLink::Connected);
 
@@ -1516,7 +1592,10 @@ pub async fn stream_messages_from(
                     for (stream_key, stream_msgs) in entry {
                         for stream_msg in stream_msgs {
                             for (id, array) in stream_msg {
-                                cursor.insert(stream_key.clone(), id.clone());
+                                positions
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .insert(stream_key.clone(), id.clone());
 
                                 match decode_stream_entry(stream_key, array) {
                                     Ok(msg) => {
@@ -1537,10 +1616,23 @@ pub async fn stream_messages_from(
                 }
             }
             Err(e) => {
-                // The next read opens a fresh connection, as the publish task's next write does
-                con = None;
                 let retry_delay = fail_stream_read(&mut state, &config, &mut read_error_count);
-                log::warn!("Error reading from stream, retrying in {retry_delay:?} ({state}): {e}");
+                let retry_delay = match stream_fault(&e) {
+                    // The next read opens a fresh connection, as the publish task's next write does
+                    StreamFault::Unavailable => {
+                        con = None;
+                        retry_delay
+                    }
+                    // The connection serves; the read is tried on it once a second until repaired
+                    StreamFault::Broken => MAX_PUBLISH_RETRY_DELAY,
+                };
+                report_stream_fault(
+                    &e,
+                    &mut read_fault,
+                    &format!(
+                        "Error reading from stream, retrying in {retry_delay:?} ({state}): {e}"
+                    ),
+                );
 
                 if !wait_for_retry_delay(retry_delay, &stream_signal).await {
                     break;
@@ -1550,7 +1642,36 @@ pub async fn stream_messages_from(
     }
 
     log_task_stopped(MSGBUS_STREAM);
-    Ok(())
+}
+
+/// Reads each of `stream_keys` after its entry in `positions`, failing with a timed out I/O error
+/// when no reply comes within [`MAX_STREAM_READ`].
+async fn read_after_positions(
+    con: &mut ConnectionManager,
+    stream_keys: &[&str],
+    positions: &StreamPositions,
+    opts: &StreamReadOptions,
+) -> Result<RedisStreamBulk, redis::RedisError> {
+    let ids: Vec<String> = {
+        let positions = positions.lock().unwrap_or_else(PoisonError::into_inner);
+        stream_keys
+            .iter()
+            .map(|&key| positions[key].clone())
+            .collect()
+    };
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+
+    tokio::time::timeout(
+        MAX_STREAM_READ,
+        con.xread_options(&[stream_keys], &[&id_refs], opts),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(redis::RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("No reply within {MAX_STREAM_READ:?}"),
+        )))
+    })
 }
 
 /// Marks the stream read degraded after a failed connect or read and returns the delay before the
@@ -1566,11 +1687,11 @@ fn fail_stream_read(
     retry_delay
 }
 
-/// Returns the options of each stream read: wait at most 100 ms for new entries and take at most
-/// [`STREAM_READ_BATCH_SIZE`] entries from each stream.
+/// Returns the options of each stream read: wait at most [`STREAM_READ_BLOCK`] for new entries and
+/// take at most [`STREAM_READ_BATCH_SIZE`] entries from each stream.
 fn stream_read_options() -> StreamReadOptions {
     StreamReadOptions::default()
-        .block(100)
+        .block(usize::try_from(STREAM_READ_BLOCK.as_millis()).unwrap_or(usize::MAX))
         .count(STREAM_READ_BATCH_SIZE)
 }
 
@@ -1654,7 +1775,7 @@ const UNAVAILABLE_REPLY_CODES: [&str; 9] = [
     "NOREPLICAS",
 ];
 
-/// What a Redis error of the stream's writes or trims is.
+/// What a Redis error of the stream's writes, trims or reads is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StreamFault {
     /// Transport or availability trouble: a lost, refused or timed out connection, or the reply of
@@ -3778,7 +3899,8 @@ mod tests {
             start_reader(&fake, &stream_keys, StreamStart::Beginning);
 
         let first = receive_payload(&mut rx).await;
-        fake.wrong_type_reads.store(1, Ordering::SeqCst);
+        // The key holds the wrong type for two reads, then is repaired
+        fake.wrong_type_reads.store(2, Ordering::SeqCst);
         wait_until_async(
             || {
                 let wrong_type_reads = Arc::clone(&fake.wrong_type_reads);
@@ -3794,6 +3916,8 @@ mod tests {
         let result = handle.await.unwrap();
 
         let logs = thread_logs();
+        let errors = error_lines(&logs);
+        let wrong_type_at = fake.wrong_type_at.lock().unwrap().clone();
         assert!(result.is_ok());
         assert!(!finished_after_the_error);
         assert_eq!([first, second], ["1", "2"]);
@@ -3806,10 +3930,20 @@ mod tests {
             ]
         );
         assert_read_records(&logs);
-        assert!(logs.iter().any(|(level, line)| *level == log::Level::Warn
-            && line.starts_with("Error reading from stream")
-            && line.contains("WRONGTYPE")));
-        assert_eq!(error_lines(&logs), Vec::<String>::new());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with("Error reading from stream") && errors[0].contains("WRONGTYPE"),
+            "{}",
+            errors[0]
+        );
+        assert!(
+            !logs.iter().any(|(level, line)| *level == log::Level::Warn
+                && line.starts_with("Error reading from stream")),
+            "{logs:?}"
+        );
+        // Read again on its connection, at most once a second
+        assert!(wrong_type_at[1] - wrong_type_at[0] >= MAX_PUBLISH_RETRY_DELAY);
+        assert_eq!(fake.connections.lock().unwrap().len(), 1);
     }
 
     #[rstest]
@@ -3819,30 +3953,35 @@ mod tests {
         let _clock = ManualClock::hold();
         let stream_keys = vec!["stream-0".to_string()];
         let fake = FakeRedisStreams::start(&stream_keys, 1).await;
+        let mut clock = ReaderClock::new(&fake);
         let (mut rx, stream_signal, handle) =
             start_reader(&fake, &stream_keys, StreamStart::Beginning);
         let mut received = Vec::new();
 
-        drive_until(
-            || take_received(&mut rx, &mut received) == 1,
-            Duration::from_secs(5),
-        )
-        .await;
+        clock
+            .drive_until(
+                || take_received(&mut rx, &mut received) == 1,
+                Duration::from_secs(5),
+            )
+            .await;
         fake.available.store(false, Ordering::SeqCst);
         let outage_start = tokio::time::Instant::now();
-        drive(Duration::from_secs(600)).await;
+        clock.drive(Duration::from_secs(600)).await;
         fake.append(2, "2");
         let returned_at = tokio::time::Instant::now();
         fake.available.store(true, Ordering::SeqCst);
-        drive_until(
-            || take_received(&mut rx, &mut received) == 2,
-            Duration::from_secs(5),
-        )
-        .await;
+        clock
+            .drive_until(
+                || take_received(&mut rx, &mut received) == 2,
+                Duration::from_secs(5),
+            )
+            .await;
         let delivered_at = tokio::time::Instant::now();
         let finished_before_the_stop = handle.is_finished();
         stream_signal.store(true, Ordering::Relaxed);
-        drive_until(|| handle.is_finished(), Duration::from_secs(5)).await;
+        clock
+            .drive_until(|| handle.is_finished(), Duration::from_secs(5))
+            .await;
         let result = handle.await.unwrap();
 
         let logs = thread_logs();
@@ -3862,15 +4001,13 @@ mod tests {
         assert!(result.is_ok());
         assert!(!finished_before_the_stop);
         assert!(attempts.len() >= 500, "{} attempts", attempts.len());
-        assert!(attempts[0] - outage_start <= MAX_PUBLISH_RETRY_DELAY + 2 * CLOCK_STEP);
-        assert!(
-            returned_at - *attempts.last().unwrap() <= MAX_PUBLISH_RETRY_DELAY + 2 * CLOCK_STEP
-        );
-        assert!(
-            longest_wait <= MAX_PUBLISH_RETRY_DELAY + 2 * CLOCK_STEP,
-            "{longest_wait:?}"
-        );
-        assert!(delivered_at - returned_at <= MAX_PUBLISH_RETRY_DELAY + 2 * CLOCK_STEP);
+        // The clock moves only while the task waits, so each attempt is timed by the task's own
+        // wait; the first follows the read the fake held when the outage began, answered on the
+        // clock's next step
+        assert!(attempts[0] - outage_start <= MAX_PUBLISH_RETRY_DELAY + CLOCK_STEP);
+        assert!(returned_at - *attempts.last().unwrap() <= MAX_PUBLISH_RETRY_DELAY);
+        assert!(longest_wait <= MAX_PUBLISH_RETRY_DELAY, "{longest_wait:?}");
+        assert!(delivered_at - returned_at <= MAX_PUBLISH_RETRY_DELAY);
         assert_eq!(received, stream_payloads(&stream_keys, &["1", "2"]));
         assert_eq!(
             state_records(&logs),
@@ -3892,11 +4029,12 @@ mod tests {
         let stream_keys = vec!["stream-0".to_string()];
         let fake = FakeRedisStreams::start(&stream_keys, 0).await;
         fake.available.store(false, Ordering::SeqCst);
+        let mut clock = ReaderClock::new(&fake);
         let (mut rx, stream_signal, handle) =
             start_reader(&fake, &stream_keys, StreamStart::Beginning);
         let mut received = Vec::new();
 
-        drive(Duration::from_secs(30)).await;
+        clock.drive(Duration::from_secs(30)).await;
         let received_while_absent = take_received(&mut rx, &mut received);
         let finished_while_absent = handle.is_finished();
         for n in 1..=3 {
@@ -3904,21 +4042,25 @@ mod tests {
         }
         let returned_at = tokio::time::Instant::now();
         fake.available.store(true, Ordering::SeqCst);
-        drive_until(
-            || take_received(&mut rx, &mut received) == 3,
-            Duration::from_secs(5),
-        )
-        .await;
+        clock
+            .drive_until(
+                || take_received(&mut rx, &mut received) == 3,
+                Duration::from_secs(5),
+            )
+            .await;
         let delivered_at = tokio::time::Instant::now();
         stream_signal.store(true, Ordering::Relaxed);
-        drive_until(|| handle.is_finished(), Duration::from_secs(5)).await;
+        clock
+            .drive_until(|| handle.is_finished(), Duration::from_secs(5))
+            .await;
         let result = handle.await.unwrap();
 
         let logs = thread_logs();
         assert!(result.is_ok());
         assert_eq!(received_while_absent, 0);
         assert!(!finished_while_absent);
-        assert!(delivered_at - returned_at <= MAX_PUBLISH_RETRY_DELAY + 2 * CLOCK_STEP);
+        // The clock moves only while the task waits: the entries arrive at the end of its wait
+        assert!(delivered_at - returned_at <= MAX_PUBLISH_RETRY_DELAY);
         assert_eq!(received, stream_payloads(&stream_keys, &["1", "2", "3"]));
         assert_eq!(
             state_records(&logs),
@@ -3938,29 +4080,34 @@ mod tests {
         let _clock = ManualClock::hold();
         let stream_keys = vec!["stream-0".to_string(), "stream-1".to_string()];
         let fake = FakeRedisStreams::start(&stream_keys, 2).await;
+        let mut clock = ReaderClock::new(&fake);
         let (mut rx, stream_signal, handle) =
             start_reader(&fake, &stream_keys, StreamStart::Beginning);
         let mut received = Vec::new();
 
-        drive_until(
-            || take_received(&mut rx, &mut received) == 4,
-            Duration::from_secs(5),
-        )
-        .await;
+        clock
+            .drive_until(
+                || take_received(&mut rx, &mut received) == 4,
+                Duration::from_secs(5),
+            )
+            .await;
         fake.available.store(false, Ordering::SeqCst);
-        drive(Duration::from_secs(3)).await;
+        clock.drive(Duration::from_secs(3)).await;
         fake.append(3, "3");
         fake.available.store(true, Ordering::SeqCst);
-        drive_until(
-            || take_received(&mut rx, &mut received) >= 6,
-            Duration::from_secs(5),
-        )
-        .await;
+        clock
+            .drive_until(
+                || take_received(&mut rx, &mut received) >= 6,
+                Duration::from_secs(5),
+            )
+            .await;
         // Long enough for any entry delivered again to arrive
-        drive(Duration::from_secs(2)).await;
+        clock.drive(Duration::from_secs(2)).await;
         take_received(&mut rx, &mut received);
         stream_signal.store(true, Ordering::Relaxed);
-        drive_until(|| handle.is_finished(), Duration::from_secs(5)).await;
+        clock
+            .drive_until(|| handle.is_finished(), Duration::from_secs(5))
+            .await;
         let result = handle.await.unwrap();
 
         let logs = thread_logs();
@@ -4025,6 +4172,224 @@ mod tests {
     }
 
     #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_messages_from_now_deliver_an_entry_written_before_the_first_connection() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let stream_keys = vec!["stream-0".to_string()];
+        let fake = FakeRedisStreams::start(&stream_keys, 0).await;
+        fake.available.store(false, Ordering::SeqCst);
+        let mut clock = ReaderClock::new(&fake);
+        let (mut rx, stream_signal, handle) = start_reader(&fake, &stream_keys, StreamStart::Now);
+        let mut received = Vec::new();
+
+        clock.drive(Duration::from_secs(30)).await;
+        // Stamped after the task started, and before its first connection on the realtime clock
+        let n = realtime_ms_after(realtime_ms());
+        fake.append(n, "written while absent");
+        realtime_ms_after(n);
+        fake.available.store(true, Ordering::SeqCst);
+        clock
+            .drive_until(
+                || take_received(&mut rx, &mut received) == 1,
+                Duration::from_secs(5),
+            )
+            .await;
+        stream_signal.store(true, Ordering::Relaxed);
+        clock
+            .drive_until(|| handle.is_finished(), Duration::from_secs(5))
+            .await;
+        let result = handle.await.unwrap();
+
+        let logs = thread_logs();
+        assert!(result.is_ok());
+        assert_eq!(
+            received,
+            stream_payloads(&stream_keys, &["written while absent"])
+        );
+        assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_messages_connect_again_after_a_read_that_gets_no_reply() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let stream_keys = vec!["stream-0".to_string()];
+        let fake = FakeRedisStreams::start(&stream_keys, 0).await;
+        fake.silent_reads.store(1, Ordering::SeqCst);
+        let mut clock = ReaderClock::new(&fake);
+        let (mut rx, stream_signal, handle) =
+            start_reader(&fake, &stream_keys, StreamStart::Beginning);
+        let mut received = Vec::new();
+
+        clock
+            .drive_until(
+                || failed_reads(&thread_logs()) == 1,
+                Duration::from_secs(30),
+            )
+            .await;
+        let degraded_at = tokio::time::Instant::now();
+        let read_at = fake.silent_read_at.lock().unwrap().unwrap();
+        fake.append(1, "1");
+        clock
+            .drive_until(
+                || take_received(&mut rx, &mut received) == 1,
+                Duration::from_secs(5),
+            )
+            .await;
+        let delivered_at = tokio::time::Instant::now();
+        stream_signal.store(true, Ordering::Relaxed);
+        clock
+            .drive_until(|| handle.is_finished(), Duration::from_secs(5))
+            .await;
+        let result = handle.await.unwrap();
+
+        let logs = thread_logs();
+        let failed: Vec<&String> = logs
+            .iter()
+            .filter(|(_, line)| line.starts_with("Error reading from stream"))
+            .map(|(_, line)| line)
+            .collect();
+        assert!(result.is_ok());
+        // Failed when no reply came within the read's blocking time plus the attempt bound (the
+        // connection's own response timeout is 20 s); the clock moves in steps of `CLOCK_STEP`
+        assert!(
+            degraded_at - read_at >= MAX_STREAM_READ
+                && degraded_at - read_at <= MAX_STREAM_READ + CLOCK_STEP,
+            "{:?}",
+            degraded_at - read_at
+        );
+        assert!(delivered_at - degraded_at <= MAX_PUBLISH_RETRY_DELAY);
+        assert!(fake.connections.lock().unwrap().len() >= 2);
+        assert_eq!(received, stream_payloads(&stream_keys, &["1"]));
+        assert!(failed[0].contains("No reply within 5.1s"), "{}", failed[0]);
+        assert_eq!(
+            state_records(&logs),
+            [
+                ("degraded".to_string(), false, 0, 0),
+                ("connected".to_string(), true, 0, 0),
+            ]
+        );
+        assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    #[rstest]
+    fn test_backing_starts_its_stream_task_again_after_it_ends_without_the_stop() {
+        capture_logs();
+        let stream_keys = vec!["trader-PUBLISHER-007:stream".to_string()];
+        let fake = get_runtime().block_on(FakeRedisStreams::start(&stream_keys, 0));
+        let mut backing = RedisMessageBusBacking::new(
+            TraderId::from("TESTER-007"),
+            UUID4::new(),
+            MessageBusConfig::default(),
+            fake.config(),
+        )
+        .unwrap();
+        // The backing's stream task as `new` starts it, its first task failing after two entries
+        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<BusMessage>(100);
+        let tasks = Arc::new(AtomicUsize::new(0));
+        backing.stream_handle = Some(get_runtime().spawn(read_streams_until_stopped(
+            stream_tx,
+            fake.config(),
+            stream_keys,
+            Arc::clone(&backing.stream_signal),
+            move |tx, config, stream_keys, positions, signal| {
+                let first = tasks.fetch_add(1, Ordering::SeqCst) == 0;
+                async move {
+                    if !first {
+                        return read_streams(tx, config, stream_keys, positions, signal).await;
+                    }
+                    let (read_tx, mut read_rx) = tokio::sync::mpsc::channel(1);
+                    let read = tokio::spawn(read_streams(
+                        read_tx,
+                        config,
+                        stream_keys,
+                        positions,
+                        signal,
+                    ));
+                    for _ in 0..2 {
+                        tx.send(read_rx.recv().await.unwrap()).await.unwrap();
+                    }
+                    read.abort();
+                    panic!("the stream task fails after its second entry");
+                }
+            },
+        )));
+
+        // Read once: the task has taken the current time
+        wait_until(
+            || !fake.reads.lock().unwrap().is_empty(),
+            Duration::from_secs(5),
+        );
+        let n = realtime_ms_after(realtime_ms());
+        fake.append(n, "1");
+        fake.append(n + 1, "2");
+        let before_the_end = [
+            get_runtime().block_on(receive_payload(&mut stream_rx)),
+            get_runtime().block_on(receive_payload(&mut stream_rx)),
+        ];
+        wait_until(
+            || task_ends(&every_thread_logs()).len() == 1,
+            Duration::from_secs(5),
+        );
+        fake.append(n + 2, "3");
+        let after_the_end = get_runtime().block_on(receive_payload(&mut stream_rx));
+        let more = get_runtime().block_on(async {
+            tokio::time::timeout(Duration::from_millis(500), stream_rx.recv()).await
+        });
+        backing.publish(fake_bus_message());
+        wait_until(
+            || !fake.written.lock().unwrap().is_empty(),
+            Duration::from_secs(5),
+        );
+        let closed = backing.is_closed();
+        backing.close();
+
+        let ends = task_ends(&every_thread_logs());
+        assert_eq!(before_the_end, ["1", "2"]);
+        assert_eq!(after_the_end, "3");
+        assert!(more.is_err(), "{more:?}");
+        assert!(!closed);
+        assert_eq!(fake.written.lock().unwrap().len(), 1);
+        assert_eq!(ends.len(), 1, "{ends:?}");
+        assert_eq!(ends[0].0, log::Level::Error);
+        assert!(
+            ends[0].1.contains("panicked") && ends[0].1.ends_with("starting it again in 1s"),
+            "{}",
+            ends[0].1
+        );
+    }
+
+    /// The realtime clock in milliseconds.
+    fn realtime_ms() -> usize {
+        usize::try_from(get_atomic_clock_realtime().get_time_ms()).unwrap()
+    }
+
+    /// Waits until the realtime clock is past `ms` and returns it in milliseconds.
+    fn realtime_ms_after(ms: usize) -> usize {
+        while realtime_ms() <= ms {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        realtime_ms()
+    }
+
+    /// How many reads of the stream task failed in `logs`.
+    fn failed_reads(logs: &[(log::Level, String)]) -> usize {
+        logs.iter()
+            .filter(|(_, line)| line.starts_with("Error reading from stream"))
+            .count()
+    }
+
+    /// The lines of `logs` on a stream task that ended without the stop.
+    fn task_ends(logs: &[(log::Level, String)]) -> Vec<(log::Level, String)> {
+        logs.iter()
+            .filter(|(_, line)| line.starts_with("Task 'msgbus-stream' ended without the stop"))
+            .cloned()
+            .collect()
+    }
+
+    #[rstest]
     fn test_way_out_and_inbound_stay_open_after_a_read_error_redis_does_not_retry() {
         let stream_keys = vec!["trader-PUBLISHER-007:stream".to_string()];
         let fake = get_runtime().block_on(FakeRedisStreams::start(&stream_keys, 0));
@@ -4050,20 +4415,26 @@ mod tests {
             || fake.wrong_type_reads.load(Ordering::SeqCst) == 0,
             Duration::from_secs(5),
         );
-        let closed_after_the_error = backing.is_closed();
         // The backing reads from the current time on, so the entry's ID is later
         let n = usize::try_from(get_atomic_clock_realtime().get_time_ms()).unwrap() + 1_000_000;
         fake.append(n, "after the error");
         let message = get_runtime().block_on(async {
             tokio::time::timeout(Duration::from_secs(5), stream_rx.recv()).await
         });
+        backing.publish(fake_bus_message());
+        wait_until(
+            || !fake.written.lock().unwrap().is_empty(),
+            Duration::from_secs(5),
+        );
         backing.close();
 
-        assert!(!closed_after_the_error);
         let message = message
             .expect("the entry should arrive")
             .expect("the stream task should keep the inbound side open");
+        let written = fake.written.lock().unwrap().clone();
         assert_eq!(message.payload, Bytes::from("after the error"));
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].field("payload").as_deref(), Some("test_payload"));
     }
 
     /// Spawns `stream_messages_from` on `stream_keys` of `fake`, starting after `start`.
@@ -4393,6 +4764,123 @@ mod tests {
             tokio::time::advance(CLOCK_STEP).await;
             run_sockets().await;
         }
+    }
+
+    /// Moves the paused clock for one stream task reading a [`FakeRedisStreams`], and only while
+    /// the task waits on a timer: on a read the fake holds, or in the wait its last retry line
+    /// names. Before each step it lets the task and the sockets run with the clock still until the
+    /// task waits again, so no request or reply in flight sees the clock move, and it steps to the
+    /// end of each retry wait exactly. The task's retry lines are this thread's.
+    struct ReaderClock<'a> {
+        fake: &'a FakeRedisStreams,
+        /// How many lines of every thread have been read for this thread's retry lines.
+        scanned: usize,
+        /// When the wait the last retry line names ends.
+        wake: Option<tokio::time::Instant>,
+        /// How many reads the fake had held when that wait began.
+        held_before: usize,
+    }
+
+    impl<'a> ReaderClock<'a> {
+        fn new(fake: &'a FakeRedisStreams) -> Self {
+            Self {
+                fake,
+                scanned: THREAD_LOGS.0.lock().unwrap().len(),
+                wake: None,
+                held_before: 0,
+            }
+        }
+
+        /// Whether the task waits on a timer: in a retry wait not yet over, or on a read made after
+        /// the last retry wait began that the fake holds.
+        fn waits(&mut self) -> bool {
+            let now = tokio::time::Instant::now();
+            let thread = std::thread::current().id();
+            {
+                let logs = THREAD_LOGS.0.lock().unwrap();
+                for (logged_on, _, line) in &logs[self.scanned..] {
+                    if *logged_on != thread {
+                        continue;
+                    }
+                    if let Some(delay) = retry_delay_of(line) {
+                        self.wake = Some(now + delay);
+                        self.held_before = self.fake.reads_held.load(Ordering::SeqCst);
+                    }
+                }
+                self.scanned = logs.len();
+            }
+
+            match self.wake {
+                Some(wake) if now < wake => true,
+                _ => {
+                    self.fake.read_held.load(Ordering::SeqCst)
+                        && self.fake.reads_held.load(Ordering::SeqCst) > self.held_before
+                }
+            }
+        }
+
+        /// Moves the clock on by [`CLOCK_STEP`], to `until` or to the end of the retry wait,
+        /// whichever comes first.
+        async fn step(&self, until: tokio::time::Instant) {
+            let now = tokio::time::Instant::now();
+            let mut step = CLOCK_STEP.min(until.saturating_duration_since(now));
+            if let Some(wake) = self.wake.filter(|&wake| wake > now) {
+                step = step.min(wake - now);
+            }
+            tokio::time::advance(step).await;
+        }
+
+        /// Moves the clock on by `duration`, the task waiting at its end.
+        async fn drive(&mut self, duration: Duration) {
+            let end = tokio::time::Instant::now() + duration;
+
+            loop {
+                settle_until(|| self.waits()).await;
+                if tokio::time::Instant::now() >= end {
+                    return;
+                }
+                self.step(end).await;
+            }
+        }
+
+        /// Moves the clock on until `done` holds, failing after `limit`.
+        async fn drive_until(&mut self, mut done: impl FnMut() -> bool, limit: Duration) {
+            let end = tokio::time::Instant::now() + limit;
+
+            loop {
+                settle_until(|| done() || self.waits()).await;
+                if done() {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < end,
+                    "Not done within {limit:?}"
+                );
+                self.step(end).await;
+            }
+        }
+    }
+
+    /// The wait a stream task's retry line names (`..., retrying in <delay> (...`), a whole number
+    /// of milliseconds or seconds, as every wait of at most a second is.
+    fn retry_delay_of(line: &str) -> Option<Duration> {
+        let (_, rest) = line.split_once(", retrying in ")?;
+        let (delay, _) = rest.split_once(" (")?;
+        Some(match delay.strip_suffix("ms") {
+            Some(millis) => Duration::from_millis(millis.parse().unwrap()),
+            None => Duration::from_secs(delay.strip_suffix('s').unwrap().parse().unwrap()),
+        })
+    }
+
+    /// The lines of every thread at warning level or above.
+    fn every_thread_logs() -> Vec<(log::Level, String)> {
+        THREAD_LOGS
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, level, line)| (*level, line.clone()))
+            .collect()
     }
 
     /// The warning and error lines of every thread. A test on a current-thread runtime runs the
@@ -4783,7 +5271,11 @@ mod tests {
     /// [`FAKE_INSTANCE_ID`] and number `n`, answers `XREAD` as Redis does, and records each read.
     /// It records the time of each accepted connection in `connections`. While `available` is unset
     /// it closes each connection at once, and while `wrong_type_reads` is above zero it answers
-    /// that many reads with Redis's `WRONGTYPE` error, which the client does not retry.
+    /// that many reads with Redis's `WRONGTYPE` error, which the client does not retry, at the times
+    /// in `wrong_type_at`. While `silent_reads` is above zero it leaves that many reads unanswered,
+    /// the last at `silent_read_at`. `read_held` is set while the last read it received is held
+    /// unanswered (empty, until its 10 ms nil reply, or silent), and `reads_held` counts the reads
+    /// it held. It queues each `XADD` of a transaction and records it in `written` at `EXEC`.
     #[derive(Clone)]
     struct FakeRedisStreams {
         port: u16,
@@ -4791,6 +5283,12 @@ mod tests {
         reads: Arc<std::sync::Mutex<Vec<FakeStreamRead>>>,
         available: Arc<AtomicBool>,
         wrong_type_reads: Arc<AtomicUsize>,
+        wrong_type_at: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+        silent_reads: Arc<AtomicUsize>,
+        silent_read_at: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+        read_held: Arc<AtomicBool>,
+        reads_held: Arc<AtomicUsize>,
+        written: Arc<std::sync::Mutex<Vec<FakeXadd>>>,
         connections: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
     }
 
@@ -4804,6 +5302,12 @@ mod tests {
                 reads: Arc::new(std::sync::Mutex::new(Vec::new())),
                 available: Arc::new(AtomicBool::new(true)),
                 wrong_type_reads: Arc::new(AtomicUsize::new(0)),
+                wrong_type_at: Arc::new(std::sync::Mutex::new(Vec::new())),
+                silent_reads: Arc::new(AtomicUsize::new(0)),
+                silent_read_at: Arc::new(std::sync::Mutex::new(None)),
+                read_held: Arc::new(AtomicBool::new(false)),
+                reads_held: Arc::new(AtomicUsize::new(0)),
+                written: Arc::new(std::sync::Mutex::new(Vec::new())),
                 connections: Arc::new(std::sync::Mutex::new(Vec::new())),
             };
             let (keys, server) = (stream_keys.to_vec(), fake.clone());
@@ -4832,10 +5336,25 @@ mod tests {
             socket.set_nodelay(true).unwrap();
             let (read, mut write) = socket.into_split();
             let mut reader = tokio::io::BufReader::new(read);
+            let mut queued_xadds = Vec::new();
 
             while let Some(command) = read_resp_command(&mut reader).await {
                 if !self.available.load(Ordering::SeqCst) {
                     break;
+                }
+
+                if command[0].eq_ignore_ascii_case(b"XREAD") {
+                    self.read_held.store(false, Ordering::SeqCst);
+
+                    if self
+                        .silent_reads
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok()
+                    {
+                        *self.silent_read_at.lock().unwrap() = Some(tokio::time::Instant::now());
+                        self.hold_read();
+                        continue;
+                    }
                 }
 
                 let reply = match command[0].to_ascii_uppercase().as_slice() {
@@ -4849,6 +5368,10 @@ mod tests {
                             .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                             .is_ok() =>
                     {
+                        self.wrong_type_at
+                            .lock()
+                            .unwrap()
+                            .push(tokio::time::Instant::now());
                         "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
                             .to_string()
                     }
@@ -4856,10 +5379,27 @@ mod tests {
                         let reply = xread_reply(&command, &keys, &self.streams, &self.reads);
                         if reply.is_none() {
                             // An empty blocking read times out with a nil reply
+                            self.hold_read();
                             tokio::time::sleep(Duration::from_millis(10)).await;
+                            self.read_held.store(false, Ordering::SeqCst);
                         }
                         reply.unwrap_or_else(|| "*-1\r\n".to_string())
                     }
+                    b"MULTI" => {
+                        queued_xadds.clear();
+                        "+OK\r\n".to_string()
+                    }
+                    b"XADD" => {
+                        queued_xadds.push(FakeXadd::parse(&command));
+                        "+QUEUED\r\n".to_string()
+                    }
+                    b"EXEC" => {
+                        let replies = "$3\r\n0-1\r\n".repeat(queued_xadds.len());
+                        let len = queued_xadds.len();
+                        self.written.lock().unwrap().append(&mut queued_xadds);
+                        format!("*{len}\r\n{replies}")
+                    }
+                    b"XTRIM" => ":0\r\n".to_string(),
                     _ => "+OK\r\n".to_string(),
                 };
 
@@ -4867,6 +5407,11 @@ mod tests {
                     break;
                 }
             }
+        }
+
+        fn hold_read(&self) {
+            self.reads_held.fetch_add(1, Ordering::SeqCst);
+            self.read_held.store(true, Ordering::SeqCst);
         }
 
         fn append(&self, n: usize, payload: &str) {
