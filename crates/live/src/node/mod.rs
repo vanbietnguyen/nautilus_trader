@@ -445,6 +445,16 @@ impl LiveNode {
             anyhow::bail!("Already running");
         }
 
+        let start_result = self.start_node().await;
+
+        if self.state().is_running() {
+            return start_result;
+        }
+
+        Self::close_external_egress(start_result)
+    }
+
+    async fn start_node(&mut self) -> anyhow::Result<()> {
         if self.external_msgbus.is_some() {
             log::warn!(
                 "External message bus ingress is configured but LiveNode::start() does not service it; use LiveNode::run()"
@@ -581,6 +591,16 @@ impl LiveNode {
             anyhow::bail!("Not running");
         }
 
+        let stop_result = self.stop_node().await;
+
+        if self.state().is_running() {
+            return stop_result;
+        }
+
+        Self::close_external_egress(stop_result)
+    }
+
+    async fn stop_node(&mut self) -> anyhow::Result<()> {
         self.handle.set_shutting_down();
 
         #[cfg(feature = "plugin")]
@@ -602,8 +622,6 @@ impl LiveNode {
         if drained_events > 0 {
             log::info!("Drained {drained_events} remaining events during shutdown");
         }
-
-        let stop_result = Self::close_external_egress(stop_result);
 
         match (controller_stop_result, stop_result) {
             (Ok(()), Ok(())) => Ok(()),
@@ -1112,6 +1130,16 @@ impl LiveNode {
             anyhow::bail!("Runner already consumed - run() called twice");
         }
 
+        let run_result = self.run_node(mode).await;
+
+        if self.state().is_running() {
+            return run_result;
+        }
+
+        Self::close_external_egress(run_result)
+    }
+
+    async fn run_node(&mut self, mode: NodeRunMode) -> anyhow::Result<()> {
         self.prepare_cache().await?;
 
         let Some(runner) = self.runner.take() else {
@@ -2002,9 +2030,6 @@ impl LiveNode {
         let stop_result = self.finalize_stop().await;
 
         if let Err(e) = dispatch_result {
-            // A failed callback dispatch ends the loop, nothing is dispatched after the stop
-            let stop_result = Self::close_external_egress(stop_result);
-
             if let Err(stop_err) = stop_result {
                 log::error!("Failed to finalize node after callback failure: {stop_err}");
                 // Python converts the outer display message, so preserve both diagnostics there.
@@ -2025,8 +2050,6 @@ impl LiveNode {
             &mut data_evt_rx,
             &mut data_cmd_rx,
         );
-
-        let stop_result = Self::close_external_egress(stop_result);
 
         log::info!("Event loop stopped");
 
@@ -2394,8 +2417,7 @@ impl LiveNode {
     async fn abort_startup(&mut self, reason: &str) -> anyhow::Result<()> {
         log::info!("{reason}, aborting startup");
         self.handle.set_shutting_down();
-        let finalize_result = self.finalize_stop().await;
-        Self::close_external_egress(finalize_result)
+        self.finalize_stop().await
     }
 
     async fn abort_startup_with_error(
@@ -2455,8 +2477,6 @@ impl LiveNode {
                 log::info!("Drained {drained_events} remaining events during shutdown");
             }
         }
-
-        let finalize_result = Self::close_external_egress(finalize_result);
 
         let mut errors = Vec::new();
 
@@ -2533,7 +2553,7 @@ impl LiveNode {
         log::info!("Trader startup failed, aborting startup");
         self.handle.set_shutting_down();
         let stop_result = self.kernel.stop_trader_after_start_failure();
-        let finalize_result = Self::close_external_egress(self.finalize_stop().await);
+        let finalize_result = self.finalize_stop().await;
 
         match (stop_result, finalize_result) {
             (Ok(()), Ok(())) => Err(start_err),
@@ -2631,8 +2651,9 @@ impl LiveNode {
 
     /// Closes the message bus way out and adds its error to `stop_result`.
     ///
-    /// Each caller of `finalize_stop` calls this once, after the last dispatch it makes itself, so
-    /// what the clients sent while they disconnected reaches the way out before it closes.
+    /// `start`, `stop` and `run_with_mode` each call this once at their exit when they leave the
+    /// node not running, after their last dispatch, so what the clients sent while they
+    /// disconnected reaches the way out before it closes.
     fn close_external_egress(stop_result: anyhow::Result<()>) -> anyhow::Result<()> {
         let Err(e) = msgbus::get_message_bus().borrow_mut().close() else {
             return stop_result;

@@ -1061,6 +1061,120 @@ async fn test_start_aborted_after_client_connected_closes_way_out_once() {
     );
 }
 
+#[rstest]
+#[tokio::test(flavor = "current_thread")]
+async fn test_start_failed_at_cache_preparation_closes_way_out_once(
+    #[values(false, true)] through_run: bool,
+) {
+    let (mut node, steps) = stop_recording_node(false, false);
+    node.cache_database_factory = Some(Box::new(FailingCacheDatabaseFactory));
+
+    let error = if through_run {
+        node.run().await.unwrap_err()
+    } else {
+        node.start().await.unwrap_err()
+    };
+    let seen = steps.lock().clone();
+    node.dispose();
+    let seen_after_dispose = steps.lock().clone();
+
+    assert_eq!(
+        format!("{error:#}"),
+        "failed to create cache database backing: cache database unavailable"
+    );
+    assert_eq!(seen, vec!["closed".to_string()]);
+    assert_eq!(seen_after_dispose, seen);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_run_aborted_start_writes_record_sent_during_disconnect_before_closing_way_out() {
+    let (mut node, steps) = sending_stop_recording_node(false, false, true);
+    node.handle().stop();
+
+    node.run().await.unwrap();
+    let seen = steps.lock().clone();
+    node.dispose();
+    let seen_after_dispose = steps.lock().clone();
+
+    assert_eq!(seen, sent_stop_steps());
+    assert_eq!(seen_after_dispose, seen);
+}
+
+/// The topic published on after an entry point refused to act.
+const AFTER_REFUSAL_TOPIC: &str = "data.quotes.AFTER-REFUSAL";
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_start_refused_while_running_keeps_way_out_open() {
+    let (mut node, steps) = stop_recording_node(false, false);
+    node.start().await.unwrap();
+
+    let error = node.start().await.unwrap_err();
+    msgbus::publish_quote(AFTER_REFUSAL_TOPIC.into(), &QuoteTick::default());
+    let seen = steps.lock().clone();
+    node.stop().await.unwrap();
+    node.dispose();
+
+    assert_eq!(error.to_string(), "Already running");
+    assert_eq!(
+        seen,
+        vec![
+            "client connected".to_string(),
+            format!("published {AFTER_REFUSAL_TOPIC}"),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_stop_refused_before_start_keeps_way_out_open() {
+    let (mut node, steps) = stop_recording_node(false, false);
+
+    let error = node.stop().await.unwrap_err();
+    let seen_after_refusal = steps.lock().clone();
+    node.start().await.unwrap();
+    msgbus::publish_quote(AFTER_REFUSAL_TOPIC.into(), &QuoteTick::default());
+    let seen = steps.lock().clone();
+    node.stop().await.unwrap();
+    node.dispose();
+
+    assert_eq!(error.to_string(), "Not running");
+    assert!(seen_after_refusal.is_empty(), "{seen_after_refusal:?}");
+    assert_eq!(
+        seen,
+        vec![
+            "client connected".to_string(),
+            format!("published {AFTER_REFUSAL_TOPIC}"),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_start_that_succeeds_keeps_way_out_open() {
+    let (mut node, steps) = stop_recording_node(false, false);
+
+    node.start().await.unwrap();
+    let seen = steps.lock().clone();
+    node.stop().await.unwrap();
+    node.dispose();
+
+    assert_eq!(seen, vec!["client connected".to_string()]);
+}
+
+/// A cache database factory whose database does not answer.
+#[derive(Debug)]
+struct FailingCacheDatabaseFactory;
+
+#[async_trait::async_trait]
+impl CacheDatabaseFactory for FailingCacheDatabaseFactory {
+    async fn create(
+        &self,
+        _trader_id: TraderId,
+        _instance_id: UUID4,
+        _config: nautilus_common::cache::CacheConfig,
+    ) -> anyhow::Result<Box<dyn CacheDatabaseAdapter>> {
+        anyhow::bail!("cache database unavailable")
+    }
+}
+
 struct StopRecordingBackingFactory {
     steps: StopSteps,
 }
