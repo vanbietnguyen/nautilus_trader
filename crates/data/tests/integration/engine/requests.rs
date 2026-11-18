@@ -3735,6 +3735,19 @@ fn run_joined_release(
     held: &[TradeTick],
     answered: Vec<TradeTick>,
 ) {
+    run_joined_release_observed(fixture, bar_types, interleave, held, answered, |_| {});
+}
+
+/// Runs [`run_joined_release`], giving `observe` the request's ID once it is executed.
+#[cfg(feature = "streaming")]
+fn run_joined_release_observed(
+    fixture: &JoinFixture,
+    bar_types: &[BarType],
+    interleave: bool,
+    held: &[TradeTick],
+    answered: Vec<TradeTick>,
+    observe: impl FnOnce(UUID4),
+) {
     let mut params = joined_params(fixture.bar_type, NY_2026_11_12_2000, &[NY_2026_11_12_1800]);
     params["bar_types"] = json!(
         bar_types
@@ -3744,11 +3757,13 @@ fn run_joined_release(
     );
     params["interleave"] = json!(interleave);
     let request = trades_request(vec![fixture.instrument_id], None, fixture.client_id, params);
+    let request_id = *request.request_id();
     fixture
         .engine
         .borrow_mut()
         .execute_request(request)
         .unwrap();
+    observe(request_id);
     let tail_id = assert_replay_tail(fixture, NY_2026_11_12_1800);
 
     for bar_type in bar_types {
@@ -7209,8 +7224,11 @@ fn test_interleaved_joined_release_cuts_and_floors_each_bar_type_trade_by_trade(
     let id = fixture.instrument_id;
     let tick = fixture.bar_type;
     let volume = BarType::from(format!("{id}-1000-VOLUME-LAST-INTERNAL").as_str());
+    let cache = Rc::clone(fixture.engine.borrow().cache());
+    let delivered = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&delivered);
 
-    run_joined_release(
+    run_joined_release_observed(
         &fixture,
         &[tick, volume],
         true,
@@ -7220,6 +7238,23 @@ fn test_interleaved_joined_release_cuts_and_floors_each_bar_type_trade_by_trade(
             release_trade(id, 102 * MS_NS, 400 * MS_NS, "0.65020", "h2"),
         ],
         vec![release_trade(id, 100 * MS_NS, 200 * MS_NS, "0.65000", "a1")],
+        |request_id| {
+            msgbus::register_response_handler(
+                &request_id,
+                TypedHandler::from(move |envelope: &DataResponseEnvelope| {
+                    if let Some(DataResponse::Bars(resp)) = envelope.response() {
+                        for bar in resp.data.iter() {
+                            let cached = cached_bars(&cache, &[tick, volume]);
+                            recorded.borrow_mut().push(OrderedDelivery::Bar(
+                                bar.bar_type,
+                                bar.ts_event,
+                                cached,
+                            ));
+                        }
+                    }
+                }),
+            );
+        },
     );
 
     // Each builder drops the trade in the cut's millisecond and floors h1 at the answer's floor
@@ -7230,4 +7265,25 @@ fn test_interleaved_joined_release_cuts_and_floors_each_bar_type_trade_by_trade(
     ];
     assert_eq!(built_bars(&fixture, tick), expected);
     assert_eq!(built_bars(&fixture, volume), expected);
+
+    // The requester is given each held trade's bars of both types before the next trade's, as
+    // live publishes them: a1's, then h1's, then h2's, each bar cached just before its part
+    let bar = |bar_type, ts_init, cached: [usize; 2]| {
+        OrderedDelivery::Bar(
+            bar_type,
+            UnixNanos::from(NY_2026_11_12_1800 + ts_init),
+            cached.to_vec(),
+        )
+    };
+    assert_eq!(
+        *delivered.borrow(),
+        vec![
+            bar(tick, 200 * MS_NS, [1, 0]),
+            bar(volume, 200 * MS_NS, [1, 1]),
+            bar(tick, 200 * MS_NS, [2, 1]),
+            bar(volume, 200 * MS_NS, [2, 2]),
+            bar(tick, 400 * MS_NS, [3, 2]),
+            bar(volume, 400 * MS_NS, [3, 3]),
+        ]
+    );
 }

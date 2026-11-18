@@ -562,6 +562,19 @@ impl DataEngine {
             .max()
             .unwrap_or_default();
 
+        // One topic's trades held from each subscription on: a shorter buffer is a longer's tail
+        debug_assert!(builders.iter().all(|(_, shorter)| {
+            let without_floor =
+                |copy: &Option<TradeTick>| copy.map(|trade| (trade.trade_id, trade.ts_event));
+            builders.iter().all(|(_, longer)| {
+                longer.len() < shorter.len()
+                    || longer[longer.len() - shorter.len()..]
+                        .iter()
+                        .map(without_floor)
+                        .eq(shorter.iter().map(without_floor))
+            })
+        }));
+
         for index in 0..longest {
             let start = bars.borrow().len();
 

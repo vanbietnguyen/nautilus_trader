@@ -3168,9 +3168,9 @@ pub trait DataActor {
     /// terminal envelope for the join naming the request; the request is not joined and is
     /// answered as described here. Only `RequestJoin` is checked: the engine's low-level
     /// pipeline registration (`new_request_pipeline`, `register_request_pipeline_leg`) must not
-    /// be given the ID of a request that set `interleave`. A client's direct answer, a catalog's answer with any client
-    /// gaps, and the history/live join (`cut_warmup`) are served; with `quotes`, the quotes
-    /// parts go out in the merged order between the trades and bars parts.
+    /// be given the ID of a request that set `interleave`. A client's direct answer, a catalog's
+    /// answer with any client gaps, and the history/live join (`cut_warmup`) are served; with
+    /// `quotes`, the quotes parts go out in the merged order between the trades and bars parts.
     ///
     /// Limits: a trade stamped exactly at a time bar's close is in that bar (left-open
     /// intervals) and the bar comes after it; live, the order of that timer and that trade is
