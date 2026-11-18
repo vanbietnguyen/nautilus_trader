@@ -235,8 +235,8 @@ pub struct DataEngine {
     /// until they are cleaned up.
     request_replays: AHashMap<UUID4, RequestReplay>,
     /// The replays of builders kept by request (`update_subscriptions`) between their requests,
-    /// each idle until a request continues it, a subscription adopts its builders or the asker
-    /// removes them.
+    /// each idle until a request continues it, a subscription adopts its builders or the request
+    /// claiming it releases them (see [`Self::release_kept_bars`]).
     kept_replays: Vec<RequestReplay>,
     /// What the clean-up of a request whose builders are kept by request left to do for their
     /// subscriptions (see [`Release`]), until its terminal is out.
@@ -890,7 +890,9 @@ impl DataEngine {
     /// Errors during execution are logged.
     pub fn execute(&mut self, cmd: DataCommand) {
         match &cmd {
-            DataCommand::Subscribe(_) | DataCommand::Unsubscribe(_) => self.command_count += 1,
+            DataCommand::Subscribe(_)
+            | DataCommand::Unsubscribe(_)
+            | DataCommand::ReleaseKeptBars(_) => self.command_count += 1,
             DataCommand::Request(_) => self.request_count += 1,
             #[cfg(feature = "defi")]
             DataCommand::DefiRequest(_) => self.request_count += 1,
@@ -920,6 +922,7 @@ impl DataEngine {
                 c.venue().copied(),
                 Some(*c.request_id()),
             ),
+            DataCommand::ReleaseKeptBars(c) => ("ReleaseKeptBars", None, None, Some(c.command_id)),
             #[cfg(feature = "defi")]
             DataCommand::DefiRequest(c) => (
                 "DefiRequest",
@@ -948,6 +951,10 @@ impl DataEngine {
             DataCommand::Subscribe(c) => self.execute_subscribe(c),
             DataCommand::Unsubscribe(c) => self.execute_unsubscribe(&c),
             DataCommand::Request(c) => self.execute_request(c),
+            DataCommand::ReleaseKeptBars(c) => {
+                self.release_kept_bars(&c);
+                Ok(())
+            }
             #[cfg(feature = "defi")]
             DataCommand::DefiRequest(c) => self.execute_defi_request(c),
             #[cfg(feature = "defi")]

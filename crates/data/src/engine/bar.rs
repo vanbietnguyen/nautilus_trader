@@ -21,8 +21,8 @@ use nautilus_common::{
     cache::Cache,
     clock::{Clock, VirtualClock},
     messages::data::{
-        BarsResponse, DataResponseEnvelope, QuotesResponse, SubscribeBars, SubscribeCommand,
-        TradesResponse,
+        BarsResponse, DataResponseEnvelope, QuotesResponse, ReleaseKeptBars, SubscribeBars,
+        SubscribeCommand, TradesResponse,
     },
     msgbus::{self, MStr, Topic, TypedHandler},
 };
@@ -47,7 +47,7 @@ use super::{
     process_engine_bar, request_bar_aggregation_from_params, request_params,
     requests::{
         FILTER_EXPR, INTERLEAVE, INTERLEAVE_REFUSED, KEPT_ANSWERED_BARE, KEPT_REFUSED,
-        UPDATE_SUBSCRIPTIONS, time_zone_from_params,
+        UPDATE_SUBSCRIPTIONS, carries_quotes, time_zone_from_params,
     },
     responses::{parent_request_window, quotes_part},
     switchboard,
@@ -80,8 +80,8 @@ pub(super) struct InterleavedRequest {
 /// (`update_subscriptions`, keyed by their bar types alone) outlive it, idle in
 /// `DataEngine::kept_replays`, until a later request continues the replay (see
 /// [`DataEngine::admit_kept_request`]), a subscription takes them over (see
-/// [`DataEngine::hand_over_kept_builders`]) or the asker removes them. Nothing asks a builder
-/// whether it is historical.
+/// [`DataEngine::hand_over_kept_builders`]) or the request claiming the replay releases them (see
+/// [`DataEngine::release_kept_bars`]). Nothing asks a builder whether it is historical.
 #[derive(Debug)]
 pub(super) struct RequestReplay {
     clock: Rc<RefCell<VirtualClock>>,
@@ -106,10 +106,13 @@ pub(super) struct RequestReplay {
     /// response (see [`DataEngine::mark_bare_response`]). A kept replay so marked is removed
     /// when its request ends, not kept.
     partial: bool,
-    /// Whether a kept builder of it was unsubscribed while its request was in flight (see
-    /// [`DataEngine::unsubscribe_bars`]), with a subscription held back on it or without: the
-    /// request keeps the builder to its end, then the replay is removed, not kept.
-    unsubscribed: bool,
+    /// The request that started it or last continued it: the one whose ID releases its kept
+    /// builders (see [`DataEngine::release_kept_bars`]). A refused request never changes it.
+    claim: UUID4,
+    /// The kept builders its claiming request released while that request was in flight (see
+    /// [`DataEngine::release_kept_bars`]): the request keeps them to its end, then they are
+    /// removed, not kept, unless a subscription held back on one takes it over then.
+    released: Vec<BarAggregatorKey>,
 }
 
 /// Kept builders of one replay handed over to their subscriptions in one engine turn: the
@@ -368,11 +371,12 @@ impl DataEngine {
         // A continued replay keeps its clock, timers and grid; only its window is the request's
         let replay = match continued {
             Some(replay) => RequestReplay {
+                claim: request_id,
                 end: None,
                 dispatched,
                 partial: false,
                 covered: None,
-                unsubscribed: false,
+                released: Vec::new(),
                 ..replay
             },
             None => RequestReplay {
@@ -387,7 +391,8 @@ impl DataEngine {
                 end: None,
                 dispatched,
                 partial: false,
-                unsubscribed: false,
+                claim: request_id,
+                released: Vec::new(),
             },
         };
 
@@ -455,6 +460,8 @@ impl DataEngine {
     /// - A bar type it asks is built from another bar (a composite): a kept builder is handed
     ///   over to its subscription alone or with builders that share nothing. The error names the
     ///   first.
+    /// - A bar type it asks is not fed by its own records (see [`why_not_fed_by_own_records`]):
+    ///   its builder would be kept as covering a window it never saw. The error names the first.
     /// - The engine's clock is not a [`VirtualClock`]: at a hand-over the builders' pending
     ///   closes move from the replay's clock to the engine's, which a live clock would fire at
     ///   its own time instead of theirs.
@@ -482,6 +489,14 @@ impl DataEngine {
             anyhow::bail!(
                 "{KEPT_REFUSED}: {bar_type} is built from another bar; a kept request names only \
                  bar types built directly from its own records"
+            );
+        }
+        if let Some((bar_type, why)) = state.bar_types.iter().find_map(|bar_type| {
+            why_not_fed_by_own_records(req, bar_type).map(|why| (bar_type, why))
+        }) {
+            anyhow::bail!(
+                "{KEPT_REFUSED}: its own records do not feed {bar_type}: {why}; a kept request \
+                 names only bar types built directly from its own records"
             );
         }
         anyhow::ensure!(
@@ -665,16 +680,51 @@ impl DataEngine {
             .position(|replay| replay.builders.contains(key))
     }
 
-    /// Marks the replay of the request in flight that runs the kept builder under `key` as
-    /// unsubscribed (see [`RequestReplay::unsubscribed`]): it is removed when its request ends.
-    fn mark_unsubscribed_in_flight(&mut self, key: &BarAggregatorKey) {
-        for replay in self
-            .request_replays
-            .values_mut()
-            .filter(|replay| replay.builders.contains(key))
+    /// Releases the claim of the request `cmd.request_id` on the builder of `cmd.bar_type` kept by
+    /// request (see [`ReleaseKeptBars`]), acting only when that request claims the builder's
+    /// replay (see [`RequestReplay::claim`]): an idle builder is stopped and removed, and its
+    /// replay with it when it is the last; one that request still runs is marked, and removed at
+    /// its end (see [`RequestReplay::released`]), its answer untouched. Only the released bar
+    /// type's builder goes: the others of the replay are left as they are. A release naming any
+    /// other request, or a builder no replay holds any more (a subscription took it over), is
+    /// ignored.
+    pub(super) fn release_kept_bars(&mut self, cmd: &ReleaseKeptBars) {
+        let key = bar_aggregator_key(cmd.bar_type, None);
+
+        if let Some(index) = self
+            .kept_replays
+            .iter()
+            .position(|replay| replay.claim == cmd.request_id && replay.builders.contains(&key))
         {
-            replay.unsubscribed = true;
+            if let Err(e) = self.stop_bar_aggregator(cmd.bar_type, None) {
+                log::error!(
+                    "Error stopping kept bar aggregator for {}: {e}",
+                    cmd.bar_type
+                );
+            }
+            let replay = &mut self.kept_replays[index];
+            replay.builders.retain(|kept| *kept != key);
+            if replay.builders.is_empty() {
+                self.kept_replays.swap_remove(index);
+            }
+            return;
         }
+
+        // A replay in flight is keyed by the request claiming it
+        if let Some(replay) = self.request_replays.get_mut(&cmd.request_id)
+            && replay.builders.contains(&key)
+        {
+            if !replay.released.contains(&key) {
+                replay.released.push(key);
+            }
+            return;
+        }
+
+        log::debug!(
+            "Ignoring release of {} by request {}: it claims no kept builder of it",
+            cmd.bar_type,
+            cmd.request_id
+        );
     }
 
     /// Returns whether the builder of `bar_type` is kept by request and idle on its replay, so a
@@ -1027,9 +1077,9 @@ impl DataEngine {
     /// stay on their replay after a success (see [`Self::release_kept_builders`]), which returns
     /// the builders it hands over to their subscriptions; after anything else, after an answer
     /// that may not hold every record of its window (a bare response, see
-    /// [`RequestReplay::partial`]), or when one of them was unsubscribed while the request was in
-    /// flight, the replay is removed with them (see [`Self::remove_kept_builders`]), which returns
-    /// the new builders of their held-back subscriptions. Either is returned (see [`Release`]),
+    /// [`RequestReplay::partial`]), the replay is removed with them (see
+    /// [`Self::remove_kept_builders`]), which returns the new builders of their held-back
+    /// subscriptions. Either is returned (see [`Release`]),
     /// for the caller to do once the answer's bars and its terminal are out (see
     /// [`Self::finish_release`]). With `interleaved`, the entry of an interleaving request
     /// holding its undelivered bars, the bars its held live trades complete go there; the entry
@@ -1051,7 +1101,7 @@ impl DataEngine {
         if state.update_subscriptions {
             let answer = interleaved.map(|interleaved| Rc::clone(&interleaved.bars));
             return match replay {
-                Some(replay) if succeeded && !replay.partial && !replay.unsubscribed => self
+                Some(replay) if succeeded && !replay.partial => self
                     .release_kept_builders(&state, replay, joined, answer.as_deref())
                     .map(Release::HandOver),
                 replay => self
@@ -1071,8 +1121,10 @@ impl DataEngine {
 
     /// Keeps the builders of a kept request that succeeded on its replay, idle: no output
     /// handler, nothing drives them, their armed deadlines stay armed, until a later request
-    /// continues the replay from its coverage, a subscription takes them over or the asker
-    /// removes them.
+    /// continues the replay from its coverage, a subscription takes them over or the request
+    /// claiming the replay releases them (see [`Self::release_kept_bars`]). Those the request
+    /// released while it ran (see [`RequestReplay::released`]) are removed now, after its answer,
+    /// and the replay goes with its last builder.
     ///
     /// The builders whose subscriptions were held back while the answer was in flight leave the
     /// replay now, together, on a clock of their own (see [`Self::hand_over_clock`]), and are
@@ -1113,6 +1165,20 @@ impl DataEngine {
                 held,
             })
         };
+
+        for key in std::mem::take(&mut replay.released) {
+            if !replay.builders.contains(&key) {
+                continue;
+            }
+
+            if let Err(e) = self.stop_bar_aggregator(key.0, None) {
+                log::error!(
+                    "Error stopping released kept bar aggregator for {}: {e}",
+                    key.0
+                );
+            }
+            replay.builders.retain(|kept| *kept != key);
+        }
 
         for key in &replay.builders {
             if let Some(aggregator) = self.bar_aggregators.get(key) {
@@ -1929,31 +1995,21 @@ impl DataEngine {
             .single_bar_type()
             .expect("native engine receives one bar type");
 
-        // A builder kept by request that no subscription took over is removed, with its replay
-        // when it is the last; no subscription of it is released
+        // A builder kept by request that no subscription took over is the claiming request's: an
+        // unsubscribe never removes it (see `release_kept_bars`)
         let key = bar_aggregator_key(bar_type, None);
-        if let Some(index) = self.kept_replay_index(&key) {
-            if let Err(e) = self.stop_bar_aggregator(bar_type, None) {
-                log::error!("Error stopping kept bar aggregator for {bar_type}: {e}");
-            }
-            let replay = &mut self.kept_replays[index];
-            replay.builders.retain(|kept| *kept != key);
-            if replay.builders.is_empty() {
-                self.kept_replays.swap_remove(index);
-            }
+        if self.kept_replay_index(&key).is_some() {
             return;
         }
 
-        // A kept builder a request is still running: that request runs to its end with it, and
-        // then its replay is removed instead of kept; a subscription held back on it is released
-        // now, its builder left to the request
+        // A kept builder a request is still running stays the request's: a subscription held
+        // back on it is released now, and only that subscription
         let in_flight = self
             .request_replays
             .values()
             .any(|replay| replay.builders.contains(&key));
         let held_back = in_flight && self.bar_aggregator_handlers.contains_key(&key);
         if in_flight && !held_back {
-            self.mark_unsubscribed_in_flight(&key);
             return;
         }
 
@@ -1988,7 +2044,6 @@ impl DataEngine {
             self.subscriptions_bar_aggregation
                 .remove(&bar_type.standard());
             self.unsubscribe_bar_aggregator(&command);
-            self.mark_unsubscribed_in_flight(&key);
         } else if self
             .bar_aggregators
             .contains_key(&bar_aggregator_key(bar_type, None))
@@ -2769,6 +2824,32 @@ fn why_not_fed_by_trades(bar_type: &BarType, instrument_id: InstrumentId) -> Opt
         Some("it is built from quotes")
     } else if bar_type.instrument_id() != instrument_id {
         Some("it is of another instrument")
+    } else {
+        None
+    }
+}
+
+/// Returns why the builder of `bar_type` is not fed by the records `req` asks, or `None` when it
+/// is: a trades request's trades feed `LAST` bars of its instruments (its quotes, when it carries
+/// them, the others); a quotes request's quotes feed the bars of its instruments that are not
+/// `LAST`; a bars request's bars feed only bars built from other bars. Any other kind is not
+/// judged here.
+fn why_not_fed_by_own_records(req: &RequestCommand, bar_type: &BarType) -> Option<&'static str> {
+    let (instrument_ids, feeds_last, feeds_quotes) = match req {
+        RequestCommand::Trades(r) => (&r.instrument_ids, true, carries_quotes(req)),
+        RequestCommand::Quotes(r) => (&r.instrument_ids, false, true),
+        RequestCommand::Bars(_) => {
+            return Some("a bars request feeds only bars built from other bars");
+        }
+        _ => return None,
+    };
+
+    if !instrument_ids.contains(&bar_type.instrument_id()) {
+        Some("it is of another instrument")
+    } else if bar_type.spec().price_type == PriceType::Last && !feeds_last {
+        Some("it is built from trades and the request asks quotes")
+    } else if bar_type.spec().price_type != PriceType::Last && !feeds_quotes {
+        Some("it is built from quotes and the request asks trades")
     } else {
         None
     }

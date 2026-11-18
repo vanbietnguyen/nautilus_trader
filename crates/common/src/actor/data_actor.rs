@@ -71,11 +71,11 @@ use crate::{
             BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
             DataCommand, DataResponse, DataResponseEnvelope, FundingRatesResponse,
             InstrumentResponse, InstrumentsResponse, IntoBarTypes, IntoInstrumentIds,
-            QuotesResponse, RequestBars, RequestBookDeltas, RequestBookDepth, RequestBookSnapshot,
-            RequestCommand, RequestCustomData, RequestFundingRates, RequestInstrument,
-            RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars, SubscribeBookDeltas,
-            SubscribeBookDepth, SubscribeBookSnapshots, SubscribeCommand, SubscribeCustomData,
-            SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
+            QuotesResponse, ReleaseKeptBars, RequestBars, RequestBookDeltas, RequestBookDepth,
+            RequestBookSnapshot, RequestCommand, RequestCustomData, RequestFundingRates,
+            RequestInstrument, RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars,
+            SubscribeBookDeltas, SubscribeBookDepth, SubscribeBookSnapshots, SubscribeCommand,
+            SubscribeCustomData, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
             SubscribeInstrumentClose, SubscribeInstrumentStatus, SubscribeInstruments,
             SubscribeMarkPrices, SubscribeOptionChain, SubscribeOptionGreeks, SubscribeQuotes,
             SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
@@ -3177,8 +3177,10 @@ pub trait DataActor {
     /// With `params["update_subscriptions"] = true` the request's aggregators are kept under
     /// their bar types and outlive it, so a later request can continue them and a subscription
     /// to their bar types takes them over. They compute as above, on a clock of their own; such
-    /// a request must give a `start`, name no `limit`, no filter expression, no `point_data` and
-    /// no bar type built from another bar, and not be a continuous-future request, on an engine
+    /// a request must give a `start`, name no `limit`, no filter expression, no `point_data`, no
+    /// bar type built from another bar and no bar type its own records do not feed (`LAST` bars
+    /// of its instruments on a trades request, others of them on a quotes request, none on a bars
+    /// request), and not be a continuous-future request, on an engine
     /// whose clock is a `VirtualClock` (a backtest's); any other is refused before dispatch, with
     /// one terminal envelope naming the case. A request none of whose aggregators exists starts
     /// them, their clock at its `start`. A request whose aggregators are exactly those one earlier kept request left, none
@@ -3212,11 +3214,18 @@ pub trait DataActor {
     /// gets a new aggregator, started then and fed the held trades after the answer's terminal,
     /// so their bars come after it. A joined request
     /// (`cut_warmup`) closes nothing after its last trade: its held live trades, through the
-    /// join's cut and floor, move its clock on before the takeover. [`Self::unsubscribe_bars`]
-    /// for a bar type kept and not subscribed since removes its aggregator; made while a request
-    /// runs it, a held-back subscription of it is released at once, that request runs to its
-    /// end with the aggregator, and then its aggregators are removed as on a failure: nothing is
-    /// taken over, and another held-back subscription gets a new aggregator.
+    /// join's cut and floor, move its clock on before the takeover.
+    ///
+    /// A kept aggregator is claimed by the request that started or last continued it, not by an
+    /// actor. The actor records the ID of every such request it sends, by bar type, until it
+    /// subscribes that bar type, and releases them, each as its own command
+    /// ([`ReleaseKeptBars`]), at [`Self::unsubscribe_bars`] of the bar type, when it stops, and
+    /// at its reset and disposal. The engine acts only on the claiming request's ID: an idle
+    /// aggregator of the released bar type is removed (the replay goes with its last one); one
+    /// that request still runs is removed at its end, after its answer, unless a subscription held
+    /// back on it takes it over then; any other ID is ignored. A refused request claims nothing.
+    /// An unsubscribe never removes a kept aggregator: a held-back subscription's releases only
+    /// that subscription. An aggregator a subscription took over, no release touches.
     ///
     /// With `params["interleave"] = true` and `params["bar_types"]`, the engine answers the
     /// trades together with the bars it builds from them, in the order a subscriber running
@@ -3532,7 +3541,10 @@ where
     }
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
-        DataActor::on_stop(self)
+        DataActor::on_stop(self)?;
+        // A stopped actor holds no builder kept by request
+        self.core().release_kept_requests();
+        Ok(())
     }
 
     fn on_resume(&mut self) -> anyhow::Result<()> {
@@ -3584,9 +3596,11 @@ pub struct DataActorCore {
     indicators: Indicators,
     warning_events: AHashSet<String>, // TODO: TBD
     requests: RefCell<RequestLifecycle>,
-    /// The bar types whose builders this actor keeps by request (`update_subscriptions`) and has
-    /// not subscribed since: [`Self::unsubscribe_bars`] removes them (see [`KeptBarTypes`]).
-    kept_bar_types: Rc<RefCell<KeptBarTypes>>,
+    /// The ID of every request keeping bar builders by request (`update_subscriptions`) this
+    /// actor sent, by bar type, since it last released them or subscribed that bar type: each is
+    /// released at [`Self::unsubscribe_bars`] of its bar type, and all at
+    /// [`Self::unsubscribe_all`] and when the actor stops (see [`ReleaseKeptBars`]).
+    kept_requests: RefCell<IndexMap<BarType, Vec<UUID4>>>,
     signal_classes: AHashMap<String, String>,
     #[cfg(feature = "defi")]
     block_handlers: AHashMap<MStr<Topic>, Subscription<TypedHandler<Block>>>,
@@ -4316,10 +4330,9 @@ impl DataActorCore {
     /// Removes every message bus handler and releases each retained venue subscription.
     ///
     /// Called on disposal so retirement leaves no handler which would resolve an actor that
-    /// deregistration has already removed. Each bar type the actor acquired by a kept request
-    /// (`update_subscriptions`) and has not subscribed since is released too, as
-    /// [`Self::unsubscribe_bars`] releases one (see [`KeptBarTypes`]); the claims of its kept
-    /// requests still in flight are dropped with their handlers.
+    /// deregistration has already removed. The ID of every request keeping bar builders by request
+    /// (`update_subscriptions`) the actor sent since it last released them or subscribed their bar
+    /// type is released too, a request still in flight included (see [`ReleaseKeptBars`]).
     pub(crate) fn unsubscribe_all(&mut self) {
         let mut commands = Vec::new();
 
@@ -4412,10 +4425,7 @@ impl DataActorCore {
             }
         }
 
-        let kept = std::mem::take(&mut *self.kept_bar_types.borrow_mut());
-        for bar_type in kept.acquired {
-            self.send_data_cmd(kept_unsubscribe(bar_type, None, self.timestamp_ns()));
-        }
+        self.release_kept_requests();
         #[cfg(feature = "python")]
         self.message_bus.clear();
     }
@@ -4497,7 +4507,7 @@ impl DataActorCore {
             indicators: Indicators::default(),
             warning_events: AHashSet::new(),
             requests: RefCell::new(RequestLifecycle::default()),
-            kept_bar_types: Rc::default(),
+            kept_requests: RefCell::default(),
             signal_classes: AHashMap::new(),
             #[cfg(feature = "defi")]
             block_handlers: AHashMap::new(),
@@ -5450,10 +5460,10 @@ impl DataActorCore {
                 handler.clone(),
                 DataCommand::Subscribe(SubscribeCommand::Bars(member)),
             ) {
-                // This subscription takes over a builder of it the actor kept by request
-                self.kept_bar_types
+                // A builder of it the actor kept by request is taken over: no release touches it
+                self.kept_requests
                     .borrow_mut()
-                    .take_over(&bar_type.standard());
+                    .shift_remove(&bar_type.standard());
                 acquired.push(*bar_type);
             }
         }
@@ -6275,11 +6285,11 @@ impl DataActorCore {
 
     /// Unsubscribes the actor from bars using each type's retained route.
     ///
-    /// A bar type the actor kept by request (`update_subscriptions`) and has not subscribed
-    /// since is released too: the engine is sent the unsubscribe, and removes its kept builder.
-    /// The actor keeps one only once its request ended with no failure reason (a refused or
-    /// failed one leaves it nothing to release); one a request still in flight asked is
-    /// released when that request ends so.
+    /// The ID of every request keeping bar builders by request (`update_subscriptions`) the actor
+    /// sent for the bar type since it last released them or subscribed it is released too, each
+    /// as its own command (see [`ReleaseKeptBars`]): the engine removes the kept builder only for
+    /// the request that started or last continued its replay (one still in flight at its end),
+    /// and ignores any other. The unsubscribe itself never removes a kept builder.
     ///
     /// # Errors
     ///
@@ -6295,16 +6305,14 @@ impl DataActorCore {
         ensure_routable_bar_types(&bar_types, client_id.is_some())?;
         let mut retained = Vec::new();
         for bar_type in bar_types {
-            match self.remove_bar_subscription(bar_type) {
-                Some(command) => retained.push(command),
-                None if self
-                    .kept_bar_types
-                    .borrow_mut()
-                    .release(&bar_type.standard()) =>
-                {
-                    self.send_data_cmd(kept_unsubscribe(bar_type, client_id, self.timestamp_ns()));
-                }
-                None => {}
+            if let Some(command) = self.remove_bar_subscription(bar_type) {
+                retained.push(command);
+            }
+
+            let bar_type = bar_type.standard();
+            let request_ids = self.kept_requests.borrow_mut().shift_remove(&bar_type);
+            for request_id in request_ids.into_iter().flatten() {
+                self.send_data_cmd(release_kept_bars(bar_type, request_id, self.timestamp_ns()));
             }
         }
         self.release_subscriptions(retained);
@@ -6788,9 +6796,8 @@ impl DataActorCore {
             params,
         });
 
-        let handler = self.kept_request_handler(request_id, client_id, !kept.is_empty(), handler);
         self.register_request_handler(command.request_id(), handler)?;
-        self.kept_bar_types.borrow_mut().ask(request_id, kept);
+        self.record_kept_request(request_id, kept);
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -6838,9 +6845,8 @@ impl DataActorCore {
             params,
         });
 
-        let handler = self.kept_request_handler(request_id, client_id, !kept.is_empty(), handler);
         self.register_request_handler(command.request_id(), handler)?;
-        self.kept_bar_types.borrow_mut().ask(request_id, kept);
+        self.record_kept_request(request_id, kept);
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -6892,9 +6898,8 @@ impl DataActorCore {
             params,
         });
 
-        let handler = self.kept_request_handler(request_id, client_id, !kept.is_empty(), handler);
         self.register_request_handler(command.request_id(), handler)?;
-        self.kept_bar_types.borrow_mut().ask(request_id, kept);
+        self.record_kept_request(request_id, kept);
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -6956,42 +6961,26 @@ impl DataActorCore {
         Ok(())
     }
 
-    /// Returns `handler` for the request `request_id`, which keeps bar builders by request
-    /// (`update_subscriptions`) when `keeps`: at the request's terminal, before `handler` gets
-    /// it, the bar types it asked are settled (see [`KeptBarTypes::settle`]), and one this actor
-    /// unsubscribed while the request was in flight is released then, through `client_id`.
-    fn kept_request_handler(
-        &self,
-        request_id: UUID4,
-        client_id: Option<ClientId>,
-        keeps: bool,
-        handler: TypedHandler<DataResponseEnvelope>,
-    ) -> TypedHandler<DataResponseEnvelope> {
-        if !keeps {
-            return handler;
+    /// Records `request_id` as a request this actor sent that keeps the builders of `bar_types` by
+    /// request (`update_subscriptions`), to release it later (see [`Self::kept_requests`]). It is
+    /// recorded whatever becomes of the request: the engine alone knows which request claims a
+    /// kept builder, and ignores a release naming any other.
+    fn record_kept_request(&self, request_id: UUID4, bar_types: Vec<BarType>) {
+        let mut kept_requests = self.kept_requests.borrow_mut();
+        for bar_type in bar_types {
+            kept_requests.entry(bar_type).or_default().push(request_id);
         }
+    }
 
-        let kept_bar_types = Rc::clone(&self.kept_bar_types);
-        let clock = self.clock.clone();
-        TypedHandler::from_with_id(handler.id(), move |envelope: &DataResponseEnvelope| {
-            if envelope.completed() {
-                let released = kept_bar_types
-                    .borrow_mut()
-                    .settle(&request_id, envelope.failure_reason().is_none());
-                for bar_type in released {
-                    let ts_init = clock
-                        .as_ref()
-                        .map_or_else(UnixNanos::default, |clock| clock.borrow().timestamp_ns());
-                    let endpoint = MessagingSwitchboard::data_engine_queue_execute();
-                    msgbus::send_data_command(
-                        endpoint,
-                        kept_unsubscribe(bar_type, client_id, ts_init),
-                    );
-                }
+    /// Releases the ID of every request keeping bar builders by request this actor recorded (see
+    /// [`Self::kept_requests`]), each as its own command (see [`ReleaseKeptBars`]).
+    fn release_kept_requests(&self) {
+        let kept_requests = std::mem::take(&mut *self.kept_requests.borrow_mut());
+        for (bar_type, request_ids) in kept_requests {
+            for request_id in request_ids {
+                self.send_data_cmd(release_kept_bars(bar_type, request_id, self.timestamp_ns()));
             }
-
-            handler.handle(envelope);
-        })
+        }
     }
 
     /// Returns whether this actor is awaiting completion of a request.
@@ -7148,98 +7137,15 @@ impl DataActorNative for DataActorCore {
     }
 }
 
-/// The bar types whose builders an actor keeps by request (`update_subscriptions`) and has not
-/// subscribed since. A bar type is the actor's only once the request that asked it ended with no
-/// failure reason; a refused or failed request is dropped before its terminal reaches the actor's
-/// handler, so the actor never releases a builder another requester keeps.
-#[derive(Debug, Default)]
-struct KeptBarTypes {
-    /// Those the actor acquired.
-    acquired: AHashSet<BarType>,
-    /// Those asked by each request in flight.
-    pending: AHashMap<UUID4, Vec<BarType>>,
-    /// Pending ones the actor unsubscribed meanwhile: released once acquired.
-    released: AHashSet<BarType>,
-}
-
-impl KeptBarTypes {
-    /// Records `bar_types` as asked by the request `request_id`, in flight.
-    fn ask(&mut self, request_id: UUID4, bar_types: Vec<BarType>) {
-        if !bar_types.is_empty() {
-            self.pending.insert(request_id, bar_types);
-        }
-    }
-
-    /// Ends the claim of the request `request_id` at its terminal: when it `succeeded` its bar
-    /// types are acquired, otherwise dropped. Returns those unsubscribed while it ran, to release
-    /// now.
-    fn settle(&mut self, request_id: &UUID4, succeeded: bool) -> Vec<BarType> {
-        let mut release = Vec::new();
-
-        for bar_type in self.pending.remove(request_id).unwrap_or_default() {
-            let unsubscribed = self.released.remove(&bar_type);
-            if !succeeded {
-                continue;
-            }
-
-            if unsubscribed {
-                release.push(bar_type);
-            } else {
-                self.acquired.insert(bar_type);
-            }
-        }
-
-        release
-    }
-
-    /// Forgets `bar_type`, whose builder a subscription of the actor takes over.
-    fn take_over(&mut self, bar_type: &BarType) {
-        self.acquired.remove(bar_type);
-        self.released.remove(bar_type);
-        for bar_types in self.pending.values_mut() {
-            bar_types.retain(|pending| pending != bar_type);
-        }
-    }
-
-    /// Returns whether the actor's unsubscribe of `bar_type` is sent now: only for one it acquired,
-    /// which it forgets, with any claim of its own request in flight continuing it (the engine
-    /// removes that replay at the request's end). One only a request in flight asked is released
-    /// when that request acquires it (see [`Self::settle`]).
-    fn release(&mut self, bar_type: &BarType) -> bool {
-        if self.acquired.remove(bar_type) {
-            for bar_types in self.pending.values_mut() {
-                bar_types.retain(|pending| pending != bar_type);
-            }
-            return true;
-        }
-
-        if self
-            .pending
-            .values()
-            .any(|bar_types| bar_types.contains(bar_type))
-        {
-            self.released.insert(*bar_type);
-        }
-
-        false
-    }
-}
-
-/// Returns the command that releases the builder of `bar_type` an actor kept by request.
-fn kept_unsubscribe(
-    bar_type: BarType,
-    client_id: Option<ClientId>,
-    ts_init: UnixNanos,
-) -> DataCommand {
-    DataCommand::Unsubscribe(UnsubscribeCommand::Bars(UnsubscribeBars::new(
+/// Returns the command that releases the claim of the request `request_id` on the builder of
+/// `bar_type` kept by request.
+fn release_kept_bars(bar_type: BarType, request_id: UUID4, ts_init: UnixNanos) -> DataCommand {
+    DataCommand::ReleaseKeptBars(ReleaseKeptBars::new(
         bar_type,
-        client_id,
-        Some(bar_type.instrument_id().venue),
+        request_id,
         UUID4::new(),
         ts_init,
-        None,
-        None,
-    )))
+    ))
 }
 
 /// Returns the bar types, standard, whose builders a request with `params` keeps: its
