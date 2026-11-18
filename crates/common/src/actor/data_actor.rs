@@ -3080,8 +3080,10 @@ pub trait DataActor {
     /// With `params["bar_types"]` and without `update_subscriptions`, the engine also builds
     /// those bars from the quotes and adds them to the cache, as for a trades request (see
     /// [`Self::request_trades`]): on the request's own clock, each close firing before the first
-    /// quote after it, and at an answer that completes with no failure reason, with no `limit`,
-    /// the closes up to `min(end, the engine clock's time when the request was dispatched)`.
+    /// quote after it, and at an answer that completes with no failure reason, with no `limit`
+    /// or filter expression and not a bare response, the closes up to `min(end, the engine
+    /// clock's time when the request was dispatched)`. A part of its window that no source
+    /// covers fails the request, as for a trades request.
     ///
     /// # Errors
     ///
@@ -3136,7 +3138,8 @@ pub trait DataActor {
     /// catalog's quote file intervals fails the request with one terminal envelope naming the
     /// gap, while a gap in its trade file intervals that no client can fill is answered as an
     /// ordinary trades request answers it: the gap holds no trades, its quotes are still
-    /// delivered, and the request completes with no failure reason.
+    /// delivered, and the request completes with no failure reason, unless it builds bars
+    /// without `update_subscriptions` (below), when the gap fails it.
     ///
     /// With `params["bar_types"]`, and without `interleave` and `update_subscriptions`, the
     /// engine also builds those bars and adds them to the cache; the requester is given the
@@ -3152,9 +3155,19 @@ pub trait DataActor {
     /// `min(end, the engine clock's time when the request was dispatched)` (that time without an
     /// `end`) fire after the last trade, none later; for a time-range pipeline once, after its
     /// last child. An answer with a failure reason, a failed child, or a request with a `limit`
-    /// fires no close after its last trade. With `update_subscriptions` the aggregators work as
-    /// before: a time bar is built at the next trade after its close, the last one when the
-    /// answer completes. A part of the window that no source covers is not a failure.
+    /// fires no close after its last trade.
+    ///
+    /// Those closes need an answer holding every record of its window, so such a request fails
+    /// when a part of its window has no source: a part no catalog file holds when no client
+    /// resolves, or the part after the last child of a time-range pipeline whose durations run
+    /// out before its end. The failure reason names the first such part, the records that
+    /// exist are still delivered, and no close fires after the last of them. A client's answer,
+    /// empty or not, is a source. A request that names a `limit` or a filter expression
+    /// (`filter_expr`), or that its client answers with a bare response (`DataEngine::response`,
+    /// which certifies no coverage), completes with no failure reason and closes nothing after
+    /// its last record. With `update_subscriptions` the aggregators work as before: a time bar
+    /// is built at the next trade after its close, the last one when the answer completes, and
+    /// a part of the window that no source covers is not a failure.
     ///
     /// With `params["interleave"] = true` and `params["bar_types"]`, the engine answers the
     /// trades together with the bars it builds from them, in the order a subscriber running
@@ -3180,7 +3193,11 @@ pub trait DataActor {
     /// closes up to `min(end, the engine clock's time when the request was dispatched)` (that
     /// time without an `end`) fire after the last trade (with `quotes`, after the last quote or
     /// trade), each bar a part of its own, and none later. An answer with a failure reason, or
-    /// a request with a `limit`, fires no close after its last trade.
+    /// a request with a `limit`, fires no close after its last trade. As without `interleave`,
+    /// a part of the window that no source covers fails the request, its existing trades and
+    /// the bars before its last trade still delivered, the last trades part carrying the
+    /// reason; and a request with a filter expression, or answered by a bare response,
+    /// completes but closes nothing after its last record.
     ///
     /// Bars of different types that one trade completes come in the order live publishes them,
     /// whatever the order of `bar_types`: with `update_subscriptions`, time bars first (their
@@ -3232,8 +3249,8 @@ pub trait DataActor {
     /// boundary, are built at the next trade after their close, not when the close passes, so
     /// at the end of the answer history can differ from live, and two time bar types whose
     /// closes interleave come one type after the other, not in close order; with `quotes`, such
-    /// a bar goes out before that next trade, after the quotes before it. A part of the window
-    /// that no source covers is not a failure.
+    /// a bar goes out before that next trade, after the quotes before it. For such a request a
+    /// part of the window that no source covers is not a failure.
     ///
     /// # Errors
     ///
@@ -3274,7 +3291,8 @@ pub trait DataActor {
     /// (`continuous_future_transitions`) runs one such clock across its segments; a segment
     /// change only sets the price adjustment applied to the records fed after it, so a bar open
     /// at the change continues; the closes up to its end fire once, when its last segment
-    /// completes with no failure reason.
+    /// completes with no failure reason. As for a trades request, a `limit` or a filter
+    /// expression leaves nothing closed after its last record.
     ///
     /// # Errors
     ///

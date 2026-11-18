@@ -45,7 +45,7 @@ use super::{
     handlers::{JoinedRelease, JoinedSlot, JoinedTradeHandler, WarmupBuffer},
     has_continuous_future_params, has_time_range_pipeline_params, log_error_on_cache_insert,
     process_engine_bar, request_bar_aggregation_from_params, request_params,
-    requests::{INTERLEAVE, INTERLEAVE_REFUSED, time_zone_from_params},
+    requests::{FILTER_EXPR, INTERLEAVE, INTERLEAVE_REFUSED, time_zone_from_params},
     responses::{parent_request_window, quotes_part},
     switchboard,
 };
@@ -85,8 +85,11 @@ pub(super) struct RequestReplay {
     end: Option<UnixNanos>,
     /// The engine clock's time when the request was dispatched: its answer covers no later.
     dispatched: UnixNanos,
-    /// Whether the request named a `limit`, so its answer may stop before its window ends.
-    limit: bool,
+    /// Whether its answer may not hold every record of its window, so its end of coverage fires
+    /// nothing: the request named a `limit` or a filter expression (see
+    /// [`window_not_wholly_known`]), or its answer came as a bare response (see
+    /// [`DataEngine::response`]).
+    partial: bool,
 }
 
 /// The completed answer of an interleaving trades request, delivered by
@@ -269,7 +272,7 @@ impl DataEngine {
                 armed: false,
                 end: None,
                 dispatched: self.clock.borrow().timestamp_ns(),
-                limit: false,
+                partial: false,
             };
             self.request_replays.insert(request_id, replay);
         }
@@ -318,8 +321,8 @@ impl DataEngine {
     }
 
     /// Records the window of the replay of `req` (for a pipeline, its parent), if it has one:
-    /// its `end` and whether it names a `limit`. Then arms it at the request's `start`; without
-    /// one it is armed at its first record.
+    /// its `end` and whether its window is not wholly known (see [`window_not_wholly_known`]).
+    /// Then arms it at the request's `start`; without one it is armed at its first record.
     pub(super) fn open_request_replay(&mut self, req: &RequestCommand) {
         let request_id = *req.request_id();
         let (start, end) = parent_request_window(Some(req));
@@ -327,11 +330,38 @@ impl DataEngine {
             return;
         };
         replay.end = end;
-        replay.limit = names_a_limit(req);
+        replay.partial = window_not_wholly_known(req);
 
         if let Some(start) = start {
             self.arm_replay(request_id, start);
         }
+    }
+
+    /// Marks the replay of `request_id`, if it has one, as answered by a bare response, which does
+    /// not certify that it holds every record of the window (see [`RequestReplay::partial`]).
+    pub(super) fn mark_bare_response(&mut self, request_id: UUID4) {
+        if let Some(replay) = self.request_replays.get_mut(&request_id) {
+            replay.partial = true;
+        }
+    }
+
+    /// Returns whether `req` builds bars on a replay (see [`RequestReplay`]): its own, or the one
+    /// of the time-range pipeline it is a child of. A request whose replay is not made yet is
+    /// read from its parameters: bar types without `update_subscriptions`.
+    #[cfg(feature = "streaming")]
+    pub(super) fn builds_bars_on_a_replay(&self, req: &RequestCommand) -> bool {
+        let request_id = *req.request_id();
+        let owner = self
+            .time_range_pipeline_parent_request_id
+            .get(&request_id)
+            .copied()
+            .unwrap_or(request_id);
+
+        self.request_replays.contains_key(&owner)
+            || request_bar_aggregation_from_params(request_params(req))
+                .ok()
+                .flatten()
+                .is_some_and(|state| !state.update_subscriptions)
     }
 
     /// Returns the replay clock of `request_id`, `None` for a request without a replay.
@@ -438,13 +468,13 @@ impl DataEngine {
 
     /// Drives the replay of `request_id` through the end of its coverage at its completed answer
     /// with no failure reason: `min(end, dispatched)` (`dispatched` without an end), so every
-    /// close the answer covered fires and nothing later. A request that named a `limit` may
-    /// stop short of its window, so its replay is not driven.
+    /// close the answer covered fires and nothing later. An answer that may not hold every record
+    /// of the window (see [`RequestReplay::partial`]) does not drive it.
     fn end_replay_coverage(&self, request_id: UUID4) {
         let Some(covered) = self
             .request_replays
             .get(&request_id)
-            .filter(|replay| !replay.limit)
+            .filter(|replay| !replay.partial)
             .map(|replay| {
                 replay
                     .end
@@ -1946,15 +1976,21 @@ fn live_delivery_order(bar_type: &BarType) -> (bool, String) {
     (!bar_type.spec().is_time_aggregated(), bar_type.to_string())
 }
 
-/// Returns whether `req` names a `limit`, so its answer may stop before its window ends. Only
-/// the kinds whose records feed aggregators are read.
-fn names_a_limit(req: &RequestCommand) -> bool {
-    match req {
+/// Returns whether the window of `req` is not wholly known by the asker's own choice: it names a
+/// `limit`, so its answer may stop before its window ends (only the kinds whose records feed
+/// aggregators are read), or a filter expression (`filter_expr`), so rows of its window are left
+/// out.
+fn window_not_wholly_known(req: &RequestCommand) -> bool {
+    let limit = match req {
         RequestCommand::Quotes(cmd) => cmd.limit.is_some(),
         RequestCommand::Trades(cmd) => cmd.limit.is_some(),
         RequestCommand::Bars(cmd) => cmd.limit.is_some(),
         _ => false,
-    }
+    };
+    let filter = request_params(req)
+        .and_then(|params| params.get_str(FILTER_EXPR))
+        .is_some_and(|filter_expr| !filter_expr.is_empty());
+    limit || filter
 }
 
 /// Returns whether `bar_type`'s builder runs on a clock: a time bar closes, and a `RANGE` bar

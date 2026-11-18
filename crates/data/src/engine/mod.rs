@@ -2026,8 +2026,17 @@ impl DataEngine {
     /// Processes a payload-only reply as a completed request.
     ///
     /// Payload-only replies do not certify coverage for catalog write-back. Use
-    /// [`Self::response_envelope`] to report explicit source completion.
-    pub fn response(&mut self, mut resp: DataResponse) {
+    /// [`Self::response_envelope`] to report explicit source completion. Nor do they certify
+    /// that they hold every record of the window: a request that builds bars on a replay of its
+    /// own and is answered this way closes nothing after its last record.
+    pub fn response(&mut self, resp: DataResponse) {
+        self.mark_bare_response(*resp.correlation_id());
+        self.payload_response(resp);
+    }
+
+    /// Completes the request of `resp`, a payload-only reply or one the engine made, with `resp`
+    /// as its one completed answer.
+    fn payload_response(&mut self, mut resp: DataResponse) {
         resp.trim_to_bounds();
         let request = self.inflight_requests.remove(resp.correlation_id());
         #[cfg(feature = "streaming")]

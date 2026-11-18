@@ -38,6 +38,8 @@ const LAST_POST_INSTRUMENT_ID: &str = "last_post_instrument_id";
 const FIRST_PRE_INSTRUMENT_ID: &str = "first_pre_instrument_id";
 const BAR_TYPES: &str = "bar_types";
 pub(super) const INTERLEAVE: &str = "interleave";
+/// The request parameter naming a filter expression, which leaves rows of the window out.
+pub(super) const FILTER_EXPR: &str = "filter_expr";
 const UPDATE_SUBSCRIPTIONS: &str = "update_subscriptions";
 const SCHEMA: &str = "schema";
 const CUT_WARMUP: &str = "cut_warmup";
@@ -585,6 +587,16 @@ fn session_open_on(date: civil::Date, time_zone: &TimeZone) -> anyhow::Result<Un
         .to_datetime(SESSION_OPEN_TIME)
         .to_zoned(time_zone.clone())?;
     Ok(UnixNanos::from(open.timestamp()))
+}
+
+/// Returns the failure reason of a request that builds bars when no source covers `[start, end]`
+/// of its window, the first such part, for `cause`.
+pub(super) fn uncovered_window_reason(start: UnixNanos, end: UnixNanos, cause: &str) -> String {
+    format!(
+        "No source covers {} to {} of the request's window: {cause}",
+        start.to_datetime_utc(),
+        end.to_datetime_utc(),
+    )
 }
 
 /// Names and counts the trading days a join did not serve, by their opens in New York time.

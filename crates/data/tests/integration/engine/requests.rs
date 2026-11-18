@@ -489,11 +489,9 @@ fn test_request_scoped_time_bar_aggregation_handles_trade_response(
         Some(params),
     )));
 
-    // The close at the last trade's stamp stays armed until the end, the dispatch time (1 s)
-    assert_eq!(
-        cache.borrow().bar(&bar_type).map(|bar| bar.ts_event),
-        Some(UnixNanos::from(1_000_000_000))
-    );
+    // The close at the last trade's stamp stays armed, and a bare response does not certify
+    // that it holds every record of the window, so nothing fires after its last record
+    assert_eq!(cache.borrow().bar(&bar_type).map(|bar| bar.ts_event), None);
     assert!(saver.get_messages().is_empty());
 }
 
@@ -8978,8 +8976,24 @@ fn run_merged(
         "quotes": true,
     });
     let request = windowed_trades_request(fixture, window, params);
-    let request_id = *request.request_id();
+    let delivered = tap_merged(fixture, *request.request_id(), bar_types);
 
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+    delivered.take()
+}
+
+/// Records, as [`Merged`], every part the requester of `request_id` is sent.
+#[cfg(feature = "streaming")]
+fn tap_merged(
+    fixture: &JoinFixture,
+    request_id: UUID4,
+    bar_types: &[BarType],
+) -> Rc<RefCell<Vec<Merged>>> {
     let cache = Rc::clone(fixture.engine.borrow().cache());
     let instrument_id = fixture.instrument_id;
     let watched = bar_types.to_vec();
@@ -9018,14 +9032,7 @@ fn run_merged(
         }
     });
     msgbus::register_response_handler(&request_id, handler);
-
-    fixture
-        .engine
-        .borrow_mut()
-        .execute_request(request)
-        .unwrap();
-    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
-    delivered.take()
+    delivered
 }
 
 /// A quote at one bid and ask, stamped `ts`.
@@ -9361,4 +9368,449 @@ fn test_merged_answer_that_fails_fires_no_end_of_coverage_and_ends_once(
         t("10:03:00") - 1
     );
     assert_eq!(delivered, vec![Merged::End(Some(reason))]);
+}
+
+/// The gap example on 2024-01-08 (UTC): a request over 09:56 to 10:05 whose catalog file ends at
+/// 09:59:59.999999999 and holds trades at 09:56:30, 09:57:30 and 09:58:30.
+#[cfg(feature = "streaming")]
+const GAP_WINDOW: (&str, &str) = ("09:56:00", "10:05:00");
+
+#[cfg(feature = "streaming")]
+fn gap_ns(time: &str) -> u64 {
+    utc_ns(&format!("2024-01-08T{time}Z"))
+}
+
+/// Registers the gap example's catalog on `engine`, its file ending at `file_end`.
+#[cfg(feature = "streaming")]
+fn register_gap_catalog(
+    engine: &mut DataEngine,
+    instrument_id: InstrumentId,
+    label: &str,
+    file_end: u64,
+) -> CatalogTempDir {
+    let trades: Vec<_> = [("09:56:30", "t1"), ("09:57:30", "t2"), ("09:58:30", "t3")]
+        .into_iter()
+        .map(|(time, id)| split_trade(instrument_id, gap_ns(time), id))
+        .collect();
+    register_trade_catalog_with_trades(
+        engine,
+        label,
+        &trades,
+        Some((gap_ns(GAP_WINDOW.0), file_end)),
+    )
+}
+
+/// A trades request over the gap example's window, routed to `client_id`.
+#[cfg(feature = "streaming")]
+fn gap_request(instrument_id: InstrumentId, client_id: ClientId, params: Value) -> RequestCommand {
+    RequestCommand::Trades(RequestTrades::new(
+        instrument_id,
+        timestamp_of(Some(gap_ns(GAP_WINDOW.0))),
+        timestamp_of(Some(gap_ns(GAP_WINDOW.1))),
+        None,
+        Some(client_id),
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(serde_json::from_value(params).unwrap()),
+    ))
+}
+
+/// The failure reason of the gap example: no source covers 10:00 to 10:05.
+#[cfg(feature = "streaming")]
+const GAP_REASON: &str = "No source covers 2024-01-08T10:00:00Z to 2024-01-08T10:05:00Z of the \
+                          request's window: no catalog file holds it and no client resolves";
+
+/// The gap example's engine, dispatched at 12:00, with a client the requests below may name.
+#[cfg(feature = "streaming")]
+fn gap_fixture(
+    audusd_sim: CurrencyPair,
+    client_id: ClientId,
+    venue: Venue,
+    watched: &[BarType],
+) -> PlainFixture {
+    PlainFixture::new(
+        vec![InstrumentAny::CurrencyPair(audusd_sim)],
+        client_id,
+        venue,
+        without_flat_bars(),
+        gap_ns("12:00:00"),
+        watched,
+    )
+}
+
+/// A plain request over a part of its window no catalog file holds and no client resolves:
+/// its answer fails naming that part, delivers the catalog's records, fires the closes before
+/// its last record and nothing after it, and ends once.
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_plain_request_over_a_gap_no_client_resolves_fails_and_closes_nothing_after_it(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let minute = bar_type_of(id, "1-MINUTE");
+    let mut fixture = gap_fixture(audusd_sim, client_id, venue, &[minute]);
+    let _catalog_dir =
+        register_gap_catalog(&mut fixture.engine, id, "gap-plain", gap_ns("10:00:00") - 1);
+
+    let params = json!({ "bar_types": [minute.to_string()] });
+    fixture.execute(gap_request(id, ClientId::new("ABSENT"), params));
+
+    // Without the failure the end (10:05) would fire the 09:59 close holding t3
+    assert_eq!(
+        fixture.cached(),
+        vec![vec![(gap_ns("09:57:00"), 1), (gap_ns("09:58:00"), 1)]]
+    );
+    assert_eq!(fixture.ends(), vec![Some(GAP_REASON.to_owned())]);
+    assert_eq!(fixture.cache.borrow().trade_count(&id), 3);
+    assert!(fixture.trades_requests().is_empty());
+}
+
+/// The same on the interleaved path: its trades and bars in live order, the closes before its
+/// last record only, and one terminal, the last trades part, carrying the reason.
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_interleaved_request_over_a_gap_no_client_resolves_fails_and_closes_nothing_after_it(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, gap_ns("12:00:00"));
+    let id = fixture.instrument_id;
+    let minute = bar_type_of(id, "1-MINUTE");
+    let _catalog_dir = register_gap_catalog(
+        &mut fixture.engine.borrow_mut(),
+        id,
+        "gap-interleaved",
+        gap_ns("10:00:00") - 1,
+    );
+
+    let params = json!({
+        "bar_types": [minute.to_string()],
+        "update_subscriptions": false,
+        "interleave": true,
+    });
+    let request = gap_request(id, ClientId::new("ABSENT"), params);
+    let delivered = tap_merged(&fixture, *request.request_id(), &[minute]);
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+
+    assert_eq!(
+        delivered.take(),
+        vec![
+            merged_trades(&["t1"], &[0, 0]),
+            merged_bar(minute, gap_ns("09:57:00"), 1, &[1, 0]),
+            merged_trades(&["t2"], &[1, 0]),
+            merged_bar(minute, gap_ns("09:58:00"), 1, &[2, 0]),
+            merged_trades(&["t3"], &[2, 0]),
+            Merged::End(Some(GAP_REASON.to_owned())),
+        ]
+    );
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+}
+
+/// With a client, the part no catalog file holds goes to it; its answer, here empty and bare,
+/// is a source: nothing fails, and the end fires the closes through 10:05.
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_plain_request_over_a_gap_its_client_answers_empty_fires_the_end_of_coverage(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let minute = bar_type_of(id, "1-MINUTE");
+    let mut fixture = gap_fixture(audusd_sim, client_id, venue, &[minute]);
+    let _catalog_dir = register_gap_catalog(
+        &mut fixture.engine,
+        id,
+        "gap-client",
+        gap_ns("10:00:00") - 1,
+    );
+
+    let params = json!({ "bar_types": [minute.to_string()] });
+    fixture.execute(gap_request(id, client_id, params));
+    let before = fixture.cached();
+    let legs = fixture.trades_requests();
+    fixture
+        .engine
+        .response(trades_answer(legs[0].request_id, client_id, id, &[]));
+
+    assert_eq!(legs.len(), 1);
+    assert_eq!(
+        (legs[0].start, legs[0].end),
+        (
+            timestamp_of(Some(gap_ns("10:00:00"))),
+            timestamp_of(Some(gap_ns("10:05:00")))
+        )
+    );
+    // The catalog leg's records wait in the pipeline for the client leg
+    assert_eq!(before, vec![vec![]]);
+    assert_eq!(
+        fixture.cached(),
+        vec![vec![
+            (gap_ns("09:57:00"), 1),
+            (gap_ns("09:58:00"), 1),
+            (gap_ns("09:59:00"), 1),
+        ]]
+    );
+    assert_eq!(fixture.ends(), vec![None]);
+}
+
+/// A request that builds no bars, over the same gap with no client, completes as before: the
+/// catalog's records and no failure.
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_request_without_bars_over_a_gap_no_client_resolves_completes_as_before(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let mut fixture = gap_fixture(audusd_sim, client_id, venue, &[]);
+    let _catalog_dir = register_gap_catalog(
+        &mut fixture.engine,
+        id,
+        "gap-no-bars",
+        gap_ns("10:00:00") - 1,
+    );
+
+    fixture.execute(gap_request(id, ClientId::new("ABSENT"), json!({})));
+
+    assert_eq!(fixture.ends(), vec![None]);
+    assert_eq!(fixture.cache.borrow().trade_count(&id), 3);
+}
+
+/// A window its catalog file wholly holds, with no client, is answered as before: the end fires
+/// the closes through 10:05.
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_plain_request_over_a_wholly_covered_window_fires_the_end_of_coverage(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let minute = bar_type_of(id, "1-MINUTE");
+    let mut fixture = gap_fixture(audusd_sim, client_id, venue, &[minute]);
+    let _catalog_dir =
+        register_gap_catalog(&mut fixture.engine, id, "gap-covered", gap_ns("10:05:00"));
+
+    let params = json!({ "bar_types": [minute.to_string()] });
+    fixture.execute(gap_request(id, ClientId::new("ABSENT"), params));
+
+    assert_eq!(
+        fixture.cached(),
+        vec![vec![
+            (gap_ns("09:57:00"), 1),
+            (gap_ns("09:58:00"), 1),
+            (gap_ns("09:59:00"), 1),
+        ]]
+    );
+    assert_eq!(fixture.ends(), vec![None]);
+}
+
+/// A time-range pipeline over 10:00 to 10:09 in 3-minute children stops after an empty child
+/// (its one duration runs out) at 10:06: the parent fails naming 10:06 to 10:09 and fires no
+/// close after its last record.
+#[rstest]
+fn test_time_range_pipeline_ending_before_the_parent_end_fails_at_the_parent(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let minute = bar_type_of(id, "1-MINUTE");
+    let mut fixture = PlainFixture::new(
+        vec![InstrumentAny::CurrencyPair(audusd_sim)],
+        client_id,
+        venue,
+        without_flat_bars(),
+        utc_ns("2024-01-08T12:00:00Z"),
+        &[minute],
+    );
+    fixture.execute(plain_trades_request(
+        id,
+        client_id,
+        UUID4::new(),
+        (
+            Some(utc_ns("2024-01-08T10:00:00Z")),
+            Some(utc_ns("2024-01-08T10:09:00Z")),
+        ),
+        None,
+        plain_params(
+            &[minute],
+            json!({ "time_range_generator": "", "durations_seconds": [180] }),
+        ),
+    ));
+
+    let first = fixture.trades_requests()[0].request_id;
+    let answer = trades_answer(
+        first,
+        client_id,
+        id,
+        &[
+            (utc_ns("2024-01-08T10:01:30Z"), "1.00000", 1),
+            (utc_ns("2024-01-08T10:02:30Z"), "1.00000", 2),
+        ],
+    );
+    let after_first = fixture.answer(answer, true, None);
+    let second = fixture.trades_requests()[1].request_id;
+    let answer = trades_answer(second, client_id, id, &[]);
+    let after_second = fixture.answer(answer, true, None);
+
+    // Without the failure the parent's end (10:09) would fire the 10:03 close holding the second
+    // trade
+    let closed = vec![vec![(utc_ns("2024-01-08T10:02:00Z"), 1)]];
+    assert_eq!(after_first, closed);
+    assert_eq!(after_second, closed);
+    assert_eq!(fixture.trades_requests().len(), 2);
+    assert_eq!(
+        fixture.ends(),
+        vec![Some(
+            "No source covers 2024-01-08T10:06:00.000000001Z to 2024-01-08T10:09:00Z of the \
+             request's window: its time-range pipeline ended before it, its durations having \
+             run out"
+                .to_owned()
+        )]
+    );
+}
+
+/// How a plain request's window is left not wholly known.
+#[derive(Clone, Copy, Debug)]
+enum NotWhole {
+    /// It names a filter expression.
+    Filter,
+    /// Its client answers with a bare response.
+    Bare,
+}
+
+/// A request that names a filter, or is answered by a bare response, completes with no failure,
+/// fires the closes before its last record, and nothing after it.
+#[rstest]
+#[case::filter(NotWhole::Filter)]
+#[case::bare_response(NotWhole::Bare)]
+fn test_plain_request_whose_window_is_not_wholly_known_fires_no_end_of_coverage(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] not_whole: NotWhole,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (five, range) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "10-RANGE"));
+    let mut fixture = PlainFixture::new(
+        vec![InstrumentAny::CurrencyPair(audusd_sim)],
+        client_id,
+        venue,
+        without_flat_bars(),
+        new_york("2024-01-08T20:00:00"),
+        &[five, range],
+    );
+    let extra = match not_whole {
+        NotWhole::Filter => json!({ "filter_expr": "size > 0" }),
+        NotWhole::Bare => json!({}),
+    };
+    let request_id = UUID4::new();
+    fixture.execute(plain_trades_request(
+        id,
+        client_id,
+        request_id,
+        (
+            Some(new_york("2024-01-08T16:50:00")),
+            Some(new_york("2024-01-08T18:00:00") + 1),
+        ),
+        None,
+        plain_params(&[five, range], extra),
+    ));
+
+    let answer = trades_answer(
+        request_id,
+        client_id,
+        id,
+        &[
+            (new_york("2024-01-08T16:52:00"), "1.00000", 1),
+            (new_york("2024-01-08T16:57:00"), "1.00000", 2),
+            (new_york("2024-01-08T16:59:58"), "1.00000", 3),
+        ],
+    );
+    let cached = match not_whole {
+        NotWhole::Filter => fixture.answer(answer, true, None),
+        NotWhole::Bare => {
+            fixture.engine.response(answer);
+            fixture.cached()
+        }
+    };
+
+    // The 16:55 close fires before the 16:57 trade; neither 17:00 nor the 18:00 boundary fires
+    assert_eq!(
+        cached,
+        vec![vec![(new_york("2024-01-08T16:55:00"), 1)], vec![]]
+    );
+    assert_eq!(fixture.ends(), vec![None]);
+}
+
+/// A time-range child over a part no catalog file holds, with no client, fails as a plain
+/// request does, and so does its parent: the child's records delivered, no close after them.
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_time_range_child_over_a_gap_no_client_resolves_fails_its_parent(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let minute = bar_type_of(id, "1-MINUTE");
+    let mut fixture = gap_fixture(audusd_sim, client_id, venue, &[minute]);
+    let trades = [
+        split_trade(id, gap_ns("10:00:30"), "t1"),
+        split_trade(id, gap_ns("10:01:30"), "t2"),
+    ];
+    let _catalog_dir = register_trade_catalog_with_trades(
+        &mut fixture.engine,
+        "gap-time-range",
+        &trades,
+        Some((gap_ns("10:00:00"), gap_ns("10:02:00") - 1)),
+    );
+
+    fixture.execute(plain_trades_request(
+        id,
+        ClientId::new("ABSENT"),
+        UUID4::new(),
+        (Some(gap_ns("10:00:00")), Some(gap_ns("10:06:00"))),
+        None,
+        plain_params(
+            &[minute],
+            json!({ "time_range_generator": "", "durations_seconds": [180] }),
+        ),
+    ));
+
+    assert_eq!(fixture.cached(), vec![vec![(gap_ns("10:01:00"), 1)]]);
+    assert_eq!(
+        fixture.ends(),
+        vec![Some(
+            "No source covers 2024-01-08T10:02:00Z to 2024-01-08T10:03:00Z of the request's \
+             window: no catalog file holds it and no client resolves"
+                .to_owned()
+        )]
+    );
 }

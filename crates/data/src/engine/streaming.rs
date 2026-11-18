@@ -44,8 +44,9 @@ use ustr::Ustr;
 use super::{
     DataEngine,
     requests::{
-        AdmittedJoin, QUOTES_REFUSED, describe_missing_sessions, has_continuous_future_params,
-        request_params, sets_quotes, trading_days,
+        AdmittedJoin, FILTER_EXPR, QUOTES_REFUSED, describe_missing_sessions,
+        has_continuous_future_params, request_params, sets_quotes, trading_days,
+        uncovered_window_reason,
     },
     time_range::has_time_range_pipeline_params,
 };
@@ -57,6 +58,8 @@ const PARAM_SUBSCRIPTION_NAME: &str = "subscription_name";
 const PARAM_FROM_DAY_START: &str = "from_day_start";
 const CATALOG_CLIENT_ID: &str = "CATALOG";
 const PARAM_REPLAY_START: &str = "replay_start";
+/// Why a part of the window of a request that builds bars has no source.
+const NO_SOURCE: &str = "no catalog file holds it and no client resolves";
 
 pub(crate) type CatalogMap = AHashMap<Ustr, DataCatalog>;
 
@@ -456,7 +459,11 @@ impl DataEngine {
 
     /// Returns the plan of a date-range request for the one identifier `key`: one catalog leg
     /// from the first catalog that covers part of the window (unless `skip_catalog_data`), plus
-    /// one client leg per interval it misses when a client resolves.
+    /// one client leg per interval it misses when a client resolves. A client's answer, empty or
+    /// not, is a source. When none resolves, a request that builds bars on a replay (see
+    /// [`Self::builds_bars_on_a_replay`]) gets a payload-free leg naming the first missed
+    /// interval, so its answer fails and closes nothing after its last record; any other request
+    /// is answered by its catalog leg alone, as before.
     fn plan_date_range_request(
         &mut self,
         req: &RequestCommand,
@@ -542,11 +549,20 @@ impl DataEngine {
             .get_client(client_id.as_ref(), venue.as_ref())
             .is_some();
 
+        let mut plan = Vec::new();
+        let mut uncovered = None;
+
         if !has_client {
+            if self.builds_bars_on_a_replay(req)
+                && let Some(&(start, end)) = missing_intervals.first()
+            {
+                uncovered = Some(RequestLeg::Terminal {
+                    request_id: UUID4::new(),
+                    reason: uncovered_window_reason(start.into(), end.into(), NO_SOURCE),
+                });
+            }
             missing_intervals.clear();
         }
-
-        let mut plan = Vec::new();
 
         if !skip_catalog_data && let Some(catalog) = winning_catalog {
             let request =
@@ -564,6 +580,8 @@ impl DataEngine {
             let request = with_dates_for_pipeline(req, Some(start), Some(end), now_ns);
             plan.push(RequestLeg::Client(request));
         }
+
+        plan.extend(uncovered);
 
         Ok(plan)
     }
@@ -922,7 +940,7 @@ impl DataEngine {
                 None,
                 now,
             )?;
-            self.response(response);
+            self.payload_response(response);
             return Ok(());
         }
 
@@ -976,13 +994,13 @@ impl DataEngine {
                                 ));
                             }
 
-                            self.response(response);
+                            self.payload_response(response);
                             Ok(())
                         })
                 }
                 RequestLeg::Client(request) => self.dispatch_request_to_client(request).map(|_| ()),
                 RequestLeg::Response(response) => {
-                    self.response(response);
+                    self.payload_response(response);
                     Ok(())
                 }
                 RequestLeg::Terminal { request_id, reason } => {
@@ -1252,7 +1270,7 @@ impl DataEngine {
                     now_ns,
                     Some(catalog_response_params(cmd.params.as_ref())),
                 )));
-                self.response(response);
+                self.payload_response(response);
                 return Ok(());
             }
         }
@@ -1387,7 +1405,7 @@ impl DataEngine {
             now_ns,
             Some(catalog_response_params(cmd.params.as_ref())),
         ));
-        self.response(response);
+        self.payload_response(response);
         Ok(())
     }
 }
@@ -1854,7 +1872,7 @@ fn request_end(req: &RequestCommand) -> Option<Timestamp> {
 
 fn request_filter_expr(params: Option<&Params>) -> Option<String> {
     params
-        .and_then(|params| params.get_str("filter_expr"))
+        .and_then(|params| params.get_str(FILTER_EXPR))
         .filter(|filter_expr| !filter_expr.is_empty())
         .map(ToString::to_string)
 }

@@ -26,12 +26,18 @@ use serde_json::Value;
 
 use super::{
     DataEngine, datetime_to_unix_nanos,
-    requests::{remove_request_bar_aggregation_params, request_params, response_params},
+    requests::{
+        remove_request_bar_aggregation_params, request_params, response_params,
+        uncovered_window_reason,
+    },
 };
 
 pub(super) const TIME_RANGE_GENERATOR: &str = "time_range_generator";
 const TIME_RANGE_DURATIONS_SECONDS: &str = "durations_seconds";
 const TIME_RANGE_POINT_DATA: &str = "point_data";
+/// Why the part of a parent's window after its last child window has no source.
+const PIPELINE_ENDED_SHORT: &str =
+    "its time-range pipeline ended before it, its durations having run out";
 
 #[derive(Debug, Clone)]
 pub(super) struct TimeRangePipelineState {
@@ -337,7 +343,19 @@ impl DataEngine {
             log::error!("Cannot emit empty time-range response for parent {parent_id}");
             return;
         };
-        self.response(response);
+
+        // A parent that builds bars and whose children ended before its end fails, closing nothing
+        if self.request_replays.contains_key(&parent_id)
+            && let Some((start, end)) = state.generator.uncovered()
+        {
+            let reason = uncovered_window_reason(start, end, PIPELINE_ENDED_SHORT);
+            self.process_response_envelope(
+                DataResponseEnvelope::new(response, true, None).with_failure(reason),
+            );
+            return;
+        }
+
+        self.payload_response(response);
     }
 }
 
@@ -420,6 +438,14 @@ impl DefaultTimeRangeGenerator {
             start_ns: request_start_ns,
             end_ns,
         })
+    }
+
+    /// Returns the part of the window after the last child window, when the generator stopped
+    /// before the end (its durations ran out): from where the next child would start to the end.
+    fn uncovered(&self) -> Option<(UnixNanos, UnixNanos)> {
+        let offset = DurationNanos::new(u64::from(self.iteration_index > 0 && !self.point_data));
+        let start = self.prev_request_end_ns.saturating_add(offset);
+        (start <= self.last_end_ns).then_some((start, self.last_end_ns))
     }
 
     fn can_yield_initial_window(&self) -> bool {

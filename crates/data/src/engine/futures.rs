@@ -289,7 +289,7 @@ impl DataEngine {
             self.clock.borrow().timestamp_ns(),
             Some(Params::new(params)),
         ));
-        self.response(response);
+        self.payload_response(response);
     }
 
     pub(super) fn handle_continuous_future_child_response(
