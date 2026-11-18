@@ -61,22 +61,17 @@ pub(super) struct InterleavedRequest {
     start: Option<UnixNanos>,
     end: Option<UnixNanos>,
     params: Option<Params>,
-    /// The engine clock's time when the request was dispatched: its answer covers no later.
-    dispatched: UnixNanos,
-    /// Whether the request named a `limit`, so its answer may stop before its window ends.
-    limit: bool,
-    /// The replay its own builders run on, for a request without `update_subscriptions`.
-    replay: Option<RequestReplay>,
 }
 
-/// The replay of an interleaving request without `update_subscriptions`: one clock that its own
-/// builders run on as a subscription's builders run on the engine clock, driven by the engine
-/// as a backtest drives its clock (see [`DataEngine::replay_until`]).
+/// The replay of a request without `update_subscriptions`, interleaving or not: one clock that
+/// its own builders run on as a subscription's builders run on the engine clock, driven by the
+/// engine as a backtest drives its clock (see [`DataEngine::replay_until`]). A pipeline's
+/// replay is its parent's: every child answer drives it.
 ///
 /// It records, for each builder of the request, what drives its clock (this replay), where its
-/// bars go (the request's answer, through the output handler set up with the request) and how
-/// long it lives (the request: the builders end with its entry). Nothing asks a builder whether
-/// it is historical.
+/// bars go (the request's answer, through the output handler set up with the request: parts of
+/// an interleaving request's answer, otherwise the cache) and how long it lives (the request:
+/// the builders end with it). Nothing asks a builder whether it is historical.
 #[derive(Debug)]
 pub(super) struct RequestReplay {
     clock: Rc<RefCell<VirtualClock>>,
@@ -85,6 +80,12 @@ pub(super) struct RequestReplay {
     /// Whether its builders' timers are armed: at the request's `start`, or without one at its
     /// first record.
     armed: bool,
+    /// The request's `end`: its answer covers no later.
+    end: Option<UnixNanos>,
+    /// The engine clock's time when the request was dispatched: its answer covers no later.
+    dispatched: UnixNanos,
+    /// Whether the request named a `limit`, so its answer may stop before its window ends.
+    limit: bool,
 }
 
 /// The completed answer of an interleaving trades request, delivered by
@@ -238,6 +239,10 @@ impl DataEngine {
         Ok(())
     }
 
+    /// Prepares the aggregators of `request_id` (for a pipeline, its parent) as `state`
+    /// describes them. Without `update_subscriptions` they are the request's own and end with
+    /// it: they run on a replay of their own (see [`RequestReplay`]), whose window
+    /// [`Self::open_request_replay`] records.
     pub(super) fn prepare_request_bar_aggregators_from_state(
         &mut self,
         request_id: UUID4,
@@ -251,6 +256,22 @@ impl DataEngine {
 
         self.request_bar_aggregations
             .insert(request_id, state.clone());
+
+        if !state.update_subscriptions {
+            let replay = RequestReplay {
+                clock: Rc::new(RefCell::new(VirtualClock::new())),
+                builders: state
+                    .bar_types
+                    .iter()
+                    .map(|bar_type| bar_aggregator_key(*bar_type, Some(request_id)))
+                    .collect(),
+                armed: false,
+                end: None,
+                dispatched: self.clock.borrow().timestamp_ns(),
+                limit: false,
+            };
+            self.request_replays.insert(request_id, replay);
+        }
 
         if let Err(e) = self.init_request_bar_aggregators(request_id, state) {
             self.cleanup_request_bar_aggregators(&request_id);
@@ -276,25 +297,10 @@ impl DataEngine {
             state.bar_types.sort_by_cached_key(live_delivery_order);
 
             let (start, end) = parent_request_window(Some(req));
-            // Its builders are its own and end with it: they run on a replay of their own
-            let replay = (!state.update_subscriptions).then(|| RequestReplay {
-                clock: Rc::new(RefCell::new(VirtualClock::new())),
-                builders: state
-                    .bar_types
-                    .iter()
-                    .map(|bar_type| {
-                        bar_aggregator_key(*bar_type, state.aggregator_request_id(request_id))
-                    })
-                    .collect(),
-                armed: false,
-            });
             let interleaved = InterleavedRequest {
                 start,
                 end,
                 params: request_params(req).cloned(),
-                dispatched: self.clock.borrow().timestamp_ns(),
-                limit: matches!(req, RequestCommand::Trades(cmd) if cmd.limit.is_some()),
-                replay,
                 ..InterleavedRequest::default()
             };
             self.interleaved_requests.insert(request_id, interleaved);
@@ -303,27 +309,47 @@ impl DataEngine {
         let result = self.prepare_request_bar_aggregators_from_state(request_id, &state);
         if result.is_err() {
             self.interleaved_requests.remove(&request_id);
+        } else {
+            self.open_request_replay(req);
         }
 
         result
     }
 
+    /// Records the window of the replay of `req` (for a pipeline, its parent), if it has one:
+    /// its `end` and whether it names a `limit`. Then arms it at the request's `start`; without
+    /// one it is armed at its first record.
+    pub(super) fn open_request_replay(&mut self, req: &RequestCommand) {
+        let request_id = *req.request_id();
+        let (start, end) = parent_request_window(Some(req));
+        let Some(replay) = self.request_replays.get_mut(&request_id) else {
+            return;
+        };
+        replay.end = end;
+        replay.limit = names_a_limit(req);
+
+        if let Some(start) = start {
+            self.arm_replay(request_id, start);
+        }
+    }
+
     /// Returns the replay clock of `request_id`, `None` for a request without a replay.
     fn replay_clock(&self, request_id: UUID4) -> Option<Rc<RefCell<VirtualClock>>> {
-        self.interleaved_requests
+        self.request_replays
             .get(&request_id)
-            .and_then(|interleaved| interleaved.replay.as_ref())
             .map(|replay| Rc::clone(&replay.clock))
     }
 
     /// Arms the timers of the replay of `request_id` at `instant`, once: the replay clock is set
     /// there first, then each builder with a timer starts it as a subscription's builder does,
-    /// in the request's order.
+    /// in the request's order. Then, as for a subscription's builders, each time bar built from
+    /// another time bar of the request is linked to that source's builder, so at one instant
+    /// the source closes first and its bar is in the dependent's (see
+    /// [`Self::connect_time_bar_source`]).
     fn arm_replay(&mut self, request_id: UUID4, instant: UnixNanos) {
         let Some(replay) = self
-            .interleaved_requests
+            .request_replays
             .get_mut(&request_id)
-            .and_then(|interleaved| interleaved.replay.as_mut())
             .filter(|replay| !replay.armed)
         else {
             return;
@@ -340,6 +366,16 @@ impl DataEngine {
                     .start_timer(Some(Rc::clone(aggregator)));
             }
         }
+
+        let bar_types = self
+            .request_bar_aggregations
+            .get(&request_id)
+            .map(|state| state.bar_types.clone())
+            .unwrap_or_default();
+
+        for bar_type in bar_types {
+            self.connect_time_bar_source(bar_type, Some(request_id));
+        }
     }
 
     /// Readies the replay of `request_id` for a record stamped `ts`, as a backtest readies its
@@ -349,11 +385,10 @@ impl DataEngine {
     /// it fires after every record of its instant. The clock never moves back: a record stamped
     /// before it fires nothing and is the builders' stale case. Does nothing for a request
     /// without a replay.
-    fn replay_until(&mut self, request_id: UUID4, ts: UnixNanos) {
+    pub(super) fn replay_until(&mut self, request_id: UUID4, ts: UnixNanos) {
         let Some(armed) = self
-            .interleaved_requests
+            .request_replays
             .get(&request_id)
-            .and_then(|interleaved| interleaved.replay.as_ref())
             .map(|replay| replay.armed)
         else {
             return;
@@ -406,13 +441,13 @@ impl DataEngine {
     /// stop short of its window, so its replay is not driven.
     fn end_replay_coverage(&self, request_id: UUID4) {
         let Some(covered) = self
-            .interleaved_requests
+            .request_replays
             .get(&request_id)
-            .filter(|interleaved| interleaved.replay.is_some() && !interleaved.limit)
-            .map(|interleaved| {
-                interleaved.end.map_or(interleaved.dispatched, |end| {
-                    end.min(interleaved.dispatched)
-                })
+            .filter(|replay| !replay.limit)
+            .map(|replay| {
+                replay
+                    .end
+                    .map_or(replay.dispatched, |end| end.min(replay.dispatched))
             })
         else {
             return;
@@ -488,16 +523,6 @@ impl DataEngine {
 
         self.set_request_bar_aggregator_chain_handlers(request_id, state);
 
-        // The replay starts at the request's start; without one, at its first record
-        if let Some(start) = self
-            .interleaved_requests
-            .get(&request_id)
-            .filter(|interleaved| interleaved.replay.is_some())
-            .and_then(|interleaved| interleaved.start)
-        {
-            self.arm_replay(request_id, start);
-        }
-
         Ok(())
     }
 
@@ -532,7 +557,7 @@ impl DataEngine {
             let interleaved = self.interleaved_requests.get(&request_id);
             let interleaved_bars = interleaved.map(|interleaved| Rc::clone(&interleaved.bars));
             // A replay's builder computes as a subscription's, not in historical mode
-            let historical = interleaved.is_none_or(|interleaved| interleaved.replay.is_none());
+            let historical = !self.request_replays.contains_key(&request_id);
 
             let handler: Box<dyn FnMut(Bar)> = Box::new(move |bar: Bar| {
                 // Request-generated bars are delivered only through the cache, or as response
@@ -574,10 +599,8 @@ impl DataEngine {
         joined: Option<JoinedRelease>,
         interleaved: Option<&InterleavedRequest>,
     ) -> bool {
-        let held = self.interleaved_requests.remove(request_id);
-        let replayed = interleaved
-            .or(held.as_ref())
-            .is_some_and(|interleaved| interleaved.replay.is_some());
+        self.interleaved_requests.remove(request_id);
+        let replayed = self.request_replays.remove(request_id).is_some();
 
         let Some(state) = self.request_bar_aggregations.remove(request_id) else {
             return false;
@@ -662,10 +685,18 @@ impl DataEngine {
         }
     }
 
+    /// Feeds an answer of a request that does not interleave to its aggregators (see
+    /// [`Self::feed_request_bar_aggregators`]), their bars entering the cache as they are built.
+    ///
+    /// A `completed` answer ends the request. With no `failure` reason it first drives the
+    /// request's replay through the end of its coverage (see [`Self::end_replay_coverage`]),
+    /// once: for a pipeline, this is its parent's terminal, after every child answer. Then its
+    /// aggregators are cleaned up.
     pub(super) fn process_request_bar_aggregation_response(
         &mut self,
         resp: &DataResponse,
         completed: bool,
+        failure: Option<&str>,
     ) {
         let correlation_id = *resp.correlation_id();
 
@@ -673,31 +704,50 @@ impl DataEngine {
             return;
         };
 
-        match resp {
-            DataResponse::Quotes(r) => {
-                for quote in r.data.iter() {
-                    self.update_request_bar_aggregators_from_quote(&state, correlation_id, *quote);
-                }
-            }
-            DataResponse::Trades(r) => {
-                for trade in r.data.iter() {
-                    self.update_request_bar_aggregators_from_trade(&state, correlation_id, *trade);
-                }
-            }
-            DataResponse::Bars(r) => {
-                for bar in r.data.iter() {
-                    self.update_request_bar_aggregators_from_bar(&state, correlation_id, *bar);
-                }
-            }
-            _ => {}
-        }
+        self.feed_request_bar_aggregators(&state, correlation_id, resp);
 
         if completed {
+            if failure.is_none() {
+                self.end_replay_coverage(correlation_id);
+            }
+
             let joined = match resp {
                 DataResponse::Trades(r) => joined_release(&state, &r.data),
                 _ => None,
             };
             self.release_request_bar_aggregators(&correlation_id, joined, None);
+        }
+    }
+
+    /// Feeds the quotes, trades or bars of `resp` to the aggregators of `request_id` (for a
+    /// pipeline, its parent), one record at a time. Before each record its replay fires the
+    /// closes due strictly before the record's `ts_init` (see [`Self::replay_until`]).
+    pub(super) fn feed_request_bar_aggregators(
+        &mut self,
+        state: &RequestBarAggregation,
+        request_id: UUID4,
+        resp: &DataResponse,
+    ) {
+        match resp {
+            DataResponse::Quotes(r) => {
+                for quote in r.data.iter() {
+                    self.replay_until(request_id, quote.ts_init);
+                    self.update_request_bar_aggregators_from_quote(state, request_id, *quote);
+                }
+            }
+            DataResponse::Trades(r) => {
+                for trade in r.data.iter() {
+                    self.replay_until(request_id, trade.ts_init);
+                    self.update_request_bar_aggregators_from_trade(state, request_id, *trade);
+                }
+            }
+            DataResponse::Bars(r) => {
+                for bar in r.data.iter() {
+                    self.replay_until(request_id, bar.ts_init);
+                    self.update_request_bar_aggregators_from_bar(state, request_id, *bar);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1631,35 +1681,43 @@ impl DataEngine {
             .chain(std::iter::once(bar_type));
 
         for bar_type in bar_types {
-            if !bar_type.is_composite()
-                || !bar_type.spec().is_time_aggregated()
-                || !bar_type.composite().is_internally_aggregated()
-                || !bar_type.composite().spec().is_time_aggregated()
-            {
-                continue;
-            }
+            self.connect_time_bar_source(bar_type, None);
+        }
+    }
 
-            let Some(source) = self
-                .bar_aggregators
-                .get(&bar_aggregator_key(bar_type.composite(), None))
-            else {
-                continue;
-            };
+    /// Links the builder of `bar_type` keyed by `request_id` (`None` for a subscription's) to
+    /// the builder of its source under the same key, when both exist and `bar_type` is a time
+    /// bar built from an internally aggregated time bar: when both close at one instant, the
+    /// source closes first, so its bar is in the dependent's.
+    fn connect_time_bar_source(&self, bar_type: BarType, request_id: Option<UUID4>) {
+        if !bar_type.is_composite()
+            || !bar_type.spec().is_time_aggregated()
+            || !bar_type.composite().is_internally_aggregated()
+            || !bar_type.composite().spec().is_time_aggregated()
+        {
+            return;
+        }
 
-            let Some(aggregator) = self
-                .bar_aggregators
-                .get(&bar_aggregator_key(bar_type, None))
-            else {
-                continue;
-            };
+        let Some(source) = self
+            .bar_aggregators
+            .get(&bar_aggregator_key(bar_type.composite(), request_id))
+        else {
+            return;
+        };
 
-            if let Some(aggregator) = aggregator
-                .borrow_mut()
-                .as_any_mut()
-                .downcast_mut::<TimeBarAggregator>()
-            {
-                aggregator.set_timer_source(Rc::downgrade(source));
-            }
+        let Some(aggregator) = self
+            .bar_aggregators
+            .get(&bar_aggregator_key(bar_type, request_id))
+        else {
+            return;
+        };
+
+        if let Some(aggregator) = aggregator
+            .borrow_mut()
+            .as_any_mut()
+            .downcast_mut::<TimeBarAggregator>()
+        {
+            aggregator.set_timer_source(Rc::downgrade(source));
         }
     }
 
@@ -1826,6 +1884,17 @@ fn why_not_fed_by_trades(bar_type: &BarType, instrument_id: InstrumentId) -> Opt
 /// that same order.
 fn live_delivery_order(bar_type: &BarType) -> (bool, String) {
     (!bar_type.spec().is_time_aggregated(), bar_type.to_string())
+}
+
+/// Returns whether `req` names a `limit`, so its answer may stop before its window ends. Only
+/// the kinds whose records feed aggregators are read.
+fn names_a_limit(req: &RequestCommand) -> bool {
+    match req {
+        RequestCommand::Quotes(cmd) => cmd.limit.is_some(),
+        RequestCommand::Trades(cmd) => cmd.limit.is_some(),
+        RequestCommand::Bars(cmd) => cmd.limit.is_some(),
+        _ => false,
+    }
 }
 
 /// Returns whether `bar_type`'s builder runs on a clock: a time bar closes, and a `RANGE` bar

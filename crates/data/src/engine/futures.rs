@@ -48,6 +48,7 @@ impl DataEngine {
             request_id,
             &continuous_request.request_bar_aggregation,
         )?;
+        self.open_request_replay(&RequestCommand::Bars(parent.clone()));
 
         let response_client_id = match self.resolve_request_client_id(
             parent.client_id.as_ref(),
@@ -360,8 +361,12 @@ impl DataEngine {
         self.process_continuous_future_aggregation_response(parent_id, resp);
     }
 
+    /// Feeds a segment's answer to the parent's primary aggregator on the parent's one replay,
+    /// each record after the closes due strictly before it (see `DataEngine::replay_until`).
+    /// Only the parent's own terminal ends the replay's coverage; a segment change only sets
+    /// the aggregator's price adjustment, so a bar open at the change continues.
     fn process_continuous_future_aggregation_response(
-        &self,
+        &mut self,
         parent_id: UUID4,
         resp: &DataResponse,
     ) {
@@ -375,6 +380,7 @@ impl DataEngine {
         match resp {
             DataResponse::Quotes(r) => {
                 for quote in r.data.iter() {
+                    self.replay_until(parent_id, quote.ts_init);
                     self.update_request_bar_aggregator(
                         primary_bar_type,
                         aggregator_request_id,
@@ -386,6 +392,7 @@ impl DataEngine {
             }
             DataResponse::Trades(r) => {
                 for trade in r.data.iter() {
+                    self.replay_until(parent_id, trade.ts_init);
                     self.update_request_bar_aggregator(
                         primary_bar_type,
                         aggregator_request_id,
@@ -397,6 +404,7 @@ impl DataEngine {
             }
             DataResponse::Bars(r) => {
                 for bar in r.data.iter() {
+                    self.replay_until(parent_id, bar.ts_init);
                     self.update_request_bar_aggregator(
                         primary_bar_type,
                         aggregator_request_id,

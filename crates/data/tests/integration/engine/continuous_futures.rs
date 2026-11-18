@@ -240,12 +240,13 @@ fn test_continuous_future_request_adjusts_external_bars_across_transitions(
         UnixNanos::from(minute(1)),
         child.params,
     )));
+    // The close at the bar's stamp stays armed until the next segment's first bar
     assert_eq!(
         cache
             .borrow()
             .bar(&target_bar_type.standard())
             .map(|bar| bar.open),
-        Some(Price::from("90.00"))
+        None
     );
 
     let child = recorded_bars_request(&recorder, 1);
@@ -271,12 +272,13 @@ fn test_continuous_future_request_adjusts_external_bars_across_transitions(
         UnixNanos::from(minute(2)),
         child.params,
     )));
+    // The first segment's bar, closed before this segment's first bar, keeps its adjustment
     assert_eq!(
         cache
             .borrow()
             .bar(&target_bar_type.standard())
             .map(|bar| bar.open),
-        Some(Price::from("91.00"))
+        Some(Price::from("90.00"))
     );
 
     let child = recorded_bars_request(&recorder, 2);
@@ -506,14 +508,9 @@ fn test_continuous_future_request_inserts_history_behind_newer_live_bar(
         .bars(&standard)
         .map(|bars| bars.iter().map(|bar| bar.ts_event).collect())
         .unwrap_or_default();
-    assert_eq!(
-        stamps,
-        vec![
-            UnixNanos::from(minute(3)),
-            UnixNanos::from(minute(1)),
-            UnixNanos::from(minute(0)),
-        ],
-    );
+    // The close at the last bar's stamp stays armed until the next segment's first bar, and the
+    // first close, at the replay's start, is empty
+    assert_eq!(stamps, vec![UnixNanos::from(minute(3))]);
 }
 
 #[rstest]
@@ -593,12 +590,13 @@ fn test_continuous_future_request_applies_ratio_to_external_bars(
         UnixNanos::from(minute(1)),
         child.params,
     )));
+    // The close at the bar's stamp stays armed until the next segment's first bar
     assert_eq!(
         cache
             .borrow()
             .bar(&target_bar_type.standard())
             .map(|bar| bar.open),
-        Some(Price::from("50.00"))
+        None
     );
 
     let child = recorded_bars_request(&recorder, 1);

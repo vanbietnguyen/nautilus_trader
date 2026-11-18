@@ -1056,9 +1056,10 @@ fn test_time_range_pipeline_updates_parent_request_bar_aggregation(
         ],
     ));
 
+    // The parent's terminal fires the closes through its end, 2 s
     assert_eq!(
         cache.borrow().bar(&bar_type).map(|bar| bar.ts_event),
-        Some(UnixNanos::from(1_000_000_000)),
+        Some(UnixNanos::from(2_000_000_000)),
         "parent request aggregator must consume time-range child trade data"
     );
 

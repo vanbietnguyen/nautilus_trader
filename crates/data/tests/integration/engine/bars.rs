@@ -1165,36 +1165,43 @@ fn test_request_time_bar_boundary_assignment(
         }
     }
 
-    let (close, volume, ts_event) = if interval == BarIntervalType::LeftOpen {
-        ("102.00000", 3, 11_000_000_000)
+    // The close at the last samples' stamp stays armed, so they are in the closing bar with
+    // either interval type, and it fires only before a later sample: with no `end`, nothing after
+    // the dispatch time (the engine clock, 0) fires when the answer completes
+    let bars = cache.borrow().bars(&bar_type);
+    if !advance {
+        assert_eq!(bars, None);
+        return;
+    }
+
+    let ts_event = if interval == BarIntervalType::LeftOpen {
+        11_000_000_000
     } else {
-        ("100.00000", 1, 10_000_000_000)
+        10_000_000_000
     };
 
     let expected = Bar::new(
         bar_type,
         Price::from("100.00000"),
-        Price::from(close),
+        Price::from("102.00000"),
         Price::from("100.00000"),
-        Price::from(close),
-        Quantity::from(volume),
+        Price::from("102.00000"),
+        Quantity::from(3),
         UnixNanos::from(ts_event),
         UnixNanos::from(11_000_000_000),
     );
-    let bars: Vec<_> = cache.borrow().bars(&bar_type).unwrap();
-    assert_eq!(bars, vec![expected]);
+    assert_eq!(bars, Some(vec![expected]));
 }
 
 #[rstest]
-#[case::right_open(BarIntervalType::RightOpen, ("102.00000", 3, 10_000_000_000))]
-#[case::left_open(BarIntervalType::LeftOpen, ("103.00000", 4, 12_000_000_000))]
+#[case::right_open(BarIntervalType::RightOpen)]
+#[case::left_open(BarIntervalType::LeftOpen)]
 fn test_request_time_bar_boundary_finalizes_sources_before_dependents(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
     venue: Venue,
     #[case] interval: BarIntervalType,
-    #[case] expected: (&str, u64, u64),
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
@@ -1283,20 +1290,9 @@ fn test_request_time_bar_boundary_finalizes_sources_before_dependents(
         None,
     )));
 
-    let (close, volume, ts_event) = expected;
-
-    let expected = Bar::new(
-        target.standard(),
-        Price::from("100.00000"),
-        Price::from(close),
-        Price::from("100.00000"),
-        Price::from(close),
-        Quantity::from(volume),
-        UnixNanos::from(ts_event),
-        UnixNanos::from(12_000_000_000),
-    );
-    let bars: Vec<_> = cache.borrow().bars(&target.standard()).unwrap();
-    assert_eq!(bars, vec![expected]);
+    // The 2-second close at the last trade's stamp stays armed, and with no `end` nothing after
+    // the dispatch time (the engine clock, 0) fires when the answer completes
+    assert_eq!(cache.borrow().bars(&target.standard()), None);
 }
 
 #[rstest]

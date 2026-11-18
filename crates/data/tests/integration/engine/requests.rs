@@ -488,10 +488,9 @@ fn test_request_scoped_time_bar_aggregation_handles_trade_response(
         Some(params),
     )));
 
-    assert_eq!(
-        cache.borrow().bar(&bar_type).map(|bar| bar.ts_event),
-        Some(UnixNanos::from(1_000_000_000)),
-    );
+    // The close at the last trade's stamp stays armed, and with no `end` nothing after the
+    // dispatch time (the engine clock, 0) fires when the answer completes
+    assert_eq!(cache.borrow().bar(&bar_type).map(|bar| bar.ts_event), None);
     assert!(saver.get_messages().is_empty());
 }
 
@@ -8092,4 +8091,819 @@ fn test_replayed_request_with_a_limit_or_a_failure_fires_no_close_after_its_last
         .filter(|delivered| delivered.completed)
         .count();
     assert_eq!(terminals, 1, "{stop:?}");
+}
+
+/// Each watched bar type's bars in the cache, oldest first, as (close stamp, volume).
+type CachedBars = Vec<Vec<(u64, u64)>>;
+
+/// A request that builds bars without `interleave` or `update_subscriptions` (the plain path),
+/// dispatched as the engine clock reads `dispatched`: the bars of the watched bar types that
+/// reach the cache, and the failure reason of each terminal its requester is given.
+struct PlainFixture {
+    engine: DataEngine,
+    cache: Rc<RefCell<Cache>>,
+    recorder: Rc<RefCell<Vec<DataCommand>>>,
+    client_id: ClientId,
+    watched: Vec<BarType>,
+    ends: Rc<RefCell<Vec<Option<String>>>>,
+}
+
+impl PlainFixture {
+    fn new(
+        instruments: Vec<InstrumentAny>,
+        client_id: ClientId,
+        venue: Venue,
+        config: DataEngineConfig,
+        dispatched: u64,
+        watched: &[BarType],
+    ) -> Self {
+        let clock = data_engine_clock_at(dispatched);
+        let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+        for instrument in instruments {
+            cache.borrow_mut().add_instrument(instrument).unwrap();
+        }
+        let mut engine = DataEngine::new(clock, Rc::clone(&cache), Some(config));
+        let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+        register_mock_client(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            Rc::clone(&cache),
+            client_id,
+            venue,
+            None,
+            &recorder,
+            &mut engine,
+        );
+
+        Self {
+            engine,
+            cache,
+            recorder,
+            client_id,
+            watched: watched.iter().map(BarType::standard).collect(),
+            ends: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    /// Executes `request`, recording the failure reason of each terminal its requester is given.
+    fn execute(&mut self, request: RequestCommand) {
+        let ends = Rc::clone(&self.ends);
+        let handler = TypedHandler::from(move |envelope: &DataResponseEnvelope| {
+            if envelope.completed() {
+                ends.borrow_mut()
+                    .push(envelope.failure_reason().map(str::to_owned));
+            }
+        });
+        msgbus::register_response_handler(request.request_id(), handler);
+        self.engine.execute_request(request).unwrap();
+    }
+
+    /// Sends `response` in one envelope and returns the watched bars in the cache after it.
+    fn answer(
+        &mut self,
+        response: DataResponse,
+        completed: bool,
+        failure: Option<&str>,
+    ) -> CachedBars {
+        let envelope = DataResponseEnvelope::new(response, completed, None);
+        let envelope = match failure {
+            Some(reason) => envelope.with_failure(reason.to_owned()),
+            None => envelope,
+        };
+        self.engine.response_envelope(envelope);
+        self.cached()
+    }
+
+    fn cached(&self) -> CachedBars {
+        self.watched
+            .iter()
+            .map(|bar_type| {
+                let mut bars: Vec<_> = self
+                    .cache
+                    .borrow()
+                    .bars(bar_type)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|bar| (bar.ts_event.as_u64(), bar.volume.as_f64() as u64))
+                    .collect();
+                bars.reverse();
+                bars
+            })
+            .collect()
+    }
+
+    /// The trades requests the engine dispatched to the client, in order (a pipeline's
+    /// children).
+    fn trades_requests(&self) -> Vec<RequestTrades> {
+        self.recorder
+            .borrow()
+            .iter()
+            .filter_map(|command| match command {
+                DataCommand::Request(RequestCommand::Trades(request)) => Some(request.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ends(&self) -> Vec<Option<String>> {
+        self.ends.borrow().clone()
+    }
+}
+
+fn plain_params(bar_types: &[BarType], extra: Value) -> Params {
+    let mut params = json!({
+        "bar_types": bar_types.iter().map(ToString::to_string).collect::<Vec<_>>(),
+    });
+    if let Value::Object(extra) = extra {
+        for (key, value) in extra {
+            params[key] = value;
+        }
+    }
+    serde_json::from_value(params).unwrap()
+}
+
+fn timestamp_of(ns: Option<u64>) -> Option<jiff::Timestamp> {
+    ns.map(|ns| UnixNanos::from(ns).to_datetime_utc())
+}
+
+/// A trades request for `instrument_id` with `params`, in the window `start`..`end`.
+fn plain_trades_request(
+    instrument_id: InstrumentId,
+    client_id: ClientId,
+    request_id: UUID4,
+    window: (Option<u64>, Option<u64>),
+    limit: Option<usize>,
+    params: Params,
+) -> RequestCommand {
+    RequestCommand::Trades(RequestTrades::new(
+        instrument_id,
+        timestamp_of(window.0),
+        timestamp_of(window.1),
+        limit.map(|limit| NonZeroUsize::new(limit).unwrap()),
+        Some(client_id),
+        request_id,
+        UnixNanos::default(),
+        Some(params),
+    ))
+}
+
+/// An answer of trades (`ts`, price, size) under `request_id`.
+fn trades_answer(
+    request_id: UUID4,
+    client_id: ClientId,
+    instrument_id: InstrumentId,
+    trades: &[(u64, &str, u64)],
+) -> DataResponse {
+    let trades: Vec<_> = trades
+        .iter()
+        .map(|(ts, price, size)| make_trade(instrument_id, price, *size, &format!("t{ts}"), *ts))
+        .collect();
+    DataResponse::Trades(TradesResponse::new(
+        request_id,
+        client_id,
+        instrument_id,
+        trades,
+        None,
+        None,
+        UnixNanos::default(),
+        None,
+    ))
+}
+
+/// The example: a plain trades request whose last trade is at 16:59:58 and whose end is just past
+/// the 18:00 range boundary. Each trade comes in a partial envelope of its own, so the cache is
+/// read after each record.
+#[rstest]
+fn test_plain_request_delivers_the_closes_after_its_last_trade_through_its_end(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (five, range) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "10-RANGE"));
+    let mut fixture = PlainFixture::new(
+        vec![InstrumentAny::CurrencyPair(audusd_sim)],
+        client_id,
+        venue,
+        without_flat_bars(),
+        new_york("2024-01-08T20:00:00"),
+        &[five, range],
+    );
+    let request_id = UUID4::new();
+    fixture.execute(plain_trades_request(
+        id,
+        client_id,
+        request_id,
+        (
+            Some(new_york("2024-01-08T16:50:00")),
+            Some(new_york("2024-01-08T18:00:00") + 1),
+        ),
+        None,
+        plain_params(&[five, range], json!({})),
+    ));
+
+    let mut steps = Vec::new();
+    for (ts, size) in [
+        (new_york("2024-01-08T16:52:00"), 1),
+        (new_york("2024-01-08T16:57:00"), 2),
+        (new_york("2024-01-08T16:59:58"), 3),
+    ] {
+        let answer = trades_answer(request_id, client_id, id, &[(ts, "1.00000", size)]);
+        steps.push(fixture.answer(answer, false, None));
+    }
+    let answer = trades_answer(request_id, client_id, id, &[]);
+    steps.push(fixture.answer(answer, true, None));
+
+    // The 16:55 close fires before the 16:57 trade; after the last trade the end of the answer
+    // fires the 17:00 close and then the 18:00 boundary, whose range bar holds every trade
+    let five_minute = |civil: &str, volume| (new_york(civil), volume);
+    assert_eq!(
+        steps,
+        vec![
+            vec![vec![], vec![]],
+            vec![vec![five_minute("2024-01-08T16:55:00", 1)], vec![]],
+            vec![vec![five_minute("2024-01-08T16:55:00", 1)], vec![]],
+            vec![
+                vec![
+                    five_minute("2024-01-08T16:55:00", 1),
+                    five_minute("2024-01-08T17:00:00", 5),
+                ],
+                vec![five_minute("2024-01-08T18:00:00", 6)],
+            ],
+        ]
+    );
+    assert_eq!(fixture.ends(), vec![None]);
+}
+
+/// A 15-MINUTE bar built from the request's own 5-MINUTE bar, listed after or before it.
+#[rstest]
+#[case::source_first(false)]
+#[case::dependent_first(true)]
+fn test_plain_request_bar_built_from_its_own_bar_holds_the_source_bar_closing_with_it(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] dependent_first: bool,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let five = bar_type_of(id, "5-MINUTE");
+    let fifteen = BarType::from(format!("{id}-15-MINUTE-LAST-INTERNAL@5-MINUTE-INTERNAL").as_str());
+    let listed = if dependent_first {
+        [fifteen, five]
+    } else {
+        [five, fifteen]
+    };
+    let mut fixture = PlainFixture::new(
+        vec![InstrumentAny::CurrencyPair(audusd_sim)],
+        client_id,
+        venue,
+        without_flat_bars(),
+        utc_ns("2024-01-08T12:00:00Z"),
+        &[five, fifteen],
+    );
+    let request_id = UUID4::new();
+    fixture.execute(plain_trades_request(
+        id,
+        client_id,
+        request_id,
+        (
+            Some(utc_ns("2024-01-08T10:00:00Z")),
+            Some(utc_ns("2024-01-08T10:20:00Z")),
+        ),
+        None,
+        plain_params(&listed, json!({})),
+    ));
+
+    let answer = trades_answer(
+        request_id,
+        client_id,
+        id,
+        &[
+            (utc_ns("2024-01-08T10:01:00Z"), "1.00000", 1),
+            (utc_ns("2024-01-08T10:06:00Z"), "1.00000", 2),
+            (utc_ns("2024-01-08T10:11:00Z"), "1.00000", 4),
+            (utc_ns("2024-01-08T10:16:00Z"), "1.00000", 8),
+        ],
+    );
+    let cached = fixture.answer(answer, true, None);
+
+    // At 10:15 the source closes first, so its bar (4) is in the 15-minute bar
+    assert_eq!(
+        cached,
+        vec![
+            vec![
+                (utc_ns("2024-01-08T10:05:00Z"), 1),
+                (utc_ns("2024-01-08T10:10:00Z"), 2),
+                (utc_ns("2024-01-08T10:15:00Z"), 4),
+                (utc_ns("2024-01-08T10:20:00Z"), 8),
+            ],
+            vec![(utc_ns("2024-01-08T10:15:00Z"), 7)],
+        ]
+    );
+}
+
+/// A bar type built from quotes (BID) on a plain quotes request.
+#[rstest]
+fn test_plain_quotes_request_closes_its_bid_bar_at_its_time_with_no_later_quote(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let bid = BarType::from(format!("{id}-5-MINUTE-BID-INTERNAL").as_str());
+    let mut fixture = PlainFixture::new(
+        vec![InstrumentAny::CurrencyPair(audusd_sim)],
+        client_id,
+        venue,
+        without_flat_bars(),
+        utc_ns("2024-01-08T12:00:00Z"),
+        &[bid],
+    );
+    let request_id = UUID4::new();
+    fixture.execute(RequestCommand::Quotes(RequestQuotes::new(
+        id,
+        timestamp_of(Some(utc_ns("2024-01-08T10:00:00Z"))),
+        timestamp_of(Some(utc_ns("2024-01-08T10:05:00Z"))),
+        None,
+        Some(client_id),
+        request_id,
+        UnixNanos::default(),
+        Some(plain_params(&[bid], json!({}))),
+    )));
+
+    let quotes = [
+        make_quote(id, "1.00000", "1.00010", utc_ns("2024-01-08T10:01:00Z")),
+        make_quote(id, "1.00020", "1.00030", utc_ns("2024-01-08T10:03:00Z")),
+    ];
+    let answer = DataResponse::Quotes(QuotesResponse::new(
+        request_id,
+        client_id,
+        id,
+        quotes.to_vec(),
+        None,
+        None,
+        UnixNanos::default(),
+        None,
+    ));
+    let partial = fixture.answer(answer, false, None);
+    let answer = DataResponse::Quotes(QuotesResponse::new(
+        request_id,
+        client_id,
+        id,
+        Vec::new(),
+        None,
+        None,
+        UnixNanos::default(),
+        None,
+    ));
+    let completed = fixture.answer(answer, true, None);
+
+    assert_eq!(partial, vec![vec![]]);
+    assert_eq!(completed, vec![vec![(utc_ns("2024-01-08T10:05:00Z"), 2)]]);
+}
+
+/// A plain bars request of external 1-MINUTE bars feeding a 5-MINUTE bar built from them.
+#[rstest]
+fn test_plain_bars_request_feeds_a_larger_time_bar_closing_at_its_time(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let minute = BarType::from(format!("{id}-1-MINUTE-LAST-EXTERNAL").as_str());
+    let five = BarType::from(format!("{id}-5-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL").as_str());
+    let mut fixture = PlainFixture::new(
+        vec![InstrumentAny::CurrencyPair(audusd_sim)],
+        client_id,
+        venue,
+        without_flat_bars(),
+        utc_ns("2024-01-08T12:00:00Z"),
+        &[five],
+    );
+    let request_id = UUID4::new();
+    fixture.execute(RequestCommand::Bars(RequestBars::new(
+        minute,
+        timestamp_of(Some(utc_ns("2024-01-08T10:00:00Z"))),
+        timestamp_of(Some(utc_ns("2024-01-08T10:10:00Z"))),
+        None,
+        Some(client_id),
+        request_id,
+        UnixNanos::default(),
+        Some(plain_params(&[five], json!({}))),
+    )));
+
+    let bars = [
+        ("2024-01-08T10:01:00Z", 1),
+        ("2024-01-08T10:03:00Z", 2),
+        ("2024-01-08T10:05:00Z", 4),
+        ("2024-01-08T10:06:00Z", 8),
+    ]
+    .map(|(close, volume)| {
+        make_bar(
+            minute,
+            "1.00000",
+            "1.00000",
+            "1.00000",
+            "1.00000",
+            volume,
+            utc_ns(close),
+        )
+    });
+    let mut steps = Vec::new();
+    for bar in bars {
+        let answer = DataResponse::Bars(BarsResponse::new(
+            request_id,
+            client_id,
+            minute,
+            vec![bar],
+            None,
+            None,
+            UnixNanos::default(),
+            None,
+        ));
+        steps.push(fixture.answer(answer, false, None));
+    }
+    let answer = DataResponse::Bars(BarsResponse::new(
+        request_id,
+        client_id,
+        minute,
+        Vec::new(),
+        None,
+        None,
+        UnixNanos::default(),
+        None,
+    ));
+    steps.push(fixture.answer(answer, true, None));
+
+    // The 10:05 bar holds the 1-minute bar stamped 10:05 and closes before the 10:06 one
+    let closed_at_five = (utc_ns("2024-01-08T10:05:00Z"), 7);
+    assert_eq!(
+        steps,
+        vec![
+            vec![vec![]],
+            vec![vec![]],
+            vec![vec![]],
+            vec![vec![closed_at_five]],
+            vec![vec![closed_at_five, (utc_ns("2024-01-08T10:10:00Z"), 8)]],
+        ]
+    );
+}
+
+/// A time-range pipeline over 10:00 to 10:06 in two 3-minute children: the first ends inside
+/// the 5-minute interval that closes at 10:05.
+fn time_range_fixture(
+    audusd_sim: CurrencyPair,
+    client_id: ClientId,
+    venue: Venue,
+    bar_type: BarType,
+) -> (PlainFixture, UUID4) {
+    let id = audusd_sim.id;
+    let mut fixture = PlainFixture::new(
+        vec![InstrumentAny::CurrencyPair(audusd_sim)],
+        client_id,
+        venue,
+        without_flat_bars(),
+        utc_ns("2024-01-08T12:00:00Z"),
+        &[bar_type],
+    );
+    let request_id = UUID4::new();
+    fixture.execute(plain_trades_request(
+        id,
+        client_id,
+        request_id,
+        (
+            Some(utc_ns("2024-01-08T10:00:00Z")),
+            Some(utc_ns("2024-01-08T10:06:00Z")),
+        ),
+        None,
+        plain_params(
+            &[bar_type],
+            json!({ "time_range_generator": "", "durations_seconds": [180] }),
+        ),
+    ));
+    (fixture, request_id)
+}
+
+#[rstest]
+fn test_time_range_pipeline_runs_one_replay_across_its_children_and_ends_it_once(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let five = bar_type_of(id, "5-MINUTE");
+    let (mut fixture, _) = time_range_fixture(audusd_sim, client_id, venue, five);
+
+    let first = fixture.trades_requests()[0].request_id;
+    let answer = trades_answer(
+        first,
+        client_id,
+        id,
+        &[
+            (utc_ns("2024-01-08T10:01:00Z"), "1.00000", 1),
+            (utc_ns("2024-01-08T10:02:00Z"), "1.00000", 2),
+        ],
+    );
+    let after_first = fixture.answer(answer, true, None);
+    let children = fixture.trades_requests();
+    let second = children[1].request_id;
+    let answer = trades_answer(
+        second,
+        client_id,
+        id,
+        &[(utc_ns("2024-01-08T10:04:00Z"), "1.00000", 4)],
+    );
+    let after_second = fixture.answer(answer, true, None);
+
+    // Nothing closes at the first child's end; the parent's end (10:06) fires the 10:05 close
+    // once, after the last child, and its bar holds both children's trades
+    assert_eq!(children.len(), 2);
+    assert_eq!(
+        (children[0].end, children[1].start),
+        (
+            timestamp_of(Some(utc_ns("2024-01-08T10:03:00Z"))),
+            timestamp_of(Some(utc_ns("2024-01-08T10:03:00Z") + 1)),
+        )
+    );
+    assert_eq!(after_first, vec![vec![]]);
+    assert_eq!(
+        after_second,
+        vec![vec![(utc_ns("2024-01-08T10:05:00Z"), 7)]]
+    );
+    assert_eq!(fixture.trades_requests().len(), 2);
+    assert_eq!(fixture.ends(), vec![None]);
+}
+
+#[rstest]
+fn test_time_range_pipeline_child_failure_fires_no_end_of_coverage(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let five = bar_type_of(id, "5-MINUTE");
+    let (mut fixture, _) = time_range_fixture(audusd_sim, client_id, venue, five);
+
+    let first = fixture.trades_requests()[0].request_id;
+    let answer = trades_answer(
+        first,
+        client_id,
+        id,
+        &[(utc_ns("2024-01-08T10:01:00Z"), "1.00000", 1)],
+    );
+    let after_first = fixture.answer(answer, false, None);
+    let answer = trades_answer(first, client_id, id, &[]);
+    let failed = fixture.answer(answer, true, Some("the child failed"));
+
+    assert_eq!(after_first, vec![vec![]]);
+    assert_eq!(failed, vec![vec![]]);
+    assert_eq!(fixture.trades_requests().len(), 1);
+    assert_eq!(fixture.ends(), vec![Some("the child failed".to_owned())]);
+}
+
+/// A plain answer that completes with a failure reason fires no close after its last record.
+#[rstest]
+fn test_plain_request_failed_answer_fires_no_end_of_coverage(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let five = bar_type_of(id, "5-MINUTE");
+    let mut fixture = PlainFixture::new(
+        vec![InstrumentAny::CurrencyPair(audusd_sim)],
+        client_id,
+        venue,
+        without_flat_bars(),
+        utc_ns("2024-01-08T12:00:00Z"),
+        &[five],
+    );
+    let request_id = UUID4::new();
+    fixture.execute(plain_trades_request(
+        id,
+        client_id,
+        request_id,
+        (
+            Some(utc_ns("2024-01-08T10:00:00Z")),
+            Some(utc_ns("2024-01-08T10:10:00Z")),
+        ),
+        None,
+        plain_params(&[five], json!({})),
+    ));
+
+    let answer = trades_answer(
+        request_id,
+        client_id,
+        id,
+        &[
+            (utc_ns("2024-01-08T10:01:00Z"), "1.00000", 1),
+            (utc_ns("2024-01-08T10:06:00Z"), "1.00000", 2),
+        ],
+    );
+    let cached = fixture.answer(answer, true, Some("the source stopped"));
+
+    assert_eq!(cached, vec![vec![(utc_ns("2024-01-08T10:05:00Z"), 1)]]);
+    assert_eq!(fixture.ends(), vec![Some("the source stopped".to_owned())]);
+}
+
+/// A continuous-future request across two segments (ESH24 to 10:03, then ESM24): one replay
+/// clock runs across them. A segment change only sets the aggregator's price adjustment, which
+/// applies to each record as it is fed, so the bar open at the change continues.
+#[rstest]
+fn test_continuous_future_request_runs_one_replay_across_its_segments(
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+) {
+    let _ = stub_msgbus;
+    let target = BarType::from("ES.GLBX-5-MINUTE-LAST-INTERNAL");
+    let mut fixture = PlainFixture::new(
+        Vec::new(),
+        client_id,
+        Venue::from("GLBX"),
+        DataEngineConfig::default(),
+        utc_ns("2024-01-08T11:00:00Z"),
+        &[target],
+    );
+    let esh = add_es_contract(&fixture.cache, "ESH24.GLBX", "ESH24");
+    let esm = add_es_contract(&fixture.cache, "ESM24.GLBX", "ESM24");
+    let params = params_from_json(json!({
+        "continuous_future_adjustment_mode": "BACKWARD_SPREAD",
+        "continuous_future_transitions": [{
+            "transition_time_ns": utc_ns("2024-01-08T10:03:00Z"),
+            "pre_instrument_id": esh.to_string(),
+            "post_instrument_id": esm.to_string(),
+            "pre_price": "100.00",
+            "post_price": "95.00"
+        }]
+    }));
+    fixture.execute(RequestCommand::Bars(RequestBars::new(
+        target,
+        timestamp_of(Some(utc_ns("2024-01-08T10:00:00Z"))),
+        timestamp_of(Some(utc_ns("2024-01-08T10:10:00Z"))),
+        None,
+        Some(client_id),
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(params),
+    )));
+
+    let first = fixture.trades_requests()[0].clone();
+    let answer = trades_answer(
+        first.request_id,
+        fixture.client_id,
+        esh,
+        &[(utc_ns("2024-01-08T10:01:00Z"), "100.00", 1)],
+    );
+    let after_first = fixture.answer(answer, true, None);
+    let second = fixture.trades_requests()[1].clone();
+    let answer = trades_answer(
+        second.request_id,
+        fixture.client_id,
+        esm,
+        &[
+            (utc_ns("2024-01-08T10:04:00Z"), "96.00", 2),
+            (utc_ns("2024-01-08T10:06:00Z"), "97.00", 4),
+        ],
+    );
+    let after_second = fixture.answer(answer, true, None);
+
+    assert_eq!(
+        (first.instrument_ids, second.instrument_ids),
+        (vec![esh], vec![esm]),
+        "one child per segment"
+    );
+    assert_eq!(after_first, vec![vec![]]);
+    assert_eq!(
+        after_second,
+        vec![vec![
+            (utc_ns("2024-01-08T10:05:00Z"), 3),
+            (utc_ns("2024-01-08T10:10:00Z"), 4),
+        ]]
+    );
+    // The 10:05 bar, closed before the 10:06 trade
+    let bar = fixture.cache.borrow().bars(&target).unwrap()[1];
+    assert_eq!(
+        (bar.open, bar.high, bar.low, bar.close),
+        (
+            Price::from("95.00"),
+            Price::from("96.00"),
+            Price::from("95.00"),
+            Price::from("96.00"),
+        ),
+        "ESH24 adjusted by -5.00, ESM24 as is"
+    );
+    assert_eq!(fixture.ends(), vec![None]);
+}
+
+/// A plain request with a `limit` fires no close after its last trade.
+#[rstest]
+fn test_plain_request_with_a_limit_fires_no_end_of_coverage(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let five = bar_type_of(id, "5-MINUTE");
+    let mut fixture = PlainFixture::new(
+        vec![InstrumentAny::CurrencyPair(audusd_sim)],
+        client_id,
+        venue,
+        without_flat_bars(),
+        utc_ns("2024-01-08T12:00:00Z"),
+        &[five],
+    );
+    let request_id = UUID4::new();
+    fixture.execute(plain_trades_request(
+        id,
+        client_id,
+        request_id,
+        (
+            Some(utc_ns("2024-01-08T10:00:00Z")),
+            Some(utc_ns("2024-01-08T10:10:00Z")),
+        ),
+        Some(100),
+        plain_params(&[five], json!({})),
+    ));
+
+    let answer = trades_answer(
+        request_id,
+        client_id,
+        id,
+        &[
+            (utc_ns("2024-01-08T10:01:00Z"), "1.00000", 1),
+            (utc_ns("2024-01-08T10:06:00Z"), "1.00000", 2),
+        ],
+    );
+    let cached = fixture.answer(answer, true, None);
+
+    assert_eq!(cached, vec![vec![(utc_ns("2024-01-08T10:05:00Z"), 1)]]);
+    assert_eq!(fixture.ends(), vec![None]);
+}
+
+/// A plain request with no `end`: its answer covers up to the engine clock's time when it was
+/// dispatched (10:07:30), and nothing after it fires.
+#[rstest]
+fn test_plain_request_without_an_end_fires_nothing_after_its_dispatch_time(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let one = bar_type_of(id, "1-MINUTE");
+    let mut fixture = PlainFixture::new(
+        vec![InstrumentAny::CurrencyPair(audusd_sim)],
+        client_id,
+        venue,
+        DataEngineConfig::default(),
+        utc_ns("2024-01-08T10:07:30Z"),
+        &[one],
+    );
+    let request_id = UUID4::new();
+    fixture.execute(plain_trades_request(
+        id,
+        client_id,
+        request_id,
+        (Some(utc_ns("2024-01-08T10:00:00Z")), None),
+        None,
+        plain_params(&[one], json!({})),
+    ));
+
+    let answer = trades_answer(
+        request_id,
+        client_id,
+        id,
+        &[(utc_ns("2024-01-08T10:01:30Z"), "1.00000", 1)],
+    );
+    let cached = fixture.answer(answer, true, None);
+
+    // Flat bars after the trade, the last at 10:07
+    let flat = |civil: &str| (utc_ns(civil), 0);
+    assert_eq!(
+        cached,
+        vec![vec![
+            (utc_ns("2024-01-08T10:02:00Z"), 1),
+            flat("2024-01-08T10:03:00Z"),
+            flat("2024-01-08T10:04:00Z"),
+            flat("2024-01-08T10:05:00Z"),
+            flat("2024-01-08T10:06:00Z"),
+            flat("2024-01-08T10:07:00Z"),
+        ]]
+    );
 }

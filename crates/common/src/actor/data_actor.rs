@@ -3077,6 +3077,12 @@ pub trait DataActor {
 
     /// Request historical [`QuoteTick`] data for the given `instrument_ids`.
     ///
+    /// With `params["bar_types"]` and without `update_subscriptions`, the engine also builds
+    /// those bars from the quotes and adds them to the cache, as for a trades request (see
+    /// [`Self::request_trades`]): on the request's own clock, each close firing before the first
+    /// quote after it, and at an answer that completes with no failure reason, with no `limit`,
+    /// the closes up to `min(end, the engine clock's time when the request was dispatched)`.
+    ///
     /// # Errors
     ///
     /// Returns an error if input parameters are invalid.
@@ -3130,6 +3136,24 @@ pub trait DataActor {
     /// gap, while a gap in its trade file intervals that no client can fill is answered as an
     /// ordinary trades request answers it: the gap holds no trades, its quotes are still
     /// delivered, and the request completes with no failure reason.
+    ///
+    /// With `params["bar_types"]`, and without `interleave` and `update_subscriptions`, the
+    /// engine also builds those bars and adds them to the cache; the requester is given the
+    /// trades as before. The request's aggregators are its own and compute as a subscription's
+    /// do, on a clock of their own that the engine drives as a backtest drives its clock, from
+    /// the request's `start` (its first trade without one). Before each trade, every time bar
+    /// close and every `RANGE` daily boundary due strictly before it fires, in time order, so its
+    /// bar is in the cache before the trade is fed; a close at a trade's own instant fires after
+    /// every trade of that instant. A time bar built from another time bar of the request closes
+    /// after that source at one instant, so the source's bar is in it. A time-range pipeline
+    /// (`time_range_generator`) runs one such clock across its child requests. When the answer
+    /// completes with no failure reason and the request names no `limit`, the closes up to
+    /// `min(end, the engine clock's time when the request was dispatched)` (that time without an
+    /// `end`) fire after the last trade, none later; for a time-range pipeline once, after its
+    /// last child. An answer with a failure reason, a failed child, or a request with a `limit`
+    /// fires no close after its last trade. With `update_subscriptions` the aggregators work as
+    /// before: a time bar is built at the next trade after its close, the last one when the
+    /// answer completes. A part of the window that no source covers is not a failure.
     ///
     /// With `params["interleave"] = true` and `params["bar_types"]`, the engine answers the
     /// trades together with the bars it builds from them, in the order a subscriber running
@@ -3238,6 +3262,15 @@ pub trait DataActor {
     }
 
     /// Request historical [`Bar`] data for the given `bar_types`.
+    ///
+    /// With `params["bar_types"]` and without `update_subscriptions`, the engine also builds
+    /// those bars from the requested bars and adds them to the cache, as for a trades request
+    /// (see [`Self::request_trades`]): on the request's own clock, a close at a bar's stamp
+    /// firing after that bar, so the bar is in it. A continuous-future request
+    /// (`continuous_future_transitions`) runs one such clock across its segments; a segment
+    /// change only sets the price adjustment applied to the records fed after it, so a bar open
+    /// at the change continues; the closes up to its end fire once, when its last segment
+    /// completes with no failure reason.
     ///
     /// # Errors
     ///

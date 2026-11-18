@@ -292,8 +292,10 @@ impl DataEngine {
         }
     }
 
+    /// Feeds a child answer to the parent's aggregators on the parent's one replay; only the
+    /// parent's own terminal ends the replay's coverage.
     fn process_time_range_pipeline_aggregation_response(
-        &self,
+        &mut self,
         parent_id: UUID4,
         resp: &DataResponse,
     ) {
@@ -301,24 +303,7 @@ impl DataEngine {
             return;
         };
 
-        match resp {
-            DataResponse::Quotes(r) => {
-                for quote in r.data.iter() {
-                    self.update_request_bar_aggregators_from_quote(&state, parent_id, *quote);
-                }
-            }
-            DataResponse::Trades(r) => {
-                for trade in r.data.iter() {
-                    self.update_request_bar_aggregators_from_trade(&state, parent_id, *trade);
-                }
-            }
-            DataResponse::Bars(r) => {
-                for bar in r.data.iter() {
-                    self.update_request_bar_aggregators_from_bar(&state, parent_id, *bar);
-                }
-            }
-            _ => {}
-        }
+        self.feed_request_bar_aggregators(&state, parent_id, resp);
     }
 
     fn emit_empty_time_range_pipeline_response(&mut self, parent_id: UUID4) {

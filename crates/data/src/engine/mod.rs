@@ -68,7 +68,7 @@ use anyhow::Context;
 pub use bar::BarAggregatorSubscription;
 use bar::{
     BarAggregationSubscription, BarAggregatorKey, BarAggregatorWarmup, InterleavedRequest,
-    bar_aggregator_key,
+    RequestReplay, bar_aggregator_key,
 };
 use book::{
     BookDeltasKey, BookSnapshotInfos, BookSnapshotKey, BookSnapshotSource, BookSnapshotter,
@@ -231,6 +231,9 @@ pub struct DataEngine {
     deferred_bars: Rc<RefCell<VecDeque<Bar>>>,
     /// Each interleaving request's own state, until its bars and its one terminal are out.
     interleaved_requests: AHashMap<UUID4, InterleavedRequest>,
+    /// The replay of each request (for a pipeline, its parent) whose aggregators are its own,
+    /// until they are cleaned up.
+    request_replays: AHashMap<UUID4, RequestReplay>,
     /// Each joined request's deadline, from its dispatch until its completion or its expiry
     /// claims it.
     request_deadlines: AHashMap<UUID4, UnixNanos>,
@@ -321,6 +324,7 @@ impl DataEngine {
             deferred_cmd_queue: Rc::new(RefCell::new(VecDeque::new())),
             deferred_bars: Rc::new(RefCell::new(VecDeque::new())),
             interleaved_requests: AHashMap::new(),
+            request_replays: AHashMap::new(),
             request_deadlines: AHashMap::new(),
             suppressed_legs: AHashSet::new(),
             late_envelopes: 0,
@@ -578,6 +582,7 @@ impl DataEngine {
 
         self.request_bar_aggregations.clear();
         self.interleaved_requests.clear();
+        self.request_replays.clear();
         self.inflight_requests.clear();
         self.request_deadlines.clear();
         self.suppressed_legs.clear();
@@ -2216,7 +2221,11 @@ impl DataEngine {
             return;
         }
 
-        self.process_request_bar_aggregation_response(&resp, envelope.completed());
+        self.process_request_bar_aggregation_response(
+            &resp,
+            envelope.completed(),
+            envelope.failure_reason(),
+        );
 
         msgbus::send_response_envelope(envelope);
     }
@@ -2266,7 +2275,7 @@ impl DataEngine {
                 }
             }
             DataResponse::OptionChainReferencePrice(r) => {
-                self.process_request_bar_aggregation_response(resp, true);
+                self.process_request_bar_aggregation_response(resp, true, None);
                 self.handle_option_chain_reference_price_response(&correlation_id, r);
                 return false;
             }
