@@ -19,12 +19,13 @@ use anyhow::Context;
 use jiff::tz::TimeZone;
 use nautilus_common::{
     cache::Cache,
+    clock::{Clock, VirtualClock},
     messages::data::{
         BarsResponse, DataResponseEnvelope, SubscribeBars, SubscribeCommand, TradesResponse,
     },
     msgbus::{self, MStr, Topic, TypedHandler},
 };
-use nautilus_core::{Params, UUID4, UnixNanos, datetime::get_timezone};
+use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos, datetime::get_timezone};
 use nautilus_model::{
     data::{Bar, BarType, QuoteTick, TradeTick},
     identifiers::{ClientId, InstrumentId},
@@ -60,6 +61,30 @@ pub(super) struct InterleavedRequest {
     start: Option<UnixNanos>,
     end: Option<UnixNanos>,
     params: Option<Params>,
+    /// The engine clock's time when the request was dispatched: its answer covers no later.
+    dispatched: UnixNanos,
+    /// Whether the request named a `limit`, so its answer may stop before its window ends.
+    limit: bool,
+    /// The replay its own builders run on, for a request without `update_subscriptions`.
+    replay: Option<RequestReplay>,
+}
+
+/// The replay of an interleaving request without `update_subscriptions`: one clock that its own
+/// builders run on as a subscription's builders run on the engine clock, driven by the engine
+/// as a backtest drives its clock (see [`DataEngine::replay_until`]).
+///
+/// It records, for each builder of the request, what drives its clock (this replay), where its
+/// bars go (the request's answer, through the output handler set up with the request) and how
+/// long it lives (the request: the builders end with its entry). Nothing asks a builder whether
+/// it is historical.
+#[derive(Debug)]
+pub(super) struct RequestReplay {
+    clock: Rc<RefCell<VirtualClock>>,
+    /// The builders it drives, in the request's order.
+    builders: Vec<BarAggregatorKey>,
+    /// Whether its builders' timers are armed: at the request's `start`, or without one at its
+    /// first record.
+    armed: bool,
 }
 
 /// The completed answer of an interleaving trades request, delivered by
@@ -251,10 +276,25 @@ impl DataEngine {
             state.bar_types.sort_by_cached_key(live_delivery_order);
 
             let (start, end) = parent_request_window(Some(req));
+            // Its builders are its own and end with it: they run on a replay of their own
+            let replay = (!state.update_subscriptions).then(|| RequestReplay {
+                clock: Rc::new(RefCell::new(VirtualClock::new())),
+                builders: state
+                    .bar_types
+                    .iter()
+                    .map(|bar_type| {
+                        bar_aggregator_key(*bar_type, state.aggregator_request_id(request_id))
+                    })
+                    .collect(),
+                armed: false,
+            });
             let interleaved = InterleavedRequest {
                 start,
                 end,
                 params: request_params(req).cloned(),
+                dispatched: self.clock.borrow().timestamp_ns(),
+                limit: matches!(req, RequestCommand::Trades(cmd) if cmd.limit.is_some()),
+                replay,
                 ..InterleavedRequest::default()
             };
             self.interleaved_requests.insert(request_id, interleaved);
@@ -266,6 +306,119 @@ impl DataEngine {
         }
 
         result
+    }
+
+    /// Returns the replay clock of `request_id`, `None` for a request without a replay.
+    fn replay_clock(&self, request_id: UUID4) -> Option<Rc<RefCell<VirtualClock>>> {
+        self.interleaved_requests
+            .get(&request_id)
+            .and_then(|interleaved| interleaved.replay.as_ref())
+            .map(|replay| Rc::clone(&replay.clock))
+    }
+
+    /// Arms the timers of the replay of `request_id` at `instant`, once: the replay clock is set
+    /// there first, then each builder with a timer starts it as a subscription's builder does,
+    /// in the request's order.
+    fn arm_replay(&mut self, request_id: UUID4, instant: UnixNanos) {
+        let Some(replay) = self
+            .interleaved_requests
+            .get_mut(&request_id)
+            .and_then(|interleaved| interleaved.replay.as_mut())
+            .filter(|replay| !replay.armed)
+        else {
+            return;
+        };
+        replay.armed = true;
+        replay.clock.borrow().set_time(instant);
+
+        for key in &replay.builders {
+            if let Some(aggregator) = self.bar_aggregators.get(key)
+                && has_timer(&key.0)
+            {
+                aggregator
+                    .borrow_mut()
+                    .start_timer(Some(Rc::clone(aggregator)));
+            }
+        }
+    }
+
+    /// Readies the replay of `request_id` for a record stamped `ts`, as a backtest readies its
+    /// clock for a datum: arms it at `ts` when it is not armed yet, otherwise fires every
+    /// deadline strictly before `ts` (see [`Self::drive_replay`]), then sets the replay clock
+    /// to `ts`. A deadline at `ts` stays armed until a later record or the end of coverage, so
+    /// it fires after every record of its instant. The clock never moves back: a record stamped
+    /// before it fires nothing and is the builders' stale case. Does nothing for a request
+    /// without a replay.
+    fn replay_until(&mut self, request_id: UUID4, ts: UnixNanos) {
+        let Some(armed) = self
+            .interleaved_requests
+            .get(&request_id)
+            .and_then(|interleaved| interleaved.replay.as_ref())
+            .map(|replay| replay.armed)
+        else {
+            return;
+        };
+
+        if !armed {
+            self.arm_replay(request_id, ts);
+            return;
+        }
+
+        self.drive_replay(request_id, ts.saturating_sub(DurationNanos::new(1)));
+
+        if let Some(clock) = self.replay_clock(request_id) {
+            let clock = clock.borrow();
+            if ts > clock.timestamp_ns() {
+                clock.set_time(ts);
+            }
+        }
+    }
+
+    /// Drives the replay of `request_id` through `through`, inclusive: takes the earliest armed
+    /// deadline, sets the replay clock to it and runs its handlers (ties in the clock's order,
+    /// time then timer name) with no borrow of the clock or a builder held, then looks again,
+    /// since a handler may arm a new deadline, until none is left at or before `through`.
+    fn drive_replay(&self, request_id: UUID4, through: UnixNanos) {
+        let Some(clock) = self.replay_clock(request_id) else {
+            return;
+        };
+
+        loop {
+            let handlers = {
+                let mut clock = clock.borrow_mut();
+                let Some(deadline) = next_deadline(&clock).filter(|deadline| *deadline <= through)
+                else {
+                    break;
+                };
+                let events = clock.advance_time(deadline, true);
+                clock.match_handlers(events)
+            };
+
+            for handler in handlers {
+                handler.run();
+            }
+        }
+    }
+
+    /// Drives the replay of `request_id` through the end of its coverage at its completed answer
+    /// with no failure reason: `min(end, dispatched)` (`dispatched` without an end), so every
+    /// close the answer covered fires and nothing later. A request that named a `limit` may
+    /// stop short of its window, so its replay is not driven.
+    fn end_replay_coverage(&self, request_id: UUID4) {
+        let Some(covered) = self
+            .interleaved_requests
+            .get(&request_id)
+            .filter(|interleaved| interleaved.replay.is_some() && !interleaved.limit)
+            .map(|interleaved| {
+                interleaved.end.map_or(interleaved.dispatched, |end| {
+                    end.min(interleaved.dispatched)
+                })
+            })
+        else {
+            return;
+        };
+
+        self.drive_replay(request_id, covered);
     }
 
     /// Records the client an interleaving request (or a leg of its pipeline) was dispatched to.
@@ -300,6 +453,7 @@ impl DataEngine {
         state: &RequestBarAggregation,
     ) -> anyhow::Result<()> {
         let aggregator_request_id = state.aggregator_request_id(request_id);
+        let replay_clock = self.replay_clock(request_id);
 
         for bar_type in &state.bar_types {
             self.create_bar_aggregator_for_key(
@@ -308,9 +462,21 @@ impl DataEngine {
                 state.skip_first_non_full_bar,
                 state.time_zone.clone(),
             )?;
-            self.setup_bar_aggregator(*bar_type, true, aggregator_request_id)?;
 
             let key = bar_aggregator_key(*bar_type, aggregator_request_id);
+            match &replay_clock {
+                // Set up as a subscription's builder, on the replay clock; armed at its start
+                Some(clock) => {
+                    if let Some(aggregator) = self.bar_aggregators.get(&key)
+                        && has_timer(bar_type)
+                    {
+                        let clock: Rc<RefCell<dyn Clock>> = Rc::clone(clock) as _;
+                        aggregator.borrow_mut().set_clock(clock);
+                    }
+                }
+                None => self.setup_bar_aggregator(*bar_type, true, aggregator_request_id)?,
+            }
+
             if let Some(aggregator) = self.bar_aggregators.get(&key) {
                 if state.disable_build_with_no_updates {
                     aggregator.borrow_mut().set_build_with_no_updates(false);
@@ -321,6 +487,16 @@ impl DataEngine {
         }
 
         self.set_request_bar_aggregator_chain_handlers(request_id, state);
+
+        // The replay starts at the request's start; without one, at its first record
+        if let Some(start) = self
+            .interleaved_requests
+            .get(&request_id)
+            .filter(|interleaved| interleaved.replay.is_some())
+            .and_then(|interleaved| interleaved.start)
+        {
+            self.arm_replay(request_id, start);
+        }
 
         Ok(())
     }
@@ -353,10 +529,10 @@ impl DataEngine {
                 .collect();
 
             let cache = Rc::clone(&self.cache);
-            let interleaved_bars = self
-                .interleaved_requests
-                .get(&request_id)
-                .map(|interleaved| Rc::clone(&interleaved.bars));
+            let interleaved = self.interleaved_requests.get(&request_id);
+            let interleaved_bars = interleaved.map(|interleaved| Rc::clone(&interleaved.bars));
+            // A replay's builder computes as a subscription's, not in historical mode
+            let historical = interleaved.is_none_or(|interleaved| interleaved.replay.is_none());
 
             let handler: Box<dyn FnMut(Bar)> = Box::new(move |bar: Bar| {
                 // Request-generated bars are delivered only through the cache, or as response
@@ -373,7 +549,9 @@ impl DataEngine {
                 }
             });
 
-            aggregator.borrow_mut().set_historical_mode(true, handler);
+            aggregator
+                .borrow_mut()
+                .set_historical_mode(historical, handler);
         }
     }
 
@@ -384,18 +562,22 @@ impl DataEngine {
     /// Cleans up the request's aggregators like [`Self::cleanup_request_bar_aggregators`], each
     /// joined builder releasing its held live trades through its own copy of `joined`.
     ///
-    /// With `bars`, the undelivered bars of an interleaving request, its builders release their
-    /// held live trades together, trade by trade (see
+    /// With `interleaved`, the entry of an interleaving request holding its undelivered bars,
+    /// its builders release their held live trades together, trade by trade (see
     /// [`Self::release_held_trades_trade_by_trade`]); otherwise one builder after the other.
     /// An interleaving request's entry still held here goes with them, undelivered: only
-    /// [`Self::finish_interleaved`], which takes the entry first, delivers its bars.
+    /// [`Self::finish_interleaved`], which takes the entry first, delivers its bars. A replay's
+    /// builders hold no historical close, so nothing is flushed from them: they stop.
     fn release_request_bar_aggregators(
         &mut self,
         request_id: &UUID4,
         joined: Option<JoinedRelease>,
-        bars: Option<&RefCell<Vec<Bar>>>,
+        interleaved: Option<&InterleavedRequest>,
     ) -> bool {
-        self.interleaved_requests.remove(request_id);
+        let held = self.interleaved_requests.remove(request_id);
+        let replayed = interleaved
+            .or(held.as_ref())
+            .is_some_and(|interleaved| interleaved.replay.is_some());
 
         let Some(state) = self.request_bar_aggregations.remove(request_id) else {
             return false;
@@ -403,8 +585,13 @@ impl DataEngine {
 
         let aggregator_request_id = state.aggregator_request_id(*request_id);
 
-        if let Some(bars) = bars {
-            self.release_held_trades_trade_by_trade(&state, aggregator_request_id, joined, bars);
+        if let Some(interleaved) = interleaved {
+            self.release_held_trades_trade_by_trade(
+                &state,
+                aggregator_request_id,
+                joined,
+                &interleaved.bars,
+            );
         }
 
         // Finish each source before the aggregators that depend on it, so the bars from its
@@ -416,7 +603,9 @@ impl DataEngine {
             let has_live_handlers =
                 state.update_subscriptions && self.bar_aggregator_handlers.contains_key(&key);
 
-            self.finish_historical_bar_aggregator(&key, has_live_handlers, joined);
+            if !replayed {
+                self.finish_historical_bar_aggregator(&key, has_live_handlers, joined);
+            }
 
             let keep_running = if has_live_handlers {
                 match self.setup_bar_aggregator(bar_type, false, aggregator_request_id) {
@@ -599,11 +788,14 @@ impl DataEngine {
     /// Answers a trades request that set `interleave` with response parts in live order.
     ///
     /// Trades feed the request aggregators one at a time; admission leaves only bar types its
-    /// trades feed (see [`Self::admit_interleave`]). A bar a trade completes is delivered before
-    /// that trade, except a `RANGE_INCLUSIVE` bar, which contains its completing trade and is
-    /// delivered after it (the live publication order); a time bar is completed by the first
-    /// trade after its close, so it goes out before that trade, as its live timer publishes it.
-    /// The aggregators are fed in live's order (see [`live_delivery_order`]), so bars of
+    /// trades feed (see [`Self::admit_interleave`]). Without `update_subscriptions`, before each
+    /// trade the request's replay fires the closes due strictly before it (see
+    /// [`Self::replay_until`]): time bars and `RANGE` bars completed at their daily boundary go
+    /// out before the trade, in the order of their closes. A bar a trade completes is delivered
+    /// before that trade, except a `RANGE_INCLUSIVE` bar, which contains its completing trade and
+    /// is delivered after it (the live publication order). With `update_subscriptions` a time
+    /// bar is still completed by the first trade after its close, so it goes out before that
+    /// trade. The aggregators are fed in live's order (see [`live_delivery_order`]), so bars of
     /// different types one trade completes come in the order live publishes them. Each bar
     /// delivery first sends the trades gathered since the previous one; each bar is a part of
     /// its own, in the order the aggregators produced it, and enters the cache only as
@@ -626,6 +818,11 @@ impl DataEngine {
         let mut pending = Vec::new();
 
         for trade in resp.data.iter() {
+            // The closes of the request's replay due before the trade, each bar before it
+            self.replay_until(request_id, trade.ts_init);
+            let fired = std::mem::take(&mut *bars.borrow_mut());
+            send_interleaved_bars(&self.cache, resp, &mut pending, fired);
+
             self.update_request_bar_aggregators_from_trade(state, request_id, *trade);
 
             let completed = std::mem::take(&mut *bars.borrow_mut());
@@ -662,26 +859,32 @@ impl DataEngine {
     /// Ends an interleaving request: on its completed answer (`closing`), on a payload-free
     /// failure, or on expiry.
     ///
-    /// Takes the request's entry, cleans up its aggregators (a joined request's builders
-    /// releasing through the answer's cut and floor), and delivers the bars that clean-up
-    /// completed, each a part of its own in the order the clean-up produced it, entering the
-    /// cache just before its part is sent: with the answer's identity, after the answer's
-    /// trades; or, when there is no answer and a client was resolved, with the dispatched
-    /// client's identity and the request's window (none otherwise, and they do not enter the
-    /// cache). Then sends exactly one terminal, the answer's last trades part when there is one,
-    /// carrying `failure` when there is a reason.
+    /// At a completed answer with no failure reason, first drives the request's replay through
+    /// the end of its coverage (see [`Self::end_replay_coverage`]). Then takes the request's
+    /// entry, cleans up its aggregators (a joined request's builders releasing through the
+    /// answer's cut and floor), and delivers the bars that end and that clean-up completed, each
+    /// a part of its own in the order they were produced, entering the cache just before its
+    /// part is sent: with the answer's identity, after the answer's trades; or, when there is
+    /// no answer and a client was resolved, with the dispatched client's identity and the
+    /// request's window (none otherwise, and they do not enter the cache). Then sends exactly
+    /// one terminal, the answer's last trades part when there is one, carrying `failure` when
+    /// there is a reason.
     pub(super) fn finish_interleaved(
         &mut self,
         request_id: UUID4,
         failure: Option<String>,
         closing: Option<ClosingPart<'_>>,
     ) {
+        if closing.is_some() && failure.is_none() {
+            self.end_replay_coverage(request_id);
+        }
+
         let interleaved = self
             .interleaved_requests
             .remove(&request_id)
             .unwrap_or_default();
         let joined = closing.as_ref().and_then(|closing| closing.joined);
-        self.release_request_bar_aggregators(&request_id, joined, Some(&interleaved.bars));
+        self.release_request_bar_aggregators(&request_id, joined, Some(&interleaved));
         let remaining = std::mem::take(&mut *interleaved.bars.borrow_mut());
 
         let terminal = if let Some(ClosingPart {
@@ -1609,15 +1812,35 @@ fn why_not_fed_by_trades(bar_type: &BarType, instrument_id: InstrumentId) -> Opt
 /// Returns the key that orders the bar types of an interleaving request as live delivers the bars
 /// one trade completes, so its aggregators are fed, and produce their bars, in that order.
 ///
-/// Every bar type admitted is fed by the trades (see [`why_not_fed_by_trades`]). A time bar is
-/// published by its timer before the trade is (a test or backtest clock takes timers due at one
-/// instant in name order, `TIME_BAR_<bar type>`). The trades topic's router then calls the other
-/// aggregators at one priority in handler ID order, `BarTradeHandler|<bar type>`: the bar type's
-/// string order (a builder subscribed during a joined warm-up has `JoinedTradeHandler|<bar
-/// type>`, so the order holds among builders subscribed alike). A `RANGE_INCLUSIVE` bar is
-/// published after the trade, its aggregator having been called in that same order.
+/// Every bar type admitted is fed by the trades (see [`why_not_fed_by_trades`]). A request with
+/// its own replay builds no time bar from a trade: its replay fires every close before the
+/// trade, in close order, ties in timer name order (`RANGE_BAR_<bar type>` before
+/// `TIME_BAR_<bar type>`), so the key orders only its other bar types. With
+/// `update_subscriptions`, the next trade after a close completes the time bar; it is placed
+/// first, as live's timer publishes it before the trade (a test or backtest clock takes timers
+/// due at one instant in name order, `TIME_BAR_<bar type>`). The trades topic's router then
+/// calls the other aggregators at one priority in handler ID order, `BarTradeHandler|<bar
+/// type>`: the bar type's string order (a builder subscribed during a joined warm-up has
+/// `JoinedTradeHandler|<bar type>`, so the order holds among builders subscribed alike). A
+/// `RANGE_INCLUSIVE` bar is published after the trade, its aggregator having been called in
+/// that same order.
 fn live_delivery_order(bar_type: &BarType) -> (bool, String) {
     (!bar_type.spec().is_time_aggregated(), bar_type.to_string())
+}
+
+/// Returns whether `bar_type`'s builder runs on a clock: a time bar closes, and a `RANGE` bar
+/// completes at its daily boundary, when a timer fires.
+fn has_timer(bar_type: &BarType) -> bool {
+    bar_type.spec().is_time_aggregated() || bar_type.spec().aggregation == BarAggregation::Range
+}
+
+/// Returns the earliest deadline armed on `clock`, if any.
+fn next_deadline(clock: &VirtualClock) -> Option<UnixNanos> {
+    clock
+        .timer_names()
+        .into_iter()
+        .filter_map(|name| clock.next_time_ns(name))
+        .min()
 }
 
 /// Returns whether a bar an interleaving request's trade completes is delivered after that trade:

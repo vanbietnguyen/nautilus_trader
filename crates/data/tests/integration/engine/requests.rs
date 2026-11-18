@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use nautilus_model::enums::BarIntervalType;
+
 use super::*;
 
 #[rstest]
@@ -4359,6 +4361,30 @@ fn execute_interleaved(
     request_id
 }
 
+/// Executes an interleaved trades request like [`execute_interleaved`], without
+/// `update_subscriptions` and with an `end`: at a completed answer its replay fires the closes up
+/// to `end`, not up to the fixture's engine clock, years later.
+fn execute_interleaved_until(
+    fixture: &JoinFixture,
+    instrument_id: InstrumentId,
+    bar_types: &[BarType],
+    end: u64,
+) -> UUID4 {
+    let params = json!({
+        "bar_types": bar_types.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "update_subscriptions": false,
+        "interleave": true,
+    });
+    let request = trades_request(vec![instrument_id], Some(end), fixture.client_id, params);
+    let request_id = *request.request_id();
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+    request_id
+}
+
 /// Answers `request_id` with trades (`ts`, trade ID) of `instrument_id` in one envelope.
 fn answer_trades(
     fixture: &JoinFixture,
@@ -4465,16 +4491,11 @@ fn test_interleaved_failure_after_a_part_delivers_its_bars_once_and_none_to_the_
             terminal(Some(ResponsePart::Trades(second, trade_ids(&["b1"]))), None),
         ]
     );
-    // The bar a2 completed is pending until the clean-up flushes it
+    // The bar closing at a2's instant fires only after a2, and a failure fires no close
     assert_eq!(
         tap.take(first),
         vec![
             part(ResponsePart::Trades(first, trade_ids(&["a1", "a2"]))),
-            part(ResponsePart::Bars(
-                first,
-                seconds,
-                at_ns(&[SECOND_NS + SECOND_NS / 5])
-            )),
             terminal(None, Some("the source stopped")),
         ]
     );
@@ -4493,7 +4514,7 @@ fn test_interleaved_completion_delivers_its_clean_up_bars_then_one_terminal(
     let seconds = second_bars(id);
     let tap = TappedResponses::install();
 
-    let request_id = execute_interleaved(&fixture, id, &[seconds], false);
+    let request_id = execute_interleaved_until(&fixture, id, &[seconds], 2 * SECOND_NS);
     let answer = answer_trades(
         &fixture,
         request_id,
@@ -4503,7 +4524,7 @@ fn test_interleaved_completion_delivers_its_clean_up_bars_then_one_terminal(
     );
     fixture.engine.borrow_mut().response_envelope(answer);
 
-    // The bar a2 completed is pending until the clean-up flushes it
+    // The bar closing at a2's instant fires after a2, at the end of the answer's coverage
     assert_eq!(
         tap.take(request_id),
         vec![
@@ -4613,7 +4634,7 @@ fn test_two_interleaved_requests_one_after_the_other_each_get_their_own_bars(
     let seconds = second_bars(id);
     let tap = TappedResponses::install();
 
-    let first = execute_interleaved(&fixture, id, &[seconds], false);
+    let first = execute_interleaved_until(&fixture, id, &[seconds], 2 * SECOND_NS);
     let answer = answer_trades(
         &fixture,
         first,
@@ -4623,7 +4644,7 @@ fn test_two_interleaved_requests_one_after_the_other_each_get_their_own_bars(
     );
     fixture.engine.borrow_mut().response_envelope(answer);
     // The same trades again: each request's aggregators are its own
-    let second = execute_interleaved(&fixture, id, &[seconds], false);
+    let second = execute_interleaved_until(&fixture, id, &[seconds], 2 * SECOND_NS);
     let answer = answer_trades(
         &fixture,
         second,
@@ -4681,7 +4702,7 @@ fn test_two_interleaved_requests_at_the_same_time_for_different_instruments_each
     let tap = TappedResponses::install();
 
     let first = execute_interleaved(&fixture, aud, &[aud_seconds], false);
-    let second = execute_interleaved(&fixture, gbp, &[gbp_seconds], false);
+    let second = execute_interleaved_until(&fixture, gbp, &[gbp_seconds], 3 * SECOND_NS);
     let (a1, a2) = (SECOND_NS / 5, SECOND_NS + SECOND_NS / 5);
     let (b1, b2, b3) = (
         SECOND_NS / 4,
@@ -4702,7 +4723,7 @@ fn test_two_interleaved_requests_at_the_same_time_for_different_instruments_each
     let answer = answer_trades(&fixture, second, gbp, &[(b3, "b3")], true);
     fixture.engine.borrow_mut().response_envelope(answer);
 
-    // A completed time bar is pending until the next one completes or the clean-up flushes it
+    // A bar closing at a trade's instant fires before the next trade, or at the end of coverage
     assert_eq!(
         tap.take(second),
         vec![
@@ -4713,11 +4734,11 @@ fn test_two_interleaved_requests_at_the_same_time_for_different_instruments_each
             terminal(Some(ResponsePart::Trades(second, Vec::new())), None),
         ]
     );
+    // A failure fires no close after the last trade
     assert_eq!(
         tap.take(first),
         vec![
             part(ResponsePart::Trades(first, trade_ids(&["a1", "a2"]))),
-            part(ResponsePart::Bars(first, aud_seconds, at_ns(&[a2]))),
             terminal(None, Some("the source stopped")),
         ]
     );
@@ -4736,7 +4757,8 @@ fn test_interleaved_request_routes_three_partial_envelopes_to_its_entry_until_th
     let seconds = second_bars(id);
     let tap = TappedResponses::install();
 
-    let request_id = execute_interleaved(&fixture, id, &[seconds], false);
+    let request_id =
+        execute_interleaved_until(&fixture, id, &[seconds], 2 * SECOND_NS + SECOND_NS / 2);
     for (index, trade_id) in ["a1", "a2", "a3"].into_iter().enumerate() {
         let ts = index as u64 * SECOND_NS + SECOND_NS / 5;
         let answer = answer_trades(&fixture, request_id, id, &[(ts, trade_id)], false);
@@ -4745,7 +4767,7 @@ fn test_interleaved_request_routes_three_partial_envelopes_to_its_entry_until_th
     let answer = answer_trades(&fixture, request_id, id, &[], true);
     fixture.engine.borrow_mut().response_envelope(answer);
 
-    // A completed time bar is pending until the next one completes or the clean-up flushes it
+    // A bar closing at a trade's instant fires before the next trade, or at the end of coverage
     let bars = |ts: u64| part(ResponsePart::Bars(request_id, seconds, at_ns(&[ts])));
     let trades = |id: &str| part(ResponsePart::Trades(request_id, trade_ids(&[id])));
     assert_eq!(
@@ -7286,4 +7308,788 @@ fn test_interleaved_joined_release_cuts_and_floors_each_bar_type_trade_by_trade(
             bar(volume, 400 * MS_NS, [3, 3]),
         ]
     );
+}
+
+/// What the requester of an interleaving request with its own replay (no `update_subscriptions`)
+/// is given, in order: each trade, and each bar with its volume, with the number of bars of
+/// every watched bar type the cache holds at its callback; then the request's end, with its
+/// failure reason.
+#[derive(Clone, Debug, PartialEq)]
+enum Replayed {
+    Trade(TradeId, Vec<usize>),
+    Bar(BarType, UnixNanos, Quantity, Vec<usize>),
+    End(Option<String>),
+}
+
+fn traded(trade_id: &str, cached: &[usize]) -> Replayed {
+    Replayed::Trade(TradeId::new(trade_id), cached.to_vec())
+}
+
+fn closed(bar_type: BarType, ts: u64, volume: u64, cached: &[usize]) -> Replayed {
+    Replayed::Bar(
+        bar_type.standard(),
+        UnixNanos::from(ts),
+        Quantity::from(volume),
+        cached.to_vec(),
+    )
+}
+
+/// The instant of a made-up civil time in New York, e.g. `2024-01-08T16:59:58`.
+fn new_york(civil: &str) -> u64 {
+    let zoned: jiff::Zoned = format!("{civil}[America/New_York]").parse().unwrap();
+    u64::try_from(zoned.timestamp().as_nanosecond()).unwrap()
+}
+
+/// The instant of a made-up UTC time, e.g. `2024-01-08T10:00:00Z`.
+fn utc_ns(value: &str) -> u64 {
+    u64::try_from(value.parse::<jiff::Timestamp>().unwrap().as_nanosecond()).unwrap()
+}
+
+fn bar_type_of(instrument_id: InstrumentId, spec: &str) -> BarType {
+    BarType::from(format!("{instrument_id}-{spec}-LAST-INTERNAL").as_str())
+}
+
+/// An interleaving trades request without `update_subscriptions`, as the engine clock reads
+/// `dispatched` when it is dispatched.
+#[derive(Clone, Copy, Default)]
+struct ReplaySpec {
+    dispatched: u64,
+    start: Option<u64>,
+    end: Option<u64>,
+    limit: Option<usize>,
+    time_zone: Option<&'static str>,
+}
+
+/// An engine configured by `config` with a mock client; its requester's deliveries.
+struct ReplayFixture {
+    engine: DataEngine,
+    instrument_id: InstrumentId,
+    client_id: ClientId,
+    request_id: UUID4,
+    delivered: Rc<RefCell<Vec<Replayed>>>,
+}
+
+impl ReplayFixture {
+    /// Dispatches the request of `spec` for `bar_types` and records what its requester is
+    /// given, watching the cache's bars of `bar_types`.
+    fn execute(
+        audusd_sim: CurrencyPair,
+        client_id: ClientId,
+        venue: Venue,
+        config: DataEngineConfig,
+        bar_types: &[BarType],
+        spec: ReplaySpec,
+    ) -> Self {
+        let instrument_id = audusd_sim.id;
+        let mut clock = VirtualClock::new();
+        let _ = clock.advance_time(UnixNanos::from(spec.dispatched), true);
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(clock));
+        let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+            .unwrap();
+        let mut engine = DataEngine::new(clock, Rc::clone(&cache), Some(config));
+        let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+        register_mock_client(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            Rc::clone(&cache),
+            client_id,
+            venue,
+            None,
+            &recorder,
+            &mut engine,
+        );
+
+        let mut params = json!({
+            "bar_types": bar_types.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "interleave": true,
+        });
+        if let Some(time_zone) = spec.time_zone {
+            params["time_zone"] = json!(time_zone);
+        }
+        let params: Params = serde_json::from_value(params).unwrap();
+        let request_id = UUID4::new();
+
+        let delivered = Rc::new(RefCell::new(Vec::new()));
+        let recorded = Rc::clone(&delivered);
+        let watched = bar_types.to_vec();
+        let handler = TypedHandler::from(move |envelope: &DataResponseEnvelope| {
+            match envelope.response() {
+                Some(DataResponse::Trades(resp)) => {
+                    for trade in resp.data.iter() {
+                        let cached = cached_bars(&cache, &watched);
+                        recorded
+                            .borrow_mut()
+                            .push(Replayed::Trade(trade.trade_id, cached));
+                    }
+                }
+                Some(DataResponse::Bars(resp)) => {
+                    for bar in resp.data.iter() {
+                        let cached = cached_bars(&cache, &watched);
+                        recorded.borrow_mut().push(Replayed::Bar(
+                            bar.bar_type,
+                            bar.ts_event,
+                            bar.volume,
+                            cached,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+
+            if envelope.completed() {
+                recorded
+                    .borrow_mut()
+                    .push(Replayed::End(envelope.failure_reason().map(str::to_owned)));
+            }
+        });
+        msgbus::register_response_handler(&request_id, handler);
+
+        let at = |ns: Option<u64>| ns.map(|ns| UnixNanos::from(ns).to_datetime_utc());
+        engine
+            .execute_request(RequestCommand::Trades(RequestTrades::new(
+                instrument_id,
+                at(spec.start),
+                at(spec.end),
+                spec.limit.map(|limit| NonZeroUsize::new(limit).unwrap()),
+                Some(client_id),
+                request_id,
+                UnixNanos::from(spec.dispatched),
+                Some(params),
+            )))
+            .unwrap();
+
+        Self {
+            engine,
+            instrument_id,
+            client_id,
+            request_id,
+            delivered,
+        }
+    }
+
+    /// Answers the request in one envelope with trades (`ts`, size, trade ID) at one price.
+    fn answer(&mut self, trades: &[(u64, u64, &str)], completed: bool, failure: Option<&str>) {
+        let trades: Vec<_> = trades
+            .iter()
+            .map(|(ts, size, trade_id)| {
+                make_trade(self.instrument_id, "1.00000", *size, trade_id, *ts)
+            })
+            .collect();
+        let envelope = DataResponseEnvelope::new(
+            DataResponse::Trades(TradesResponse::new(
+                self.request_id,
+                self.client_id,
+                self.instrument_id,
+                trades,
+                None,
+                None,
+                UnixNanos::default(),
+                None,
+            )),
+            completed,
+            None,
+        );
+        let envelope = match failure {
+            Some(reason) => envelope.with_failure(reason.to_owned()),
+            None => envelope,
+        };
+        self.engine.response_envelope(envelope);
+    }
+
+    fn delivered(&self) -> Vec<Replayed> {
+        self.delivered.borrow().clone()
+    }
+}
+
+fn without_flat_bars() -> DataEngineConfig {
+    DataEngineConfig {
+        time_bars_build_with_no_updates: false,
+        ..DataEngineConfig::default()
+    }
+}
+
+#[rstest]
+fn test_replayed_request_delivers_the_closes_after_its_last_trade_through_its_end(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (five, range) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "10-RANGE"));
+    let spec = ReplaySpec {
+        dispatched: new_york("2024-01-08T20:00:00"),
+        start: Some(new_york("2024-01-08T16:50:00")),
+        end: Some(new_york("2024-01-08T18:00:00") + 1),
+        ..ReplaySpec::default()
+    };
+    let mut fixture = ReplayFixture::execute(
+        audusd_sim,
+        client_id,
+        venue,
+        without_flat_bars(),
+        &[five, range],
+        spec,
+    );
+
+    fixture.answer(
+        &[
+            (new_york("2024-01-08T16:52:00"), 1, "t1"),
+            (new_york("2024-01-08T16:57:00"), 2, "t2"),
+            (new_york("2024-01-08T16:59:58"), 3, "t3"),
+        ],
+        true,
+        None,
+    );
+
+    // The 17:00 bar closes and the 18:00 boundary completes the range bar after the last trade
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            traded("t1", &[0, 0]),
+            closed(five, new_york("2024-01-08T16:55:00"), 1, &[1, 0]),
+            traded("t2", &[1, 0]),
+            traded("t3", &[1, 0]),
+            closed(five, new_york("2024-01-08T17:00:00"), 5, &[2, 0]),
+            closed(range, new_york("2024-01-08T18:00:00"), 6, &[2, 1]),
+            Replayed::End(None),
+        ]
+    );
+}
+
+#[rstest]
+fn test_replayed_trade_at_a_close_is_in_the_closing_bar_and_at_the_boundary_completes_the_range_bar(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (five, range) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "10-RANGE"));
+    let spec = ReplaySpec {
+        dispatched: new_york("2024-01-08T20:00:00"),
+        start: Some(new_york("2024-01-08T17:50:00")),
+        end: Some(new_york("2024-01-08T18:02:00")),
+        ..ReplaySpec::default()
+    };
+    let mut fixture = ReplayFixture::execute(
+        audusd_sim,
+        client_id,
+        venue,
+        without_flat_bars(),
+        &[five, range],
+        spec,
+    );
+
+    fixture.answer(
+        &[
+            (new_york("2024-01-08T17:52:00"), 1, "a"),
+            (new_york("2024-01-08T17:55:00"), 2, "b"),
+            (new_york("2024-01-08T18:00:00"), 4, "c"),
+            (new_york("2024-01-08T18:01:00"), 8, "d"),
+        ],
+        true,
+        None,
+    );
+
+    // b is in the bar closing at its instant, which comes after it; c's own update completes the
+    // range bar at the boundary, before c, and c is in the 5-minute bar closing at 18:00
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            traded("a", &[0, 0]),
+            traded("b", &[0, 0]),
+            closed(five, new_york("2024-01-08T17:55:00"), 3, &[1, 0]),
+            closed(range, new_york("2024-01-08T18:00:00"), 3, &[1, 1]),
+            traded("c", &[1, 1]),
+            closed(five, new_york("2024-01-08T18:00:00"), 4, &[2, 1]),
+            traded("d", &[2, 1]),
+            Replayed::End(None),
+        ]
+    );
+}
+
+#[rstest]
+fn test_replayed_time_bars_whose_closes_interleave_come_in_close_order_ties_by_timer_name(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (two, three) = (bar_type_of(id, "2-MINUTE"), bar_type_of(id, "3-MINUTE"));
+    let spec = ReplaySpec {
+        dispatched: utc_ns("2024-01-08T12:00:00Z"),
+        start: Some(utc_ns("2024-01-08T10:00:00Z")),
+        end: Some(utc_ns("2024-01-08T10:07:59Z")),
+        ..ReplaySpec::default()
+    };
+    let mut fixture = ReplayFixture::execute(
+        audusd_sim,
+        client_id,
+        venue,
+        DataEngineConfig::default(),
+        &[three, two],
+        spec,
+    );
+
+    fixture.answer(
+        &[
+            (utc_ns("2024-01-08T10:00:30Z"), 1, "t1"),
+            (utc_ns("2024-01-08T10:07:30Z"), 2, "t2"),
+        ],
+        true,
+        None,
+    );
+
+    // Named out of order: the bars come in close order, the 10:06 tie in timer name order
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            traded("t1", &[0, 0]),
+            closed(two, utc_ns("2024-01-08T10:02:00Z"), 1, &[0, 1]),
+            closed(three, utc_ns("2024-01-08T10:03:00Z"), 1, &[1, 1]),
+            closed(two, utc_ns("2024-01-08T10:04:00Z"), 0, &[1, 2]),
+            closed(two, utc_ns("2024-01-08T10:06:00Z"), 0, &[1, 3]),
+            closed(three, utc_ns("2024-01-08T10:06:00Z"), 0, &[2, 3]),
+            traded("t2", &[2, 3]),
+            Replayed::End(None),
+        ]
+    );
+}
+
+#[rstest]
+fn test_replayed_range_boundary_and_time_close_at_one_instant_come_range_then_time(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (five, range) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "10-RANGE"));
+    let spec = ReplaySpec {
+        dispatched: new_york("2024-01-08T20:00:00"),
+        start: Some(new_york("2024-01-08T17:56:00")),
+        end: Some(new_york("2024-01-08T18:04:00")),
+        ..ReplaySpec::default()
+    };
+    let mut fixture = ReplayFixture::execute(
+        audusd_sim,
+        client_id,
+        venue,
+        without_flat_bars(),
+        &[five, range],
+        spec,
+    );
+
+    fixture.answer(
+        &[
+            (new_york("2024-01-08T17:58:00"), 1, "t1"),
+            (new_york("2024-01-08T18:03:00"), 2, "t2"),
+        ],
+        true,
+        None,
+    );
+
+    // No record at 18:00: the clock's order, `RANGE_BAR_` before `TIME_BAR_`
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            traded("t1", &[0, 0]),
+            closed(range, new_york("2024-01-08T18:00:00"), 1, &[0, 1]),
+            closed(five, new_york("2024-01-08T18:00:00"), 1, &[1, 1]),
+            traded("t2", &[1, 1]),
+            Replayed::End(None),
+        ]
+    );
+}
+
+#[rstest]
+fn test_replayed_right_open_time_bar_takes_a_trade_at_its_close_as_a_subscription_does(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
+    let config = DataEngineConfig {
+        time_bars_interval_type: BarIntervalType::RightOpen,
+        ..without_flat_bars()
+    };
+    let spec = ReplaySpec {
+        dispatched: utc_ns("2024-01-08T12:00:00Z"),
+        start: Some(utc_ns("2024-01-08T10:00:00Z")),
+        end: Some(utc_ns("2024-01-08T10:10:00Z")),
+        ..ReplaySpec::default()
+    };
+    let mut fixture = ReplayFixture::execute(audusd_sim, client_id, venue, config, &[five], spec);
+
+    fixture.answer(
+        &[
+            (utc_ns("2024-01-08T10:01:00Z"), 1, "a"),
+            (utc_ns("2024-01-08T10:05:00Z"), 2, "b"),
+            (utc_ns("2024-01-08T10:06:00Z"), 4, "c"),
+        ],
+        true,
+        None,
+    );
+
+    // The timer at b's instant fires after b, as a backtest runs it; a right-open bar is
+    // stamped at its open
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            traded("a", &[0]),
+            traded("b", &[0]),
+            closed(five, utc_ns("2024-01-08T10:00:00Z"), 3, &[1]),
+            traded("c", &[1]),
+            closed(five, utc_ns("2024-01-08T10:05:00Z"), 4, &[2]),
+            Replayed::End(None),
+        ]
+    );
+}
+
+#[rstest]
+#[case::flat_bars(true)]
+#[case::no_flat_bars(false)]
+fn test_replayed_weekend_completes_the_range_bar_once_at_friday_18_00(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] build_with_no_updates: bool,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (hour, range) = (bar_type_of(id, "1-HOUR"), bar_type_of(id, "10-RANGE"));
+    let config = DataEngineConfig {
+        time_bars_build_with_no_updates: build_with_no_updates,
+        ..DataEngineConfig::default()
+    };
+    let spec = ReplaySpec {
+        dispatched: new_york("2024-01-15T09:00:00"),
+        start: Some(new_york("2024-01-12T16:00:00")),
+        end: Some(new_york("2024-01-14T18:00:00") + 1),
+        ..ReplaySpec::default()
+    };
+    let mut fixture =
+        ReplayFixture::execute(audusd_sim, client_id, venue, config, &[hour, range], spec);
+
+    fixture.answer(
+        &[
+            (new_york("2024-01-12T16:30:00"), 1, "t1"),
+            (new_york("2024-01-12T16:59:58"), 2, "t2"),
+        ],
+        true,
+        None,
+    );
+
+    let friday_18_00 = new_york("2024-01-12T18:00:00");
+    let mut expected = vec![
+        traded("t1", &[0, 0]),
+        traded("t2", &[0, 0]),
+        closed(hour, new_york("2024-01-12T17:00:00"), 3, &[1, 0]),
+        closed(range, friday_18_00, 3, &[1, 1]),
+    ];
+    if build_with_no_updates {
+        // Every hour from Friday 18:00 to Sunday 18:00, after the range bar at a tie
+        for (index, cached) in (0..=48).zip(2..) {
+            let ts = friday_18_00 + index * 3_600 * NANOSECONDS_IN_SECOND;
+            expected.push(closed(hour, ts, 0, &[cached, 1]));
+        }
+    }
+    expected.push(Replayed::End(None));
+    assert_eq!(fixture.delivered(), expected);
+}
+
+#[rstest]
+fn test_replayed_two_day_grid_starts_at_the_request_start_not_at_the_first_trade(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let two_days = bar_type_of(audusd_sim.id, "2-DAY");
+    let spec = ReplaySpec {
+        dispatched: utc_ns("2024-01-11T00:00:00Z"),
+        start: Some(utc_ns("2024-01-08T12:00:00Z")),
+        end: Some(utc_ns("2024-01-10T02:00:00Z")),
+        ..ReplaySpec::default()
+    };
+    let mut fixture = ReplayFixture::execute(
+        audusd_sim,
+        client_id,
+        venue,
+        DataEngineConfig::default(),
+        &[two_days],
+        spec,
+    );
+
+    fixture.answer(
+        &[
+            (utc_ns("2024-01-09T01:00:00Z"), 1, "t1"),
+            (utc_ns("2024-01-10T01:00:00Z"), 2, "t2"),
+        ],
+        true,
+        None,
+    );
+
+    // Anchored on Monday, the start: the bar closes Wednesday 00:00, not Thursday
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            traded("t1", &[0]),
+            closed(two_days, utc_ns("2024-01-10T00:00:00Z"), 1, &[1]),
+            traded("t2", &[1]),
+            Replayed::End(None),
+        ]
+    );
+}
+
+#[rstest]
+fn test_replayed_month_bar_closes_at_the_month_end_with_no_trade_near_it(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let month = bar_type_of(audusd_sim.id, "1-MONTH");
+    let spec = ReplaySpec {
+        dispatched: utc_ns("2024-03-05T00:00:00Z"),
+        start: Some(utc_ns("2024-01-10T00:00:00Z")),
+        end: Some(utc_ns("2024-02-21T00:00:00Z")),
+        ..ReplaySpec::default()
+    };
+    let mut fixture = ReplayFixture::execute(
+        audusd_sim,
+        client_id,
+        venue,
+        DataEngineConfig::default(),
+        &[month],
+        spec,
+    );
+
+    fixture.answer(
+        &[
+            (utc_ns("2024-01-15T00:00:00Z"), 1, "t1"),
+            (utc_ns("2024-02-20T00:00:00Z"), 2, "t2"),
+        ],
+        true,
+        None,
+    );
+
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            traded("t1", &[0]),
+            closed(month, utc_ns("2024-02-01T00:00:00Z"), 1, &[1]),
+            traded("t2", &[1]),
+            Replayed::End(None),
+        ]
+    );
+}
+
+#[rstest]
+fn test_replayed_day_bars_follow_new_york_midnight_across_a_daylight_saving_change(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let day = bar_type_of(audusd_sim.id, "1-DAY");
+    let spec = ReplaySpec {
+        dispatched: new_york("2024-03-12T00:00:00"),
+        start: Some(new_york("2024-03-08T12:00:00")),
+        end: Some(new_york("2024-03-11T10:00:00")),
+        time_zone: Some("America/New_York"),
+        ..ReplaySpec::default()
+    };
+    let mut fixture = ReplayFixture::execute(
+        audusd_sim,
+        client_id,
+        venue,
+        DataEngineConfig::default(),
+        &[day],
+        spec,
+    );
+
+    fixture.answer(
+        &[
+            (new_york("2024-03-08T13:00:00"), 1, "t1"),
+            (new_york("2024-03-11T09:00:00"), 2, "t2"),
+        ],
+        true,
+        None,
+    );
+
+    // Daylight saving starts 2024-03-10 02:00: that day lasts 23 hours
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            traded("t1", &[0]),
+            closed(day, new_york("2024-03-09T00:00:00"), 1, &[1]),
+            closed(day, new_york("2024-03-10T00:00:00"), 0, &[2]),
+            closed(day, new_york("2024-03-11T00:00:00"), 0, &[3]),
+            traded("t2", &[3]),
+            Replayed::End(None),
+        ]
+    );
+    assert_eq!(
+        new_york("2024-03-11T00:00:00") - new_york("2024-03-10T00:00:00"),
+        23 * 3_600 * NANOSECONDS_IN_SECOND
+    );
+}
+
+#[rstest]
+#[case::no_end(None)]
+#[case::end_ahead_of_the_engine_clock(Some("2024-01-08T10:20:00Z"))]
+fn test_replayed_closes_after_the_dispatch_time_do_not_fire(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] end: Option<&str>,
+) {
+    let _ = stub_msgbus;
+    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
+    let spec = ReplaySpec {
+        dispatched: utc_ns("2024-01-08T10:07:30Z"),
+        start: Some(utc_ns("2024-01-08T10:00:00Z")),
+        end: end.map(utc_ns),
+        ..ReplaySpec::default()
+    };
+    let mut fixture = ReplayFixture::execute(
+        audusd_sim,
+        client_id,
+        venue,
+        DataEngineConfig::default(),
+        &[five],
+        spec,
+    );
+    // The engine clock moves on before the answer: the dispatch time bounds the coverage
+    let _ = fixture
+        .engine
+        .clock()
+        .borrow_mut()
+        .as_any_mut()
+        .downcast_mut::<VirtualClock>()
+        .unwrap()
+        .advance_time(UnixNanos::from(utc_ns("2024-01-08T10:30:00Z")), true);
+
+    fixture.answer(
+        &[
+            (utc_ns("2024-01-08T10:01:00Z"), 1, "t1"),
+            (utc_ns("2024-01-08T10:03:00Z"), 2, "t2"),
+        ],
+        true,
+        None,
+    );
+
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            traded("t1", &[0]),
+            traded("t2", &[0]),
+            closed(five, utc_ns("2024-01-08T10:05:00Z"), 3, &[1]),
+            Replayed::End(None),
+        ]
+    );
+}
+
+/// How a replayed request ends without driving its replay through its end.
+#[derive(Clone, Copy, Debug)]
+enum ReplayStop {
+    /// Its answer completes, but it named a `limit`.
+    Limit,
+    /// Its answer completes with a failure reason.
+    FailedAnswer,
+    /// A payload-free terminal with a failure reason follows a partial answer.
+    FailedAfterParts,
+}
+
+#[rstest]
+#[case::limit(ReplayStop::Limit)]
+#[case::failed_answer(ReplayStop::FailedAnswer)]
+#[case::failed_after_parts(ReplayStop::FailedAfterParts)]
+fn test_replayed_request_with_a_limit_or_a_failure_fires_no_close_after_its_last_trade(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] stop: ReplayStop,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (five, range) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "10-RANGE"));
+    let spec = ReplaySpec {
+        dispatched: new_york("2024-01-08T20:00:00"),
+        start: Some(new_york("2024-01-08T16:50:00")),
+        end: Some(new_york("2024-01-08T18:00:00") + 1),
+        limit: matches!(stop, ReplayStop::Limit).then_some(100),
+        ..ReplaySpec::default()
+    };
+    let tap = TappedResponses::install();
+    let mut fixture = ReplayFixture::execute(
+        audusd_sim,
+        client_id,
+        venue,
+        without_flat_bars(),
+        &[five, range],
+        spec,
+    );
+    let trades = [
+        (new_york("2024-01-08T16:52:00"), 1, "t1"),
+        (new_york("2024-01-08T16:57:00"), 2, "t2"),
+        (new_york("2024-01-08T16:59:58"), 3, "t3"),
+    ];
+    let reason = "the source stopped";
+
+    let failure = match stop {
+        ReplayStop::Limit => {
+            fixture.answer(&trades, true, None);
+            None
+        }
+        ReplayStop::FailedAnswer => {
+            fixture.answer(&trades, true, Some(reason));
+            Some(reason.to_owned())
+        }
+        ReplayStop::FailedAfterParts => {
+            fixture.answer(&trades, false, None);
+            fixture
+                .engine
+                .response_envelope(DataResponseEnvelope::terminal(
+                    fixture.request_id,
+                    Some(reason.to_owned()),
+                ));
+            Some(reason.to_owned())
+        }
+    };
+
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            traded("t1", &[0, 0]),
+            closed(five, new_york("2024-01-08T16:55:00"), 1, &[1, 0]),
+            traded("t2", &[1, 0]),
+            traded("t3", &[1, 0]),
+            Replayed::End(failure),
+        ],
+        "{stop:?}"
+    );
+    let terminals = tap
+        .take(fixture.request_id)
+        .into_iter()
+        .filter(|delivered| delivered.completed)
+        .count();
+    assert_eq!(terminals, 1, "{stop:?}");
 }

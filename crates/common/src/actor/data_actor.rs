@@ -3137,15 +3137,31 @@ pub trait DataActor {
     /// (`on_historical_trades`) and bars parts (`on_historical_bars`), the last a trades part,
     /// possibly empty, that completes the request. A bar a trade completes comes before that
     /// trade, except a `RANGE_INCLUSIVE` bar, which contains its completing trade and comes
-    /// after it; a time bar comes before the first trade after its close. Bars of different
-    /// types that one trade completes come in the order live publishes them, whatever the order
-    /// of `bar_types`: time bars first (their timers run before the trade is published; two due
-    /// at one instant in bar type order, as a backtest clock takes them), then the others in the
-    /// string order of their bar types (the trades topic calls their aggregators in handler ID
-    /// order, `BarTradeHandler|<bar type>`), the `RANGE_INCLUSIVE` ones after the trade in that
-    /// same order. Each bar is a part of its own, in the order the aggregators produced it, and
-    /// enters the cache only when its part is delivered, so a handler of a trade or of a bar
-    /// finds in the cache exactly the bars delivered before it. Trades enter the cache as for
+    /// after it.
+    ///
+    /// Without `update_subscriptions`, the request's aggregators are its own and compute as a
+    /// subscription's do, on a clock of their own that the engine drives as a backtest drives
+    /// its clock. It starts at the request's `start` (at its first trade without one), so a
+    /// calendar grid such as a 2-DAY bar's is anchored there. Before each trade, every time bar
+    /// close and every `RANGE` daily boundary (18:00 `America/New_York` by default) due strictly
+    /// before it fires, in time order, two at one instant in timer name order (`RANGE` before
+    /// time bars, time bars in bar type order), and its bar comes before the trade; a close at
+    /// a trade's own instant fires after every trade of that instant, so that trade is in the
+    /// closing bar. When the answer completes with no failure reason and the request names no
+    /// `limit`, the closes up to `min(end, the engine clock's time when the request was
+    /// dispatched)` (that time without an `end`) fire after the last trade, each bar a part of
+    /// its own, and none later. An answer with a failure reason, or a request with a `limit`,
+    /// fires no close after its last trade.
+    ///
+    /// Bars of different types that one trade completes come in the order live publishes them,
+    /// whatever the order of `bar_types`: with `update_subscriptions`, time bars first (their
+    /// timers run before the trade is published; two due at one instant in bar type order, as a
+    /// backtest clock takes them), then the others in the string order of their bar types (the
+    /// trades topic calls their aggregators in handler ID order, `BarTradeHandler|<bar type>`),
+    /// the `RANGE_INCLUSIVE` ones after the trade in that same order (without it, a trade
+    /// completes no time bar). Each bar is a part of its own, in the order the aggregators
+    /// produced it, and enters the cache only when its part is delivered, so a handler of a
+    /// trade or of a bar finds in the cache exactly the bars delivered before it. Trades enter the cache as for
     /// an ordinary trades request, when the engine receives the envelope holding them, before
     /// its first part is delivered: a handler may find later trades of that envelope in the
     /// cache (with `quotes`, later trades of the same run; a run of quotes enters the cache just
@@ -3172,21 +3188,24 @@ pub trait DataActor {
     /// answer with any client gaps, and the history/live join (`cut_warmup`) are served; with
     /// `quotes`, the quotes parts go out in the merged order between the trades and bars parts.
     ///
-    /// Limits: a trade stamped exactly at a time bar's close is in that bar (left-open
-    /// intervals) and the bar comes after it; live, the order of that timer and that trade is
-    /// not defined. A live builder subscribed during a `cut_warmup` warm-up has the handler ID
-    /// `JoinedTradeHandler|<bar type>`, so live calls it after every builder subscribed
-    /// otherwise; the order above holds among builders subscribed alike. Bars never delivered
-    /// do not reach the cache. Bars completed only by the request's clean-up after a failure
-    /// with no answer (its held live trades, its last time bar) go out with the dispatched
-    /// client's identity, each bar a part of its own, cached just before it is sent.
+    /// Limits: live, the order of a timer and a trade at the same instant is not defined. With
+    /// `update_subscriptions`, a trade stamped exactly at a time bar's close is in that bar
+    /// (left-open intervals) and the bar comes after it. A live builder subscribed during a
+    /// `cut_warmup` warm-up has the handler ID `JoinedTradeHandler|<bar type>`, so live calls
+    /// it after every builder subscribed otherwise; the order above holds among builders
+    /// subscribed alike. Bars never delivered do not reach the cache. Bars completed only by
+    /// the request's clean-up after a failure with no answer (with `update_subscriptions`: its
+    /// held live trades, its last time bar) go out with the dispatched client's identity, each
+    /// bar a part of its own, cached just before it is sent.
     ///
-    /// Not fixed yet (a later change): a history answer has no clock. Time bars, and a
-    /// `RANGE` bar completed by its daily boundary (18:00 `America/New_York` by default), are
-    /// built at the next trade after their close, not when the close passes. So relative to a
-    /// quote between the close and that trade (with `quotes`), and at the end of the answer,
-    /// history can differ from live; and two time bar types whose closes interleave come one
-    /// type after the other, not in close order.
+    /// Still as before (later changes): with `update_subscriptions` the aggregators have no
+    /// clock while the answer is in flight. Time bars, and a `RANGE` bar completed by its daily
+    /// boundary, are built at the next trade after their close, not when the close passes, so
+    /// at the end of the answer history can differ from live, and two time bar types whose
+    /// closes interleave come one type after the other, not in close order. With `quotes`, bars
+    /// are placed at trades only: a close between two trades goes out before the later trade,
+    /// after the quotes between them. A part of the window that no source covers is not a
+    /// failure.
     ///
     /// # Errors
     ///
