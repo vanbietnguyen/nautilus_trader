@@ -6576,3 +6576,268 @@ fn test_interleave_leg_of_a_request_join_is_refused_before_dispatch_naming_the_j
     );
     assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
 }
+
+/// A request that sets `interleave` and aggregates no bars.
+#[derive(Clone, Copy, Debug)]
+enum BarlessShape {
+    /// A trades request whose `bar_types` is an empty list.
+    EmptyBarTypes,
+    /// A trades request without `bar_types` whose `interleave` is not a boolean.
+    NotBoolean,
+    /// A quotes request.
+    QuotesRequest,
+    /// A bars request.
+    BarsRequest,
+    /// A trades request for an external client.
+    ExternalClient,
+    /// A trades request nested in a time-range pipeline.
+    TimeRange,
+    /// A trades request for two instruments.
+    Batch,
+    /// A trades request a `RequestJoin` sent before it takes as a leg.
+    JoinLeg,
+}
+
+/// What executing a request shows: its result, what its requester was given, the number of
+/// commands its client received, and the request and time-range pipelines left open.
+#[derive(Debug, PartialEq)]
+struct Executed {
+    result: Result<(), String>,
+    delivered: Vec<Delivered>,
+    dispatched: usize,
+    pipelines: (usize, usize),
+}
+
+/// Executes the request `request_id` of `shape` on an engine of its own, with `interleave` set
+/// to `interleave` or absent, and returns what it shows.
+fn execute_barless(
+    audusd_sim: CurrencyPair,
+    client_id: ClientId,
+    venue: Venue,
+    shape: BarlessShape,
+    interleave: Option<Value>,
+    request_id: UUID4,
+) -> Executed {
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let mut params = json!({ "update_subscriptions": false });
+    let mut instrument_ids = vec![id];
+    match shape {
+        BarlessShape::EmptyBarTypes => params["bar_types"] = json!([]),
+        BarlessShape::ExternalClient => {
+            let engine = fixture.engine.borrow();
+            engine
+                .cache()
+                .borrow_mut()
+                .add_external_data_client(client_id);
+        }
+        BarlessShape::TimeRange => {
+            params["time_range_generator"] = json!("");
+            params["durations_seconds"] = json!([1]);
+        }
+        BarlessShape::Batch => instrument_ids.push(InstrumentId::from("GBP/USD.SIM")),
+        BarlessShape::JoinLeg => {
+            let join = RequestJoin::new(
+                vec![request_id],
+                Some(UnixNanos::from(1_000).to_datetime_utc()),
+                Some(UnixNanos::from(2_999).to_datetime_utc()),
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            );
+            fixture
+                .engine
+                .borrow_mut()
+                .execute_request(RequestCommand::Join(join))
+                .unwrap();
+        }
+        BarlessShape::NotBoolean | BarlessShape::QuotesRequest | BarlessShape::BarsRequest => {}
+    }
+    if let Some(value) = interleave {
+        params["interleave"] = value;
+    }
+    let (start, end) = (
+        Some(UnixNanos::from(1_000).to_datetime_utc()),
+        Some(UnixNanos::from(2_999).to_datetime_utc()),
+    );
+    let params = Some(serde_json::from_value(params).unwrap());
+    let request = match shape {
+        BarlessShape::QuotesRequest => RequestCommand::Quotes(RequestQuotes::new(
+            instrument_ids,
+            start,
+            end,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::default(),
+            params,
+        )),
+        BarlessShape::BarsRequest => RequestCommand::Bars(RequestBars::new(
+            fixture.bar_type,
+            start,
+            end,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::default(),
+            params,
+        )),
+        _ => RequestCommand::Trades(RequestTrades::new(
+            instrument_ids,
+            start,
+            end,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::default(),
+            params,
+        )),
+    };
+    let tap = TappedResponses::install();
+
+    let result = fixture.engine.borrow_mut().execute_request(request);
+
+    let engine = fixture.engine.borrow();
+    Executed {
+        result: result.map_err(|e| e.to_string()),
+        delivered: tap.take(request_id),
+        dispatched: fixture.recorder.borrow().len(),
+        pipelines: (
+            engine.request_pipeline_count(),
+            engine.time_range_pipeline_count(),
+        ),
+    }
+}
+
+#[rstest]
+#[case::empty_bar_types(BarlessShape::EmptyBarTypes, json!(true))]
+#[case::not_boolean(BarlessShape::NotBoolean, json!("true"))]
+#[case::quotes_request(BarlessShape::QuotesRequest, json!(true))]
+#[case::bars_request(BarlessShape::BarsRequest, json!(true))]
+#[case::external_client(BarlessShape::ExternalClient, json!(true))]
+#[case::time_range(BarlessShape::TimeRange, json!(true))]
+#[case::batch(BarlessShape::Batch, json!(true))]
+#[case::join_leg(BarlessShape::JoinLeg, json!(true))]
+fn test_interleave_request_without_bar_types_is_answered_as_without_the_parameter(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] shape: BarlessShape,
+    #[case] interleave: Value,
+) {
+    let _ = stub_msgbus;
+    let request_id = UUID4::new();
+
+    let with = execute_barless(
+        audusd_sim.clone(),
+        client_id,
+        venue,
+        shape,
+        Some(interleave),
+        request_id,
+    );
+    let without = execute_barless(audusd_sim, client_id, venue, shape, None, request_id);
+
+    assert!(
+        with.result
+            .as_ref()
+            .err()
+            .is_none_or(|error| !error.starts_with(INTERLEAVE_REFUSED)),
+        "{with:?}"
+    );
+    assert_eq!(with, without);
+}
+
+#[rstest]
+fn test_request_join_naming_a_dispatched_interleave_request_is_refused_and_leaves_it_its_answer(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let tick = fixture.bar_type;
+    let tap = TappedResponses::install();
+    // The request is admitted, its shared aggregator gathering, and a live subscription waits
+    let leg_id = execute_interleaved(&fixture, id, &[tick], true);
+    fixture
+        .engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+            SubscribeBars::new(
+                tick,
+                Some(client_id),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )));
+    let live_bars = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&live_bars);
+    msgbus::subscribe_bars(
+        switchboard::get_bars_topic(tick).into(),
+        TypedHandler::from(move |bar: &Bar| recorded.borrow_mut().push(bar.ts_event)),
+        None,
+    );
+    let join_id = UUID4::new();
+    let join = RequestJoin::new(
+        vec![leg_id],
+        Some(UnixNanos::from(1).to_datetime_utc()),
+        Some(UnixNanos::from(2).to_datetime_utc()),
+        join_id,
+        UnixNanos::default(),
+        None,
+        None,
+    );
+
+    let result = fixture
+        .engine
+        .borrow_mut()
+        .execute_request(RequestCommand::Join(join));
+
+    let error = result
+        .expect_err("a join naming a dispatched `interleave` request must be refused")
+        .to_string();
+    assert_eq!(
+        error,
+        format!(
+            "{INTERLEAVE_REFUSED}: the request join {join_id} would take {leg_id}, already \
+             dispatched, as a leg and rebuild its answer as one data type"
+        )
+    );
+    assert_eq!(
+        tap.take(join_id),
+        vec![terminal(None, Some(&error))],
+        "the join ends with one terminal"
+    );
+    assert_eq!(tap.take(leg_id), Vec::new(), "the request is not ended");
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+
+    let answer = answer_trades(&fixture, leg_id, id, &[(1, "t1"), (2, "t2")], true);
+    fixture.engine.borrow_mut().response_envelope(answer);
+
+    assert_eq!(
+        tap.take(leg_id),
+        vec![
+            part(ResponsePart::Bars(leg_id, tick, at_ns(&[1]))),
+            part(ResponsePart::Trades(leg_id, trade_ids(&["t1"]))),
+            part(ResponsePart::Bars(leg_id, tick, at_ns(&[2]))),
+            terminal(Some(ResponsePart::Trades(leg_id, trade_ids(&["t2"]))), None),
+        ],
+        "the request's own answer delivers its bars and its one terminal"
+    );
+    // Its entry and its aggregator are released: a live trade's bar is published, not gathered
+    fixture
+        .engine
+        .borrow_mut()
+        .process_data(Data::Trade(make_trade(id, "1.0000", 1, "live-1", 10)));
+    assert_eq!(*live_bars.borrow(), at_ns(&[10]));
+    assert_eq!(tap.take(leg_id), Vec::new());
+    assert_eq!(tap.take(join_id), Vec::new());
+}

@@ -86,11 +86,14 @@ impl DataEngine {
     /// (`cut_warmup`): each answer reaches [`Self::respond_interleaved_trades`]. It sees the
     /// request's route in the engine's routing order: its kind, its client, the pipeline it is
     /// a leg of, the pipelines its params nest it in, its instruments, then its bar types.
-    /// Without `interleave`, or with it `false`, the request is admitted at once, unread.
+    /// Without `interleave`, or with it `false`, the request is admitted at once, unread; so is
+    /// a request that aggregates no bars (no `bar_types`, or an empty list), whatever its kind,
+    /// route or `interleave` value, which nothing else reads then.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request sets `interleave` and:
+    /// Returns an error if the request sets `interleave`, aggregates bars (its `bar_types` is
+    /// present and not an empty list), and:
     /// - The value is not a boolean.
     /// - It is not a trades request.
     /// - Its client is external (this engine would answer nothing).
@@ -101,9 +104,18 @@ impl DataEngine {
     /// - A bar type it asks is not fed by its trades: a composite (built from other bars),
     ///   a bar type built from quotes, or one of another instrument. The error names the first.
     pub(super) fn admit_interleave(&self, req: &RequestCommand) -> anyhow::Result<()> {
-        let Some(value) = request_params(req).and_then(|params| params.get(INTERLEAVE)) else {
+        let params = request_params(req);
+        let Some(value) = params.and_then(|params| params.get(INTERLEAVE)) else {
             return Ok(());
         };
+
+        // A request that aggregates no bars is answered as without the parameter: no bars to
+        // order. A malformed `bar_types` asks for bars, so it is admitted on and refused below
+        let aggregation = request_bar_aggregation_from_params(params);
+        if matches!(aggregation, Ok(None)) {
+            return Ok(());
+        }
+
         match value.as_bool() {
             Some(true) => {}
             Some(false) => return Ok(()),
@@ -138,7 +150,6 @@ impl DataEngine {
             );
         }
 
-        let params = request_params(req);
         if has_continuous_future_params(params) {
             anyhow::bail!(
                 "{INTERLEAVE_REFUSED}: its continuous-future params nest it in a \
@@ -161,7 +172,8 @@ impl DataEngine {
             );
         };
 
-        let Some(state) = request_bar_aggregation_from_params(params)? else {
+        // `None` returned above
+        let Some(state) = aggregation? else {
             return Ok(());
         };
 
@@ -177,6 +189,31 @@ impl DataEngine {
         Ok(())
     }
 
+    /// Admits a `RequestJoin` before it adopts `leg_ids`, or refuses it when one of them is an
+    /// interleaving request already dispatched.
+    ///
+    /// A join adopts requests in flight, so such a leg was admitted as a plain request; the join
+    /// would rebuild its answer as one data type and lose its bars. The refusal leaves the leg as
+    /// it is: it is not adopted, and its own answer delivers its bars, cleans up its entry and
+    /// its aggregators, and sends its one terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the join and the first such leg.
+    pub(super) fn admit_join_legs(&self, join_id: UUID4, leg_ids: &[UUID4]) -> anyhow::Result<()> {
+        if let Some(leg_id) = leg_ids
+            .iter()
+            .find(|leg_id| self.interleaved_requests.contains_key(leg_id))
+        {
+            anyhow::bail!(
+                "{INTERLEAVE_REFUSED}: the request join {join_id} would take {leg_id}, already \
+                 dispatched, as a leg and rebuild its answer as one data type"
+            );
+        }
+
+        Ok(())
+    }
+
     pub(super) fn prepare_request_bar_aggregators_from_state(
         &mut self,
         request_id: UUID4,
@@ -186,10 +223,6 @@ impl DataEngine {
             anyhow::bail!(
                 "Cannot request aggregated bars: one of the aggregators in `bar_types` is already running"
             );
-        }
-
-        if state.interleave {
-            self.interleaved_requests.entry(request_id).or_default();
         }
 
         self.request_bar_aggregations
@@ -1611,16 +1644,44 @@ fn send_interleaved_bars(
     }
 
     for bar in bars {
-        send_bars_parts(
+        send_bar_part(
             cache,
             resp.correlation_id,
             resp.client_id,
             (resp.start, resp.end),
             resp.ts_init,
             resp.params.as_ref(),
-            vec![bar],
+            bar,
         );
     }
+}
+
+/// Sends `bar` as a bars part of its own, carrying the request's identity and window. The bar
+/// enters the cache just before the part is sent.
+fn send_bar_part(
+    cache: &Rc<RefCell<Cache>>,
+    correlation_id: UUID4,
+    client_id: ClientId,
+    (start, end): (Option<UnixNanos>, Option<UnixNanos>),
+    ts_init: UnixNanos,
+    params: Option<&Params>,
+    bar: Bar,
+) {
+    if let Err(e) = cache.as_ref().borrow_mut().add_bar_historical(bar) {
+        log_error_on_cache_insert(&e);
+    }
+
+    let part = BarsResponse::new(
+        correlation_id,
+        client_id,
+        bar.bar_type,
+        vec![bar],
+        start,
+        end,
+        ts_init,
+        params.cloned(),
+    );
+    msgbus::send_response_part(&correlation_id, &DataResponse::Bars(part));
 }
 
 /// Sends `bars` as one bars part per bar type in completion order, each carrying the request's

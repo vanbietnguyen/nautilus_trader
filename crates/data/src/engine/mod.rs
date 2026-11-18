@@ -2536,6 +2536,9 @@ impl DataEngine {
     }
 
     fn handle_request_join(&mut self, req: RequestJoin) -> anyhow::Result<()> {
+        // Before any leg is adopted, on every route of the join
+        self.admit_join_legs(req.request_id, &req.request_ids)?;
+
         if has_time_range_pipeline_params(req.params.as_ref()) {
             return self.execute_time_range_pipeline_request(RequestCommand::Join(req));
         }

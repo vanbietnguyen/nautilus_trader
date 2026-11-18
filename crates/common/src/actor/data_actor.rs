@@ -3140,20 +3140,24 @@ pub trait DataActor {
     /// after it; a time bar comes before the first trade after its close. Each bar is a part of
     /// its own, in the order the aggregators produced it, and enters the cache only when its
     /// part is delivered, so a handler of a trade or of a bar finds in the cache exactly the
-    /// bars delivered before it. Without `bar_types` the parameter changes nothing; without the
-    /// parameter, or with `false`, the request is answered as before.
+    /// bars delivered before it. Without `bar_types`, or with an empty list, the parameter is
+    /// not read, whatever its value, and changes nothing, on a request of any kind; without
+    /// the parameter, or with `false`, the request is answered as before.
     ///
     /// Only bars built directly from the request's own trades can be given in that order, so
-    /// the engine refuses an `interleave` request before dispatching anything, with one
-    /// terminal envelope naming the reason, when: `interleave` is not a boolean; the request is
-    /// not a trades request (a quotes or bars request that sets it); the client is external;
-    /// the request is a leg of a `RequestJoin`; it sets continuous-future or time-range params;
-    /// it names more than one instrument; or a bar type in `bar_types` is not fed by its
-    /// trades: a composite (built from other bars, at any depth), a bar type built from quotes
-    /// (also with `quotes`), or one of another instrument. The engine names the first such
-    /// bar type. A client's direct answer, a catalog's answer with any client gaps, and the
-    /// history/live join (`cut_warmup`) are served; with `quotes`, the quotes parts go out in
-    /// the merged order between the trades and bars parts.
+    /// the engine refuses an `interleave` request that asks bar types before dispatching
+    /// anything, with one terminal envelope naming the reason, when: `interleave` is not a
+    /// boolean; the request is not a trades request (a quotes or bars request that sets it);
+    /// the client is external; the request is already a leg of a `RequestJoin`; it sets
+    /// continuous-future or time-range params; it names more than one instrument; or a bar type
+    /// in `bar_types` is not fed by its trades: a composite (built from other bars, at any
+    /// depth), a bar type built from quotes (also with `quotes`), or one of another instrument.
+    /// The engine names the first such bar type. A `RequestJoin` naming such a request after it
+    /// was dispatched is refused instead, with one terminal envelope for the join naming the
+    /// request; the request is not joined and is answered as described here. A client's direct
+    /// answer, a catalog's answer with any client gaps, and the history/live join
+    /// (`cut_warmup`) are served; with `quotes`, the quotes parts go out in the merged order
+    /// between the trades and bars parts.
     ///
     /// Limits: bars of different types that one trade completes come in the order of
     /// `bar_types`, while live subscribers get them in handler order (a time bar's timer before
