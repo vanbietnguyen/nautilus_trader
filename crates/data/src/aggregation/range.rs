@@ -16,7 +16,7 @@
 //! `DeepCharts`-style range bar aggregation.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fmt::Debug,
     rc::{Rc, Weak},
 };
@@ -96,6 +96,7 @@ pub struct DeepChartsRangeBarAggregator {
     boundary_offset: SignedDuration,
     timer_name: String,
     clock: Option<Rc<RefCell<dyn Clock>>>,
+    timer_active: Rc<Cell<bool>>,
     aggregator_weak: Option<Weak<RefCell<Box<dyn BarAggregator>>>>,
     next_boundary_ns: Option<UnixNanos>,
 }
@@ -108,6 +109,7 @@ impl Debug for DeepChartsRangeBarAggregator {
             .field("time_zone", &self.time_zone)
             .field("boundary_offset", &self.boundary_offset)
             .field("timer_name", &self.timer_name)
+            .field("timer_active", &self.timer_active.get())
             .field("next_boundary_ns", &self.next_boundary_ns)
             .finish()
     }
@@ -151,6 +153,7 @@ impl DeepChartsRangeBarAggregator {
             boundary_offset,
             timer_name,
             clock: None,
+            timer_active: Rc::new(Cell::new(false)),
             aggregator_weak: None,
             next_boundary_ns: None,
         }
@@ -175,13 +178,23 @@ impl DeepChartsRangeBarAggregator {
         self.arm_boundary_alert(next);
     }
 
-    fn arm_boundary_alert(&self, alert_time_ns: UnixNanos) {
+    fn arm_boundary_alert(&mut self, alert_time_ns: UnixNanos) {
         let (Some(clock), Some(aggregator_weak)) = (&self.clock, &self.aggregator_weak) else {
             return;
         };
 
+        let clock = Rc::clone(clock);
         let aggregator_weak = Weak::clone(aggregator_weak);
+
+        // Callbacks of an earlier alert, already collected by a clock, then do nothing
+        self.timer_active.set(false);
+        self.timer_active = Rc::new(Cell::new(true));
+        let active = Rc::clone(&self.timer_active);
         let callback = TimeEventCallback::RustLocal(Rc::new(move |event: TimeEvent| {
+            if !active.get() {
+                return;
+            }
+
             if let Some(aggregator) = aggregator_weak.upgrade() {
                 aggregator.borrow_mut().build_bar(&event);
             }
@@ -306,6 +319,25 @@ impl BarAggregator for DeepChartsRangeBarAggregator {
             Some(boundary) if now < boundary => self.arm_boundary_alert(boundary),
             _ => self.roll_boundary(now),
         }
+    }
+
+    /// Moves the pending boundary alert to `clock` as armed; the alert fires there, not here.
+    fn continue_on_clock(&mut self, clock: Rc<RefCell<dyn Clock>>) {
+        let now = clock.borrow().timestamp_ns();
+        if let Some(old_clock) = self.clock.replace(clock) {
+            old_clock.borrow_mut().cancel_timer(&self.timer_name);
+        }
+
+        // A boundary never scheduled stays so: the first update arms it, on this clock
+        let Some(boundary) = self.next_boundary_ns else {
+            return;
+        };
+        debug_assert!(
+            now <= boundary,
+            "Invariant: the pending boundary of {} is not before the new clock's time",
+            self.timer_name,
+        );
+        self.arm_boundary_alert(boundary);
     }
 
     fn set_aggregator_weak(&mut self, weak: Weak<RefCell<Box<dyn BarAggregator>>>) {
@@ -651,6 +683,231 @@ mod tests {
             clock.borrow().next_time_ns(&timer_name()),
             Some(ts(DAY + BOUNDARY))
         );
+    }
+
+    fn clock_at(value: &str) -> Rc<RefCell<VirtualClock>> {
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        clock.borrow_mut().set_time(utc(value));
+        clock
+    }
+
+    /// Starts an aggregator with the default boundary, 18:00 in New York, on `clock`.
+    fn started_in_new_york<H: FnMut(Bar) + 'static>(
+        handler: H,
+        clock: &Rc<RefCell<VirtualClock>>,
+    ) -> SharedAggregator {
+        let rc: SharedAggregator =
+            Rc::new(RefCell::new(Box::new(DeepChartsRangeBarAggregator::new(
+                bar_type(),
+                2,
+                0,
+                Price::from("0.25"),
+                get_timezone(RANGE_BAR_DEFAULT_TIME_ZONE).unwrap(),
+                RANGE_BAR_DEFAULT_BOUNDARY,
+                handler,
+            ))));
+        rc.borrow_mut()
+            .set_clock(Rc::clone(clock) as Rc<RefCell<dyn Clock>>);
+        rc.borrow_mut().start_timer(Some(Rc::clone(&rc)));
+        rc
+    }
+
+    fn fire_through(clock: &Rc<RefCell<VirtualClock>>, value: &str) {
+        let events = clock.borrow_mut().advance_time(utc(value), true);
+        let handlers = clock.borrow().match_handlers(events);
+        for handler in handlers {
+            handler.callback.call(handler.event);
+        }
+    }
+
+    fn trade_on(
+        rc: &SharedAggregator,
+        clock: &Rc<RefCell<VirtualClock>>,
+        price: &str,
+        size: u64,
+        value: &str,
+    ) {
+        fire_through(clock, value);
+        rc.borrow_mut()
+            .update(Price::from(price), Quantity::from(size), utc(value));
+    }
+
+    fn continue_on(rc: &SharedAggregator, clock: &Rc<RefCell<VirtualClock>>) {
+        rc.borrow_mut()
+            .continue_on_clock(Rc::clone(clock) as Rc<RefCell<dyn Clock>>);
+    }
+
+    fn bar_at(open: &str, high: &str, low: &str, close: &str, volume: u64, value: &str) -> Bar {
+        Bar::new(
+            bar_type(),
+            Price::from(open),
+            Price::from(high),
+            Price::from(low),
+            Price::from(close),
+            Quantity::from(volume),
+            utc(value),
+            utc(value),
+        )
+    }
+
+    #[rstest]
+    fn test_continue_on_clock_completes_at_pending_boundary_on_new_clock() {
+        let (bars, record) = recording_handler();
+        let old = clock_at("2026-11-16T20:00:00Z");
+        let rc = started_in_new_york(record, &old);
+        trade_on(&rc, &old, "100.00", 1, "2026-11-16T20:30:00Z");
+        trade_on(&rc, &old, "104.00", 2, "2026-11-16T21:00:00Z");
+        let new = clock_at("2026-11-16T22:00:00Z");
+
+        continue_on(&rc, &new);
+
+        assert_eq!(old.borrow().timer_count(), 0);
+        assert_eq!(
+            new.borrow().next_time_ns(&timer_name()),
+            Some(utc("2026-11-16T23:00:00Z"))
+        );
+        trade_on(&rc, &new, "102.00", 3, "2026-11-16T22:30:00Z");
+        fire_through(&new, "2026-11-16T23:00:00Z");
+        fire_through(&new, "2026-11-16T23:30:00Z");
+        fire_through(&old, "2026-11-17T23:30:00Z");
+        assert_eq!(
+            *bars.lock(),
+            vec![bar_at(
+                "100.00",
+                "104.00",
+                "100.00",
+                "102.00",
+                6,
+                "2026-11-16T23:00:00Z"
+            )]
+        );
+        assert_eq!(forming(&rc), (None, Quantity::from(0)));
+        assert_eq!(
+            new.borrow().next_time_ns(&timer_name()),
+            Some(utc("2026-11-17T23:00:00Z"))
+        );
+    }
+
+    #[rstest]
+    fn test_continue_on_clock_at_boundary_fires_on_new_clock() {
+        let (bars, record) = recording_handler();
+        let old = clock_at("2026-11-16T20:00:00Z");
+        let rc = started_in_new_york(record, &old);
+        trade_on(&rc, &old, "100.00", 1, "2026-11-16T20:30:00Z");
+        let new = clock_at("2026-11-16T23:00:00Z");
+
+        continue_on(&rc, &new);
+
+        assert_eq!(*bars.lock(), Vec::<Bar>::new());
+        assert_eq!(
+            forming(&rc),
+            (Some(Price::from("100.00")), Quantity::from(1))
+        );
+        assert_eq!(old.borrow().timer_count(), 0);
+        assert_eq!(
+            new.borrow().next_time_ns(&timer_name()),
+            Some(utc("2026-11-16T23:00:00Z"))
+        );
+        fire_through(&new, "2026-11-16T23:00:00Z");
+        fire_through(&new, "2026-11-16T23:00:01Z");
+        assert_eq!(
+            *bars.lock(),
+            vec![bar_at(
+                "100.00",
+                "100.00",
+                "100.00",
+                "100.00",
+                1,
+                "2026-11-16T23:00:00Z"
+            )]
+        );
+        assert_eq!(
+            new.borrow().next_time_ns(&timer_name()),
+            Some(utc("2026-11-17T23:00:00Z"))
+        );
+    }
+
+    #[rstest]
+    fn test_continue_on_clock_never_armed_stays_unarmed() {
+        let (bars, record) = recording_handler();
+        let old = clock_at("2026-11-16T20:00:00Z");
+        let rc: SharedAggregator =
+            Rc::new(RefCell::new(Box::new(DeepChartsRangeBarAggregator::new(
+                bar_type(),
+                2,
+                0,
+                Price::from("0.25"),
+                get_timezone(RANGE_BAR_DEFAULT_TIME_ZONE).unwrap(),
+                RANGE_BAR_DEFAULT_BOUNDARY,
+                record,
+            ))));
+        rc.borrow_mut()
+            .set_clock(Rc::clone(&old) as Rc<RefCell<dyn Clock>>);
+        rc.borrow_mut().set_aggregator_weak(Rc::downgrade(&rc));
+        let new = clock_at("2026-11-16T20:10:00Z");
+
+        continue_on(&rc, &new);
+
+        assert_eq!(old.borrow().timer_count(), 0);
+        assert_eq!(new.borrow().timer_count(), 0);
+        trade_on(&rc, &new, "100.00", 1, "2026-11-16T20:30:00Z");
+        assert_eq!(*bars.lock(), Vec::<Bar>::new());
+        assert_eq!(
+            forming(&rc),
+            (Some(Price::from("100.00")), Quantity::from(1))
+        );
+        assert_eq!(old.borrow().timer_count(), 0);
+        assert_eq!(
+            new.borrow().next_time_ns(&timer_name()),
+            Some(utc("2026-11-16T23:00:00Z"))
+        );
+    }
+
+    #[rstest]
+    fn test_continue_on_clock_voids_collected_callback() {
+        let (bars, record) = recording_handler();
+        let old = clock_at("2026-11-16T20:00:00Z");
+        let rc = started_in_new_york(record, &old);
+        trade_on(&rc, &old, "100.00", 1, "2026-11-16T20:30:00Z");
+        let events = old
+            .borrow_mut()
+            .advance_time(utc("2026-11-16T23:00:00Z"), true);
+        let collected = old.borrow().match_handlers(events);
+        let new = clock_at("2026-11-16T23:00:00Z");
+
+        continue_on(&rc, &new);
+
+        for handler in collected {
+            handler.callback.call(handler.event);
+        }
+        assert_eq!(*bars.lock(), Vec::<Bar>::new());
+        assert_eq!(
+            forming(&rc),
+            (Some(Price::from("100.00")), Quantity::from(1))
+        );
+        fire_through(&new, "2026-11-16T23:00:00Z");
+        assert_eq!(
+            *bars.lock(),
+            vec![bar_at(
+                "100.00",
+                "100.00",
+                "100.00",
+                "100.00",
+                1,
+                "2026-11-16T23:00:00Z"
+            )]
+        );
+    }
+
+    #[rstest]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "Invariant: the pending boundary")]
+    fn test_continue_on_clock_past_pending_boundary_is_a_caller_bug() {
+        let old = clock_at("2026-11-16T20:00:00Z");
+        let rc = started_in_new_york(|_| {}, &old);
+        let new = clock_at("2026-11-16T23:00:01Z");
+
+        continue_on(&rc, &new);
     }
 
     /// One synthetic tape through every construction rule, against bars computed by hand from the
