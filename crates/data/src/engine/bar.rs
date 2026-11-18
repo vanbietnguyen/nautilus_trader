@@ -474,12 +474,14 @@ impl DataEngine {
     /// Trades feed the request aggregators one at a time; admission leaves only bar types its
     /// trades feed (see [`Self::admit_interleave`]). A bar a trade completes is delivered before
     /// that trade, except a `RANGE_INCLUSIVE` bar, which contains its completing trade and is
-    /// delivered after it (the live publication order). Each bar delivery first sends the
-    /// trades gathered since the previous one, and each bar enters the cache only as its part
-    /// is sent, so a trade's handler finds in the cache the bars live publication has cached by
-    /// that trade. The last part of a partial envelope, the trades after the last completed bar
-    /// (possibly none), is sent as a part; a completed envelope ends the request through
-    /// [`Self::finish_interleaved`], with its reason.
+    /// delivered after it (the live publication order); a time bar is completed by the first
+    /// trade after its close, so it goes out before that trade, as its live timer publishes it.
+    /// Each bar delivery first sends the trades gathered since the previous one; each bar is a
+    /// part of its own, in the order the aggregators produced it, and enters the cache only as
+    /// its part is sent, so a trade's or a bar's handler finds in the cache the bars live
+    /// publication has cached by then. The last part of a partial envelope, the trades after
+    /// the last completed bar (possibly none), is sent as a part; a completed envelope ends the
+    /// request through [`Self::finish_interleaved`], with its reason.
     pub(super) fn respond_interleaved_trades(
         &mut self,
         resp: &TradesResponse,
@@ -533,10 +535,12 @@ impl DataEngine {
     ///
     /// Takes the request's entry, cleans up its aggregators (a joined request's builders
     /// releasing through the answer's cut and floor), and delivers the bars that clean-up
-    /// completed: with the answer's identity, or with the dispatched client's and the request's
-    /// window when there is no answer and a client was resolved (none otherwise, and they do not
-    /// enter the cache). Then sends exactly one terminal, the answer's last trades part when
-    /// there is one, carrying `failure` when there is a reason.
+    /// completed: with the answer's identity, each bar a part of its own after the answer's
+    /// trades; or, when there is no answer and a client was resolved, with the dispatched
+    /// client's identity and the request's window, one part per bar type, each part's bars
+    /// entering the cache together just before it is sent (none otherwise, and they do not enter
+    /// the cache). Then sends exactly one terminal, the answer's last trades part when there is
+    /// one, carrying `failure` when there is a reason.
     pub(super) fn finish_interleaved(
         &mut self,
         request_id: UUID4,
@@ -1587,8 +1591,10 @@ pub(super) fn trades_part(resp: &TradesResponse, data: Vec<TradeTick>) -> Trades
     )
 }
 
-/// Sends the trades gathered in `pending`, then `bars` as one bars part per bar type in
-/// completion order. Sends nothing when `bars` is empty.
+/// Sends the trades gathered in `pending`, then each of `bars` as a bars part of its own, in the
+/// order the aggregators produced them. A bar enters the cache just before its part is sent, so
+/// a handler of one bar never finds a later bar in the cache, even one of the same type that
+/// the same trade completed. Sends nothing when `bars` is empty.
 fn send_interleaved_bars(
     cache: &Rc<RefCell<Cache>>,
     resp: &TradesResponse,
@@ -1604,15 +1610,17 @@ fn send_interleaved_bars(
         msgbus::send_response_part(&resp.correlation_id, &DataResponse::Trades(trades));
     }
 
-    send_bars_parts(
-        cache,
-        resp.correlation_id,
-        resp.client_id,
-        (resp.start, resp.end),
-        resp.ts_init,
-        resp.params.as_ref(),
-        bars,
-    );
+    for bar in bars {
+        send_bars_parts(
+            cache,
+            resp.correlation_id,
+            resp.client_id,
+            (resp.start, resp.end),
+            resp.ts_init,
+            resp.params.as_ref(),
+            vec![bar],
+        );
+    }
 }
 
 /// Sends `bars` as one bars part per bar type in completion order, each carrying the request's

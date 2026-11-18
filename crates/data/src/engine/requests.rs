@@ -58,7 +58,9 @@ pub(super) struct RequestBarAggregation {
     pub(super) disable_build_with_no_updates: bool,
     pub(super) skip_first_non_full_bar: Option<bool>,
     pub(super) time_zone: Option<TimeZone>,
-    /// Answer a trades request as trades and aggregated bars parts in live order.
+    /// Answer a trades request as trades and aggregated bars parts in live order (admitted by
+    /// `DataEngine::admit_interleave`; what callers get is documented on
+    /// `DataActor::request_trades`, `nautilus_common::actor`).
     pub(super) interleave: bool,
     /// Release the held live trades through the join's cut and floor (an admitted `cut_warmup`
     /// request, the history/live join).

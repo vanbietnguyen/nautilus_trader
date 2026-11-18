@@ -2245,18 +2245,18 @@ fn test_trades_request_without_interleave_sends_one_response(
     );
 }
 
-/// What a subscriber is given, in order: a trade, with the bar of each watched bar type that the
-/// cache holds at its callback, or a bar.
+/// What a subscriber is given, in order: a trade or a bar, each with the number of bars of every
+/// watched bar type the cache holds at its callback.
 #[derive(Clone, Debug, PartialEq)]
 enum OrderedDelivery {
-    Trade(TradeId, Vec<Option<UnixNanos>>),
-    Bar(BarType, UnixNanos),
+    Trade(TradeId, Vec<usize>),
+    Bar(BarType, UnixNanos, Vec<usize>),
 }
 
-fn cached_bars(cache: &Rc<RefCell<Cache>>, watched: &[BarType]) -> Vec<Option<UnixNanos>> {
+fn cached_bars(cache: &Rc<RefCell<Cache>>, watched: &[BarType]) -> Vec<usize> {
     watched
         .iter()
-        .map(|bar_type| cache.borrow().bar(bar_type).map(|bar| bar.ts_event))
+        .map(|bar_type| cache.borrow().bar_count(bar_type))
         .collect()
 }
 
@@ -2287,40 +2287,35 @@ fn order_engine(
     (data_engine, cache)
 }
 
-/// Six trades: with a 10-increment range, the third and the fifth each complete a
-/// `RANGE_INCLUSIVE` bar.
+/// The order tests' trades: (price, `ts_init`, size, trade ID), a second after the epoch (a
+/// timer started at the epoch itself takes the clock's time as its start). With a 10-increment
+/// range, the third and the fifth each complete a `RANGE_INCLUSIVE` bar; the third, of 3,000,
+/// completes two 1,500-`VOLUME` bars; 1-ms time bars close before the third, the fifth and the
+/// sixth.
+const ORDER_TAPE: [(&str, u64, u64, &str); 6] = [
+    ("0.65000", 1_000_450_000, 1_000, "t1"),
+    ("0.65009", 1_000_900_000, 1_000, "t2"),
+    ("0.65011", 1_001_350_000, 3_000, "t3"),
+    ("0.65011", 1_001_800_000, 1_000, "t4"),
+    ("0.65021", 1_002_250_000, 1_000, "t5"),
+    ("0.65022", 1_004_700_000, 1_000, "t6"),
+];
+
 fn order_tape(instrument_id: InstrumentId) -> Vec<TradeTick> {
-    [
-        ("0.65000", 1_000, "t1"),
-        ("0.65009", 2_000, "t2"),
-        ("0.65011", 3_000, "t3"),
-        ("0.65011", 4_000, "t4"),
-        ("0.65021", 5_000, "t5"),
-        ("0.65022", 6_000, "t6"),
-    ]
-    .into_iter()
-    .map(|(price, ts, trade_id)| {
-        TradeTick::new(
-            instrument_id,
-            Price::from(price),
-            Quantity::from("1000"),
-            AggressorSide::Buy,
-            TradeId::new(trade_id),
-            UnixNanos::from(ts),
-            UnixNanos::from(ts),
-        )
-    })
-    .collect()
+    ORDER_TAPE
+        .into_iter()
+        .map(|(price, ts, size, trade_id)| make_trade(instrument_id, price, size, trade_id, ts))
+        .collect()
 }
 
-/// Subscribes `bar_types` live, then processes `tape` live and returns what a subscriber to its
-/// trades and to every bar type, at the default priority as an actor, is given.
+/// Subscribes `bar_types` live, then processes the order tape live, each trade after the engine
+/// clock's timers due by its `ts_init` (as a node's event loop runs them), and returns what a
+/// subscriber to its trades and to every bar type, at the default priority as an actor, is given.
 fn live_deliveries(
     audusd_sim: CurrencyPair,
     client_id: ClientId,
     venue: Venue,
     bar_types: &[BarType],
-    watched: &[BarType],
 ) -> Vec<OrderedDelivery> {
     let instrument_id = audusd_sim.id;
     let (mut data_engine, cache) = order_engine(audusd_sim, client_id, venue);
@@ -2341,9 +2336,10 @@ fn live_deliveries(
     let delivered = Rc::new(RefCell::new(Vec::new()));
     let trade_delivered = Rc::clone(&delivered);
     let trade_cache = Rc::clone(&cache);
-    let watched = watched.to_vec();
+    let watched = bar_types.to_vec();
+    let trade_watched = watched.clone();
     let trade_handler = TypedHandler::from(move |trade: &TradeTick| {
-        let cached = cached_bars(&trade_cache, &watched);
+        let cached = cached_bars(&trade_cache, &trade_watched);
         trade_delivered
             .borrow_mut()
             .push(OrderedDelivery::Trade(trade.trade_id, cached));
@@ -2353,30 +2349,63 @@ fn live_deliveries(
 
     for bar_type in bar_types {
         let bar_delivered = Rc::clone(&delivered);
+        let bar_cache = Rc::clone(&cache);
+        let bar_watched = watched.clone();
         let bar_handler = TypedHandler::from(move |bar: &Bar| {
-            bar_delivered
-                .borrow_mut()
-                .push(OrderedDelivery::Bar(bar.bar_type, bar.ts_event));
+            let cached = cached_bars(&bar_cache, &bar_watched);
+            bar_delivered.borrow_mut().push(OrderedDelivery::Bar(
+                bar.bar_type,
+                bar.ts_event,
+                cached,
+            ));
         });
         let bars_topic = switchboard::get_bars_topic(bar_type.standard());
         msgbus::subscribe_bars(bars_topic.into(), bar_handler, None);
     }
 
     for trade in order_tape(instrument_id) {
+        let clock = Rc::clone(data_engine.clock());
+        let handlers = {
+            let mut clock = clock.borrow_mut();
+            let clock = clock.as_any_mut().downcast_mut::<VirtualClock>().unwrap();
+            let events = clock.advance_time(trade.ts_init, true);
+            clock.match_handlers(events)
+        };
+        for handler in handlers {
+            handler.callback.call(handler.event);
+        }
         data_engine.process_data(Data::Trade(trade));
     }
 
     delivered.take()
 }
 
-/// Answers an interleaving trades request for `bar_types` with the same tape and returns what
-/// its requester is given, part by part.
+/// How the history engine answers an interleaving request with the order tape.
+#[derive(Clone, Copy, Debug)]
+enum HistoryAnswer {
+    /// The client answers it directly, in one envelope.
+    Client,
+    /// A catalog holding the tape answers it, as the one leg of its date-range plan.
+    #[cfg(feature = "streaming")]
+    Catalog,
+}
+
+/// Every way of [`HistoryAnswer`] this build serves.
+fn history_answers() -> Vec<HistoryAnswer> {
+    let mut answers = vec![HistoryAnswer::Client];
+    #[cfg(feature = "streaming")]
+    answers.push(HistoryAnswer::Catalog);
+    answers
+}
+
+/// Answers an interleaving trades request for `bar_types` with the order tape, the way `answer`
+/// says, and returns what its requester is given, part by part.
 fn interleaved_deliveries(
     audusd_sim: CurrencyPair,
     client_id: ClientId,
     venue: Venue,
     bar_types: &[BarType],
-    watched: &[BarType],
+    answer: HistoryAnswer,
 ) -> Vec<OrderedDelivery> {
     let instrument_id = audusd_sim.id;
     let (mut data_engine, cache) = order_engine(audusd_sim, client_id, venue);
@@ -2390,7 +2419,7 @@ fn interleaved_deliveries(
     let request_id = UUID4::new();
     let delivered = Rc::new(RefCell::new(Vec::new()));
     let recorded = Rc::clone(&delivered);
-    let watched = watched.to_vec();
+    let watched = bar_types.to_vec();
     let handler = TypedHandler::from(move |envelope: &DataResponseEnvelope| {
         if let Some(DataResponse::Trades(resp)) = envelope.response() {
             for trade in resp.data.iter() {
@@ -2401,42 +2430,141 @@ fn interleaved_deliveries(
             }
         } else if let Some(DataResponse::Bars(resp)) = envelope.response() {
             for bar in resp.data.iter() {
-                recorded
-                    .borrow_mut()
-                    .push(OrderedDelivery::Bar(bar.bar_type, bar.ts_event));
+                let cached = cached_bars(&cache, &watched);
+                recorded.borrow_mut().push(OrderedDelivery::Bar(
+                    bar.bar_type,
+                    bar.ts_event,
+                    cached,
+                ));
             }
         }
     });
     msgbus::register_response_handler(&request_id, handler);
 
-    data_engine.execute(DataCommand::Request(RequestCommand::Trades(
-        RequestTrades::new(
+    let tape = order_tape(instrument_id);
+    let (first, last) = (tape[0].ts_init, tape[tape.len() - 1].ts_init);
+    let request = |start: Option<UnixNanos>, end: Option<UnixNanos>| {
+        DataCommand::Request(RequestCommand::Trades(RequestTrades::new(
             instrument_id,
-            None,
-            None,
+            start.as_ref().map(UnixNanos::to_datetime_utc),
+            end.as_ref().map(UnixNanos::to_datetime_utc),
             None,
             Some(client_id),
             request_id,
             UnixNanos::default(),
             Some(params.clone()),
-        ),
-    )));
-    data_engine.response(DataResponse::Trades(TradesResponse::new(
-        request_id,
-        client_id,
-        instrument_id,
-        order_tape(instrument_id),
-        None,
-        None,
-        UnixNanos::from(6_000),
-        Some(params),
-    )));
+        )))
+    };
+
+    match answer {
+        HistoryAnswer::Client => {
+            data_engine.execute(request(None, None));
+            data_engine.response(DataResponse::Trades(TradesResponse::new(
+                request_id,
+                client_id,
+                instrument_id,
+                tape,
+                None,
+                None,
+                last,
+                Some(params.clone()),
+            )));
+        }
+        #[cfg(feature = "streaming")]
+        HistoryAnswer::Catalog => {
+            advance_clock_to(data_engine.clock(), 2 * NANOSECONDS_IN_SECOND);
+            let _catalog_dir = register_trade_catalog_with_trades(
+                &mut data_engine,
+                "interleave-order",
+                &tape,
+                Some((first.as_u64(), last.as_u64())),
+            );
+            data_engine.execute(request(Some(first), Some(last)));
+            assert_eq!(data_engine.request_pipeline_count(), 0);
+        }
+    }
 
     delivered.take()
 }
 
-fn delivered_bar(bar_type: BarType, ts: u64) -> OrderedDelivery {
-    OrderedDelivery::Bar(bar_type.standard(), UnixNanos::from(ts))
+fn delivered_trade(trade_id: &str, cached: &[usize]) -> OrderedDelivery {
+    OrderedDelivery::Trade(TradeId::new(trade_id), cached.to_vec())
+}
+
+fn delivered_bar(bar_type: BarType, ts: u64, cached: &[usize]) -> OrderedDelivery {
+    OrderedDelivery::Bar(bar_type.standard(), UnixNanos::from(ts), cached.to_vec())
+}
+
+#[rstest]
+#[case::tick("2-TICK")]
+#[case::volume("1500-VOLUME")]
+#[case::value("1000-VALUE")]
+#[case::tick_imbalance("2-TICK_IMBALANCE")]
+#[case::tick_runs("2-TICK_RUNS")]
+#[case::volume_imbalance("2000-VOLUME_IMBALANCE")]
+#[case::volume_runs("2000-VOLUME_RUNS")]
+#[case::value_imbalance("1000-VALUE_IMBALANCE")]
+#[case::value_runs("1000-VALUE_RUNS")]
+#[case::renko("5-RENKO")]
+#[case::range("10-RANGE")]
+#[case::range_inclusive("10-RANGE_INCLUSIVE")]
+#[case::time("1-MILLISECOND")]
+fn test_interleaved_bars_of_each_trade_fed_aggregation_reach_handlers_and_cache_as_live(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] spec: &str,
+) {
+    let _ = stub_msgbus;
+    let bar_type = BarType::from(format!("{}-{spec}-LAST-INTERNAL", audusd_sim.id).as_str());
+
+    let live = live_deliveries(audusd_sim.clone(), client_id, venue, &[bar_type]);
+
+    assert!(
+        live.iter()
+            .any(|delivered| matches!(delivered, OrderedDelivery::Bar(..))),
+        "the tape completes a {bar_type} bar: {live:?}"
+    );
+    for answer in history_answers() {
+        let history =
+            interleaved_deliveries(audusd_sim.clone(), client_id, venue, &[bar_type], answer);
+        assert_eq!(history, live, "{answer:?}");
+    }
+}
+
+#[rstest]
+fn test_interleaved_trade_completing_two_bars_of_one_type_delivers_them_one_at_a_time_as_live(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let volume = BarType::from(format!("{}-1500-VOLUME-LAST-INTERNAL", audusd_sim.id).as_str());
+    // t3, of 3,000, completes two bars: the first one's handler does not find the second cached
+    let expected = vec![
+        delivered_trade("t1", &[0]),
+        delivered_bar(volume, 1_000_900_000, &[1]),
+        delivered_trade("t2", &[1]),
+        delivered_bar(volume, 1_001_350_000, &[2]),
+        delivered_bar(volume, 1_001_350_000, &[3]),
+        delivered_trade("t3", &[3]),
+        delivered_bar(volume, 1_001_800_000, &[4]),
+        delivered_trade("t4", &[4]),
+        delivered_trade("t5", &[4]),
+        delivered_bar(volume, 1_004_700_000, &[5]),
+        delivered_trade("t6", &[5]),
+    ];
+
+    let live = live_deliveries(audusd_sim.clone(), client_id, venue, &[volume]);
+
+    assert_eq!(live, expected);
+    for answer in history_answers() {
+        let history =
+            interleaved_deliveries(audusd_sim.clone(), client_id, venue, &[volume], answer);
+        assert_eq!(history, live, "{answer:?}");
+    }
 }
 
 #[rstest]
@@ -2451,29 +2579,29 @@ fn test_interleaved_trade_handler_finds_in_the_cache_only_the_bars_live_has_cach
     let range_inclusive = BarType::from(format!("{id}-10-RANGE_INCLUSIVE-LAST-INTERNAL").as_str());
     let range = BarType::from(format!("{id}-10-RANGE-LAST-INTERNAL").as_str());
     let bar_types = [range_inclusive, range];
-    let trade = |trade_id: &str, cached: [Option<u64>; 2]| {
-        let cached = cached.iter().map(|ts| ts.map(UnixNanos::from)).collect();
-        OrderedDelivery::Trade(TradeId::new(trade_id), cached)
-    };
-    // t3 completes a bar of each type: neither is in the cache for t1 and t2
+    // t3 completes a bar of each type: neither is in the cache for t1 and t2, and the
+    // `RANGE_INCLUSIVE` one, which contains t3, follows it
     let expected = vec![
-        trade("t1", [None, None]),
-        trade("t2", [None, None]),
-        delivered_bar(range, 3_000),
-        trade("t3", [None, Some(3_000)]),
-        delivered_bar(range_inclusive, 3_000),
-        trade("t4", [Some(3_000), Some(3_000)]),
-        trade("t5", [Some(3_000), Some(3_000)]),
-        delivered_bar(range_inclusive, 5_000),
-        delivered_bar(range, 6_000),
-        trade("t6", [Some(5_000), Some(6_000)]),
+        delivered_trade("t1", &[0, 0]),
+        delivered_trade("t2", &[0, 0]),
+        delivered_bar(range, 1_001_350_000, &[0, 1]),
+        delivered_trade("t3", &[0, 1]),
+        delivered_bar(range_inclusive, 1_001_350_000, &[1, 1]),
+        delivered_trade("t4", &[1, 1]),
+        delivered_trade("t5", &[1, 1]),
+        delivered_bar(range_inclusive, 1_002_250_000, &[2, 1]),
+        delivered_bar(range, 1_004_700_000, &[2, 2]),
+        delivered_trade("t6", &[2, 2]),
     ];
 
-    let live = live_deliveries(audusd_sim.clone(), client_id, venue, &bar_types, &bar_types);
-    let history = interleaved_deliveries(audusd_sim, client_id, venue, &bar_types, &bar_types);
+    let live = live_deliveries(audusd_sim.clone(), client_id, venue, &bar_types);
 
     assert_eq!(live, expected);
-    assert_eq!(history, live);
+    for answer in history_answers() {
+        let history =
+            interleaved_deliveries(audusd_sim.clone(), client_id, venue, &bar_types, answer);
+        assert_eq!(history, live, "{answer:?}");
+    }
 }
 
 // Made-up clock times and trading-day opens (civil 18:00 New York) for the join's admission

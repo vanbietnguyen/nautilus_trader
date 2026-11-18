@@ -3131,6 +3131,39 @@ pub trait DataActor {
     /// ordinary trades request answers it: the gap holds no trades, its quotes are still
     /// delivered, and the request completes with no failure reason.
     ///
+    /// With `params["interleave"] = true` and `params["bar_types"]`, the engine answers the
+    /// trades together with the bars it builds from them, in the order a subscriber running
+    /// live would have been given them: typed parts under the request's ID, trades parts
+    /// (`on_historical_trades`) and bars parts (`on_historical_bars`), the last a trades part,
+    /// possibly empty, that completes the request. A bar a trade completes comes before that
+    /// trade, except a `RANGE_INCLUSIVE` bar, which contains its completing trade and comes
+    /// after it; a time bar comes before the first trade after its close. Each bar is a part of
+    /// its own, in the order the aggregators produced it, and enters the cache only when its
+    /// part is delivered, so a handler of a trade or of a bar finds in the cache exactly the
+    /// bars delivered before it. Without `bar_types` the parameter changes nothing; without the
+    /// parameter, or with `false`, the request is answered as before.
+    ///
+    /// Only bars built directly from the request's own trades can be given in that order, so
+    /// the engine refuses an `interleave` request before dispatching anything, with one
+    /// terminal envelope naming the reason, when: `interleave` is not a boolean; the request is
+    /// not a trades request (a quotes or bars request that sets it); the client is external;
+    /// the request is a leg of a `RequestJoin`; it sets continuous-future or time-range params;
+    /// it names more than one instrument; or a bar type in `bar_types` is not fed by its
+    /// trades: a composite (built from other bars, at any depth), a bar type built from quotes
+    /// (also with `quotes`), or one of another instrument. The engine names the first such
+    /// bar type. A client's direct answer, a catalog's answer with any client gaps, and the
+    /// history/live join (`cut_warmup`) are served; with `quotes`, the quotes parts go out in
+    /// the merged order between the trades and bars parts.
+    ///
+    /// Limits: bars of different types that one trade completes come in the order of
+    /// `bar_types`, while live subscribers get them in handler order (a time bar's timer before
+    /// the trade's handlers; the others by bar type). A trade stamped exactly at a time bar's
+    /// close is in that bar (left-open intervals) and the bar comes after it; live, the order
+    /// of that timer and that trade is not defined. Bars never delivered do not reach the
+    /// cache. Bars completed only by the request's clean-up after a failure with no answer
+    /// (its held live trades, its last time bar) go out with the dispatched client's identity
+    /// as one part per bar type, each part's bars cached together just before it is sent.
+    ///
     /// # Errors
     ///
     /// Returns an error if input parameters are invalid.
