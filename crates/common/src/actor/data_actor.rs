@@ -3178,7 +3178,8 @@ pub trait DataActor {
     /// a request must give a `start` and name no `limit` and no filter expression. A request none of whose aggregators
     /// exists starts them, their clock at its `start`. A request whose aggregators are exactly
     /// those one earlier kept request left, none subscribed and none in use by a request in
-    /// flight, continues them on their clock when its `start` is the next nanosecond after that
+    /// flight, in the time zone they were made in, none fed from a source already taken over
+    /// (below), continues them on their clock when its `start` is the next nanosecond after that
     /// request's coverage (`min(end, the engine clock's time when it was dispatched)`, which
     /// its completed answer with no failure reason closed through): an open bar, a pending close
     /// (one at that very nanosecond fires after the records stamped then) and a calendar grid pass
@@ -3193,18 +3194,24 @@ pub trait DataActor {
     /// closes due before the engine clock's time are published to it, stamped at their own
     /// close, then the aggregator continues on the engine clock with its pending close or
     /// `RANGE` boundary as armed (one at the engine clock's time fires there once, after the
-    /// records stamped then); nothing is flushed. Made while the answer is in flight, it is held
-    /// back: its live trades are held and, when the request succeeds, the ones stamped after its
-    /// coverage (the answer holds every trade up to it) are fed to the aggregator as the
-    /// answer's trades are (the closes due before each fire first, their bars still the
-    /// answer's), trade by trade across bar types, then the aggregator is taken over as above.
-    /// When the request fails, expires or is answered by a bare response instead, the
-    /// subscription gets a new aggregator, started then and fed the held trades. A joined request (`cut_warmup`) closes nothing after
-    /// its last trade: its held live trades, through the join's cut and floor, move its clock on
-    /// before the takeover. [`Self::unsubscribe_bars`] for a bar type kept and not subscribed
-    /// since removes its aggregator; made while a request runs it, that request runs to its end,
-    /// and then its aggregators are removed as on a failure: nothing is taken over, and a
-    /// held-back subscription gets a new aggregator.
+    /// records stamped then); nothing is flushed. A later subscription's aggregator catches up
+    /// alone. An aggregator built from the bars of a kept one taken over before it gets those
+    /// bars still, when it is taken over in turn (its clock readied before each), and from the
+    /// bus from then on. Made while the answer is in flight, a subscription is held back: its
+    /// live records are held and, when the request succeeds, the ones stamped after its coverage
+    /// (the answer holds every record up to it) are fed to the aggregators as the answer's are
+    /// (the closes due before each fire first), in the order they arrived, across bar types
+    /// and kinds; with `interleave` the held trades' bars are still the answer's, otherwise they
+    /// are published. The aggregators held back are taken over together, as above, after the
+    /// answer's last bars and its terminal, so their bars come in close order after them. When
+    /// the request fails, expires or is answered by a bare response instead, the subscription
+    /// gets a new aggregator, started then and fed the held trades. A joined request
+    /// (`cut_warmup`) closes nothing after its last trade: its held live trades, through the
+    /// join's cut and floor, move its clock on before the takeover. [`Self::unsubscribe_bars`]
+    /// for a bar type kept and not subscribed since removes its aggregator; made while a request
+    /// runs it, a held-back subscription of it is released at once, that request runs to its
+    /// end with the aggregator, and then its aggregators are removed as on a failure: nothing is
+    /// taken over, and another held-back subscription gets a new aggregator.
     ///
     /// With `params["interleave"] = true` and `params["bar_types"]`, the engine answers the
     /// trades together with the bars it builds from them, in the order a subscriber running
@@ -3572,9 +3579,9 @@ pub struct DataActorCore {
     indicators: Indicators,
     warning_events: AHashSet<String>, // TODO: TBD
     requests: RefCell<RequestLifecycle>,
-    /// The bar types whose builders this actor kept by request (`update_subscriptions`) and has
-    /// not subscribed since: [`Self::unsubscribe_bars`] removes them.
-    kept_bar_types: RefCell<AHashSet<BarType>>,
+    /// The bar types whose builders this actor keeps by request (`update_subscriptions`) and has
+    /// not subscribed since: [`Self::unsubscribe_bars`] removes them (see [`KeptBarTypes`]).
+    kept_bar_types: Rc<RefCell<KeptBarTypes>>,
     signal_classes: AHashMap<String, String>,
     #[cfg(feature = "defi")]
     block_handlers: AHashMap<MStr<Topic>, Subscription<TypedHandler<Block>>>,
@@ -4477,7 +4484,7 @@ impl DataActorCore {
             indicators: Indicators::default(),
             warning_events: AHashSet::new(),
             requests: RefCell::new(RequestLifecycle::default()),
-            kept_bar_types: RefCell::new(AHashSet::new()),
+            kept_bar_types: Rc::default(),
             signal_classes: AHashMap::new(),
             #[cfg(feature = "defi")]
             block_handlers: AHashMap::new(),
@@ -5433,7 +5440,7 @@ impl DataActorCore {
                 // This subscription takes over a builder of it the actor kept by request
                 self.kept_bar_types
                     .borrow_mut()
-                    .remove(&bar_type.standard());
+                    .take_over(&bar_type.standard());
                 acquired.push(*bar_type);
             }
         }
@@ -6257,6 +6264,9 @@ impl DataActorCore {
     ///
     /// A bar type the actor kept by request (`update_subscriptions`) and has not subscribed
     /// since is released too: the engine is sent the unsubscribe, and removes its kept builder.
+    /// The actor keeps one only once its request ended with no failure reason (a refused or
+    /// failed one leaves it nothing to release); one a request still in flight asked is
+    /// released when that request ends so.
     ///
     /// # Errors
     ///
@@ -6277,18 +6287,9 @@ impl DataActorCore {
                 None if self
                     .kept_bar_types
                     .borrow_mut()
-                    .remove(&bar_type.standard()) =>
+                    .release(&bar_type.standard()) =>
                 {
-                    let command = UnsubscribeBars::new(
-                        bar_type,
-                        client_id,
-                        Some(bar_type.instrument_id().venue),
-                        UUID4::new(),
-                        self.timestamp_ns(),
-                        None,
-                        None,
-                    );
-                    self.send_data_cmd(DataCommand::Unsubscribe(UnsubscribeCommand::Bars(command)));
+                    self.send_data_cmd(kept_unsubscribe(bar_type, client_id, self.timestamp_ns()));
                 }
                 None => {}
             }
@@ -6774,10 +6775,11 @@ impl DataActorCore {
             params,
         });
 
+        let handler = self.kept_request_handler(request_id, client_id, !kept.is_empty(), handler);
         self.register_request_handler(command.request_id(), handler)?;
+        self.kept_bar_types.borrow_mut().ask(request_id, kept);
 
         self.send_data_cmd(DataCommand::Request(command));
-        self.kept_bar_types.borrow_mut().extend(kept);
 
         Ok(request_id)
     }
@@ -6823,10 +6825,11 @@ impl DataActorCore {
             params,
         });
 
+        let handler = self.kept_request_handler(request_id, client_id, !kept.is_empty(), handler);
         self.register_request_handler(command.request_id(), handler)?;
+        self.kept_bar_types.borrow_mut().ask(request_id, kept);
 
         self.send_data_cmd(DataCommand::Request(command));
-        self.kept_bar_types.borrow_mut().extend(kept);
 
         Ok(request_id)
     }
@@ -6876,10 +6879,11 @@ impl DataActorCore {
             params,
         });
 
+        let handler = self.kept_request_handler(request_id, client_id, !kept.is_empty(), handler);
         self.register_request_handler(command.request_id(), handler)?;
+        self.kept_bar_types.borrow_mut().ask(request_id, kept);
 
         self.send_data_cmd(DataCommand::Request(command));
-        self.kept_bar_types.borrow_mut().extend(kept);
 
         Ok(request_id)
     }
@@ -6937,6 +6941,44 @@ impl DataActorCore {
             .register_response_handler(request_id, handler)?;
         self.requests.borrow_mut().register(*request_id);
         Ok(())
+    }
+
+    /// Returns `handler` for the request `request_id`, which keeps bar builders by request
+    /// (`update_subscriptions`) when `keeps`: at the request's terminal, before `handler` gets
+    /// it, the bar types it asked are settled (see [`KeptBarTypes::settle`]), and one this actor
+    /// unsubscribed while the request was in flight is released then, through `client_id`.
+    fn kept_request_handler(
+        &self,
+        request_id: UUID4,
+        client_id: Option<ClientId>,
+        keeps: bool,
+        handler: TypedHandler<DataResponseEnvelope>,
+    ) -> TypedHandler<DataResponseEnvelope> {
+        if !keeps {
+            return handler;
+        }
+
+        let kept_bar_types = Rc::clone(&self.kept_bar_types);
+        let clock = self.clock.clone();
+        TypedHandler::from_with_id(handler.id(), move |envelope: &DataResponseEnvelope| {
+            if envelope.completed() {
+                let released = kept_bar_types
+                    .borrow_mut()
+                    .settle(&request_id, envelope.failure_reason().is_none());
+                for bar_type in released {
+                    let ts_init = clock
+                        .as_ref()
+                        .map_or_else(UnixNanos::default, |clock| clock.borrow().timestamp_ns());
+                    let endpoint = MessagingSwitchboard::data_engine_queue_execute();
+                    msgbus::send_data_command(
+                        endpoint,
+                        kept_unsubscribe(bar_type, client_id, ts_init),
+                    );
+                }
+            }
+
+            handler.handle(envelope);
+        })
     }
 
     /// Returns whether this actor is awaiting completion of a request.
@@ -7091,6 +7133,100 @@ impl DataActorNative for DataActorCore {
     fn core_mut(&mut self) -> &mut DataActorCore {
         self
     }
+}
+
+/// The bar types whose builders an actor keeps by request (`update_subscriptions`) and has not
+/// subscribed since. A bar type is the actor's only once the request that asked it ended with no
+/// failure reason; a refused or failed request is dropped before its terminal reaches the actor's
+/// handler, so the actor never releases a builder another requester keeps.
+#[derive(Debug, Default)]
+struct KeptBarTypes {
+    /// Those the actor acquired.
+    acquired: AHashSet<BarType>,
+    /// Those asked by each request in flight.
+    pending: AHashMap<UUID4, Vec<BarType>>,
+    /// Pending ones the actor unsubscribed meanwhile: released once acquired.
+    released: AHashSet<BarType>,
+}
+
+impl KeptBarTypes {
+    /// Records `bar_types` as asked by the request `request_id`, in flight.
+    fn ask(&mut self, request_id: UUID4, bar_types: Vec<BarType>) {
+        if !bar_types.is_empty() {
+            self.pending.insert(request_id, bar_types);
+        }
+    }
+
+    /// Ends the claim of the request `request_id` at its terminal: when it `succeeded` its bar
+    /// types are acquired, otherwise dropped. Returns those unsubscribed while it ran, to release
+    /// now.
+    fn settle(&mut self, request_id: &UUID4, succeeded: bool) -> Vec<BarType> {
+        let mut release = Vec::new();
+
+        for bar_type in self.pending.remove(request_id).unwrap_or_default() {
+            let unsubscribed = self.released.remove(&bar_type);
+            if !succeeded {
+                continue;
+            }
+
+            if unsubscribed {
+                release.push(bar_type);
+            } else {
+                self.acquired.insert(bar_type);
+            }
+        }
+
+        release
+    }
+
+    /// Forgets `bar_type`, whose builder a subscription of the actor takes over.
+    fn take_over(&mut self, bar_type: &BarType) {
+        self.acquired.remove(bar_type);
+        self.released.remove(bar_type);
+        for bar_types in self.pending.values_mut() {
+            bar_types.retain(|pending| pending != bar_type);
+        }
+    }
+
+    /// Returns whether the actor's unsubscribe of `bar_type` is sent now: only for one it acquired,
+    /// which it forgets, with any claim of its own request in flight continuing it (the engine
+    /// removes that replay at the request's end). One only a request in flight asked is released
+    /// when that request acquires it (see [`Self::settle`]).
+    fn release(&mut self, bar_type: &BarType) -> bool {
+        if self.acquired.remove(bar_type) {
+            for bar_types in self.pending.values_mut() {
+                bar_types.retain(|pending| pending != bar_type);
+            }
+            return true;
+        }
+
+        if self
+            .pending
+            .values()
+            .any(|bar_types| bar_types.contains(bar_type))
+        {
+            self.released.insert(*bar_type);
+        }
+
+        false
+    }
+}
+
+/// Returns the command that releases the builder of `bar_type` an actor kept by request.
+fn kept_unsubscribe(
+    bar_type: BarType,
+    client_id: Option<ClientId>,
+    ts_init: UnixNanos,
+) -> DataCommand {
+    DataCommand::Unsubscribe(UnsubscribeCommand::Bars(UnsubscribeBars::new(
+        bar_type,
+        client_id,
+        Some(bar_type.instrument_id().venue),
+        UUID4::new(),
+        ts_init,
+        None,
+        None,
+    )))
 }
 
 /// Returns the bar types, standard, whose builders a request with `params` keeps: its

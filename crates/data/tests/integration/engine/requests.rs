@@ -10737,7 +10737,8 @@ fn published(bar_type: BarType, ts: u64, volume: u64, cached: &[usize]) -> Kept 
     )
 }
 
-/// An interleaving trades request whose builders are kept by request (`update_subscriptions`).
+/// An interleaving trades request whose builders are kept by request (`update_subscriptions`);
+/// with `plain`, one that does not interleave.
 #[derive(Clone, Copy, Default)]
 struct KeptSpec {
     start: Option<u64>,
@@ -10745,6 +10746,7 @@ struct KeptSpec {
     limit: Option<usize>,
     time_zone: Option<&'static str>,
     filter_expr: Option<&'static str>,
+    plain: bool,
 }
 
 /// The window from `start` to just before `next`, the next request's start.
@@ -10862,7 +10864,7 @@ impl KeptFixture {
         let mut params = json!({
             "bar_types": bar_types.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "update_subscriptions": true,
-            "interleave": true,
+            "interleave": !spec.plain,
         });
         if let Some(time_zone) = spec.time_zone {
             params["time_zone"] = json!(time_zone);
@@ -10978,6 +10980,20 @@ impl KeptFixture {
                     params,
                 ),
             )));
+    }
+
+    /// Processes a live quote (`ts`, bid size).
+    fn live_quote(&mut self, ts: u64, bid_size: u64) {
+        let quote = QuoteTick::new(
+            self.instrument_id,
+            Price::from("1.00000"),
+            Price::from("1.00010"),
+            Quantity::from(bid_size),
+            Quantity::from(1),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        );
+        self.engine.process_data(Data::Quote(quote));
     }
 
     /// Processes a live trade (`ts`, size, trade ID).
@@ -11989,4 +12005,417 @@ fn test_kept_request_answered_by_a_bare_response_gives_a_held_back_subscription_
             live_trade("h4", &[1, 0]),
         ]
     );
+}
+
+/// A kept request for 3-MINUTE and 5-MINUTE bars from 10:00, answered through 10:05 at 10:08,
+/// both subscriptions held back while it ran: its last bar, 10:05, and its terminal go out
+/// first; then the 10:06 bar its hand-over catches up is published.
+#[rstest]
+fn test_kept_request_sends_its_last_bars_and_its_end_before_its_hand_over_publishes(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (three, five) = (bar_type_of(id, "3-MINUTE"), bar_type_of(id, "5-MINUTE"));
+    let mut fixture = KeptFixture::new(
+        audusd_sim,
+        client_id,
+        venue,
+        monday("10:08:00"),
+        &[three, five],
+    );
+    let spec = KeptSpec {
+        start: Some(monday("10:00:00")),
+        end: Some(monday("10:05:00")),
+        ..KeptSpec::default()
+    };
+    let request = fixture.request(&[three, five], spec).unwrap();
+    fixture.subscribe(three, None);
+    fixture.subscribe(five, None);
+    fixture.answer(
+        request,
+        &[(monday("10:01:00"), 1, "a1"), (monday("10:04:00"), 1, "a2")],
+        None,
+    );
+
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            kept_trade(0, "a1", &[0, 0]),
+            kept_bar(0, three, monday("10:03:00"), 1, &[1, 0]),
+            kept_trade(0, "a2", &[1, 0]),
+            kept_bar(0, five, monday("10:05:00"), 2, &[1, 1]),
+            Kept::End(0, None),
+            published(three, monday("10:06:00"), 1, &[2, 1]),
+        ]
+    );
+}
+
+/// The same release on a kept request that does not interleave, answered at 10:10: its terminal
+/// goes out first; then the bars of the live trades held for its subscriptions and the bars due
+/// by 10:10 are published to them, in deadline order, not only cached.
+#[rstest]
+fn test_plain_kept_request_publishes_its_held_trades_bars_after_its_end(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (three, five) = (bar_type_of(id, "3-MINUTE"), bar_type_of(id, "5-MINUTE"));
+    let mut fixture = KeptFixture::new(
+        audusd_sim,
+        client_id,
+        venue,
+        monday("10:10:00"),
+        &[three, five],
+    );
+    let spec = KeptSpec {
+        plain: true,
+        ..kept_window(monday("10:00:00"), monday("10:02:00"))
+    };
+    let request = fixture.request(&[three, five], spec).unwrap();
+    fixture.subscribe(three, None);
+    fixture.subscribe(five, None);
+    for (ts, size, trade_id) in [
+        ("10:02:00", 2, "h1"),
+        ("10:04:00", 4, "h2"),
+        ("10:07:00", 8, "h3"),
+    ] {
+        fixture.live(monday(ts), size, trade_id);
+    }
+    fixture.answer(request, &[(monday("10:00:30"), 1, "a1")], None);
+    fixture.advance(monday("10:10:00"));
+
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            live_trade("h1", &[0, 0]),
+            live_trade("h2", &[0, 0]),
+            live_trade("h3", &[0, 0]),
+            kept_trade(0, "a1", &[0, 0]),
+            Kept::End(0, None),
+            published(three, monday("10:03:00"), 3, &[1, 0]),
+            published(five, monday("10:05:00"), 7, &[1, 1]),
+            published(three, monday("10:06:00"), 4, &[2, 1]),
+            published(three, monday("10:09:00"), 8, &[3, 1]),
+            published(five, monday("10:10:00"), 8, &[3, 2]),
+        ]
+    );
+}
+
+/// A plain kept request builds 5-MINUTE and 15-MINUTE-from-5-MINUTE bars through 10:12, from
+/// trades of 1, 2 and 4 at 10:01, 10:06 and 10:11. At 10:16 the source is subscribed, then the
+/// dependent: the source's 10:15 bar, published at its hand-over, reaches the still-kept
+/// dependent too, so its 10:15 bar has volume 7. A request continuing the dependent alone in
+/// between is refused by name. From the dependent's hand-over on it takes the source's bars
+/// from the bus only: its 10:30 bar has the 10:20 and 10:25 bars once.
+#[rstest]
+fn test_kept_source_handed_over_first_keeps_feeding_its_kept_dependent_until_its_hand_over(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let five = bar_type_of(id, "5-MINUTE");
+    let fifteen = BarType::from(format!("{id}-15-MINUTE-LAST-INTERNAL@5-MINUTE-INTERNAL").as_str());
+    let mut fixture = KeptFixture::new(
+        audusd_sim,
+        client_id,
+        venue,
+        monday("10:16:00"),
+        &[five, fifteen.standard()],
+    );
+    let plain = |spec: KeptSpec| KeptSpec {
+        plain: true,
+        ..spec
+    };
+    let request = fixture
+        .request(
+            &[five, fifteen],
+            plain(kept_window(monday("10:00:00"), monday("10:12:00"))),
+        )
+        .unwrap();
+    fixture.answer(
+        request,
+        &[
+            (monday("10:01:00"), 1, "a1"),
+            (monday("10:06:00"), 2, "a2"),
+            (monday("10:11:00"), 4, "a3"),
+        ],
+        None,
+    );
+
+    fixture.subscribe(five, None);
+    let error = fixture
+        .request(
+            &[fifteen],
+            plain(kept_window(monday("10:12:00"), monday("10:20:00"))),
+        )
+        .unwrap_err();
+    fixture.subscribe(fifteen, None);
+    fixture.live(monday("10:17:00"), 8, "l1");
+    fixture.advance(monday("10:20:00"));
+    fixture.live(monday("10:22:00"), 16, "l2");
+    fixture.advance(monday("10:30:00"));
+
+    assert!(
+        error.contains("was handed over to its subscription, which feeds it from now on"),
+        "{error}"
+    );
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            kept_trade(0, "a1", &[2, 0]),
+            kept_trade(0, "a2", &[2, 0]),
+            kept_trade(0, "a3", &[2, 0]),
+            Kept::End(0, None),
+            published(five, monday("10:15:00"), 4, &[3, 0]),
+            Kept::End(1, Some(error)),
+            published(fifteen, monday("10:15:00"), 7, &[3, 1]),
+            live_trade("l1", &[3, 1]),
+            published(five, monday("10:20:00"), 8, &[4, 1]),
+            live_trade("l2", &[4, 1]),
+            published(five, monday("10:25:00"), 16, &[5, 1]),
+            published(fifteen, monday("10:30:00"), 24, &[5, 2]),
+        ]
+    );
+}
+
+/// Populated 2-MINUTE and 3-MINUTE builders kept through 10:01, handed over together at 10:07
+/// (both subscriptions held back while their plain request ran, which names 3-MINUTE first):
+/// they catch up together, in deadline order, not in the order the request named them in.
+#[rstest]
+fn test_kept_builders_handed_over_in_one_turn_catch_up_together_in_deadline_order(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (two, three) = (bar_type_of(id, "2-MINUTE"), bar_type_of(id, "3-MINUTE"));
+    let mut fixture = KeptFixture::new(
+        audusd_sim,
+        client_id,
+        venue,
+        monday("10:07:00"),
+        &[two, three],
+    );
+    let request = fixture
+        .request(
+            &[three, two],
+            KeptSpec {
+                plain: true,
+                ..kept_window(monday("10:00:00"), monday("10:01:00"))
+            },
+        )
+        .unwrap();
+    fixture.subscribe(three, None);
+    fixture.subscribe(two, None);
+    fixture.answer(request, &[(monday("10:00:30"), 1, "a1")], None);
+
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            kept_trade(0, "a1", &[0, 0]),
+            Kept::End(0, None),
+            published(two, monday("10:02:00"), 1, &[1, 0]),
+            published(three, monday("10:03:00"), 1, &[1, 1]),
+        ]
+    );
+}
+
+/// Kept BID 2-MINUTE and 3-MINUTE builders covered through 10:00, both subscribed while their
+/// request ran, each holding the live quotes of 1, 2 and 4 at 10:01, 10:04 and 10:07: the held
+/// quotes are fed to both in arrival order, the clock readied before each, so each builder's
+/// closes fire after the quotes before them.
+#[rstest]
+fn test_held_quotes_of_several_kept_builders_are_fed_in_arrival_order(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let two = BarType::from(format!("{id}-2-MINUTE-BID-INTERNAL").as_str());
+    let three = BarType::from(format!("{id}-3-MINUTE-BID-INTERNAL").as_str());
+    let mut fixture = KeptFixture::new(
+        audusd_sim,
+        client_id,
+        venue,
+        monday("10:08:00"),
+        &[two, three],
+    );
+    let spec = KeptSpec {
+        start: Some(monday("09:54:00")),
+        end: Some(monday("10:00:00")),
+        plain: true,
+        ..KeptSpec::default()
+    };
+    let request = fixture.request(&[two, three], spec).unwrap();
+    fixture.subscribe(two, None);
+    fixture.subscribe(three, None);
+    for (ts, bid_size) in [("10:01:00", 1), ("10:04:00", 2), ("10:07:00", 4)] {
+        fixture.live_quote(monday(ts), bid_size);
+    }
+    fixture.answer(request, &[], None);
+    fixture.advance(monday("10:09:00"));
+
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            Kept::End(0, None),
+            published(two, monday("10:02:00"), 1, &[1, 0]),
+            published(three, monday("10:03:00"), 1, &[1, 1]),
+            published(two, monday("10:04:00"), 2, &[2, 1]),
+            published(three, monday("10:06:00"), 2, &[2, 2]),
+            published(two, monday("10:08:00"), 4, &[3, 2]),
+            published(three, monday("10:09:00"), 4, &[3, 3]),
+        ]
+    );
+}
+
+/// A UTC 5-MINUTE builder kept through 10:08 minus 1 ns, with a2's 2 open: the contiguous
+/// request asking it in New York's time zone is refused by name before its replay is claimed,
+/// and the next valid continuation still closes a2's bar at 10:10.
+#[rstest]
+fn test_kept_request_refused_for_its_time_zone_leaves_its_replay_as_it_was(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
+    first_kept_request(&mut fixture, five);
+    let next = kept_window(monday("10:08:00"), monday("10:15:00"));
+
+    let error = fixture
+        .request(
+            &[five],
+            KeptSpec {
+                time_zone: Some("America/New_York"),
+                ..next
+            },
+        )
+        .unwrap_err();
+    let continued = fixture.request(&[five], next).unwrap();
+    fixture.answer(continued, &[(monday("10:12:00"), 4, "b1")], None);
+
+    assert!(
+        error.starts_with(
+            "Cannot keep the bar builders of an `update_subscriptions` request: its time zone"
+        ),
+        "{error}"
+    );
+    let mut expected = first_kept_answer(five);
+    expected.extend([
+        Kept::End(1, Some(error)),
+        kept_bar(2, five, monday("10:10:00"), 2, &[2]),
+        kept_trade(2, "b1", &[2]),
+        Kept::End(2, None),
+    ]);
+    assert_eq!(fixture.delivered(), expected);
+}
+
+/// At 12:00 one requester keeps a 5-MINUTE builder through 10:08 minus 1 ns, with a2's 2 open;
+/// another's overlapping kept request is refused, and its terminal carries the refusal, so that
+/// requester has acquired nothing to unsubscribe (the actor drops the attempt): the first
+/// requester's next 10:10 bar still holds a2's 2.
+#[rstest]
+fn test_refused_kept_request_ends_with_its_refusal_and_leaves_another_requesters_replay(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
+    first_kept_request(&mut fixture, five);
+
+    let error = fixture
+        .request(&[five], kept_window(monday("10:07:00"), monday("10:15:00")))
+        .unwrap_err();
+    let continued = fixture
+        .request(&[five], kept_window(monday("10:08:00"), monday("10:15:00")))
+        .unwrap();
+    fixture.answer(continued, &[(monday("10:09:00"), 4, "b1")], None);
+
+    assert!(error.contains("overlaps the coverage through"), "{error}");
+    let mut expected = first_kept_answer(five);
+    expected.extend([
+        Kept::End(1, Some(error)),
+        kept_trade(2, "b1", &[1]),
+        kept_bar(2, five, monday("10:10:00"), 6, &[2]),
+        Kept::End(2, None),
+    ]);
+    assert_eq!(fixture.delivered(), expected);
+}
+
+/// A kept 5-MINUTE request from 10:00 to 10:08 minus 1 ns, subscribed and then unsubscribed while
+/// it runs (no other subscriber of its bars): its answer is delivered whole, the subscription's
+/// trades are released at the client, nothing is published, and its replay is removed at its
+/// end, so the first window can be asked again and its new builder closes 10:15 on its clock.
+#[rstest]
+fn test_unsubscribing_a_held_back_kept_bar_type_leaves_its_builder_to_the_request(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[]);
+    let request = fixture
+        .request(&[five], kept_window(monday("10:00:00"), monday("10:08:00")))
+        .unwrap();
+    fixture.subscribe(five, None);
+    let sent = fixture.client_commands(0).len();
+    unsubscribe(&mut fixture, five);
+    fixture.answer(
+        request,
+        &[(monday("10:01:00"), 1, "a1"), (monday("10:06:00"), 2, "a2")],
+        None,
+    );
+    let released = fixture.client_commands(sent);
+
+    let spec = KeptSpec {
+        start: Some(monday("10:00:00")),
+        end: Some(monday("10:15:00")),
+        ..KeptSpec::default()
+    };
+    let started = fixture.request(&[five], spec).unwrap();
+    fixture.answer(started, &[(monday("10:12:00"), 4, "c1")], None);
+
+    assert!(
+        matches!(
+            released.as_slice(),
+            [DataCommand::Unsubscribe(UnsubscribeCommand::Trades(_))]
+        ),
+        "{released:?}"
+    );
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            kept_trade(0, "a1", &[]),
+            kept_bar(0, five, monday("10:05:00"), 1, &[]),
+            kept_trade(0, "a2", &[]),
+            Kept::End(0, None),
+            kept_trade(1, "c1", &[]),
+            kept_bar(1, five, monday("10:15:00"), 4, &[]),
+            Kept::End(1, None),
+        ]
+    );
+    // Only the answers' bars entered the cache: none was published
+    assert_eq!(fixture.cache.borrow().bar_count(&five), 2);
 }

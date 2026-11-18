@@ -2250,13 +2250,18 @@ impl DataEngine {
             return;
         }
 
-        self.process_request_bar_aggregation_response(
+        let hand_over = self.process_request_bar_aggregation_response(
             &resp,
             envelope.completed(),
             envelope.failure_reason(),
         );
 
         msgbus::send_response_envelope(envelope);
+
+        // The kept builders it leaves catch up after its terminal
+        if let Some(hand_over) = hand_over {
+            self.hand_over_kept_builders(hand_over);
+        }
     }
 
     fn handle_response_payload(&mut self, resp: &DataResponse) -> bool {
@@ -2304,7 +2309,11 @@ impl DataEngine {
                 }
             }
             DataResponse::OptionChainReferencePrice(r) => {
-                self.process_request_bar_aggregation_response(resp, true, None);
+                if let Some(hand_over) =
+                    self.process_request_bar_aggregation_response(resp, true, None)
+                {
+                    self.hand_over_kept_builders(hand_over);
+                }
                 self.handle_option_chain_reference_price_response(&correlation_id, r);
                 return false;
             }
