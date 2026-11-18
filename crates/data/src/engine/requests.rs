@@ -538,8 +538,9 @@ pub(super) fn sets_cut_warmup(req: &RequestCommand) -> bool {
     request_params(req).and_then(|params| params.get_bool(CUT_WARMUP)) == Some(true)
 }
 
-/// Returns whether `req` is a trades request that sets `quotes`: its catalog legs also answer the
-/// instrument's quotes, delivered with its trades in one time order.
+/// Returns whether `req` is a trades request that sets `quotes`: its catalog leg, and its client
+/// for the parts the catalog does not cover, also answer the instrument's quotes, delivered with
+/// its trades in one time order.
 ///
 /// Only an admitted request reaches its legs: one that cannot carry its quotes is refused first
 /// (see [`carries_quotes`]). What callers get, and every refusal, is documented on

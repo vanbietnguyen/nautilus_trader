@@ -2399,7 +2399,7 @@ impl DataEngine {
             return DataResponseEnvelope::terminal(parent_id, failure_reason);
         }
 
-        // The quotes a `quotes` request's catalog legs answered go out with its trades
+        // The quotes a `quotes` request's catalog and client legs answered go out with its trades
         let (quotes, legs) = if parent.is_some_and(sets_quotes) {
             legs.into_iter()
                 .partition(|leg| matches!(leg, DataResponse::Quotes(_)))
@@ -2475,8 +2475,10 @@ impl DataEngine {
     ///
     /// Memory, per request (the parts are new buffers, not views of the answer): the catalog
     /// leg's query holds the window's quotes in their own buffer beside its trades until the
-    /// pipeline completes; the rebuild and the trim keep views of the leg's buffers (one leg;
-    /// a sorted copy only if its rows come unsorted) and the replay shares them; then
+    /// pipeline completes, as do its client legs' answers of the parts the catalog does not
+    /// cover; the rebuild and the trim keep views of the leg's buffers (one leg with rows; with
+    /// more, one merged copy per feed; a sorted copy if the rows come unsorted) and the replay
+    /// shares them; then
     /// [`quote_and_trade_runs`] copies every quote and trade once more into its parts, and every
     /// part exists before the first is sent (a split run is copied once more, stretch by
     /// stretch, as it is sent). The peak is therefore about twice the window's

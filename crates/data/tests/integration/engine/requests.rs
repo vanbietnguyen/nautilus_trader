@@ -5711,6 +5711,28 @@ fn windowed_trades_request(
     ))
 }
 
+/// `request`, a trades request, routed to a client no engine registers.
+#[cfg(feature = "streaming")]
+fn without_a_client(request: RequestCommand) -> RequestCommand {
+    let RequestCommand::Trades(mut cmd) = request else {
+        panic!("a trades request: {request:?}");
+    };
+    cmd.client_id = Some(ClientId::new("ABSENT"));
+    RequestCommand::Trades(cmd)
+}
+
+/// The failure reason of a `quotes` request whose window's part from `start` to `end` no
+/// catalog file holds for `feeds` and no client resolves.
+#[cfg(feature = "streaming")]
+fn uncovered_part(start: u64, end: u64, feeds: &str) -> String {
+    format!(
+        "No source covers {} to {} of the request's window: no catalog file holds its {feeds} \
+         and no client resolves",
+        UnixNanos::from(start).to_datetime_utc(),
+        UnixNanos::from(end).to_datetime_utc(),
+    )
+}
+
 /// Executes `request` and returns every envelope its requester was sent.
 #[cfg(feature = "streaming")]
 fn run_quoted(fixture: &JoinFixture, request: RequestCommand) -> Vec<QuotedDelivery> {
@@ -5891,16 +5913,30 @@ fn test_quotes_request_with_incomplete_quote_coverage_fails_with_one_terminal(
         ],
     );
     let params = quoted_params(&fixture, bars, Some(true));
-    let request = windowed_trades_request(&fixture, (1_000, 2_999), params);
+    let request = without_a_client(windowed_trades_request(&fixture, (1_000, 2_999), params));
 
-    assert_eq!(
-        run_quoted(&fixture, request),
-        vec![quoted_end(
-            QuotedPart::Nothing,
-            Some("Catalog catalog_0 does not cover the quotes of AUD/USD.SIM from 2000 to 2099"),
-        )]
-    );
+    // No client resolves: the records the catalog holds, then one terminal naming the gap
+    let reason = uncovered_part(2_000, 2_099, "quotes");
+    let expected = match bars {
+        QuotedBars::None | QuotedBars::Ticks => vec![
+            quoted(quotes_at(&[1_000])),
+            quoted(trades_of(&["t1", "t2"])),
+            quoted(quotes_at(&[2_100])),
+            quoted_end(trades_of(&[]), Some(&reason)),
+        ],
+        QuotedBars::InterleavedTicks => vec![
+            quoted(quotes_at(&[1_000])),
+            quoted(bars_at(&[1_000])),
+            quoted(trades_of(&["t1"])),
+            quoted(bars_at(&[2_050])),
+            quoted(trades_of(&["t2"])),
+            quoted(quotes_at(&[2_100])),
+            quoted_end(trades_of(&[]), Some(&reason)),
+        ],
+    };
+    assert_eq!(run_quoted(&fixture, request), expected);
     assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+    assert!(fixture.recorder.borrow().is_empty());
 }
 
 /// Completes the replay tail `tail_id` of a joined request with no trades.
@@ -5940,8 +5976,6 @@ enum Unquotable {
     SkipCatalogData,
     /// It sets a `schema`: its client answers it whole.
     Schema,
-    /// The catalog covers the window's first run only: a client leg fills the gap.
-    ClientGap,
 }
 
 /// A catalog run outside the window `[1 000, 2 999]` of the refusal test.
@@ -5960,19 +5994,12 @@ const OUTSIDE_THE_WINDOW: [QuotedRun<'static>; 1] = [QuotedRun {
 )]
 #[case::catalog_outside_the_window(
     Unquotable::CatalogOutsideTheWindow,
-    "its plan has no catalog leg; its client leg from 1000 to 2999 carries no quotes"
+    "its plan has no catalog leg"
 )]
-#[case::skip_catalog_data(
-    Unquotable::SkipCatalogData,
-    "its plan has no catalog leg; its client leg from 1000 to 2999 carries no quotes"
-)]
+#[case::skip_catalog_data(Unquotable::SkipCatalogData, "its plan has no catalog leg")]
 #[case::schema(
     Unquotable::Schema,
     "its `schema` sends it to its client, so its plan has no catalog leg"
-)]
-#[case::client_gap(
-    Unquotable::ClientGap,
-    "its client leg from 2000 to 2999 carries no quotes"
 )]
 fn test_quotes_request_whose_plan_cannot_carry_quotes_is_refused_before_any_dispatch(
     audusd_sim: CurrencyPair,
@@ -5988,7 +6015,6 @@ fn test_quotes_request_whose_plan_cannot_carry_quotes_is_refused_before_any_disp
         Unquotable::NoCatalog => &[],
         Unquotable::CatalogOutsideTheWindow => &OUTSIDE_THE_WINDOW,
         Unquotable::SkipCatalogData | Unquotable::Schema => &COUNTEREXAMPLE,
-        Unquotable::ClientGap => &COUNTEREXAMPLE[..1],
     };
     let _catalog_dir =
         (!runs.is_empty()).then(|| register_quoted_catalog(&fixture, "quotes-unquotable", runs));
@@ -9423,12 +9449,10 @@ fn test_merged_answer_that_fails_fires_no_end_of_coverage_and_ends_once(
     let t = |time: &str| utc_ns(&format!("2024-01-08T{time}Z"));
     let window = (t("10:00:00"), t("10:04:00"));
 
-    // The trades cover the window; the quotes miss 10:02:00 to 10:02:59
-    let delivered = run_merged(
+    // The trades cover the window; the quotes miss 10:02:00 to 10:02:59; no client resolves
+    let _catalog_dir = register_quoted_catalog(
         &fixture,
         "merged-failed",
-        &[minute],
-        window,
         &[
             merged_run(window, &[], &[(t("10:00:30"), "t1"), (t("10:03:30"), "t2")]),
             merged_run(
@@ -9443,14 +9467,459 @@ fn test_merged_answer_that_fails_fires_no_end_of_coverage_and_ends_once(
             ),
         ],
     );
+    let params = json!({
+        "bar_types": [minute.to_string()],
+        "update_subscriptions": false,
+        "interleave": true,
+        "quotes": true,
+    });
+    let request = without_a_client(windowed_trades_request(&fixture, window, params));
+    let delivered = tap_merged(&fixture, *request.request_id(), &[minute]);
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
 
-    // As before: no part, no bar of the closes the trades span or of the end, one terminal
-    let reason = format!(
-        "Catalog catalog_0 does not cover the quotes of AUD/USD.SIM from {} to {}",
-        t("10:02:00"),
-        t("10:03:00") - 1
+    // The records the catalog holds, the closes before the last of them, no bar of the end
+    // (10:04), and one terminal naming the gap
+    let reason = uncovered_part(t("10:02:00"), t("10:03:00") - 1, "quotes");
+    assert_eq!(
+        delivered.take(),
+        vec![
+            merged_trades(&["t1"], &[0, 0]),
+            merged_bar(minute, t("10:01:00"), 1, &[1, 0]),
+            merged_quotes(&[t("10:01:30")], &[1, 1]),
+            merged_bar(minute, t("10:02:00"), 0, &[2, 1]),
+            merged_bar(minute, t("10:03:00"), 0, &[3, 1]),
+            merged_quotes(&[t("10:03:10")], &[3, 2]),
+            merged_trades(&["t2"], &[3, 2]),
+            Merged::End(Some(reason)),
+        ]
     );
-    assert_eq!(delivered, vec![Merged::End(Some(reason))]);
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+}
+
+/// 2024-01-08 (UTC): `time` that day, to the nanosecond.
+#[cfg(feature = "streaming")]
+fn edge_ns(time: &str) -> u64 {
+    utc_ns(&format!("2024-01-08T{time}Z"))
+}
+
+/// The edge example's window, 09:59 to 10:01: its catalog holds trades t1 at 09:59:30 and t2 at
+/// 10:00:06 and quotes at 09:59:00.010, 10:00:01 and 10:00:59.990.
+#[cfg(feature = "streaming")]
+fn edge_window() -> (u64, u64) {
+    (edge_ns("09:59:00"), edge_ns("10:01:00"))
+}
+
+/// Registers the edge example's catalog: one trade file over `trade_file`, and the quote files
+/// over `quote_files`, each holding the example's quotes it covers.
+#[cfg(feature = "streaming")]
+fn register_edge_catalog(
+    fixture: &JoinFixture,
+    label: &str,
+    trade_file: (u64, u64),
+    quote_files: &[(u64, u64)],
+) -> CatalogTempDir {
+    let trades = [(edge_ns("09:59:30"), "t1"), (edge_ns("10:00:06"), "t2")];
+    let quotes = [
+        quote_at(edge_ns("09:59:00.010")),
+        quote_at(edge_ns("10:00:01")),
+        quote_at(edge_ns("10:00:59.990")),
+    ];
+    let held: Vec<Vec<_>> = quote_files
+        .iter()
+        .map(|&(first, last)| {
+            quotes
+                .iter()
+                .copied()
+                .filter(|(ts, _, _)| (first..=last).contains(ts))
+                .collect()
+        })
+        .collect();
+    let mut runs = vec![merged_run(trade_file, &[], &trades)];
+    runs.extend(
+        quote_files
+            .iter()
+            .zip(&held)
+            .map(|(&file, quotes)| merged_run(file, quotes, &[])),
+    );
+    register_quoted_catalog(fixture, label, &runs)
+}
+
+/// An interleaving `quotes` trades request for 1-MINUTE bars over the edge example's window.
+#[cfg(feature = "streaming")]
+fn edge_request(fixture: &JoinFixture, minute: BarType) -> RequestCommand {
+    let params = json!({
+        "bar_types": [minute.to_string()],
+        "update_subscriptions": false,
+        "interleave": true,
+        "quotes": true,
+    });
+    windowed_trades_request(fixture, edge_window(), params)
+}
+
+/// What the edge example's requester is given when every record of its window is the catalog's
+/// and nothing fails: the bar of 10:00 before the 10:00:01 quote, the end firing 10:01.
+#[cfg(feature = "streaming")]
+fn edge_answer(minute: BarType) -> Vec<Merged> {
+    let t = edge_ns;
+    vec![
+        merged_quotes(&[t("09:59:00.010")], &[0, 1]),
+        merged_trades(&["t1"], &[0, 1]),
+        merged_bar(minute, t("10:00:00"), 1, &[1, 1]),
+        merged_quotes(&[t("10:00:01")], &[1, 2]),
+        merged_trades(&["t2"], &[1, 2]),
+        merged_quotes(&[t("10:00:59.990")], &[1, 3]),
+        merged_bar(minute, t("10:01:00"), 1, &[2, 3]),
+        merged_trades(&[], &[2, 3]),
+        Merged::End(None),
+    ]
+}
+
+/// The legs a client received, in order: each one's kind, window and request ID.
+#[cfg(feature = "streaming")]
+fn client_legs(fixture: &JoinFixture) -> Vec<(&'static str, u64, u64, UUID4)> {
+    let at = |ts: Option<jiff::Timestamp>| {
+        u64::try_from(ts.expect("a bounded leg").as_nanosecond()).unwrap()
+    };
+    fixture
+        .recorder
+        .borrow()
+        .iter()
+        .map(|command| match command {
+            DataCommand::Request(RequestCommand::Trades(cmd)) => {
+                ("trades", at(cmd.start), at(cmd.end), cmd.request_id)
+            }
+            DataCommand::Request(RequestCommand::Quotes(cmd)) => {
+                ("quotes", at(cmd.start), at(cmd.end), cmd.request_id)
+            }
+            command => panic!("a trades or quotes leg: {command:?}"),
+        })
+        .collect()
+}
+
+/// The kinds and windows of `legs`.
+#[cfg(feature = "streaming")]
+fn leg_windows(legs: &[(&'static str, u64, u64, UUID4)]) -> Vec<(&'static str, u64, u64)> {
+    legs.iter()
+        .map(|&(kind, start, end, _)| (kind, start, end))
+        .collect()
+}
+
+/// Answers the client leg `request_id` in one completed envelope: `quotes` (stamps) on a quotes
+/// leg, `trades` (stamp, trade ID) on a trades leg.
+#[cfg(feature = "streaming")]
+fn answer_leg(
+    fixture: &JoinFixture,
+    (kind, _, _, request_id): (&'static str, u64, u64, UUID4),
+    quotes: &[u64],
+    trades: &[(u64, &str)],
+) {
+    let instrument_id = fixture.instrument_id;
+    let ts_init = UnixNanos::from(NY_2026_11_12_2000);
+    let response = if kind == "quotes" {
+        let quotes: Vec<_> = quotes
+            .iter()
+            .map(|&ts| {
+                let (ts, bid, ask) = quote_at(ts);
+                make_quote(instrument_id, bid, ask, ts)
+            })
+            .collect();
+        DataResponse::Quotes(QuotesResponse::new(
+            request_id,
+            fixture.client_id,
+            instrument_id,
+            quotes,
+            None,
+            None,
+            ts_init,
+            None,
+        ))
+    } else {
+        let trades: Vec<_> = trades
+            .iter()
+            .map(|&(ts, id)| unsided_trade(instrument_id, ts, "1.0002", id))
+            .collect();
+        DataResponse::Trades(TradesResponse::new(
+            request_id,
+            fixture.client_id,
+            instrument_id,
+            trades,
+            None,
+            None,
+            ts_init,
+            None,
+        ))
+    };
+    fixture
+        .engine
+        .borrow_mut()
+        .response_envelope(DataResponseEnvelope::new(response, true, None));
+}
+
+/// A merged request whose trade file starts 31 ms after its window's start and ends 13 ms before
+/// its end, and whose quote file starts 5 ms after and ends 2 ms before: each edge goes to its
+/// client for both feeds; the answers, empty or not, are merged at their place, and once all
+/// four have answered the end fires the 10:01 close.
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_merged_request_asks_its_client_both_feeds_over_each_part_its_files_miss(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[values(false, true)] client_rows: bool,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let minute = bar_type_of(fixture.instrument_id, "1-MINUTE");
+    let t = edge_ns;
+    let _catalog_dir = register_edge_catalog(
+        &fixture,
+        "merged-edges",
+        (t("09:59:00.031"), t("10:00:59.987")),
+        &[(t("09:59:00.005"), t("10:00:59.998"))],
+    );
+    let request = edge_request(&fixture, minute);
+    let delivered = tap_merged(&fixture, *request.request_id(), &[minute]);
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+
+    let legs = client_legs(&fixture);
+    let first = (t("09:59:00"), t("09:59:00.031") - 1);
+    let last = (t("10:00:59.987") + 1, t("10:01:00"));
+    assert_eq!(
+        leg_windows(&legs),
+        vec![
+            ("trades", first.0, first.1),
+            ("quotes", first.0, first.1),
+            ("trades", last.0, last.1),
+            ("quotes", last.0, last.1),
+        ]
+    );
+    // Nothing goes out before every leg has answered
+    assert!(delivered.borrow().is_empty());
+
+    if client_rows {
+        answer_leg(
+            &fixture,
+            legs[1],
+            &[t("09:59:00.002"), t("09:59:00.020")],
+            &[],
+        );
+        answer_leg(&fixture, legs[0], &[], &[(t("09:59:00.025"), "c1")]);
+    } else {
+        answer_leg(&fixture, legs[1], &[], &[]);
+        answer_leg(&fixture, legs[0], &[], &[]);
+    }
+    answer_leg(&fixture, legs[3], &[], &[]);
+    assert!(delivered.borrow().is_empty());
+    answer_leg(&fixture, legs[2], &[], &[]);
+
+    let expected = if client_rows {
+        // The client's two quotes and its trade at their place, around the catalog's quote
+        vec![
+            merged_quotes(
+                &[t("09:59:00.002"), t("09:59:00.010"), t("09:59:00.020")],
+                &[0, 3],
+            ),
+            merged_trades(&["c1", "t1"], &[0, 3]),
+            merged_bar(minute, t("10:00:00"), 2, &[1, 3]),
+            merged_quotes(&[t("10:00:01")], &[1, 4]),
+            merged_trades(&["t2"], &[1, 4]),
+            merged_quotes(&[t("10:00:59.990")], &[1, 5]),
+            merged_bar(minute, t("10:01:00"), 1, &[2, 5]),
+            merged_trades(&[], &[2, 5]),
+            Merged::End(None),
+        ]
+    } else {
+        edge_answer(minute)
+    };
+    assert_eq!(delivered.take(), expected);
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+}
+
+/// A gap in the quote files alone goes to the client for both feeds; the catalog's trade inside
+/// it (t2, 10:00:06) is kept, and the client's quote (10:00:01) comes at its place.
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_merged_request_asks_its_client_both_feeds_over_a_gap_in_its_quote_files_alone(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let minute = bar_type_of(fixture.instrument_id, "1-MINUTE");
+    let t = edge_ns;
+    let _catalog_dir = register_edge_catalog(
+        &fixture,
+        "merged-quote-gap",
+        edge_window(),
+        &[
+            (t("09:59:00"), t("10:00:00") - 1),
+            (t("10:00:30"), t("10:01:00")),
+        ],
+    );
+    let request = edge_request(&fixture, minute);
+    let delivered = tap_merged(&fixture, *request.request_id(), &[minute]);
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+
+    let legs = client_legs(&fixture);
+    let gap = (t("10:00:00"), t("10:00:30") - 1);
+    assert_eq!(
+        leg_windows(&legs),
+        vec![("trades", gap.0, gap.1), ("quotes", gap.0, gap.1)]
+    );
+    answer_leg(&fixture, legs[1], &[t("10:00:01")], &[]);
+    answer_leg(&fixture, legs[0], &[], &[]);
+
+    assert_eq!(delivered.take(), edge_answer(minute));
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+}
+
+/// A client that fails the quotes ask of a part fails the merged request with its reason: the
+/// records go out, the closes before the last of them fire, the end (10:01) does not, and there
+/// is one terminal.
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_merged_request_fails_when_its_client_fails_a_quotes_ask(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let minute = bar_type_of(fixture.instrument_id, "1-MINUTE");
+    let t = edge_ns;
+    let _catalog_dir = register_edge_catalog(
+        &fixture,
+        "merged-client-fails",
+        (t("09:59:00.031"), t("10:00:59.987")),
+        &[(t("09:59:00.005"), t("10:00:59.998"))],
+    );
+    let request = edge_request(&fixture, minute);
+    let delivered = tap_merged(&fixture, *request.request_id(), &[minute]);
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+
+    let legs = client_legs(&fixture);
+    answer_leg(&fixture, legs[0], &[], &[]);
+    fixture
+        .engine
+        .borrow_mut()
+        .request_failed(DataRequestFailed {
+            request_id: legs[1].3,
+            reason: "the source stopped".to_owned(),
+            response: None,
+        });
+    answer_leg(&fixture, legs[2], &[], &[]);
+    answer_leg(&fixture, legs[3], &[], &[]);
+
+    assert_eq!(
+        delivered.take(),
+        vec![
+            merged_quotes(&[t("09:59:00.010")], &[0, 1]),
+            merged_trades(&["t1"], &[0, 1]),
+            merged_bar(minute, t("10:00:00"), 1, &[1, 1]),
+            merged_quotes(&[t("10:00:01")], &[1, 2]),
+            merged_trades(&["t2"], &[1, 2]),
+            merged_quotes(&[t("10:00:59.990")], &[1, 3]),
+            merged_trades(&[], &[1, 3]),
+            Merged::End(Some("the source stopped".to_owned())),
+        ]
+    );
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+}
+
+/// With no client, a merged request fails naming the first part its files miss and the feeds
+/// they lack there; the records go out, and the end (10:01) does not fire.
+#[cfg(feature = "streaming")]
+#[rstest]
+#[case::trades_and_quotes("09:59:00.005", "trades and quotes")]
+#[case::trades("09:59:00", "trades")]
+fn test_merged_request_without_a_client_fails_naming_the_first_part_and_its_feeds(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] quote_file_start: &str,
+    #[case] feeds: &str,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let minute = bar_type_of(fixture.instrument_id, "1-MINUTE");
+    let t = edge_ns;
+    let _catalog_dir = register_edge_catalog(
+        &fixture,
+        "merged-no-client",
+        (t("09:59:00.031"), t("10:00:59.987")),
+        &[(t(quote_file_start), t("10:00:59.998"))],
+    );
+    let request = without_a_client(edge_request(&fixture, minute));
+    let delivered = tap_merged(&fixture, *request.request_id(), &[minute]);
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+
+    let reason = uncovered_part(t("09:59:00"), t("09:59:00.031") - 1, feeds);
+    assert_eq!(
+        delivered.take(),
+        vec![
+            merged_quotes(&[t("09:59:00.010")], &[0, 1]),
+            merged_trades(&["t1"], &[0, 1]),
+            merged_bar(minute, t("10:00:00"), 1, &[1, 1]),
+            merged_quotes(&[t("10:00:01")], &[1, 2]),
+            merged_trades(&["t2"], &[1, 2]),
+            merged_quotes(&[t("10:00:59.990")], &[1, 3]),
+            merged_trades(&[], &[1, 3]),
+            Merged::End(Some(reason)),
+        ]
+    );
+    assert!(fixture.recorder.borrow().is_empty());
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+}
+
+/// A window its files wholly cover is answered as before: no client leg, the end fires 10:01.
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_merged_request_over_a_window_its_files_wholly_cover_asks_its_client_nothing(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let minute = bar_type_of(fixture.instrument_id, "1-MINUTE");
+    let _catalog_dir =
+        register_edge_catalog(&fixture, "merged-covered", edge_window(), &[edge_window()]);
+    let request = edge_request(&fixture, minute);
+    let delivered = tap_merged(&fixture, *request.request_id(), &[minute]);
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+
+    assert_eq!(delivered.take(), edge_answer(minute));
+    assert!(fixture.recorder.borrow().is_empty());
 }
 
 /// The gap example on 2024-01-08 (UTC): a request over 09:56 to 10:05 whose catalog file ends at

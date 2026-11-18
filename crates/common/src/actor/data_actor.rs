@@ -3118,7 +3118,8 @@ pub trait DataActor {
     /// Request historical [`TradeTick`] data for the given `instrument_ids`.
     ///
     /// With `params["quotes"] = true` the data engine also answers the instrument's
-    /// [`QuoteTick`]s from the catalog that holds its trades, merged with the trades in one time
+    /// [`QuoteTick`]s from the catalog that holds its trades (and from its client where that
+    /// catalog's files do not cover the window: below), merged with the trades in one time
     /// order: by `ts_init`, a quote before a trade at an equal stamp. The answer arrives as typed
     /// parts under the request's ID, one per run of quotes or of trades, in that order
     /// (`on_historical_quotes`, `on_historical_trades`); the last part is a trades part, empty
@@ -3130,16 +3131,19 @@ pub trait DataActor {
     /// envelope naming the reason, when: `quotes` is not a boolean; the client is external; the
     /// request is a leg of a `RequestJoin`; it sets continuous-future, time-range, `cut_warmup`,
     /// `schema` or `skip_catalog_data` params; no catalog is registered, none covers any of its
-    /// window, or the engine is built without `streaming`; a client would serve part of its
-    /// window; or it names more than one instrument.
+    /// window, or the engine is built without `streaming`; or it names more than one
+    /// instrument.
     ///
-    /// Two limits apply. Coverage is the catalog's file intervals, not the rows they hold, so
-    /// the files must be written with intervals covering the whole window. A gap in the
-    /// catalog's quote file intervals fails the request with one terminal envelope naming the
-    /// gap, while a gap in its trade file intervals that no client can fill is answered as an
-    /// ordinary trades request answers it: the gap holds no trades, its quotes are still
-    /// delivered, and the request completes with no failure reason, unless it builds bars
-    /// (below), when the gap fails it.
+    /// Coverage is the catalog's file intervals, not the rows they hold. Each part of the window
+    /// the catalog's trade files or its quote files do not cover is asked of the request's
+    /// client for both feeds, a trades request and a quotes request over that part; their rows
+    /// are merged with the catalog's in the same order, and the request completes once every
+    /// one of them has answered. Over such a part the catalog's rows of a feed its files do
+    /// cover there are kept, so a client that also answers that feed there has its rows
+    /// delivered beside them. When no client resolves, the request fails: its reason names the
+    /// first such part and the feeds the catalog lacks there, the records that exist are still
+    /// delivered, and no close fires after the last of them. A client that fails either ask
+    /// fails the request with its reason, the same way.
     ///
     /// With `params["bar_types"]`, and without `interleave`, the engine also builds those bars
     /// and adds them to the cache; the requester is given the trades as before. The request's

@@ -464,6 +464,13 @@ impl DataEngine {
     /// [`Self::builds_bars_on_a_replay`]) gets a payload-free leg naming the first missed
     /// interval, so its answer fails and closes nothing after its last record; any other request
     /// is answered by its catalog leg alone, as before.
+    ///
+    /// A trades request that sets `quotes` misses every part of its window the catalog's trade
+    /// files or its quote files do not cover (their union, adjacent parts joined). Each such
+    /// part goes to its client for both feeds: a trades leg, then a quotes leg over the same
+    /// part; the pipeline merges their rows with the catalog leg's by `ts_init`. When no client
+    /// resolves, a payload-free leg names the first such part and the feeds the catalog lacks
+    /// there, whether or not the request builds bars.
     fn plan_date_range_request(
         &mut self,
         req: &RequestCommand,
@@ -543,6 +550,28 @@ impl DataEngine {
             missing_intervals = query_interval;
         }
 
+        // A `quotes` request's client parts are where the catalog lacks either feed
+        let quotes_missing = match winning_catalog {
+            Some(name) if sets_quotes(req) && !skip_catalog_data => {
+                let quotes_key =
+                    RequestCatalogKey::new(NautilusDataType::QuoteTick, key.identifier.clone());
+                Some(catalog_missing_intervals(
+                    self.catalogs
+                        .get_mut(&name)
+                        .expect("selected catalog is registered"),
+                    start_ns.as_u64(),
+                    end_ns.as_u64(),
+                    &quotes_key,
+                )?)
+            }
+            _ => None,
+        };
+        let mut trades_missing = Vec::new();
+        if let Some(quotes_missing) = &quotes_missing {
+            trades_missing = std::mem::take(&mut missing_intervals);
+            missing_intervals = union_of_intervals(&trades_missing, quotes_missing);
+        }
+
         let client_id = req.client_id().copied();
         let venue = req.venue().copied();
         let has_client = self
@@ -553,7 +582,14 @@ impl DataEngine {
         let mut uncovered = None;
 
         if !has_client {
-            if self.builds_bars_on_a_replay(req)
+            if let Some(quotes_missing) = &quotes_missing
+                && let Some(&part) = missing_intervals.first()
+            {
+                uncovered = Some(RequestLeg::Terminal {
+                    request_id: UUID4::new(),
+                    reason: uncovered_part_reason(part, &trades_missing, quotes_missing),
+                });
+            } else if self.builds_bars_on_a_replay(req)
                 && let Some(&(start, end)) = missing_intervals.first()
             {
                 uncovered = Some(RequestLeg::Terminal {
@@ -578,7 +614,13 @@ impl DataEngine {
             let start = UnixNanos::from(start).to_datetime_utc();
             let end = UnixNanos::from(end).to_datetime_utc();
             let request = with_dates_for_pipeline(req, Some(start), Some(end), now_ns);
+            let quotes = if quotes_missing.is_some() {
+                client_quotes_leg(&request)
+            } else {
+                None
+            };
             plan.push(RequestLeg::Client(request));
+            plan.extend(quotes.map(RequestLeg::Client));
         }
 
         plan.extend(uncovered);
@@ -810,9 +852,11 @@ impl DataEngine {
     ///
     /// It sees the request's whole route in the engine's routing order: its client, the
     /// pipeline it is a leg of, the pipeline it nests itself in, its join, its catalogs, its
-    /// `schema`, its instruments, and then the legs of its plan. Only a catalog leg answers
-    /// quotes, so the one admitted shape is a single-instrument date-range request whose plan
-    /// is one catalog leg over the whole window, from the catalog that won on trades coverage.
+    /// `schema`, its instruments, and then the legs of its plan. The one admitted shape is a
+    /// single-instrument date-range request whose plan has one catalog leg over the whole
+    /// window, from the catalog that won on trades coverage, and for each part of the window
+    /// that catalog does not cover in either feed a trades and a quotes leg its client serves
+    /// (see [`Self::plan_date_range_request`]).
     ///
     /// # Errors
     ///
@@ -823,8 +867,8 @@ impl DataEngine {
     /// - It sets continuous-future or time-range pipeline params (the pipeline answers child
     ///   requests, not one time order).
     /// - Its plan has no catalog leg (no catalog registered, a `schema`, `skip_catalog_data`,
-    ///   no catalog covering any of the window) or a leg its client serves (a gap the catalog
-    ///   does not cover, or a joined request's replay tail, which every join plans).
+    ///   no catalog covering any of the window) or a joined request's replay tail, which every
+    ///   join plans.
     /// - It does not name exactly one instrument (a batch).
     /// - Its plan cannot be made.
     ///
@@ -1162,12 +1206,12 @@ impl DataEngine {
     }
 
     /// Returns the quotes of a trades catalog leg that sets `quotes`: the instrument's quotes in
-    /// `catalog_name` over the leg's window.
+    /// `catalog_name` over the leg's window. The parts its quote files do not cover were planned
+    /// apart (see [`Self::plan_date_range_request`]).
     ///
     /// # Errors
     ///
-    /// Returns an error if the catalog's quote file intervals leave any part of the window
-    /// uncovered, or if the query fails; the leg then fails.
+    /// Returns an error if the query fails; the leg then fails.
     fn query_catalog_leg_quotes(
         &mut self,
         cmd: &RequestTrades,
@@ -1181,15 +1225,6 @@ impl DataEngine {
         let catalog = self.catalogs.get_mut(&catalog_name).ok_or_else(|| {
             anyhow::anyhow!("Catalog {catalog_name} disappeared between intervals query and read")
         })?;
-
-        let key = RequestCatalogKey::new(NautilusDataType::QuoteTick, Some(identifier.clone()));
-        let missing = catalog_missing_intervals(catalog, start_ns.as_u64(), end_ns.as_u64(), &key)?;
-        if let Some(&(first, last)) = missing.first() {
-            anyhow::bail!(
-                "Catalog {catalog_name} does not cover the quotes of {instrument_id} from {first} \
-                 to {last}"
-            );
-        }
 
         let data = quote_ticks_from_query_result(
             catalog.query_batch(
@@ -1552,11 +1587,11 @@ struct JoinPlan {
 }
 
 /// Returns why the plan of a `quotes` request cannot carry the instrument's quotes, or `None`
-/// when every leg that answers rows is a catalog leg.
+/// when it has a catalog leg and no replay tail.
 ///
-/// Only a catalog leg answers quotes, so a plan with no catalog leg, or with a leg its client
-/// serves (a gap the catalog does not cover, or the join's replay tail of the current session),
-/// would answer trades alone over part of its window.
+/// A part of the window the catalog does not cover goes to the client for both feeds (see
+/// [`DataEngine::plan_date_range_request`]), but a plan with no catalog leg, or with the join's
+/// replay tail of the current session (trades only), is not served.
 fn quotes_plan_refusal(plan: &[RequestLeg]) -> Option<String> {
     let mut reasons = Vec::new();
     if !plan
@@ -1570,22 +1605,76 @@ fn quotes_plan_refusal(plan: &[RequestLeg]) -> Option<String> {
         let RequestLeg::Client(request) = leg else {
             continue;
         };
-        let start =
-            request_start(request).map_or_else(UnixNanos::default, datetime_to_unix_nanos_or_zero);
         if request_params(request).is_some_and(|params| params.contains_key(PARAM_REPLAY_START)) {
-            reasons.push(format!(
-                "its leg from {start} is its client's replay tail, which carries no quotes"
-            ));
-        } else {
-            let end = request_end(request)
+            let start = request_start(request)
                 .map_or_else(UnixNanos::default, datetime_to_unix_nanos_or_zero);
             reasons.push(format!(
-                "its client leg from {start} to {end} carries no quotes"
+                "its leg from {start} is its client's replay tail, which carries no quotes"
             ));
         }
     }
 
     (!reasons.is_empty()).then(|| reasons.join("; "))
+}
+
+/// Returns `left` and `right`, two lists of inclusive intervals each in order, as one list in
+/// order, overlapping or adjacent intervals joined.
+fn union_of_intervals(left: &[(u64, u64)], right: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut intervals = [left, right].concat();
+    intervals.sort_unstable();
+    let mut union: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
+
+    for (start, end) in intervals {
+        match union.last_mut() {
+            Some(last) if start <= last.1.saturating_add(1) => last.1 = last.1.max(end),
+            _ => union.push((start, end)),
+        }
+    }
+    union
+}
+
+/// Returns the failure reason of a `quotes` request whose window's `part` no catalog file covers
+/// and no client resolves, naming the feeds whose missed intervals (`trades_missing`,
+/// `quotes_missing`) meet it.
+fn uncovered_part_reason(
+    (start, end): (u64, u64),
+    trades_missing: &[(u64, u64)],
+    quotes_missing: &[(u64, u64)],
+) -> String {
+    let meets = |missing: &[(u64, u64)]| {
+        missing
+            .iter()
+            .any(|&(first, last)| first <= end && start <= last)
+    };
+    let feeds = match (meets(trades_missing), meets(quotes_missing)) {
+        (true, true) => "trades and quotes",
+        (true, false) => "trades",
+        _ => "quotes",
+    };
+    uncovered_window_reason(
+        start.into(),
+        end.into(),
+        &format!("no catalog file holds its {feeds} and no client resolves"),
+    )
+}
+
+/// Returns the quotes leg that goes with the client leg `trades` of a `quotes` request: the same
+/// instruments, window, limit, client and parameters, under an ID of its own. `None` when `trades`
+/// is not a trades request.
+fn client_quotes_leg(trades: &RequestCommand) -> Option<RequestCommand> {
+    let RequestCommand::Trades(cmd) = trades else {
+        return None;
+    };
+    Some(RequestCommand::Quotes(RequestQuotes {
+        instrument_ids: cmd.instrument_ids.clone(),
+        start: cmd.start,
+        end: cmd.end,
+        limit: cmd.limit,
+        client_id: cmd.client_id,
+        request_id: UUID4::new(),
+        ts_init: cmd.ts_init,
+        params: cmd.params.clone(),
+    }))
 }
 
 /// Drops the trades whose `ts_init` falls in one of the `unavailable` spans.
