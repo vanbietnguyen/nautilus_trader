@@ -634,6 +634,14 @@ impl SimulatedExchange {
         self.matching_engines.get(instrument_id)
     }
 
+    /// Returns a mutable reference to the matching engine for the given instrument, if available.
+    pub(crate) fn get_matching_engine_mut(
+        &mut self,
+        instrument_id: &InstrumentId,
+    ) -> Option<&mut OrderMatchingEngine> {
+        self.matching_engines.get_mut(instrument_id)
+    }
+
     /// Returns a reference to all matching engines keyed by instrument ID.
     #[must_use]
     pub const fn get_matching_engines(&self) -> &IndexMap<InstrumentId, OrderMatchingEngine> {

@@ -32,7 +32,7 @@ use nautilus_common::{
     clients::ExecutionClient,
     clock::{Clock, VirtualClock},
     component::{Component, component_state},
-    enums::{ComponentState, LogColor},
+    enums::{ComponentState, Environment, LogColor},
     log_info,
     logging::{
         logging_clock_set_realtime_mode, logging_clock_set_static_mode,
@@ -82,6 +82,7 @@ use crate::{
 };
 
 const CALLBACK_DRAIN_BUDGET: usize = 1024;
+const EXCHANGE_DATA_REFUSED: &str = "Cannot add exchange data";
 
 /// Core backtesting engine for running event-driven strategy backtests on historical data.
 ///
@@ -124,6 +125,7 @@ pub struct BacktestEngine {
     backtest_start: Option<UnixNanos>,
     backtest_end: Option<UnixNanos>,
     funding_error: Option<String>,
+    has_exchange_data: bool,
 }
 
 impl Debug for BacktestEngine {
@@ -193,6 +195,7 @@ impl BacktestEngine {
             backtest_start: None,
             backtest_end: None,
             funding_error: None,
+            has_exchange_data: false,
         })
     }
 
@@ -563,6 +566,180 @@ impl BacktestEngine {
         );
 
         Ok(stream_name)
+    }
+
+    /// Applies market records to the matching engines of the simulated exchanges before a run,
+    /// so they hold the market state that a run started earlier would hold at this run's start.
+    ///
+    /// Each record, a trade or a quote, goes in the given order to the matching engine of its
+    /// instrument, through that engine's own tick processing, with its own timestamps. The
+    /// matching engine's rules decide what it keeps, as in a run: a record whose `ts_event` is
+    /// before the book's last update is skipped as stale. Nothing else receives a record: it is
+    /// not written to the cache, published on the message bus, or passed to the exchange's
+    /// simulation modules, and no clock moves. The exchanges hold no order then, so the tick
+    /// processing matches none.
+    ///
+    /// The whole batch is checked before any record is applied: a refused batch applies
+    /// nothing. A [`reset`](Self::reset) clears
+    /// what was applied, as it resets every exchange, whose matching engines reset their book,
+    /// prices and last quote, and then allows a new call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The kernel's environment is not `Backtest`.
+    /// - A run has begun or been resumed since the engine was created or last reset.
+    /// - Records were already applied since the engine was created or last reset.
+    /// - A record is neither a trade nor a quote.
+    /// - A record's instrument has no matching engine (see
+    ///   [`add_instrument`](Self::add_instrument)).
+    /// - A record's price or size precision differs from its instrument's.
+    /// - A record's `ts_init` is before the previous record's.
+    /// - The cache holds an order or a position at a record's venue.
+    /// - A matching engine at a record's venue holds market state: its book was updated, or it
+    ///   has a bid, ask or last price.
+    pub fn add_exchange_data(&mut self, data: &[Data]) -> anyhow::Result<()> {
+        self.check_exchange_data(data)?;
+
+        for record in data {
+            let instrument_id = record.instrument_id();
+
+            // Checked above: the instrument has a matching engine, and the record is a trade or
+            // a quote
+            let Some(exchange) = self.venues.get(&instrument_id.venue) else {
+                continue;
+            };
+            let mut exchange = exchange.borrow_mut();
+            let Some(matching_engine) = exchange.get_matching_engine_mut(&instrument_id) else {
+                continue;
+            };
+
+            match record {
+                Data::Trade(trade) => matching_engine.process_trade_tick(trade),
+                Data::Quote(quote) => matching_engine.process_quote_tick(quote),
+                _ => {}
+            }
+        }
+
+        self.has_exchange_data = true;
+        Ok(())
+    }
+
+    // Refuses `data` as `add_exchange_data` documents, before any record is applied
+    fn check_exchange_data(&self, data: &[Data]) -> anyhow::Result<()> {
+        let environment = self.kernel.environment();
+        anyhow::ensure!(
+            environment == Environment::Backtest,
+            "{EXCHANGE_DATA_REFUSED}: the environment is {environment:?}, not a backtest"
+        );
+        // Set when a run begins, before the kernel starts (an event-store replay included),
+        // and kept by a streaming run resumed by the next `run`, until `reset`
+        anyhow::ensure!(
+            self.run_id.is_none(),
+            "{EXCHANGE_DATA_REFUSED}: a run has begun or been resumed; call `reset` first"
+        );
+        anyhow::ensure!(
+            !self.has_exchange_data,
+            "{EXCHANGE_DATA_REFUSED}: records were already applied; call `reset` first"
+        );
+
+        let mut venues: Vec<Venue> = Vec::new();
+        let mut previous_ts_init = UnixNanos::default();
+
+        for (index, record) in data.iter().enumerate() {
+            let (instrument_id, ts_init, price_precisions, size_precisions) = match record {
+                Data::Trade(trade) => (
+                    trade.instrument_id,
+                    trade.ts_init,
+                    [trade.price.precision; 2],
+                    [trade.size.precision; 2],
+                ),
+                Data::Quote(quote) => (
+                    quote.instrument_id,
+                    quote.ts_init,
+                    [quote.bid_price.precision, quote.ask_price.precision],
+                    [quote.bid_size.precision, quote.ask_size.precision],
+                ),
+                _ => anyhow::bail!(
+                    "{EXCHANGE_DATA_REFUSED}: record {index} is neither a trade nor a quote"
+                ),
+            };
+
+            let precisions = self.venues.get(&instrument_id.venue).and_then(|exchange| {
+                exchange
+                    .borrow()
+                    .get_matching_engine(&instrument_id)
+                    .map(|matching_engine| {
+                        let instrument = &matching_engine.instrument;
+                        (instrument.price_precision(), instrument.size_precision())
+                    })
+            });
+            let Some((price_precision, size_precision)) = precisions else {
+                anyhow::bail!(
+                    "{EXCHANGE_DATA_REFUSED}: record {index} is of {instrument_id}, which the \
+                     engine does not have"
+                );
+            };
+            anyhow::ensure!(
+                price_precisions == [price_precision; 2] && size_precisions == [size_precision; 2],
+                "{EXCHANGE_DATA_REFUSED}: record {index} has a price or size precision other \
+                 than {instrument_id}'s (price {price_precision}, size {size_precision})"
+            );
+            anyhow::ensure!(
+                ts_init >= previous_ts_init,
+                "{EXCHANGE_DATA_REFUSED}: record {index} has ts_init {ts_init}, before the \
+                 previous record's {previous_ts_init}"
+            );
+            previous_ts_init = ts_init;
+
+            if !venues.contains(&instrument_id.venue) {
+                venues.push(instrument_id.venue);
+            }
+        }
+
+        for venue in &venues {
+            self.check_exchange_is_empty(*venue)?;
+        }
+
+        Ok(())
+    }
+
+    // Refuses records for `venue` unless it holds no order, position or market state. An order
+    // reaches an exchange only through the cache (the execution engine caches each order it
+    // routes, and a run loads the cache's open orders into the exchanges), so the cache is read
+    fn check_exchange_is_empty(&self, venue: Venue) -> anyhow::Result<()> {
+        {
+            let cache = self.kernel.cache.borrow();
+            anyhow::ensure!(
+                cache
+                    .orders(Some(&venue), None, None, None, None)
+                    .is_empty(),
+                "{EXCHANGE_DATA_REFUSED}: the cache holds an order at {venue}"
+            );
+            anyhow::ensure!(
+                cache
+                    .positions(Some(&venue), None, None, None, None)
+                    .is_empty(),
+                "{EXCHANGE_DATA_REFUSED}: the cache holds a position at {venue}"
+            );
+        }
+
+        if let Some(exchange) = self.venues.get(&venue) {
+            let exchange = exchange.borrow();
+            for (instrument_id, matching_engine) in exchange.get_matching_engines() {
+                let core = matching_engine.get_core();
+                anyhow::ensure!(
+                    matching_engine.get_book().update_count == 0
+                        && core.bid.is_none()
+                        && core.ask.is_none()
+                        && core.last.is_none(),
+                    "{EXCHANGE_DATA_REFUSED}: the matching engine of {instrument_id} holds \
+                     market state"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Adds an actor to the backtest engine.
@@ -1267,6 +1444,7 @@ impl BacktestEngine {
         self.last_liquidation_ns = None;
         self.end_ns = UnixNanos::default();
         self.has_book_processed.clear();
+        self.has_exchange_data = false;
 
         self.accumulator.clear();
         self.cancel_funding_settlement_timers();
@@ -2565,7 +2743,11 @@ mod tests {
         },
         msgbus::{
             self, MessagingSwitchboard, TypedHandler,
-            stubs::{TypedIntoMessageSavingHandler, get_typed_into_message_saving_handler},
+            stubs::{
+                TypedIntoMessageSavingHandler, get_typed_into_message_saving_handler,
+                get_typed_message_saving_handler,
+            },
+            switchboard::{get_quotes_topic, get_trades_topic},
         },
         nautilus_actor,
     };
@@ -2579,15 +2761,16 @@ mod tests {
         },
     };
     use nautilus_model::{
-        data::{Data, IndexPriceUpdate, InstrumentClose, InstrumentStatus, QuoteTick},
+        data::{Data, IndexPriceUpdate, InstrumentClose, InstrumentStatus, QuoteTick, TradeTick},
         enums::{
-            AccountType, BookType, ContingencyType, InstrumentCloseType, LiquiditySide,
-            MarketStatus, MarketStatusAction, OmsType, OrderSide, OrderStatus, OrderType,
-            PositionSide, TriggerType,
+            AccountType, AggressorSide, BookType, ContingencyType, InstrumentCloseType,
+            LiquiditySide, MarketStatus, MarketStatusAction, OmsType, OrderSide, OrderStatus,
+            OrderType, PositionSide, TriggerType,
         },
         events::OrderEventAny,
         identifiers::{
-            AccountId, ActorId, ClientId, ClientOrderId, PositionId, StrategyId, TraderId, Venue,
+            AccountId, ActorId, ClientId, ClientOrderId, PositionId, StrategyId, TradeId, TraderId,
+            Venue,
         },
         instruments::{
             BinaryOption, CryptoPerpetual, Instrument, InstrumentAny,
@@ -2599,7 +2782,9 @@ mod tests {
         },
         types::{Currency, Money, Price, Quantity},
     };
-    use nautilus_system::{KernelEventStore, RegisteredComponents};
+    use nautilus_system::{
+        ClockFactory, KernelEventStore, RegisteredComponents, kernel::NautilusKernelDependencies,
+    };
     use nautilus_testkit::{
         cache::TestCacheDatabaseControl,
         components::{StateActor, StateStrategy},
@@ -5488,5 +5673,653 @@ mod tests {
             .unwrap()
             .market_status;
         assert_eq!(market_status, MarketStatus::Closed);
+    }
+
+    // Adds the venue options of our backtests (netting, margin, an L1 book that trades move,
+    // a static latency of 250 ms) and ETHUSDT-PERP.BINANCE, returning the instrument's ID
+    fn add_exchange_data_venue(engine: &mut BacktestEngine) -> InstrumentId {
+        let instrument = crypto_perpetual_ethusdt();
+        let instrument_id = instrument.id();
+        let venue_config = SimulatedVenueConfig::builder()
+            .venue(instrument_id.venue)
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec![Money::from("1_000_000 USDT")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .latency_model(LatencyModelHandle::new(StaticLatencyModel::new(
+                DurationNanos::new(250_000_000),
+                DurationNanos::default(),
+                DurationNanos::default(),
+                DurationNanos::default(),
+            )))
+            .use_reduce_only(true)
+            .support_contingent_orders(true)
+            .build()
+            .unwrap();
+        engine.add_venue(venue_config).unwrap();
+        engine
+            .add_instrument(&InstrumentAny::CryptoPerpetual(instrument))
+            .unwrap();
+        instrument_id
+    }
+
+    // Logging is bypassed so these tests can share one process
+    fn exchange_data_config() -> BacktestEngineConfig {
+        BacktestEngineConfig {
+            bypass_logging: true,
+            ..Default::default()
+        }
+    }
+
+    fn create_exchange_data_engine() -> (BacktestEngine, InstrumentId) {
+        let mut engine = BacktestEngine::new(exchange_data_config()).unwrap();
+        let instrument_id = add_exchange_data_venue(&mut engine);
+        (engine, instrument_id)
+    }
+
+    fn exchange_trade(
+        instrument_id: InstrumentId,
+        price: &str,
+        aggressor_side: AggressorSide,
+        ts_event: u64,
+        ts_init: u64,
+    ) -> Data {
+        Data::Trade(TradeTick::new(
+            instrument_id,
+            Price::from(price),
+            Quantity::from("2.000"),
+            aggressor_side,
+            TradeId::from(format!("T-{ts_init}").as_str()),
+            UnixNanos::from(ts_event),
+            UnixNanos::from(ts_init),
+        ))
+    }
+
+    fn exchange_quote(instrument_id: InstrumentId, bid: &str, ask: &str, ts: u64) -> Data {
+        Data::Quote(QuoteTick::new(
+            instrument_id,
+            Price::from(bid),
+            Price::from(ask),
+            Quantity::from("3.000"),
+            Quantity::from("4.000"),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        ))
+    }
+
+    // What order handling reads from a matching engine: its L1 book and its core's prices
+    #[derive(Debug, PartialEq)]
+    struct MatchingEngineState {
+        bid: Option<Price>,
+        ask: Option<Price>,
+        bid_size: Option<Quantity>,
+        ask_size: Option<Quantity>,
+        ts_last: UnixNanos,
+        update_count: u64,
+        core_bid: Option<Price>,
+        core_ask: Option<Price>,
+        core_last: Option<Price>,
+    }
+
+    fn matching_engine_state(
+        engine: &BacktestEngine,
+        instrument_id: InstrumentId,
+    ) -> MatchingEngineState {
+        let exchange = engine.venues[&instrument_id.venue].borrow();
+        let matching_engine = exchange.get_matching_engine(&instrument_id).unwrap();
+        let book = matching_engine.get_book();
+        let core = matching_engine.get_core();
+        MatchingEngineState {
+            bid: book.best_bid_price(),
+            ask: book.best_ask_price(),
+            bid_size: book.best_bid_size(),
+            ask_size: book.best_ask_size(),
+            ts_last: book.ts_last,
+            update_count: book.update_count,
+            core_bid: core.bid,
+            core_ask: core.ask,
+            core_last: core.last,
+        }
+    }
+
+    // Records of the session before the start: trades only (fills against trades), a quote
+    // then a buy trade (the core's bid is restored from the quote), and a trade arriving
+    // after one with a later event time (stale, skipped)
+    #[rstest]
+    #[case::trades(vec![
+        ("trade", "1000.00", "", AggressorSide::Buy, 100, 100),
+        ("trade", "1000.50", "", AggressorSide::Sell, 200, 200),
+        ("trade", "1001.00", "", AggressorSide::NoAggressor, 300, 300),
+    ], Price::from("1001.00"), Price::from("1001.00"))]
+    #[case::quote_then_trade(vec![
+        ("quote", "999.00", "1001.00", AggressorSide::NoAggressor, 100, 100),
+        ("trade", "1002.00", "", AggressorSide::Buy, 200, 200),
+    ], Price::from("999.00"), Price::from("1002.00"))]
+    #[case::stale_trade(vec![
+        ("trade", "1000.00", "", AggressorSide::NoAggressor, 900, 900),
+        ("trade", "1001.00", "", AggressorSide::NoAggressor, 850, 950),
+    ], Price::from("1000.00"), Price::from("1000.00"))]
+    fn test_add_exchange_data_equals_the_streamed_state(
+        #[case] rows: Vec<(&str, &str, &str, AggressorSide, u64, u64)>,
+        #[case] core_bid: Price,
+        #[case] core_last: Price,
+    ) {
+        let (mut engine, instrument_id) = create_exchange_data_engine();
+        let records: Vec<Data> = rows
+            .iter()
+            .map(|(kind, first, second, aggressor_side, ts_event, ts_init)| {
+                if *kind == "quote" {
+                    exchange_quote(instrument_id, first, second, *ts_init)
+                } else {
+                    exchange_trade(instrument_id, first, *aggressor_side, *ts_event, *ts_init)
+                }
+            })
+            .collect();
+        let (trade_handler, trades_published) = get_typed_message_saving_handler::<TradeTick>(None);
+        let (quote_handler, quotes_published) = get_typed_message_saving_handler::<QuoteTick>(None);
+        msgbus::subscribe_trades(get_trades_topic(instrument_id).into(), trade_handler, None);
+        msgbus::subscribe_quotes(get_quotes_topic(instrument_id).into(), quote_handler, None);
+        let clock_before = engine.kernel.clock.borrow().timestamp_ns();
+
+        engine.add_exchange_data(&records).unwrap();
+
+        let applied = matching_engine_state(&engine, instrument_id);
+        assert_eq!(applied.core_bid, Some(core_bid));
+        assert_eq!(applied.core_last, Some(core_last));
+        assert!(trades_published.get_messages().is_empty());
+        assert!(quotes_published.get_messages().is_empty());
+        let cache = engine.kernel.cache.borrow();
+        assert!(cache.trades(&instrument_id).is_none());
+        assert!(cache.quotes(&instrument_id).is_none());
+        drop(cache);
+        assert_eq!(engine.kernel.clock.borrow().timestamp_ns(), clock_before);
+
+        let (mut streamed, _) = create_exchange_data_engine();
+        streamed.add_data(records, None, true, true).unwrap();
+        streamed.run(None, None, None, false).unwrap();
+        assert_eq!(applied, matching_engine_state(&streamed, instrument_id));
+    }
+
+    // Submits a market buy at its submit alert; its settle alert, after the order's latency,
+    // lets the venue handle the order, both before the run's first record
+    #[derive(Debug)]
+    struct MarketBuyAtAlert {
+        core: StrategyCore,
+        instrument_id: InstrumentId,
+        submit_ns: UnixNanos,
+        settle_ns: UnixNanos,
+    }
+
+    impl MarketBuyAtAlert {
+        fn new(instrument_id: InstrumentId, submit_ns: u64, settle_ns: u64) -> Self {
+            Self {
+                core: StrategyCore::new(StrategyConfig {
+                    strategy_id: Some(StrategyId::from("MARKET-BUY-001")),
+                    order_id_tag: Some("001".to_string()),
+                    ..Default::default()
+                }),
+                instrument_id,
+                submit_ns: UnixNanos::from(submit_ns),
+                settle_ns: UnixNanos::from(settle_ns),
+            }
+        }
+    }
+
+    impl DataActor for MarketBuyAtAlert {
+        fn on_start(&mut self) -> anyhow::Result<()> {
+            let (submit_ns, settle_ns) = (self.submit_ns, self.settle_ns);
+            self.clock()
+                .set_time_alert_ns("submit", submit_ns, None, None)?;
+            self.clock()
+                .set_time_alert_ns("settle", settle_ns, None, None)?;
+            Ok(())
+        }
+
+        fn on_time_event(&mut self, event: &TimeEvent) -> anyhow::Result<()> {
+            if event.name == "submit" {
+                let order = self.order().market(
+                    self.instrument_id,
+                    OrderSide::Buy,
+                    Quantity::from("1.000"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                self.submit_order(order, None, None, None)?;
+            }
+            Ok(())
+        }
+    }
+
+    nautilus_strategy!(MarketBuyAtAlert);
+
+    // The run starts at 1 s and its first record comes at 5 s: the order sent at 2 s reaches
+    // the venue at 2.25 s and is handled at 2.5 s, against the book the call gave the
+    // exchange, or against an empty book
+    #[rstest]
+    #[case::applied(true)]
+    #[case::not_applied(false)]
+    fn test_add_exchange_data_market_order_before_the_first_record(#[case] applied: bool) {
+        let (mut engine, instrument_id) = create_exchange_data_engine();
+        let last_trade = exchange_trade(
+            instrument_id,
+            "1000.00",
+            AggressorSide::Buy,
+            500_000_000,
+            500_000_000,
+        );
+        if applied {
+            engine
+                .add_exchange_data(std::slice::from_ref(&last_trade))
+                .unwrap();
+        }
+
+        // The history's answer, from which the risk engine prices the order
+        let Data::Trade(cached_trade) = last_trade else {
+            unreachable!();
+        };
+        engine
+            .kernel
+            .cache
+            .borrow_mut()
+            .add_trade(cached_trade)
+            .unwrap();
+        engine
+            .add_strategy(MarketBuyAtAlert::new(
+                instrument_id,
+                2_000_000_000,
+                2_500_000_000,
+            ))
+            .unwrap();
+        let first_record = exchange_trade(
+            instrument_id,
+            "1100.00",
+            AggressorSide::Buy,
+            5_000_000_000,
+            5_000_000_000,
+        );
+        engine
+            .add_data(vec![first_record], None, true, true)
+            .unwrap();
+
+        engine
+            .run(
+                Some(UnixNanos::from(1_000_000_000)),
+                Some(UnixNanos::from(10_000_000_000)),
+                None,
+                false,
+            )
+            .unwrap();
+
+        let cache = engine.kernel.cache.borrow();
+        let orders = cache.orders(None, Some(&instrument_id), None, None, None);
+        assert_eq!(orders.len(), 1);
+        let order = &orders[0];
+
+        if applied {
+            assert_eq!(order.status(), OrderStatus::Filled);
+            assert_eq!(order.avg_px(), Some(Price::from("1000.00").as_decimal()));
+        } else {
+            assert_eq!(order.status(), OrderStatus::Rejected);
+            let OrderEventAny::Rejected(rejected) = order.last_event() else {
+                panic!("not rejected: {:?}", order.last_event());
+            };
+            assert_eq!(
+                rejected.reason.as_str(),
+                "No market for ETHUSDT-PERP.BINANCE"
+            );
+        }
+    }
+
+    // Calls `add_exchange_data` with `records` and checks it is refused with `expected`, its
+    // matching engine and the cache's trades and quotes left as they were
+    fn assert_exchange_data_refused(
+        engine: &mut BacktestEngine,
+        instrument_id: InstrumentId,
+        records: &[Data],
+        expected: &str,
+    ) {
+        let before = matching_engine_state(engine, instrument_id);
+        let cached_trades = engine.kernel.cache.borrow().trades(&instrument_id);
+        let cached_quotes = engine.kernel.cache.borrow().quotes(&instrument_id);
+
+        let error = engine.add_exchange_data(records).unwrap_err().to_string();
+
+        assert_eq!(error, format!("Cannot add exchange data: {expected}"));
+        assert_eq!(matching_engine_state(engine, instrument_id), before);
+        assert_eq!(
+            engine.kernel.cache.borrow().trades(&instrument_id),
+            cached_trades
+        );
+        assert_eq!(
+            engine.kernel.cache.borrow().quotes(&instrument_id),
+            cached_quotes
+        );
+    }
+
+    #[rstest]
+    fn test_add_exchange_data_refuses_another_environment() {
+        let (mut engine, instrument_id) = create_exchange_data_engine();
+        let config = BacktestEngineConfig {
+            environment: Environment::Sandbox,
+            ..exchange_data_config()
+        };
+        engine.kernel = NautilusKernel::new_with_dependencies(
+            "BacktestEngine".to_string(),
+            config,
+            NautilusKernelDependencies::default()
+                .with_clock_factory(Some(ClockFactory::test_default())),
+        )
+        .unwrap();
+        let records = [exchange_trade(
+            instrument_id,
+            "1000.00",
+            AggressorSide::Buy,
+            1,
+            1,
+        )];
+
+        assert_exchange_data_refused(
+            &mut engine,
+            instrument_id,
+            &records,
+            "the environment is Sandbox, not a backtest",
+        );
+    }
+
+    #[rstest]
+    #[case::run(false)]
+    #[case::streaming_run(true)]
+    fn test_add_exchange_data_refuses_a_begun_run(#[case] streaming: bool) {
+        let (mut engine, instrument_id) = create_exchange_data_engine();
+        engine
+            .run(
+                Some(UnixNanos::from(0)),
+                Some(UnixNanos::from(1)),
+                None,
+                streaming,
+            )
+            .unwrap();
+        let records = [exchange_trade(
+            instrument_id,
+            "1000.00",
+            AggressorSide::Buy,
+            2,
+            2,
+        )];
+
+        assert_exchange_data_refused(
+            &mut engine,
+            instrument_id,
+            &records,
+            "a run has begun or been resumed; call `reset` first",
+        );
+    }
+
+    #[rstest]
+    fn test_add_exchange_data_refuses_a_run_resumed_from_an_event_store() {
+        let config = BacktestEngineConfig {
+            load_state: true,
+            run_analysis: false,
+            ..exchange_data_config()
+        };
+        let mut engine = BacktestEngine::new(config.clone()).unwrap();
+        let event_store_factory = |_instance_id: UUID4, _clock: Rc<RefCell<dyn Clock>>| {
+            Ok::<_, anyhow::Error>(Box::new(BacktestReplayKernelEventStore {
+                fail_restore: false,
+            }) as Box<dyn KernelEventStore>)
+        };
+        engine.kernel = NautilusKernel::new_with(
+            "BacktestEngine".to_string(),
+            config,
+            None,
+            Some(Box::new(event_store_factory)),
+        )
+        .unwrap();
+        let instrument_id = add_exchange_data_venue(&mut engine);
+        engine
+            .run_impl(
+                Some(UnixNanos::from(0)),
+                Some(UnixNanos::from(1)),
+                None,
+                true,
+            )
+            .unwrap();
+        assert!(engine.kernel.is_event_store_replay());
+        let records = [exchange_trade(
+            instrument_id,
+            "1000.00",
+            AggressorSide::Buy,
+            2,
+            2,
+        )];
+
+        assert_exchange_data_refused(
+            &mut engine,
+            instrument_id,
+            &records,
+            "a run has begun or been resumed; call `reset` first",
+        );
+    }
+
+    #[rstest]
+    fn test_add_exchange_data_refuses_a_second_call() {
+        let (mut engine, instrument_id) = create_exchange_data_engine();
+        engine
+            .add_exchange_data(&[exchange_trade(
+                instrument_id,
+                "1000.00",
+                AggressorSide::Buy,
+                1,
+                1,
+            )])
+            .unwrap();
+        let records = [exchange_trade(
+            instrument_id,
+            "1001.00",
+            AggressorSide::Buy,
+            2,
+            2,
+        )];
+
+        assert_exchange_data_refused(
+            &mut engine,
+            instrument_id,
+            &records,
+            "records were already applied; call `reset` first",
+        );
+    }
+
+    #[rstest]
+    #[case::order(true)]
+    #[case::position(false)]
+    fn test_add_exchange_data_refuses_a_cached_order_or_position(#[case] order: bool) {
+        let (mut engine, instrument_id) = create_exchange_data_engine();
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let market_order = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(engine.trader_id())
+            .strategy_id(StrategyId::from("S-001"))
+            .instrument_id(instrument_id)
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .build();
+        let expected = if order {
+            engine
+                .kernel
+                .cache
+                .borrow_mut()
+                .add_order(market_order, None, None, false)
+                .unwrap();
+            "the cache holds an order at BINANCE"
+        } else {
+            let OrderEventAny::Filled(fill) =
+                OrderFilledTestBuilder::new(&market_order, &instrument).build()
+            else {
+                unreachable!();
+            };
+            engine
+                .kernel
+                .cache
+                .borrow_mut()
+                .add_position_without_order(&Position::new(&instrument, fill), OmsType::Netting)
+                .unwrap();
+            "the cache holds a position at BINANCE"
+        };
+        let records = [exchange_trade(
+            instrument_id,
+            "1000.00",
+            AggressorSide::Buy,
+            1,
+            1,
+        )];
+
+        assert_exchange_data_refused(&mut engine, instrument_id, &records, expected);
+    }
+
+    #[rstest]
+    fn test_add_exchange_data_refuses_an_exchange_holding_market_state() {
+        let (mut engine, instrument_id) = create_exchange_data_engine();
+        let Data::Quote(quote) = exchange_quote(instrument_id, "999.00", "1001.00", 1) else {
+            unreachable!();
+        };
+        msgbus::send_quote(
+            format!(
+                "SimulatedExchange.process_new_quote.{}",
+                instrument_id.venue
+            )
+            .into(),
+            &quote,
+        );
+        assert_eq!(
+            matching_engine_state(&engine, instrument_id).bid,
+            Some(Price::from("999.00"))
+        );
+        let records = [exchange_trade(
+            instrument_id,
+            "1000.00",
+            AggressorSide::Buy,
+            2,
+            2,
+        )];
+
+        assert_exchange_data_refused(
+            &mut engine,
+            instrument_id,
+            &records,
+            "the matching engine of ETHUSDT-PERP.BINANCE holds market state",
+        );
+    }
+
+    // Each batch's first record is valid, so a refusal shows the whole batch is checked first
+    #[rstest]
+    #[case::index_price(
+        Data::IndexPrice(IndexPriceUpdate::new(
+            InstrumentId::from("ETHUSDT-PERP.BINANCE"),
+            Price::from("1000.00"),
+            UnixNanos::from(2),
+            UnixNanos::from(2),
+        )),
+        "record 1 is neither a trade nor a quote"
+    )]
+    #[case::unknown_instrument(
+        exchange_trade(
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+            "1000.00",
+            AggressorSide::Buy,
+            2,
+            2
+        ),
+        "record 1 is of BTCUSDT-PERP.BINANCE, which the engine does not have"
+    )]
+    #[case::unknown_venue(
+        exchange_trade(
+            InstrumentId::from("ETHUSDT-PERP.XCME"),
+            "1000.00",
+            AggressorSide::Buy,
+            2,
+            2
+        ),
+        "record 1 is of ETHUSDT-PERP.XCME, which the engine does not have"
+    )]
+    #[case::trade_price_precision(
+        exchange_trade(
+            InstrumentId::from("ETHUSDT-PERP.BINANCE"),
+            "1000.000",
+            AggressorSide::Buy,
+            2,
+            2
+        ),
+        "record 1 has a price or size precision other than ETHUSDT-PERP.BINANCE's (price 2, size 3)"
+    )]
+    #[case::quote_size_precision(
+        Data::Quote(QuoteTick::new(
+            InstrumentId::from("ETHUSDT-PERP.BINANCE"),
+            Price::from("999.00"),
+            Price::from("1001.00"),
+            Quantity::from("3.0"),
+            Quantity::from("4.0"),
+            UnixNanos::from(2),
+            UnixNanos::from(2),
+        )),
+        "record 1 has a price or size precision other than ETHUSDT-PERP.BINANCE's (price 2, size 3)"
+    )]
+    #[case::ts_init_order(
+        exchange_trade(
+            InstrumentId::from("ETHUSDT-PERP.BINANCE"),
+            "1000.00",
+            AggressorSide::Buy,
+            0,
+            0
+        ),
+        "record 1 has ts_init 0, before the previous record's 1"
+    )]
+    fn test_add_exchange_data_refuses_a_record(#[case] second: Data, #[case] expected: &str) {
+        let (mut engine, instrument_id) = create_exchange_data_engine();
+        let records = [
+            exchange_trade(instrument_id, "1000.00", AggressorSide::Buy, 1, 1),
+            second,
+        ];
+
+        assert_exchange_data_refused(&mut engine, instrument_id, &records, expected);
+    }
+
+    #[rstest]
+    fn test_add_exchange_data_after_a_reset() {
+        let (mut engine, instrument_id) = create_exchange_data_engine();
+        let first = [exchange_trade(
+            instrument_id,
+            "1000.00",
+            AggressorSide::Buy,
+            1,
+            1,
+        )];
+        let second = [exchange_trade(
+            instrument_id,
+            "1001.00",
+            AggressorSide::Sell,
+            2,
+            2,
+        )];
+        engine.add_exchange_data(&first).unwrap();
+        engine.run(None, None, None, false).unwrap();
+
+        engine.reset().unwrap();
+
+        // The reset reset the matching engine (book, prices, last quote)
+        let reset = matching_engine_state(&engine, instrument_id);
+        assert_eq!(reset.bid, None);
+        assert_eq!(reset.update_count, 0);
+        assert_eq!(reset.core_last, None);
+        engine.add_exchange_data(&second).unwrap();
+        let applied = matching_engine_state(&engine, instrument_id);
+        let (mut fresh, _) = create_exchange_data_engine();
+        fresh.add_exchange_data(&second).unwrap();
+        assert_eq!(applied, matching_engine_state(&fresh, instrument_id));
+        assert_eq!(applied.core_last, Some(Price::from("1001.00")));
     }
 }
