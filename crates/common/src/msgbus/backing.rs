@@ -220,14 +220,16 @@ pub fn external_io_from_backing(
     Box<dyn MessageBusExternalIngress>,
 ) {
     let backing = Rc::new(RefCell::new(backing));
+    let closed = Rc::new(Cell::new(false));
     (
         Box::new(BackingExternalEgress {
             backing: backing.clone(),
-            closed: Rc::new(Cell::new(false)),
+            closed: closed.clone(),
         }),
         Box::new(BackingExternalIngress {
             backing,
             read_stopped: Cell::new(false),
+            egress_closed: closed,
         }),
     )
 }
@@ -268,12 +270,15 @@ impl MessageBusExternalEgress for BackingExternalEgress {
 struct BackingExternalIngress {
     backing: SharedMessageBusBacking,
     read_stopped: Cell<bool>,
+    egress_closed: SharedMessageBusCloseState,
 }
 
 #[cfg(feature = "live")]
 impl MessageBusExternalIngress for BackingExternalIngress {
+    // Closed when its read was stopped or the egress closed the backing. A backing that reports
+    // itself closed for another reason (its publishing ended) still has a read to stop
     fn is_closed(&self) -> bool {
-        self.read_stopped.get() || self.backing.borrow().is_closed()
+        self.read_stopped.get() || self.egress_closed.get()
     }
 
     fn take_receiver(&mut self) -> anyhow::Result<MessageBusExternalReceiver> {
@@ -425,6 +430,43 @@ mod tests {
 
         assert!(egress.is_closed());
         assert!(ingress.is_closed());
+    }
+
+    struct ReadStopCountingBacking {
+        read_stops: Rc<Cell<u32>>,
+    }
+
+    impl MessageBusBacking for ReadStopCountingBacking {
+        // Reports closed although nothing closed it, as a backing whose publishing ended does
+        fn is_closed(&self) -> bool {
+            true
+        }
+
+        fn publish(&self, _message: BusMessage) {}
+
+        fn stop_read(&mut self) {
+            self.read_stops.set(self.read_stops.get() + 1);
+        }
+
+        fn close(&mut self) {}
+    }
+
+    #[rstest]
+    fn test_external_ingress_stops_its_read_when_the_backing_reports_closed_unasked() {
+        let read_stops = Rc::new(Cell::new(0));
+        let backing = ReadStopCountingBacking {
+            read_stops: read_stops.clone(),
+        };
+        let (egress, mut ingress) = external_io_from_backing(Box::new(backing));
+
+        assert!(egress.is_closed());
+        assert!(!ingress.is_closed());
+
+        ingress.close();
+        ingress.close();
+
+        assert!(ingress.is_closed());
+        assert_eq!(read_stops.get(), 1);
     }
 
     #[rstest]
