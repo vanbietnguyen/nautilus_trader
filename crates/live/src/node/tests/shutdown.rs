@@ -855,7 +855,33 @@ fn sending_stop_recording_node(
     send_on_disconnect: bool,
 ) -> (LiveNode, StopSteps) {
     let steps = StopSteps::default();
+    let factory = StopRecordingBackingFactory {
+        steps: steps.clone(),
+        close_gate: Mutex::default(),
+        receiver: Mutex::default(),
+    };
+    let node = recording_node(
+        inbound,
+        fail_disconnect,
+        send_on_disconnect,
+        factory,
+        LoggerConfig::default(),
+    );
+    (node, steps)
+}
+
+/// The node of [`sending_stop_recording_node`], its way out made by `factory`, logging as
+/// `logging` says.
+fn recording_node(
+    inbound: bool,
+    fail_disconnect: bool,
+    send_on_disconnect: bool,
+    factory: StopRecordingBackingFactory,
+    logging: LoggerConfig,
+) -> LiveNode {
+    let steps = factory.steps.clone();
     let config = LiveNodeConfig {
+        logging,
         msgbus: inbound.then(|| MessageBusConfig {
             external_streams: Some(vec!["operator".to_string()]),
             ..Default::default()
@@ -870,13 +896,11 @@ fn sending_stop_recording_node(
     };
     let node = LiveNodeBuilder::from_config(config)
         .unwrap()
-        .with_external_msgbus_factory(Box::new(StopRecordingBackingFactory {
-            steps: steps.clone(),
-        }))
+        .with_external_msgbus_factory(Box::new(factory))
         .build()
         .unwrap();
     let client = StopRecordingClient {
-        steps: steps.clone(),
+        steps,
         connected: true,
         fail_disconnect,
         send_on_disconnect,
@@ -885,7 +909,7 @@ fn sending_stop_recording_node(
         DataClientAdapter::new(client.client_id(), None, false, false, Box::new(client)),
         None,
     );
-    (node, steps)
+    node
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -906,7 +930,9 @@ async fn test_stop_with_inbound_key_writes_record_published_during_disconnect() 
 async fn test_stop_without_inbound_key_closes_way_out() {
     let (mut node, steps) = stop_recording_node(false, false);
 
-    LiveNode::close_external_egress(node.finalize_stop().await).unwrap();
+    LiveNode::close_external_egress(node.finalize_stop().await)
+        .await
+        .unwrap();
     let seen = steps.lock().clone();
     node.dispose();
 
@@ -929,7 +955,9 @@ fn stop_steps() -> Vec<String> {
 async fn test_stop_stops_read_then_disconnects_then_closes_way_out() {
     let (mut node, steps) = stop_recording_node(true, false);
 
-    LiveNode::close_external_egress(node.finalize_stop().await).unwrap();
+    LiveNode::close_external_egress(node.finalize_stop().await)
+        .await
+        .unwrap();
     let seen = steps.lock().clone();
     node.dispose();
 
@@ -940,7 +968,9 @@ async fn test_stop_stops_read_then_disconnects_then_closes_way_out() {
 async fn test_stop_closes_way_out_when_disconnect_fails() {
     let (mut node, steps) = stop_recording_node(true, true);
 
-    let error = LiveNode::close_external_egress(node.finalize_stop().await).unwrap_err();
+    let error = LiveNode::close_external_egress(node.finalize_stop().await)
+        .await
+        .unwrap_err();
     let seen = steps.lock().clone();
     node.dispose();
 
@@ -957,7 +987,9 @@ async fn test_stop_closes_way_out_when_disconnect_fails() {
 async fn test_dispose_after_stop_closes_way_out_once() {
     let (mut node, steps) = stop_recording_node(true, false);
 
-    LiveNode::close_external_egress(node.finalize_stop().await).unwrap();
+    LiveNode::close_external_egress(node.finalize_stop().await)
+        .await
+        .unwrap();
     node.dispose();
     let seen = steps.lock().clone();
 
@@ -1159,6 +1191,203 @@ async fn test_start_that_succeeds_keeps_way_out_open() {
     assert_eq!(seen, vec!["client connected".to_string()]);
 }
 
+/// The entry point that leaves the node not running.
+#[derive(Clone, Copy, Debug)]
+enum NodeExit {
+    Stop,
+    Run,
+    FailedStart,
+}
+
+#[rstest]
+#[tokio::test(flavor = "current_thread")]
+async fn test_entry_point_returns_after_its_awaited_close_without_blocking_its_thread(
+    #[values(NodeExit::Stop, NodeExit::Run, NodeExit::FailedStart)] exit: NodeExit,
+) {
+    let (begun_tx, begun_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let steps = StopSteps::default();
+    let factory = StopRecordingBackingFactory {
+        steps: steps.clone(),
+        close_gate: Mutex::new(Some(CloseGate {
+            begun: begun_tx,
+            release: release_rx,
+        })),
+        receiver: Mutex::default(),
+    };
+    let mut node = recording_node(false, false, true, factory, LoggerConfig::default());
+    // Another task on the node's one thread: it runs only while the node's thread is free
+    let released = Arc::new(AtomicBool::new(false));
+    tokio::spawn({
+        let released = released.clone();
+        async move {
+            if begun_rx.await.is_ok() {
+                released.store(true, Ordering::SeqCst);
+                release_tx.send(()).unwrap();
+            }
+        }
+    });
+
+    let result = match exit {
+        NodeExit::Stop => {
+            node.start().await.unwrap();
+            node.stop().await
+        }
+        NodeExit::Run => {
+            let handle = node.handle();
+            let stop = tokio::spawn(async move {
+                while !handle.is_running() {
+                    tokio::task::yield_now().await;
+                }
+                handle.stop();
+            });
+            let result = node.run().await;
+            stop.await.unwrap();
+            result
+        }
+        NodeExit::FailedStart => {
+            node.cache_database_factory = Some(Box::new(FailingCacheDatabaseFactory));
+            node.start().await
+        }
+    };
+    let released_before_return = released.load(Ordering::SeqCst);
+    let seen = steps.lock().clone();
+    node.dispose();
+    let seen_after_dispose = steps.lock().clone();
+
+    match exit {
+        NodeExit::Stop | NodeExit::Run => {
+            result.unwrap();
+            assert_eq!(seen, sent_stop_steps());
+        }
+        NodeExit::FailedStart => {
+            assert_eq!(
+                format!("{:#}", result.unwrap_err()),
+                "failed to create cache database backing: cache database unavailable"
+            );
+            assert_eq!(seen, vec!["closed".to_string()]);
+        }
+    }
+    assert!(released_before_return);
+    assert_eq!(seen_after_dispose, seen);
+}
+
+/// The topic published on after the inbound read ended.
+const AFTER_READ_END_TOPIC: &str = "data.quotes.AFTER-READ-END";
+
+/// A node with an inbound key listed whose read delivers what the returned sender sends and ends
+/// when it is dropped, logging to a file in the returned folder.
+fn reading_node() -> (
+    LiveNode,
+    StopSteps,
+    tokio::sync::mpsc::Sender<BusMessage>,
+    std::path::PathBuf,
+) {
+    let directory = std::env::temp_dir().join(format!("nautilus-inbound-read-{}", UUID4::new()));
+    let logging = LoggerConfig {
+        fileout_level: LevelFilter::Info,
+        file_config: Some(FileWriterConfig {
+            directory: Some(directory.to_str().unwrap().to_string()),
+            file_name: Some("inbound-read".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let steps = StopSteps::default();
+    let factory = StopRecordingBackingFactory {
+        steps: steps.clone(),
+        close_gate: Mutex::default(),
+        receiver: Mutex::new(Some(receiver)),
+    };
+    let node = recording_node(true, false, false, factory, logging);
+    (node, steps, sender, directory)
+}
+
+/// The node's error lines in the log of [`reading_node`] in `directory`, which it then removes.
+fn node_errors(directory: &std::path::Path) -> Vec<String> {
+    logging_sync_to_disk().unwrap();
+    let output = std::fs::read_to_string(directory.join("inbound-read.log")).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+    output
+        .lines()
+        .filter(|line| line.contains("[ERROR]"))
+        .filter_map(|line| {
+            line.split_once(".nautilus_live::node: ")
+                .map(|(_, text)| text.to_string())
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_run_logs_one_error_when_its_inbound_read_ends_unasked() {
+    let (mut node, steps, sender, directory) = reading_node();
+    let handle = node.handle();
+    let control = tokio::spawn({
+        let steps = steps.clone();
+        async move {
+            while !handle.is_running() {
+                tokio::task::yield_now().await;
+            }
+            drop(sender);
+            while !steps.lock().contains(&"read stopped".to_string()) {
+                tokio::task::yield_now().await;
+            }
+            msgbus::publish_quote(AFTER_READ_END_TOPIC.into(), &QuoteTick::default());
+            let running = handle.is_running();
+            let seen = steps.lock().clone();
+            handle.stop();
+            (running, seen)
+        }
+    });
+
+    let result = node.run().await;
+    let (running_after_end, seen_after_end) = control.await.unwrap();
+    node.dispose();
+    let errors = node_errors(&directory);
+
+    result.unwrap();
+    assert!(running_after_end);
+    assert_eq!(
+        seen_after_end,
+        vec![
+            "client connected".to_string(),
+            "read stopped".to_string(),
+            format!("published {AFTER_READ_END_TOPIC}"),
+        ]
+    );
+    assert_eq!(
+        errors,
+        vec![
+            "External message bus ingress read ended unexpectedly: inbound messages are no longer received"
+                .to_string()
+        ]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_run_logs_no_error_when_it_stops_its_inbound_read() {
+    let (mut node, steps, sender, directory) = reading_node();
+    let handle = node.handle();
+    let stop = tokio::spawn(async move {
+        while !handle.is_running() {
+            tokio::task::yield_now().await;
+        }
+        handle.stop();
+    });
+
+    let result = node.run().await;
+    stop.await.unwrap();
+    drop(sender);
+    let seen = steps.lock().clone();
+    node.dispose();
+    let errors = node_errors(&directory);
+
+    result.unwrap();
+    assert!(seen.contains(&"read stopped".to_string()), "{seen:?}");
+    assert_eq!(errors, Vec::<String>::new());
+}
+
 /// A cache database factory whose database does not answer.
 #[derive(Debug)]
 struct FailingCacheDatabaseFactory;
@@ -1177,6 +1406,15 @@ impl CacheDatabaseFactory for FailingCacheDatabaseFactory {
 
 struct StopRecordingBackingFactory {
     steps: StopSteps,
+    close_gate: Mutex<Option<CloseGate>>,
+    receiver: Mutex<Option<tokio::sync::mpsc::Receiver<BusMessage>>>,
+}
+
+/// Holds a backing's awaited close until the test releases it: `begun` is sent when the close
+/// begins, and the close records "closed" only after `release` is sent.
+struct CloseGate {
+    begun: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl Debug for StopRecordingBackingFactory {
@@ -1196,6 +1434,8 @@ impl MessageBusBackingFactory for StopRecordingBackingFactory {
         Ok(Box::new(StopRecordingBacking {
             steps: self.steps.clone(),
             closed: false,
+            close_gate: self.close_gate.lock().take(),
+            receiver: self.receiver.lock().take(),
         }))
     }
 }
@@ -1203,6 +1443,8 @@ impl MessageBusBackingFactory for StopRecordingBackingFactory {
 struct StopRecordingBacking {
     steps: StopSteps,
     closed: bool,
+    close_gate: Option<CloseGate>,
+    receiver: Option<tokio::sync::mpsc::Receiver<BusMessage>>,
 }
 
 impl MessageBusBacking for StopRecordingBacking {
@@ -1220,9 +1462,30 @@ impl MessageBusBacking for StopRecordingBacking {
         self.steps.lock().push("read stopped".to_string());
     }
 
+    fn take_receiver(&mut self) -> anyhow::Result<tokio::sync::mpsc::Receiver<BusMessage>> {
+        self.receiver
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("external ingress receiver unavailable"))
+    }
+
     fn close(&mut self) {
         self.closed = true;
         self.steps.lock().push("closed".to_string());
+    }
+
+    fn begin_close(&mut self) -> futures_util::future::LocalBoxFuture<'static, ()> {
+        let Some(CloseGate { begun, release }) = self.close_gate.take() else {
+            self.close();
+            return Box::pin(std::future::ready(()));
+        };
+        self.closed = true;
+        let steps = self.steps.clone();
+        begun.send(()).unwrap();
+
+        Box::pin(async move {
+            release.await.unwrap();
+            steps.lock().push("closed".to_string());
+        })
     }
 }
 

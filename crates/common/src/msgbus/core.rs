@@ -94,6 +94,7 @@ use std::{
 };
 
 use ahash::{AHashMap, AHashSet};
+use futures::future::LocalBoxFuture;
 use indexmap::IndexMap;
 use nautilus_core::UUID4;
 use nautilus_model::{
@@ -764,6 +765,22 @@ impl MessageBus {
         self.has_backing = false;
         HAS_EXTERNAL_EGRESS.with(|flag| flag.set(false));
         Ok(())
+    }
+
+    /// Begins closing the message bus as [`Self::close`] does and returns a future that completes
+    /// when its external egress has closed.
+    ///
+    /// The egress is taken and the external flags cleared before this returns, so nothing is
+    /// published outward while the close is awaited. The future borrows nothing of the bus.
+    pub fn begin_close(&mut self) -> LocalBoxFuture<'static, ()> {
+        let close = self
+            .external_egress
+            .take()
+            .map(|external_egress| external_egress.borrow_mut().begin_close());
+        self.has_external_streams = false;
+        self.has_backing = false;
+        HAS_EXTERNAL_EGRESS.with(|flag| flag.set(false));
+        close.unwrap_or_else(|| Box::pin(std::future::ready(())))
     }
 
     /// Returns the handler for the `endpoint`.

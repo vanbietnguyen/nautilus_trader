@@ -48,7 +48,8 @@
 //! publish task writing what is pending meanwhile, aborts any task still running, and logs once
 //! how many entries the backing wrote, discarded and left uncertain. The synchronous `close()` uses
 //! `block_in_place` to bridge into the async shutdown path and must be called from outside any
-//! `current_thread` Tokio runtime.
+//! `current_thread` Tokio runtime; [`MessageBusBacking::begin_close`] returns the same close's
+//! future, which a caller on any runtime awaits instead.
 //!
 //! # Stream entries
 //!
@@ -87,7 +88,10 @@ use std::{
 
 use ahash::AHashMap;
 use bytes::Bytes;
-use futures::{future::BoxFuture, stream::Stream};
+use futures::{
+    future::{BoxFuture, LocalBoxFuture},
+    stream::Stream,
+};
 use jiff::{Timestamp, tz::Offset};
 use nautilus_common::{
     enums::SerializationEncoding,
@@ -477,14 +481,16 @@ impl MessageBusBacking for RedisMessageBusBacking {
     fn close(&mut self) {
         log::debug!("Closing");
 
-        // Keep close sync for now to avoid async trait method
-        tokio::task::block_in_place(|| {
-            get_runtime().block_on(async {
-                self.close_async().await;
-            });
-        });
+        let close = self.close_async();
+        tokio::task::block_in_place(|| get_runtime().block_on(close));
 
         log::debug!("Closed");
+    }
+
+    /// Begins the close of [`Self::close_async`] and returns its future, which owns what it waits
+    /// for, so a node awaits it on its own runtime without blocking.
+    fn begin_close(&mut self) -> LocalBoxFuture<'static, ()> {
+        Box::pin(self.close_async())
     }
 }
 
@@ -519,47 +525,59 @@ impl RedisMessageBusBacking {
     /// the backing runs when this returns. Then logs once how many entries the backing wrote,
     /// discarded and left uncertain in its life, at warning level when any was discarded or is
     /// uncertain. A second call does nothing.
-    pub async fn close_async(&mut self) {
+    ///
+    /// The close begins at this call: the signals and the close message are sent and the
+    /// deadline taken before it returns. The returned future owns the tasks' handles and what the
+    /// count line reads, and borrows nothing of the backing.
+    pub fn close_async(&mut self) -> impl Future<Output = ()> + Send + 'static {
         let deadline = tokio::time::Instant::now() + CLOSE_DEADLINE;
-        let Some(pub_handle) = self.pub_handle.take() else {
-            return;
-        };
+        let pub_handle = self.pub_handle.take();
 
-        self.stream_signal.store(true, Ordering::Relaxed);
-        self.heartbeat_signal.store(true, Ordering::Relaxed);
+        if pub_handle.is_some() {
+            self.stream_signal.store(true, Ordering::Relaxed);
+            self.heartbeat_signal.store(true, Ordering::Relaxed);
 
-        if !self.pub_tx.is_closed()
-            && let Err(e) = self.pub_tx.send(BusMessage::new_close())
-        {
-            log::warn!("Failed to send close message: {e:?}");
+            if !self.pub_tx.is_closed()
+                && let Err(e) = self.pub_tx.send(BusMessage::new_close())
+            {
+                log::warn!("Failed to send close message: {e:?}");
+            }
         }
 
         let (stream_handle, read_tasks) = (self.stream_handle.take(), self.read_tasks.take());
-        let stream = async move {
-            await_handle(stream_handle, MSGBUS_STREAM, deadline).await;
+        let heartbeat_handle = self.heartbeat_handle.take();
+        let pub_tx = self.pub_tx.clone();
 
-            // Its read tasks end with it, aborted or not
-            if let Some(mut read_tasks) = read_tasks {
-                read_tasks.recv().await;
+        async move {
+            let Some(pub_handle) = pub_handle else {
+                return;
+            };
+            let stream = async move {
+                await_handle(stream_handle, MSGBUS_STREAM, deadline).await;
+
+                // Its read tasks end with it, aborted or not
+                if let Some(mut read_tasks) = read_tasks {
+                    read_tasks.recv().await;
+                }
+            };
+            let (publish_aborted, (), _) = tokio::join!(
+                await_handle(Some(pub_handle), MSGBUS_PUBLISH, deadline),
+                stream,
+                await_handle(heartbeat_handle, MSGBUS_HEARTBEAT, deadline),
+            );
+
+            let counts = pub_tx.closed_counts();
+            let line = if publish_aborted {
+                format!("Closed the stream at the close's deadline of {CLOSE_DEADLINE:?}: {counts}")
+            } else {
+                format!("Closed the stream: {counts}")
+            };
+
+            if counts.discarded == 0 && counts.uncertain == 0 {
+                log::info!("{line}");
+            } else {
+                log::warn!("{line}");
             }
-        };
-        let (publish_aborted, (), _) = tokio::join!(
-            await_handle(Some(pub_handle), MSGBUS_PUBLISH, deadline),
-            stream,
-            await_handle(self.heartbeat_handle.take(), MSGBUS_HEARTBEAT, deadline),
-        );
-
-        let counts = self.pub_tx.closed_counts();
-        let line = if publish_aborted {
-            format!("Closed the stream at the close's deadline of {CLOSE_DEADLINE:?}: {counts}")
-        } else {
-            format!("Closed the stream: {counts}")
-        };
-
-        if counts.discarded == 0 && counts.uncertain == 0 {
-            log::info!("{line}");
-        } else {
-            log::warn!("{line}");
         }
     }
 }
@@ -5397,7 +5415,7 @@ mod tests {
         let tasks = backing_tasks(&backing);
 
         let took = close_on_clock(&mut backing).await;
-        backing.close_async().await;
+        backing.begin_close().await;
 
         let logs = thread_logs();
         assert_eq!(pending, 4);
@@ -5413,6 +5431,27 @@ mod tests {
             )]
         );
         assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    // The close of `begin_close` on this runtime is the test above and the deadline tests below
+    #[rstest]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_backing_blocking_close_panics_on_a_current_thread_runtime() {
+        let writer = FakeRedis::start("unused").await;
+        writer.accept_writes.store(true, Ordering::SeqCst);
+        let config = MessageBusConfig {
+            stream_per_topic: false,
+            ..Default::default()
+        };
+        let (mut backing, _) = backing_on_this_runtime(writer.config(), writer.config(), config);
+
+        let panic =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| backing.close())).unwrap_err();
+
+        assert_eq!(
+            panic.downcast_ref::<String>().map(String::as_str),
+            Some("can call blocking only when running on the multi-threaded runtime")
+        );
     }
 
     #[rstest]
@@ -5720,16 +5759,17 @@ mod tests {
         .collect()
     }
 
-    /// Closes `backing`, moving the clock on as [`drive`] does until the close's deadline and then
-    /// holding it still until the close returns, so a close that ends at its deadline ends exactly
-    /// there. Returns how long the close took on the clock, or `None` when it had not returned 5 s
-    /// of real time after the deadline.
+    /// Closes `backing` through the future of [`MessageBusBacking::begin_close`], moving the clock
+    /// on as [`drive`] does until the close's deadline and then holding it still until the close
+    /// returns, so a close that ends at its deadline ends exactly there. Returns how long the close
+    /// took on the clock, or `None` when it had not returned 5 s of real time after the deadline.
     async fn close_on_clock(backing: &mut RedisMessageBusBacking) -> Option<Duration> {
         let started = tokio::time::Instant::now();
         let deadline = started + CLOSE_DEADLINE;
         let took = Cell::new(None);
+        let closing = backing.begin_close();
         let close = async {
-            backing.close_async().await;
+            closing.await;
             took.set(Some(started.elapsed()));
         };
         let clock = async {

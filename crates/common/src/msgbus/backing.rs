@@ -35,6 +35,7 @@ use std::{
     rc::Rc,
 };
 
+use futures::future::LocalBoxFuture;
 use nautilus_core::UUID4;
 use nautilus_model::identifiers::TraderId;
 use ustr::Ustr;
@@ -113,6 +114,17 @@ pub trait MessageBusBacking {
 
     /// Closes the backing and releases any owned resources.
     fn close(&mut self);
+
+    /// Begins closing the backing and returns a future that completes when the close has ended.
+    ///
+    /// The future owns everything it waits for and borrows nothing of the backing, so the caller
+    /// can await it without blocking its thread or holding the backing.
+    ///
+    /// The default calls [`Self::close`] and returns a future that is already complete.
+    fn begin_close(&mut self) -> LocalBoxFuture<'static, ()> {
+        self.close();
+        Box::pin(std::future::ready(()))
+    }
 }
 
 /// External egress surface for serialized message bus publications.
@@ -148,6 +160,16 @@ pub trait MessageBusExternalEgress {
 
     /// Closes egress and stops accepting outbound messages.
     fn close(&mut self);
+
+    /// Begins closing egress and returns a future that completes when the close has ended.
+    ///
+    /// The future owns everything it waits for and borrows nothing of the egress.
+    ///
+    /// The default calls [`Self::close`] and returns a future that is already complete.
+    fn begin_close(&mut self) -> LocalBoxFuture<'static, ()> {
+        self.close();
+        Box::pin(std::future::ready(()))
+    }
 }
 
 /// External ingress surface for serialized message bus publications.
@@ -232,6 +254,13 @@ impl MessageBusExternalEgress for BackingExternalEgress {
         if !self.closed.replace(true) {
             self.backing.borrow_mut().close();
         }
+    }
+
+    fn begin_close(&mut self) -> LocalBoxFuture<'static, ()> {
+        if self.closed.replace(true) {
+            return Box::pin(std::future::ready(()));
+        }
+        self.backing.borrow_mut().begin_close()
     }
 }
 

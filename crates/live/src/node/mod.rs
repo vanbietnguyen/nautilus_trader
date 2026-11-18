@@ -451,7 +451,7 @@ impl LiveNode {
             return start_result;
         }
 
-        Self::close_external_egress(start_result)
+        Self::close_external_egress(start_result).await
     }
 
     async fn start_node(&mut self) -> anyhow::Result<()> {
@@ -597,7 +597,7 @@ impl LiveNode {
             return stop_result;
         }
 
-        Self::close_external_egress(stop_result)
+        Self::close_external_egress(stop_result).await
     }
 
     async fn stop_node(&mut self) -> anyhow::Result<()> {
@@ -1136,7 +1136,7 @@ impl LiveNode {
             return run_result;
         }
 
-        Self::close_external_egress(run_result)
+        Self::close_external_egress(run_result).await
     }
 
     async fn run_node(&mut self, mode: NodeRunMode) -> anyhow::Result<()> {
@@ -1958,9 +1958,8 @@ impl LiveNode {
                             self.process_external_msgbus_message(&message);
                         }
                         None => {
-                            log::info!("External message bus ingress closed");
                             external_msgbus_rx = None;
-                            self.close_external_ingress();
+                            self.end_external_ingress();
                         }
                     }
 
@@ -2191,8 +2190,26 @@ impl LiveNode {
         receiver: Option<&tokio::sync::mpsc::Receiver<BusMessage>>,
     ) {
         if receiver.is_none() {
-            self.close_external_ingress();
+            self.end_external_ingress();
         }
+    }
+
+    /// Closes the external ingress after its receiver ended, with one line: at error level when
+    /// the node had not stopped its read, which then ended unexpectedly, and at info level when it
+    /// had.
+    fn end_external_ingress(&mut self) {
+        let Some(external_ingress) = self.external_msgbus.as_ref() else {
+            return;
+        };
+
+        if external_ingress.is_closed() {
+            log::info!("External message bus ingress closed");
+        } else {
+            log::error!(
+                "External message bus ingress read ended unexpectedly: inbound messages are no longer received"
+            );
+        }
+        self.close_external_ingress();
     }
 
     fn close_external_ingress(&mut self) {
@@ -2649,21 +2666,16 @@ impl LiveNode {
         }
     }
 
-    /// Closes the message bus way out and adds its error to `stop_result`.
+    /// Closes the message bus way out, awaiting its close, and returns `stop_result`.
     ///
     /// `start`, `stop` and `run_with_mode` each call this once at their exit when they leave the
     /// node not running, after their last dispatch, so what the clients sent while they
-    /// disconnected reaches the way out before it closes.
-    fn close_external_egress(stop_result: anyhow::Result<()>) -> anyhow::Result<()> {
-        let Err(e) = msgbus::get_message_bus().borrow_mut().close() else {
-            return stop_result;
-        };
-        let close_err = format!("failed while closing the message bus: {e}");
-
-        match stop_result {
-            Ok(()) => anyhow::bail!("{close_err}"),
-            Err(stop_err) => anyhow::bail!("{stop_err}; {close_err}"),
-        }
+    /// disconnected reaches the way out before it closes. The bus is borrowed only to begin the
+    /// close, so the node's thread runs other tasks while the close is awaited.
+    async fn close_external_egress(stop_result: anyhow::Result<()>) -> anyhow::Result<()> {
+        let close = msgbus::get_message_bus().borrow_mut().begin_close();
+        close.await;
+        stop_result
     }
 
     fn drain_channels(
@@ -3254,7 +3266,7 @@ where
             result = &mut future => return result,
             message = async { match receiver.as_mut() { Some(receiver) => receiver.recv().await, None => std::future::pending().await } }, if pending.len() < capacity => {
                 let Some(message) = message else {
-                    log::info!("External message bus ingress closed");
+                    // The node logs the end once this phase returns
                     *receiver = None;
                     continue;
                 };
