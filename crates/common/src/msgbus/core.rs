@@ -768,11 +768,11 @@ impl MessageBus {
     }
 
     /// Begins closing the message bus as [`Self::close`] does and returns a future that completes
-    /// when its external egress has closed.
+    /// when its external egress has closed, or `None` when the bus had no external egress to take.
     ///
     /// The egress is taken and the external flags cleared before this returns, so nothing is
     /// published outward while the close is awaited. The future borrows nothing of the bus.
-    pub fn begin_close(&mut self) -> LocalBoxFuture<'static, ()> {
+    pub fn begin_close(&mut self) -> Option<LocalBoxFuture<'static, ()>> {
         let close = self
             .external_egress
             .take()
@@ -780,7 +780,7 @@ impl MessageBus {
         self.has_external_streams = false;
         self.has_backing = false;
         HAS_EXTERNAL_EGRESS.with(|flag| flag.set(false));
-        close.unwrap_or_else(|| Box::pin(std::future::ready(())))
+        close
     }
 
     /// Returns the handler for the `endpoint`.

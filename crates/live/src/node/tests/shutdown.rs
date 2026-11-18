@@ -929,20 +929,30 @@ async fn test_stop_with_inbound_key_writes_record_published_during_disconnect() 
 #[tokio::test(flavor = "current_thread")]
 async fn test_stop_without_inbound_key_closes_way_out() {
     let (mut node, steps) = stop_recording_node(false, false);
+    node.start().await.unwrap();
 
-    LiveNode::close_external_egress(node.finalize_stop().await)
-        .await
-        .unwrap();
+    node.stop().await.unwrap();
     let seen = steps.lock().clone();
     node.dispose();
 
-    assert!(seen.contains(&"closed".to_string()), "{seen:?}");
+    assert_eq!(
+        seen,
+        vec![
+            "client connected".to_string(),
+            "client disconnected".to_string(),
+            format!("published {DISCONNECT_TOPIC}"),
+            format!("published {FINALIZE_TOPIC}"),
+            "closed".to_string(),
+        ]
+    );
 }
 
-/// The steps of a stop with an inbound key listed: the read stopped, the client disconnected,
-/// its record and the kernel's written, then the way out closed.
+/// The steps of a started node's stop with an inbound key listed: the client connected, then
+/// the read stopped, the client disconnected, its record and the kernel's written, then the way
+/// out closed.
 fn stop_steps() -> Vec<String> {
     vec![
+        "client connected".to_string(),
         "read stopped".to_string(),
         "client disconnected".to_string(),
         format!("published {DISCONNECT_TOPIC}"),
@@ -954,10 +964,9 @@ fn stop_steps() -> Vec<String> {
 #[tokio::test(flavor = "current_thread")]
 async fn test_stop_stops_read_then_disconnects_then_closes_way_out() {
     let (mut node, steps) = stop_recording_node(true, false);
+    node.start().await.unwrap();
 
-    LiveNode::close_external_egress(node.finalize_stop().await)
-        .await
-        .unwrap();
+    node.stop().await.unwrap();
     let seen = steps.lock().clone();
     node.dispose();
 
@@ -967,10 +976,9 @@ async fn test_stop_stops_read_then_disconnects_then_closes_way_out() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_stop_closes_way_out_when_disconnect_fails() {
     let (mut node, steps) = stop_recording_node(true, true);
+    node.start().await.unwrap();
 
-    let error = LiveNode::close_external_egress(node.finalize_stop().await)
-        .await
-        .unwrap_err();
+    let error = node.stop().await.unwrap_err();
     let seen = steps.lock().clone();
     node.dispose();
 
@@ -986,10 +994,9 @@ async fn test_stop_closes_way_out_when_disconnect_fails() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_dispose_after_stop_closes_way_out_once() {
     let (mut node, steps) = stop_recording_node(true, false);
+    node.start().await.unwrap();
 
-    LiveNode::close_external_egress(node.finalize_stop().await)
-        .await
-        .unwrap();
+    node.stop().await.unwrap();
     node.dispose();
     let seen = steps.lock().clone();
 
@@ -1118,16 +1125,20 @@ async fn test_start_failed_at_cache_preparation_closes_way_out_once(
     assert_eq!(seen_after_dispose, seen);
 }
 
+#[rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn test_run_aborted_start_writes_record_sent_during_disconnect_before_closing_way_out() {
-    let (mut node, steps) = sending_stop_recording_node(false, false, true);
+async fn test_run_aborted_start_writes_record_sent_during_disconnect_before_closing_way_out(
+    #[values(false, true)] fail_disconnect: bool,
+) {
+    let (mut node, steps) = sending_stop_recording_node(false, fail_disconnect, true);
     node.handle().stop();
 
-    node.run().await.unwrap();
+    let result = node.run().await;
     let seen = steps.lock().clone();
     node.dispose();
     let seen_after_dispose = steps.lock().clone();
 
+    assert_stop_result(result, fail_disconnect);
     assert_eq!(seen, sent_stop_steps());
     assert_eq!(seen_after_dispose, seen);
 }
@@ -1189,6 +1200,121 @@ async fn test_start_that_succeeds_keeps_way_out_open() {
     node.dispose();
 
     assert_eq!(seen, vec!["client connected".to_string()]);
+}
+
+/// What ends a start after its client connected.
+#[derive(Clone, Copy, Debug)]
+enum StartFailure {
+    StopRequested,
+    TraderStart,
+}
+
+#[rstest]
+#[tokio::test(flavor = "current_thread")]
+async fn test_failed_start_writes_record_sent_during_disconnect_before_closing_way_out(
+    #[values(StartFailure::StopRequested, StartFailure::TraderStart)] failure: StartFailure,
+) {
+    let (mut node, steps) = sending_stop_recording_node(false, false, true);
+    match failure {
+        StartFailure::StopRequested => node.handle().stop(),
+        StartFailure::TraderStart => {
+            node.add_actor(StartFailingActor::new()).unwrap();
+        }
+    }
+
+    let result = node.start().await;
+    let seen = steps.lock().clone();
+    node.dispose();
+    let seen_after_dispose = steps.lock().clone();
+
+    match failure {
+        StartFailure::StopRequested => result.unwrap(),
+        StartFailure::TraderStart => {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(START_REFUSED), "{error}");
+        }
+    }
+    assert_eq!(seen, sent_stop_steps());
+    assert_eq!(seen_after_dispose, seen);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_start_after_failed_start_closed_way_out_is_refused() {
+    let (mut node, steps) = stop_recording_node(false, false);
+    node.cache_database_factory = Some(Box::new(FailingOnceCacheDatabaseFactory::default()));
+
+    let failure = node.start().await.unwrap_err();
+    let refusal = node.start().await.unwrap_err();
+    let state = node.state();
+    let cache_pending = node.has_pending_cache_database();
+    let seen = steps.lock().clone();
+    node.dispose();
+
+    assert_eq!(
+        format!("{failure:#}"),
+        "failed to create cache database backing: cache database unavailable"
+    );
+    assert_eq!(refusal.to_string(), EXTERNAL_EGRESS_CLOSED);
+    assert_eq!(state, NodeState::Idle);
+    assert!(cache_pending);
+    assert_eq!(seen, vec!["closed".to_string()]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_start_and_run_after_stop_closed_way_out_are_refused() {
+    let (mut node, steps) = stop_recording_node(false, false);
+    node.start().await.unwrap();
+    node.stop().await.unwrap();
+    let seen_after_stop = steps.lock().clone();
+
+    let start_refusal = node.start().await.unwrap_err();
+    // A stop is asked first, so a run that is not refused ends instead of running on
+    node.handle().stop();
+    let run_refusal = node.run().await.unwrap_err();
+    let state = node.state();
+    let seen = steps.lock().clone();
+    node.dispose();
+
+    assert_eq!(start_refusal.to_string(), EXTERNAL_EGRESS_CLOSED);
+    assert_eq!(run_refusal.to_string(), EXTERNAL_EGRESS_CLOSED);
+    assert_eq!(state, NodeState::Stopped);
+    assert_eq!(seen, seen_after_stop);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_start_without_way_out_keeps_upstream_retry_and_restart() {
+    let config = LiveNodeConfig {
+        exec_engine: crate::config::LiveExecutionEngineConfig {
+            reconciliation: false,
+            ..Default::default()
+        },
+        delay_post_stop: Duration::ZERO,
+        ..Default::default()
+    };
+    let mut node = LiveNode::build("RetryNode".to_string(), Some(config)).unwrap();
+    node.cache_database_factory = Some(Box::new(FailingOnceCacheDatabaseFactory::default()));
+
+    let failure = node.start().await.unwrap_err();
+    let cache_pending_after_failure = node.has_pending_cache_database();
+    node.start().await.unwrap();
+    let state_after_retry = node.state();
+    let cache_pending_after_retry = node.has_pending_cache_database();
+    node.stop().await.unwrap();
+    // Upstream lets a stopped node start again, and its trader then refuses the start
+    let restart = node.start().await.unwrap_err();
+    node.dispose();
+
+    assert_eq!(
+        format!("{failure:#}"),
+        "failed to create cache database backing: cache database unavailable"
+    );
+    assert!(cache_pending_after_failure);
+    assert_eq!(state_after_retry, NodeState::Running);
+    assert!(!cache_pending_after_retry);
+    assert_eq!(
+        restart.to_string(),
+        "Failed to start trader: Invalid state trigger STOPPED -> START"
+    );
 }
 
 /// The entry point that leaves the node not running.
@@ -1306,12 +1432,18 @@ fn reading_node() -> (
 
 /// The node's error lines in the log of [`reading_node`] in `directory`, which it then removes.
 fn node_errors(directory: &std::path::Path) -> Vec<String> {
+    let errors = node_lines(directory, "[ERROR]");
+    std::fs::remove_dir_all(directory).unwrap();
+    errors
+}
+
+/// The node's lines at `level` in the log of [`reading_node`] in `directory`.
+fn node_lines(directory: &std::path::Path, level: &str) -> Vec<String> {
     logging_sync_to_disk().unwrap();
     let output = std::fs::read_to_string(directory.join("inbound-read.log")).unwrap();
-    std::fs::remove_dir_all(directory).unwrap();
     output
         .lines()
-        .filter(|line| line.contains("[ERROR]"))
+        .filter(|line| line.contains(level))
         .filter_map(|line| {
             line.split_once(".nautilus_live::node: ")
                 .map(|(_, text)| text.to_string())
@@ -1365,8 +1497,10 @@ async fn test_run_logs_one_error_when_its_inbound_read_ends_unasked() {
     );
 }
 
+// `run` drops its receiver before its stop stops the read, so this stop never reaches the end of
+// the read: `test_inbound_read_end_after_the_node_stopped_the_read_logs_info` holds that end.
 #[tokio::test(flavor = "current_thread")]
-async fn test_run_logs_no_error_when_it_stops_its_inbound_read() {
+async fn test_run_stopped_by_its_handle_stops_its_read_and_logs_no_error() {
     let (mut node, steps, sender, directory) = reading_node();
     let handle = node.handle();
     let stop = tokio::spawn(async move {
@@ -1386,6 +1520,86 @@ async fn test_run_logs_no_error_when_it_stops_its_inbound_read() {
     result.unwrap();
     assert!(seen.contains(&"read stopped".to_string()), "{seen:?}");
     assert_eq!(errors, Vec::<String>::new());
+}
+
+// The node's own order at a stop: it stops the read, then the receiver ends. No entry point
+// reaches the end in that order today (`run` drops its receiver first), so the steps are driven
+// here as the run loop's end arm meets them.
+#[tokio::test(flavor = "current_thread")]
+async fn test_inbound_read_end_after_the_node_stopped_the_read_logs_info() {
+    let (mut node, steps, sender, directory) = reading_node();
+    let mut receiver = node.take_external_ingress_receiver().unwrap().unwrap();
+
+    node.close_external_ingress();
+    drop(sender);
+    let end = receiver.recv().await;
+    node.end_external_ingress();
+    let seen = steps.lock().clone();
+    let infos = node_lines(&directory, "[INFO]");
+    node.dispose();
+    let errors = node_errors(&directory);
+
+    assert!(end.is_none());
+    assert_eq!(seen, vec!["read stopped".to_string()]);
+    assert_eq!(
+        infos
+            .iter()
+            .filter(|line| *line == "External message bus ingress closed")
+            .count(),
+        1,
+        "{infos:?}"
+    );
+    assert_eq!(errors, Vec::<String>::new());
+}
+
+/// The error of [`StartFailingActor`]'s start.
+const START_REFUSED: &str = "actor refused to start";
+
+/// An actor whose start fails, so the trader's start fails.
+#[derive(Debug)]
+struct StartFailingActor {
+    core: DataActorCore,
+}
+
+impl StartFailingActor {
+    fn new() -> Self {
+        Self {
+            core: DataActorCore::new(DataActorConfig {
+                actor_id: Some(ActorId::from("START-FAILING-ACTOR")),
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+impl DataActor for StartFailingActor {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        anyhow::bail!(START_REFUSED)
+    }
+}
+
+nautilus_actor!(StartFailingActor);
+
+/// A cache database factory whose database does not answer the first time, and answers after.
+#[derive(Debug, Default)]
+struct FailingOnceCacheDatabaseFactory {
+    failed: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl CacheDatabaseFactory for FailingOnceCacheDatabaseFactory {
+    async fn create(
+        &self,
+        _trader_id: TraderId,
+        _instance_id: UUID4,
+        _config: nautilus_common::cache::CacheConfig,
+    ) -> anyhow::Result<Box<dyn CacheDatabaseAdapter>> {
+        if !self.failed.swap(true, Ordering::SeqCst) {
+            anyhow::bail!("cache database unavailable");
+        }
+        let (database, _control) = nautilus_testkit::cache::TestCacheDatabaseControl::create();
+        Ok(Box::new(database))
+    }
 }
 
 /// A cache database factory whose database does not answer.

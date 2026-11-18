@@ -172,6 +172,12 @@ pub use state::{LiveNodeHandle, NodeRunMode, NodeState};
 /// which shows up as lapsed heartbeats and reconnects rather than as backpressure.
 const DISPATCHES_PER_YIELD: usize = 64;
 
+/// The refusal of a start after an exit of the node closed its message bus way out.
+///
+/// The way out is not made again: a new one would restart its stream's numbers under the same
+/// program start.
+const EXTERNAL_EGRESS_CLOSED: &str = "Message bus way out was closed by an earlier exit of this node; build a new node to start again";
+
 thread_local! {
     static NODE_THREAD_OWNER: RefCell<Weak<()>> = const { RefCell::new(Weak::new()) };
 }
@@ -207,6 +213,8 @@ pub struct LiveNode {
     external_msgbus: Option<ExternalMessageBusIngress>,
     stream_processors: Vec<StreamProcessor>,
     shutdown_deadline: Option<dst::time::Instant>,
+    /// Whether an exit of this node closed the message bus way out, which is not made again.
+    external_egress_closed: bool,
     #[cfg(feature = "plugin")]
     plugins: plugin::NodePlugins,
     _thread_owner: Rc<()>,
@@ -249,6 +257,7 @@ impl LiveNode {
             external_msgbus,
             stream_processors: Vec::new(),
             shutdown_deadline: None,
+            external_egress_closed: false,
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
             _thread_owner: thread_owner,
@@ -330,6 +339,7 @@ impl LiveNode {
             external_msgbus: None,
             stream_processors: Vec::new(),
             shutdown_deadline: None,
+            external_egress_closed: false,
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
             _thread_owner: thread_owner,
@@ -439,8 +449,13 @@ impl LiveNode {
     ///
     /// # Errors
     ///
-    /// Returns an error if startup fails.
+    /// Returns an error if startup fails, or if an earlier exit of this node closed its message
+    /// bus way out.
     pub async fn start(&mut self) -> anyhow::Result<()> {
+        if self.external_egress_closed {
+            anyhow::bail!(EXTERNAL_EGRESS_CLOSED);
+        }
+
         if self.state().is_running() {
             anyhow::bail!("Already running");
         }
@@ -451,7 +466,7 @@ impl LiveNode {
             return start_result;
         }
 
-        Self::close_external_egress(start_result).await
+        self.close_external_egress(start_result).await
     }
 
     async fn start_node(&mut self) -> anyhow::Result<()> {
@@ -597,7 +612,7 @@ impl LiveNode {
             return stop_result;
         }
 
-        Self::close_external_egress(stop_result).await
+        self.close_external_egress(stop_result).await
     }
 
     async fn stop_node(&mut self) -> anyhow::Result<()> {
@@ -1120,8 +1135,13 @@ impl LiveNode {
     /// # Errors
     ///
     /// Returns an error if the node fails to start, encounters a runtime error, or shuts down
-    /// with retained submissions unresolved at the end of `delay_post_stop`.
+    /// with retained submissions unresolved at the end of `delay_post_stop`, or if an earlier
+    /// exit of this node closed its message bus way out.
     pub async fn run_with_mode(&mut self, mode: NodeRunMode) -> anyhow::Result<()> {
+        if self.external_egress_closed {
+            anyhow::bail!(EXTERNAL_EGRESS_CLOSED);
+        }
+
         if self.state().is_running() {
             anyhow::bail!("Already running");
         }
@@ -1136,7 +1156,7 @@ impl LiveNode {
             return run_result;
         }
 
-        Self::close_external_egress(run_result).await
+        self.close_external_egress(run_result).await
     }
 
     async fn run_node(&mut self, mode: NodeRunMode) -> anyhow::Result<()> {
@@ -1351,7 +1371,7 @@ impl LiveNode {
             .abort_reason()
             .or_else(|| self.startup_abort_reason())
         {
-            self.abort_startup(reason).await?;
+            let result = self.abort_startup(reason).await;
             Self::drain_channels(
                 &mut time_evt_rx,
                 &mut system_evt_rx,
@@ -1362,7 +1382,7 @@ impl LiveNode {
                 &mut data_cmd_rx,
             );
             log::info!("Event loop stopped");
-            return Ok(());
+            return result;
         }
 
         debug_assert_eq!(engine_connection_status, EngineConnectionStatus::Connected);
@@ -2028,6 +2048,7 @@ impl LiveNode {
 
         let stop_result = self.finalize_stop().await;
 
+        // After a callback failure nothing more is dispatched: the channels' contents are dropped
         if let Err(e) = dispatch_result {
             if let Err(stop_err) = stop_result {
                 log::error!("Failed to finalize node after callback failure: {stop_err}");
@@ -2431,10 +2452,22 @@ impl LiveNode {
         }
     }
 
+    /// Aborts a startup, then dispatches what the clients queued in the retained runner while they
+    /// disconnected, as `stop` does; `run` has taken the runner and drains its own receivers.
     async fn abort_startup(&mut self, reason: &str) -> anyhow::Result<()> {
         log::info!("{reason}, aborting startup");
         self.handle.set_shutting_down();
-        self.finalize_stop().await
+        let finalize_result = self.finalize_stop().await;
+        self.drain_runner_after_abort();
+        finalize_result
+    }
+
+    /// Dispatches what is pending in the retained runner after a startup abort's `finalize_stop`.
+    fn drain_runner_after_abort(&mut self) {
+        let drained_events = self.drain_runner_pending();
+        if drained_events > 0 {
+            log::info!("Drained {drained_events} remaining events during startup abort");
+        }
     }
 
     async fn abort_startup_with_error(
@@ -2571,6 +2604,7 @@ impl LiveNode {
         self.handle.set_shutting_down();
         let stop_result = self.kernel.stop_trader_after_start_failure();
         let finalize_result = self.finalize_stop().await;
+        self.drain_runner_after_abort();
 
         match (stop_result, finalize_result) {
             (Ok(()), Ok(())) => Err(start_err),
@@ -2671,10 +2705,18 @@ impl LiveNode {
     /// `start`, `stop` and `run_with_mode` each call this once at their exit when they leave the
     /// node not running, after their last dispatch, so what the clients sent while they
     /// disconnected reaches the way out before it closes. The bus is borrowed only to begin the
-    /// close, so the node's thread runs other tasks while the close is awaited.
-    async fn close_external_egress(stop_result: anyhow::Result<()>) -> anyhow::Result<()> {
+    /// close, so the node's thread runs other tasks while the close is awaited. When the bus had a
+    /// way out to close, the node remembers it and refuses to start again.
+    async fn close_external_egress(
+        &mut self,
+        stop_result: anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let close = msgbus::get_message_bus().borrow_mut().begin_close();
-        close.await;
+
+        if let Some(close) = close {
+            self.external_egress_closed = true;
+            close.await;
+        }
         stop_result
     }
 
