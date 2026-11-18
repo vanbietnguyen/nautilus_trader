@@ -40,7 +40,7 @@ const BAR_TYPES: &str = "bar_types";
 pub(super) const INTERLEAVE: &str = "interleave";
 /// The request parameter naming a filter expression, which leaves rows of the window out.
 pub(super) const FILTER_EXPR: &str = "filter_expr";
-const UPDATE_SUBSCRIPTIONS: &str = "update_subscriptions";
+pub(super) const UPDATE_SUBSCRIPTIONS: &str = "update_subscriptions";
 const SCHEMA: &str = "schema";
 const CUT_WARMUP: &str = "cut_warmup";
 const DEADLINE: &str = "deadline";

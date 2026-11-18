@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{fmt::Debug, rc::Weak};
+use std::fmt::Debug;
 
 use anyhow::Context;
 use jiff::tz::TimeZone;
@@ -47,7 +47,7 @@ use super::{
     process_engine_bar, request_bar_aggregation_from_params, request_params,
     requests::{
         FILTER_EXPR, INTERLEAVE, INTERLEAVE_REFUSED, KEPT_ANSWERED_BARE, KEPT_REFUSED,
-        time_zone_from_params,
+        UPDATE_SUBSCRIPTIONS, time_zone_from_params,
     },
     responses::{parent_request_window, quotes_part},
     switchboard,
@@ -87,9 +87,6 @@ pub(super) struct RequestReplay {
     clock: Rc<RefCell<VirtualClock>>,
     /// The builders it drives, in the request's order.
     builders: Vec<BarAggregatorKey>,
-    /// The bar types of its last request as asked, a composite with its source: its builders'
-    /// keys name only their standard bar types.
-    bar_types: Vec<BarType>,
     /// Whether its builders' timers are armed: at the request's `start`, or without one at its
     /// first record.
     armed: bool,
@@ -113,17 +110,14 @@ pub(super) struct RequestReplay {
     /// [`DataEngine::unsubscribe_bars`]), with a subscription held back on it or without: the
     /// request keeps the builder to its end, then the replay is removed, not kept.
     unsubscribed: bool,
-    /// Its kept builders driven past its coverage for a dependent handed over before them (see
-    /// [`DataEngine::adopt_kept_builder`]): no request can continue them.
-    driven_on: Vec<BarAggregatorKey>,
 }
 
 /// Kept builders of one replay handed over to their subscriptions in one engine turn: the
 /// builders whose subscriptions were held back while a request ran, at its successful end (see
-/// [`DataEngine::release_kept_builders`]), or one builder a subscription adopts (see
-/// [`DataEngine::adopt_kept_builder`]). They leave the replay together, on one clock of their own
-/// (see [`DataEngine::hand_over_clock`]), and catch up together, in deadline order (time, then
-/// timer name). A builder adopted in a later turn, by a later subscription, catches up alone.
+/// [`DataEngine::release_kept_builders`]), or the idle builders one subscribe command adopts (see
+/// [`DataEngine::adopt_kept_builders`]). They leave the replay together, on one clock of their
+/// own (see [`DataEngine::hand_over_clock`]), and catch up together, in deadline order (time,
+/// then timer name). A builder adopted by a later subscribe command catches up alone.
 #[derive(Debug)]
 #[must_use]
 pub(super) struct HandOver {
@@ -374,18 +368,15 @@ impl DataEngine {
         // A continued replay keeps its clock, timers and grid; only its window is the request's
         let replay = match continued {
             Some(replay) => RequestReplay {
-                bar_types: state.bar_types.clone(),
                 end: None,
                 dispatched,
                 partial: false,
                 covered: None,
                 unsubscribed: false,
-                driven_on: Vec::new(),
                 ..replay
             },
             None => RequestReplay {
                 clock: Rc::new(RefCell::new(VirtualClock::new())),
-                bar_types: state.bar_types.clone(),
                 builders: keys
                     .into_iter()
                     .filter(|key| !self.bar_aggregators.contains_key(key))
@@ -397,7 +388,6 @@ impl DataEngine {
                 dispatched,
                 partial: false,
                 unsubscribed: false,
-                driven_on: Vec::new(),
             },
         };
 
@@ -449,13 +439,72 @@ impl DataEngine {
         result
     }
 
+    /// Admits a request that sets `update_subscriptions` on any route, or refuses it with a
+    /// reason naming the case, before any of it runs: no replay is claimed, no join deadline
+    /// armed and no route dispatched, a merged (`quotes`) request's, an external client's and a
+    /// continuous future's included. It runs after the join's own parameter refusals and the
+    /// `interleave` admission, and before [`Self::admit_kept_request`], which admits the builders
+    /// the request keeps. A request that does not set it to `true`, or that aggregates no bars
+    /// (and is not a continuous future, whose bar types its params give otherwise), is admitted
+    /// at once; so is one whose `bar_types` cannot be read, which its route refuses as before.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request sets `update_subscriptions` and:
+    /// - It sets continuous-future params: a continuous future's builders end with its request.
+    /// - A bar type it asks is built from another bar (a composite): a kept builder is handed
+    ///   over to its subscription alone or with builders that share nothing. The error names the
+    ///   first.
+    /// - The engine's clock is not a [`VirtualClock`]: at a hand-over the builders' pending
+    ///   closes move from the replay's clock to the engine's, which a live clock would fire at
+    ///   its own time instead of theirs.
+    pub(super) fn admit_kept_route(&self, req: &RequestCommand) -> anyhow::Result<()> {
+        let Some(params) = request_params(req) else {
+            return Ok(());
+        };
+        if params.get_bool(UPDATE_SUBSCRIPTIONS) != Some(true) {
+            return Ok(());
+        }
+
+        anyhow::ensure!(
+            !has_continuous_future_params(Some(params)),
+            "{KEPT_REFUSED}: it sets continuous-future params, whose builders end with its request"
+        );
+
+        let Ok(Some(state)) = request_bar_aggregation_from_params(Some(params)) else {
+            return Ok(());
+        };
+        if let Some(bar_type) = state
+            .bar_types
+            .iter()
+            .find(|bar_type| bar_type.is_composite())
+        {
+            anyhow::bail!(
+                "{KEPT_REFUSED}: {bar_type} is built from another bar; a kept request names only \
+                 bar types built directly from its own records"
+            );
+        }
+        anyhow::ensure!(
+            self.clock
+                .borrow()
+                .as_any()
+                .downcast_ref::<VirtualClock>()
+                .is_some(),
+            "{KEPT_REFUSED}: the engine's clock is not a `VirtualClock`, so its builders' pending \
+             closes cannot move onto it at a hand-over"
+        );
+
+        Ok(())
+    }
+
     /// Admits a request with `update_subscriptions`, whose builders are kept under their bar
     /// types and outlive it, or refuses it, naming the case, before anything of it is made,
     /// changed or removed. Admitted are only: none of its builders exists (it starts a replay,
     /// see [`RequestReplay`]); or its builders are exactly those of one idle kept replay, no
     /// request has claimed that replay, and the request's `start` is the next instant after the
     /// replay's coverage (it continues the replay, claimed when its aggregators are prepared,
-    /// before dispatch). A request without `update_subscriptions` is admitted at once.
+    /// before dispatch). A request without `update_subscriptions` is admitted at once. What its
+    /// route and its bar types may be is admitted before (see [`Self::admit_kept_route`]).
     ///
     /// # Errors
     ///
@@ -463,14 +512,11 @@ impl DataEngine {
     /// running for a subscription; a request in flight has claimed one of its builders; it names
     /// a `limit`, a filter expression or `point_data` (see [`window_not_wholly_known`]); it has no
     /// `start`; some of its builders exist and some do not; its time zone is not that of an
-    /// existing builder; the source of an existing builder was handed over to its subscription
-    /// (see [`Self::handed_over_bar_handler`]); one exists that no kept replay holds; its builders
-    /// are kept by two replays, or are not all the builders of their replay; one of them was
-    /// driven past its coverage when a dependent of it was handed over (see
-    /// [`Self::adopt_kept_builder`]); that replay's last answer fired no end of coverage; or its
-    /// `start` is before that replay's start, within its coverage, or after the next instant.
-    /// Every one is checked before the replay is claimed or a builder touched, so a refusal
-    /// leaves the next valid continuation as it would have been.
+    /// existing builder; one exists that no kept replay holds; its builders are kept by two
+    /// replays, or are not all the builders of their replay; that replay's last answer fired no
+    /// end of coverage; or its `start` is before that replay's start, within its coverage, or
+    /// after the next instant. Every one is checked before the replay is claimed or a builder
+    /// touched, so a refusal leaves the next valid continuation as it would have been.
     pub(super) fn admit_kept_request(
         &self,
         req: &RequestCommand,
@@ -550,12 +596,6 @@ impl DataEngine {
                 "{KEPT_REFUSED}: its time zone is not the time zone of the kept builder of {}",
                 key.0
             );
-            anyhow::ensure!(
-                !self.bar_aggregator_warmups.contains_key(*key),
-                "{KEPT_REFUSED}: the source of the kept builder of {} was handed over to its \
-                 subscription, which feeds it from now on",
-                key.0
-            );
         }
 
         let mut holder: Option<(usize, BarAggregatorKey)> = None;
@@ -586,13 +626,6 @@ impl DataEngine {
             "{KEPT_REFUSED}: its bar types are not all the builders of the replay that keeps {}",
             first.0
         );
-        if let Some(driven) = keys.iter().find(|key| replay.driven_on.contains(key)) {
-            anyhow::bail!(
-                "{KEPT_REFUSED}: the kept builder of {} was driven past its coverage when a \
-                 dependent of it was handed over to its subscription",
-                driven.0
-            );
-        }
 
         let Some(covered) = replay.covered else {
             anyhow::bail!(
@@ -642,6 +675,13 @@ impl DataEngine {
         {
             replay.unsubscribed = true;
         }
+    }
+
+    /// Returns whether the builder of `bar_type` is kept by request and idle on its replay, so a
+    /// subscription to it adopts it (see [`Self::adopt_kept_builders`]).
+    pub(super) fn is_idle_kept_builder(&self, bar_type: BarType) -> bool {
+        self.kept_replay_index(&bar_aggregator_key(bar_type, None))
+            .is_some()
     }
 
     /// Returns whether a replay drives the clock of the builder under `key`: a request's own,
@@ -1110,10 +1150,7 @@ impl DataEngine {
                 continue;
             }
 
-            // Records held for an unsubscribed builder go with it (see `stop_bar_aggregator`)
-            let held = subscribed
-                .then(|| self.bar_aggregator_warmups.remove(&key))
-                .flatten();
+            let held = self.bar_aggregator_warmups.remove(&key);
             if let Err(e) = self.stop_bar_aggregator(bar_type, None) {
                 log::error!("Error stopping kept request bar aggregator for {bar_type}: {e}");
             }
@@ -1215,14 +1252,14 @@ impl DataEngine {
 
     /// Hands the kept builders of `hand_over` (see [`HandOver`]) over to their subscriptions, as
     /// live builders, together: each gets the publishing handler a subscription's builder gets
-    /// (see [`Self::handed_over_bar_handler`]); then their held records not fed yet are fed (see
+    /// (see [`Self::engine_bar_handler`]); then their held records not fed yet are fed (see
     /// [`Self::feed_held_records`]) and their clock is driven through the engine clock's time
     /// minus 1 ns, so the bars due by then are published in deadline order, stamped at their own
     /// close; then each builder with a timer continues on the engine clock with its pending
     /// deadline as armed (see [`BarAggregator::continue_on_clock`]): no new origin, open or first
     /// close, no flush. A deadline at the engine clock's time fires there once, after the records
     /// stamped then.
-    pub(super) fn hand_over_kept_builders(&mut self, hand_over: HandOver) {
+    pub(super) fn hand_over_kept_builders(&self, hand_over: HandOver) {
         let HandOver {
             bar_types,
             clock,
@@ -1230,7 +1267,7 @@ impl DataEngine {
         } = hand_over;
 
         for bar_type in &bar_types {
-            let handler = self.handed_over_bar_handler(*bar_type);
+            let handler = self.engine_bar_handler(*bar_type, true);
             if let Some(aggregator) = self
                 .bar_aggregators
                 .get(&bar_aggregator_key(*bar_type, None))
@@ -1258,132 +1295,44 @@ impl DataEngine {
         }
     }
 
-    /// Hands the idle kept builder of `bar_type`, held by the kept replay at `index`, over to the
-    /// subscription that adopts it, alone (see [`HandOver`]), with the bars held for it since
-    /// its source was handed over (see [`Self::handed_over_bar_handler`]); its replay goes with
-    /// its last builder.
-    ///
-    /// Its sources still kept in the replay (see [`kept_sources`]) are driven with it through its
-    /// catch-up, on its clock, so the bars it is built from are due in it as in a continuous run:
-    /// each source's bars go to the cache and to the builders driven with it that are built from
-    /// it, and are not published. Then they are idle again on the replay's clock, their next
-    /// deadlines armed there, so each is handed over in its turn from where it stands; driven
-    /// past the replay's coverage, no request can continue them (see
-    /// [`RequestReplay::driven_on`]). Until then a source's bar fired by a close of the builder's
-    /// at its own instant (see [`Self::connect_time_bar_source`]) still goes to the builder this
-    /// way; from the source's hand-over on, its bars reach the builder through the bus.
-    fn adopt_kept_builder(&mut self, index: usize, bar_type: BarType) {
-        let key = bar_aggregator_key(bar_type, None);
-        let replay = &mut self.kept_replays[index];
-        let (replay_clock, covered) = (Rc::clone(&replay.clock), replay.covered);
-        replay.builders.retain(|kept| *kept != key);
-        let sources = kept_sources(&replay.bar_types, &replay.builders, bar_type);
-        replay.driven_on.extend(
-            sources
-                .iter()
-                .map(|source| bar_aggregator_key(*source, None)),
-        );
-        if replay.builders.is_empty() {
-            self.kept_replays.swap_remove(index);
-        }
+    /// Hands the idle kept builders of `bar_types` over to the subscriptions of one subscribe
+    /// command that adopt them: the builders of each kept replay together, on one clock of their
+    /// own (see [`HandOver`]), so they catch up in deadline order; each replay goes with its last
+    /// builder. A bar type no kept replay holds any more is skipped. Idle, they hold no live
+    /// records: those are held only for a builder a request runs.
+    pub(super) fn adopt_kept_builders(&mut self, bar_types: &[BarType]) {
+        let mut remaining = bar_types.to_vec();
+        while let Some(&first) = remaining.first() {
+            let Some(index) = self.kept_replay_index(&bar_aggregator_key(first, None)) else {
+                remaining.remove(0);
+                continue;
+            };
 
-        let driven: Vec<BarType> = sources.iter().copied().chain([bar_type]).collect();
-        let clock = self.hand_over_clock(&replay_clock, &driven);
-        for source in &sources {
-            let handler = self.driven_source_bar_handler(*source, &driven);
-            if let Some(aggregator) = self.bar_aggregators.get(&bar_aggregator_key(*source, None)) {
-                aggregator.borrow_mut().set_historical_mode(false, handler);
-            }
-        }
-
-        let held = self.take_held_records(&[bar_type], None, covered);
-        self.hand_over_kept_builders(HandOver {
-            bar_types: vec![bar_type],
-            clock,
-            held,
-        });
-
-        for source in &sources {
-            if let Some(aggregator) = self.bar_aggregators.get(&bar_aggregator_key(*source, None)) {
-                let mut aggregator = aggregator.borrow_mut();
-                if has_timer(source) {
-                    let to: Rc<RefCell<dyn Clock>> = Rc::clone(&replay_clock) as _;
-                    aggregator.continue_on_clock(to);
-                }
-            }
-        }
-    }
-
-    /// Returns the output handler of the kept source `source` driven through the catch-up of a
-    /// dependent handed over before it (see [`Self::adopt_kept_builder`]): each bar goes to the
-    /// cache, unpublished, and to each builder of `driven` built from it while that builder lives.
-    fn driven_source_bar_handler(
-        &self,
-        source: BarType,
-        driven: &[BarType],
-    ) -> Box<dyn FnMut(Bar)> {
-        let mut cache = self.engine_bar_handler(source, false);
-        let dependents: Vec<_> = driven
-            .iter()
-            .filter(|dependent| {
-                dependent.is_composite() && dependent.composite().standard() == source.standard()
-            })
-            .filter_map(|dependent| {
-                self.bar_aggregators
-                    .get(&bar_aggregator_key(*dependent, None))
-                    .map(Rc::downgrade)
-            })
-            .collect();
-
-        Box::new(move |bar: Bar| {
-            cache(bar);
-            for dependent in dependents.iter().filter_map(Weak::upgrade) {
-                dependent.borrow_mut().handle_bar(bar);
-            }
-        })
-    }
-
-    /// Returns the output handler of the kept builder of `bar_type` handed over to its
-    /// subscription: the publishing handler a subscription's builder gets (see
-    /// [`Self::engine_bar_handler`]), which also holds each bar for every builder still kept
-    /// that is built from it, as live data is held for a builder a request runs (see
-    /// [`BarAggregatorWarmup`]). That builder is fed them when it is handed over in turn (see
-    /// [`Self::take_held_records`]), its clock readied before each as for a record of an
-    /// answer; from then on it takes them from the bus, through its own subscription.
-    fn handed_over_bar_handler(&mut self, bar_type: BarType) -> Box<dyn FnMut(Bar)> {
-        let mut publish = self.engine_bar_handler(bar_type, true);
-        let buffers: Vec<WarmupBuffer<Bar>> = self
-            .kept_replays
-            .iter()
-            .flat_map(|replay| {
-                replay
-                    .bar_types
+            let replay = &mut self.kept_replays[index];
+            let (adopted, rest): (Vec<BarType>, Vec<BarType>) =
+                remaining.into_iter().partition(|bar_type| {
+                    replay
+                        .builders
+                        .contains(&bar_aggregator_key(*bar_type, None))
+                });
+            remaining = rest;
+            replay.builders.retain(|kept| {
+                !adopted
                     .iter()
-                    .filter(|dependent| {
-                        dependent.is_composite()
-                            && dependent.composite().standard() == bar_type.standard()
-                    })
-                    .map(|dependent| bar_aggregator_key(*dependent, None))
-                    .filter(|key| replay.builders.contains(key))
-            })
-            .map(|key| {
-                let buffer = WarmupBuffer::new();
-                self.bar_aggregator_warmups
-                    .insert(key, BarAggregatorWarmup::Bar(buffer.clone()));
-                buffer
-            })
-            .collect();
-
-        if buffers.is_empty() {
-            return publish;
-        }
-
-        Box::new(move |bar: Bar| {
-            publish(bar);
-            for buffer in &buffers {
-                buffer.hold(&bar);
+                    .any(|bar_type| *kept == bar_aggregator_key(*bar_type, None))
+            });
+            let replay_clock = Rc::clone(&replay.clock);
+            if replay.builders.is_empty() {
+                self.kept_replays.swap_remove(index);
             }
-        })
+
+            let clock = self.hand_over_clock(&replay_clock, &adopted);
+            self.hand_over_kept_builders(HandOver {
+                bar_types: adopted,
+                clock,
+                held: Vec::new(),
+            });
+        }
     }
 
     /// Takes the live records held for the kept builders of `bar_types` (see
@@ -2474,11 +2423,14 @@ impl DataEngine {
             return Ok(());
         }
 
-        // A builder kept by request and idle on its replay is taken over, not set up again
-        if request_id.is_none()
-            && let Some(index) = self.kept_replay_index(&key)
-        {
-            self.adopt_kept_builder(index, bar_type);
+        // A builder kept by request and idle on its replay is taken over, not set up again: with
+        // the others of its subscribe command, once that command's last one is prepared
+        if request_id.is_none() && self.kept_replay_index(&key).is_some() {
+            match &mut self.pending_adoptions {
+                Some(pending) if !pending.contains(&bar_type) => pending.push(bar_type),
+                Some(_) => {}
+                None => self.adopt_kept_builders(&[bar_type]),
+            }
             return Ok(());
         }
 
@@ -2872,32 +2824,6 @@ fn names_a_limit(req: &RequestCommand) -> bool {
         RequestCommand::Bars(cmd) => cmd.limit.is_some(),
         _ => false,
     }
-}
-
-/// Returns the sources of `bar_type` still kept among `builders` of a replay whose request asked
-/// `bar_types`, nearest first: its source when kept, then that source's, and so on.
-fn kept_sources(
-    bar_types: &[BarType],
-    builders: &[BarAggregatorKey],
-    bar_type: BarType,
-) -> Vec<BarType> {
-    let mut sources = Vec::new();
-    let mut dependent = bar_type;
-
-    while dependent.is_composite() {
-        let Some(source) = bar_types
-            .iter()
-            .find(|source| source.standard() == dependent.composite().standard())
-            .copied()
-            .filter(|source| builders.contains(&bar_aggregator_key(*source, None)))
-        else {
-            break;
-        };
-        sources.push(source);
-        dependent = source;
-    }
-
-    sources
 }
 
 /// Returns whether `bar_type`'s builder runs on a clock: a time bar closes, and a `RANGE` bar

@@ -3177,12 +3177,13 @@ pub trait DataActor {
     /// With `params["update_subscriptions"] = true` the request's aggregators are kept under
     /// their bar types and outlive it, so a later request can continue them and a subscription
     /// to their bar types takes them over. They compute as above, on a clock of their own; such
-    /// a request must give a `start` and name no `limit`, no filter expression and no
-    /// `point_data`. A request none of whose aggregators exists starts them, their clock at its
-    /// `start`. A request whose aggregators are exactly those one earlier kept request left, none
+    /// a request must give a `start`, name no `limit`, no filter expression, no `point_data` and
+    /// no bar type built from another bar, and not be a continuous-future request, on an engine
+    /// whose clock is a `VirtualClock` (a backtest's); any other is refused before dispatch, with
+    /// one terminal envelope naming the case. A request none of whose aggregators exists starts
+    /// them, their clock at its `start`. A request whose aggregators are exactly those one earlier kept request left, none
     /// subscribed and none in use by a request in flight, in the time zone they were made in,
-    /// none fed from a source already taken over and none driven for one taken over before it
-    /// (below), continues them on their clock when its `start` is the next nanosecond after that
+    /// continues them on their clock when its `start` is the next nanosecond after that
     /// request's coverage (`min(end, the engine clock's time when it was dispatched)`, which
     /// its completed answer with no failure reason closed through): an open bar, a pending close
     /// (one at that very nanosecond fires after the records stamped then) and a calendar grid pass
@@ -3198,13 +3199,9 @@ pub trait DataActor {
     /// closes due before the engine clock's time are published to it, stamped at their own
     /// close, then the aggregator continues on the engine clock with its pending close or
     /// `RANGE` boundary as armed (one at the engine clock's time fires there once, after the
-    /// records stamped then); nothing is flushed. A later subscription's aggregator catches up
-    /// alone. An aggregator built from the bars of a kept one taken over before it gets those
-    /// bars still, when it is taken over in turn (its clock readied before each), and from the
-    /// bus from then on. An aggregator taken over before a kept one it is built from drives that
-    /// one with it through its catch-up: those bars go to it and to the cache, unpublished, and
-    /// to it from the bus once that one is taken over in turn; no request can continue that one
-    /// then. Made while the answer is in flight, a subscription is held back: its
+    /// records stamped then); nothing is flushed. The aggregators one subscribe command takes
+    /// over catch up together, in close order; those a later command takes over catch up alone.
+    /// Made while the answer is in flight, a subscription is held back: its
     /// live records are held and, when the request succeeds, the ones stamped after its coverage
     /// (the answer holds every record up to it) are fed to the aggregators as the answer's are
     /// (the closes due before each fire first), in the order they arrived, across bar types

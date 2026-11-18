@@ -1432,6 +1432,95 @@ fn test_continuous_future_request_emits_parent_response_on_later_dispatch_error(
     assert_eq!(recorder.borrow().len(), 1);
 }
 
+/// A continuous-future bars request that keeps its builders (`update_subscriptions`) is refused by
+/// name before any segment is asked: its builders would end with it. The same request without
+/// the flag dispatches its first segment as before.
+#[rstest]
+#[case::kept(true)]
+#[case::not_kept(false)]
+fn test_kept_continuous_future_request_is_refused_by_name_before_any_segment(
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    #[case] kept: bool,
+) {
+    let _ = stub_msgbus;
+    let mut clock = VirtualClock::new();
+    let _ = clock.advance_time(UnixNanos::from(20), true);
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    let pre_instrument = make_es_future("ESH24.GLBX", "ESH24");
+    let post_instrument = make_es_future("ESM24.GLBX", "ESM24");
+    let (pre_instrument_id, post_instrument_id) = (pre_instrument.id, post_instrument.id);
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::FuturesContract(pre_instrument))
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::FuturesContract(post_instrument))
+        .unwrap();
+    let mut data_engine = DataEngine::new(
+        Rc::new(RefCell::new(clock)) as Rc<RefCell<dyn Clock>>,
+        Rc::clone(&cache),
+        None,
+    );
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        Rc::clone(&cache),
+        client_id,
+        Venue::from("GLBX"),
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+    let params = params_from_json(json!({
+        "continuous_future_adjustment_mode": "BACKWARD_SPREAD",
+        "continuous_future_transitions": [
+            {
+                "transition_time_ns": 10,
+                "pre_instrument_id": pre_instrument_id.to_string(),
+                "post_instrument_id": post_instrument_id.to_string(),
+                "pre_price": "100.00",
+                "post_price": "105.00"
+            }
+        ],
+        "update_subscriptions": kept,
+    }));
+    let request = RequestBars::new(
+        BarType::from("ES.GLBX-2-TICK-LAST-INTERNAL"),
+        Some(UnixNanos::from(0).to_datetime_utc()),
+        Some(UnixNanos::from(20).to_datetime_utc()),
+        None,
+        Some(client_id),
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(params),
+    );
+
+    let result = data_engine.execute_request(RequestCommand::Bars(request));
+
+    if kept {
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.starts_with("Cannot keep the bar builders of an `update_subscriptions` request"),
+            "{error}"
+        );
+        assert!(
+            error.contains("it sets continuous-future params"),
+            "{error}"
+        );
+        assert!(recorder.borrow().is_empty(), "{:?}", recorder.borrow());
+    } else {
+        result.unwrap();
+        assert_eq!(
+            recorded_trades_request(&recorder, 0)
+                .single_instrument_id()
+                .unwrap(),
+            pre_instrument_id
+        );
+    }
+}
+
 #[rstest]
 fn test_continuous_future_params_require_request_bars(
     audusd_sim: CurrencyPair,

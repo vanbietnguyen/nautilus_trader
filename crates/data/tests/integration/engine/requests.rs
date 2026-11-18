@@ -1028,10 +1028,13 @@ fn test_update_subscriptions_request_aggregator_replays_live_trades_after_respon
     assert_eq!(messages[0].ts_event, UnixNanos::from(6_000));
 }
 
+/// A kept quotes request naming a 5-MINUTE bar built from 1-MINUTE bars, with its source in either
+/// order, is refused by name before dispatch: no client is asked, the requester gets the reason
+/// in one terminal.
 #[rstest]
 #[case::composite_first(true)]
 #[case::source_first(false)]
-fn test_update_subscriptions_request_chain_replays_live_quotes_before_dependents_go_live(
+fn test_update_subscriptions_request_naming_a_composite_is_refused_by_name_before_dispatch(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
@@ -1078,79 +1081,35 @@ fn test_update_subscriptions_request_chain_replays_live_quotes_before_dependents
         vec![source, composite]
     };
 
-    let request_id = UUID4::new();
     let params: Params = serde_json::from_value(json!({
         "bar_types": bar_types.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "update_subscriptions": true,
     }))
     .unwrap();
-
-    data_engine.execute(DataCommand::Request(RequestCommand::Quotes(
-        RequestQuotes::new(
-            instrument_id,
-            Some(UnixNanos::from(boundary - 300 * SEC).to_datetime_utc()),
-            Some(UnixNanos::from(boundary - 60 * SEC).to_datetime_utc()),
-            None,
-            Some(client_id),
-            request_id,
-            UnixNanos::from(boundary + 10 * SEC),
-            Some(params.clone()),
-        ),
-    )));
-
-    for bar_type in bar_types {
-        data_engine.execute(DataCommand::Subscribe(SubscribeCommand::Bars(
-            SubscribeBars::new(
-                bar_type,
-                Some(client_id),
-                Some(venue),
-                UUID4::new(),
-                UnixNanos::from(boundary + 10 * SEC),
-                None,
-                None,
-            ),
-        )));
-    }
-
-    let make_quote = |ts: u64| {
-        QuoteTick::new(
-            instrument_id,
-            Price::from("0.65000"),
-            Price::from("0.65010"),
-            Quantity::from("1000"),
-            Quantity::from("1000"),
-            UnixNanos::from(ts),
-            UnixNanos::from(ts),
-        )
-    };
-
-    // Two live quotes straddling the 5-minute boundary arrive while the response is in flight
-    data_engine.process_data(Data::Quote(make_quote(boundary - 30 * SEC)));
-    data_engine.process_data(Data::Quote(make_quote(boundary + 5 * SEC)));
-    assert!(cache.borrow().bar(&composite.standard()).is_none());
-
-    data_engine.response_envelope(DataResponseEnvelope::new(
-        DataResponse::Quotes(QuotesResponse::new(
-            request_id,
-            client_id,
-            instrument_id,
-            Vec::new(),
-            None,
-            None,
-            UnixNanos::from(boundary + 10 * SEC),
-            Some(params),
-        )),
-        true,
+    let request = RequestCommand::Quotes(RequestQuotes::new(
+        instrument_id,
+        Some(UnixNanos::from(boundary - 300 * SEC).to_datetime_utc()),
+        Some(UnixNanos::from(boundary - 60 * SEC).to_datetime_utc()),
         None,
+        Some(client_id),
+        UUID4::new(),
+        UnixNanos::from(boundary + 10 * SEC),
+        Some(params),
     ));
 
-    // The held quotes replay through the source before the composite goes live
-    let cache_ref = cache.borrow();
-    let source_bar = cache_ref.bar(&source.standard()).unwrap();
-    assert_eq!(source_bar.ts_event, UnixNanos::from(boundary));
-    let composite_bar = cache_ref.bar(&composite.standard()).unwrap();
-    assert_eq!(composite_bar.ts_event, UnixNanos::from(boundary));
-    assert_eq!(composite_bar.close, Price::from("0.65005"));
+    let (result, failures) = execute_recording_failures(&mut data_engine, request);
+
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.starts_with("Cannot keep the bar builders of an `update_subscriptions` request"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("{composite} is built from another bar")),
+        "{error}"
+    );
+    assert_eq!(failures, vec![Some(error)]);
+    assert!(recorder.borrow().is_empty(), "{:?}", recorder.borrow());
 }
 
 #[rstest]
@@ -11015,6 +10974,23 @@ impl KeptFixture {
             )));
     }
 
+    /// Subscribes `bar_types` in one command, as an actor subscribing several bar types at once.
+    fn subscribe_all(&mut self, bar_types: &[BarType]) {
+        let now = self.clock.borrow().timestamp_ns();
+        self.engine
+            .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+                SubscribeBars::new(
+                    bar_types.to_vec(),
+                    Some(self.client_id),
+                    Some(self.venue),
+                    UUID4::new(),
+                    now,
+                    None,
+                    None,
+                ),
+            )));
+    }
+
     /// Processes a live quote (`ts`, bid size).
     fn live_quote(&mut self, ts: u64, bid_size: u64) {
         let quote = QuoteTick::new(
@@ -12146,86 +12122,6 @@ fn test_plain_kept_request_publishes_its_held_trades_bars_after_its_end(
     );
 }
 
-/// A plain kept request builds 5-MINUTE and 15-MINUTE-from-5-MINUTE bars through 10:12, from
-/// trades of 1, 2 and 4 at 10:01, 10:06 and 10:11. At 10:16 the source is subscribed, then the
-/// dependent: the source's 10:15 bar, published at its hand-over, reaches the still-kept
-/// dependent too, so its 10:15 bar has volume 7. A request continuing the dependent alone in
-/// between is refused by name. From the dependent's hand-over on it takes the source's bars
-/// from the bus only: its 10:30 bar has the 10:20 and 10:25 bars once.
-#[rstest]
-fn test_kept_source_handed_over_first_keeps_feeding_its_kept_dependent_until_its_hand_over(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-) {
-    let _ = stub_msgbus;
-    let id = audusd_sim.id;
-    let five = bar_type_of(id, "5-MINUTE");
-    let fifteen = BarType::from(format!("{id}-15-MINUTE-LAST-INTERNAL@5-MINUTE-INTERNAL").as_str());
-    let mut fixture = KeptFixture::new(
-        audusd_sim,
-        client_id,
-        venue,
-        monday("10:16:00"),
-        &[five, fifteen.standard()],
-    );
-    let plain = |spec: KeptSpec| KeptSpec {
-        plain: true,
-        ..spec
-    };
-    let request = fixture
-        .request(
-            &[five, fifteen],
-            plain(kept_window(monday("10:00:00"), monday("10:12:00"))),
-        )
-        .unwrap();
-    fixture.answer(
-        request,
-        &[
-            (monday("10:01:00"), 1, "a1"),
-            (monday("10:06:00"), 2, "a2"),
-            (monday("10:11:00"), 4, "a3"),
-        ],
-        None,
-    );
-
-    fixture.subscribe(five, None);
-    let error = fixture
-        .request(
-            &[fifteen],
-            plain(kept_window(monday("10:12:00"), monday("10:20:00"))),
-        )
-        .unwrap_err();
-    fixture.subscribe(fifteen, None);
-    fixture.live(monday("10:17:00"), 8, "l1");
-    fixture.advance(monday("10:20:00"));
-    fixture.live(monday("10:22:00"), 16, "l2");
-    fixture.advance(monday("10:30:00"));
-
-    assert!(
-        error.contains("was handed over to its subscription, which feeds it from now on"),
-        "{error}"
-    );
-    assert_eq!(
-        fixture.delivered(),
-        vec![
-            kept_trade(0, "a1", &[2, 0]),
-            kept_trade(0, "a2", &[2, 0]),
-            kept_trade(0, "a3", &[2, 0]),
-            Kept::End(0, None),
-            published(five, monday("10:15:00"), 4, &[3, 0]),
-            Kept::End(1, Some(error)),
-            published(fifteen, monday("10:15:00"), 7, &[3, 1]),
-            live_trade("l1", &[3, 1]),
-            published(five, monday("10:20:00"), 8, &[4, 1]),
-            live_trade("l2", &[4, 1]),
-            published(five, monday("10:25:00"), 16, &[5, 1]),
-            published(fifteen, monday("10:30:00"), 24, &[5, 2]),
-        ]
-    );
-}
-
 /// Populated 2-MINUTE and 3-MINUTE builders kept through 10:01, handed over together at 10:07
 /// (both subscriptions held back while their plain request ran, which names 3-MINUTE first):
 /// they catch up together, in deadline order, not in the order the request named them in.
@@ -12669,14 +12565,11 @@ fn test_failed_kept_request_sends_its_end_before_its_held_back_subscription_publ
     );
 }
 
-/// The mirror of the source-first test above: at 10:16 the dependent is subscribed first, then
-/// the source. The kept source is driven with the dependent through its catch-up: its 10:15 bar
-/// (4) goes to the cache and to the dependent, unpublished, so the dependent's 10:15 bar has
-/// volume 7; a request continuing the source alone in between is refused by name, and the
-/// source's own hand-over has nothing due before 10:16. From then on the dependent takes the source's bars from the bus only: its 10:30
-/// bar has the 10:20 and 10:25 bars once.
+/// A plain kept request naming 5-MINUTE bars and 15-MINUTE bars built from them, over 10:00 to
+/// 10:08, is refused by name whole: no client is asked and no builder is made, so a kept 5-MINUTE
+/// request over the same window then starts a replay of its own, as on a fresh engine.
 #[rstest]
-fn test_kept_dependent_handed_over_first_takes_its_kept_sources_bars_once(
+fn test_kept_request_naming_a_direct_and_a_composite_bar_type_is_refused_whole_and_changes_nothing(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
@@ -12686,75 +12579,251 @@ fn test_kept_dependent_handed_over_first_takes_its_kept_sources_bars_once(
     let id = audusd_sim.id;
     let five = bar_type_of(id, "5-MINUTE");
     let fifteen = BarType::from(format!("{id}-15-MINUTE-LAST-INTERNAL@5-MINUTE-INTERNAL").as_str());
-    let mut fixture = KeptFixture::new(
-        audusd_sim,
-        client_id,
-        venue,
-        monday("10:16:00"),
-        &[five, fifteen.standard()],
-    );
-    let plain = |spec: KeptSpec| KeptSpec {
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
+    let window = kept_window(monday("10:00:00"), monday("10:08:00"));
+
+    let plain = KeptSpec {
         plain: true,
-        ..spec
+        ..window
     };
-    let request = fixture
-        .request(
-            &[five, fifteen],
-            plain(kept_window(monday("10:00:00"), monday("10:12:00"))),
-        )
-        .unwrap();
+    let error = fixture.request(&[five, fifteen], plain).unwrap_err();
+    let refused_commands = fixture.client_commands(0).len();
+    let request = fixture.request(&[five], window).unwrap();
     fixture.answer(
         request,
-        &[
-            (monday("10:01:00"), 1, "a1"),
-            (monday("10:06:00"), 2, "a2"),
-            (monday("10:11:00"), 4, "a3"),
-        ],
+        &[(monday("10:01:00"), 1, "a1"), (monday("10:06:00"), 2, "a2")],
         None,
     );
 
-    fixture.subscribe(fifteen, None);
-    let error = fixture
-        .request(
-            &[five],
-            plain(kept_window(monday("10:12:00"), monday("10:20:00"))),
-        )
-        .unwrap_err();
-    fixture.subscribe(five, None);
-    fixture.live(monday("10:17:00"), 8, "l1");
-    fixture.advance(monday("10:20:00"));
-    fixture.live(monday("10:22:00"), 16, "l2");
-    fixture.advance(monday("10:30:00"));
-
     assert!(
-        error.contains("was driven past its coverage when a dependent of it was handed over"),
+        error.starts_with("Cannot keep the bar builders of an `update_subscriptions` request"),
         "{error}"
     );
+    assert!(
+        error.contains(&format!("{fifteen} is built from another bar")),
+        "{error}"
+    );
+    assert_eq!(refused_commands, 0);
+    assert_eq!(fixture.client_commands(0).len(), 1);
     assert_eq!(
         fixture.delivered(),
         vec![
-            kept_trade(0, "a1", &[2, 0]),
-            kept_trade(0, "a2", &[2, 0]),
-            kept_trade(0, "a3", &[2, 0]),
-            Kept::End(0, None),
-            published(fifteen, monday("10:15:00"), 7, &[3, 1]),
-            Kept::End(1, Some(error)),
-            live_trade("l1", &[3, 1]),
-            published(five, monday("10:20:00"), 8, &[4, 1]),
-            live_trade("l2", &[4, 1]),
-            published(five, monday("10:25:00"), 16, &[5, 1]),
-            published(fifteen, monday("10:30:00"), 24, &[5, 2]),
+            Kept::End(0, Some(error)),
+            kept_trade(1, "a1", &[0]),
+            kept_bar(1, five, monday("10:05:00"), 1, &[1]),
+            kept_trade(1, "a2", &[1]),
+            Kept::End(1, None),
         ]
     );
 }
 
-/// The same order on a kept source whose closes are not the dependent's: kept through 10:04 with
-/// trades of 1 and 2 at 10:01 and 10:03, at 10:16 the dependent is subscribed first. The source
-/// is driven through its 10:05, 10:10 and 10:15 closes with it, so the dependent's 10:15 bar has
-/// the source's 10:05 bar (3); the source's own hand-over has nothing due before 10:16, and its
-/// 10:20 bar (8) reaches the dependent once, through the bus.
+/// A clock that is not a `VirtualClock`, as a live node's is not: it reads, and keeps its
+/// timers on, a virtual clock inside it.
+#[derive(Debug)]
+struct WallClock(VirtualClock);
+
+impl Clock for WallClock {
+    fn timestamp_ns(&self) -> UnixNanos {
+        self.0.timestamp_ns()
+    }
+
+    fn timestamp_us(&self) -> u64 {
+        self.0.timestamp_us()
+    }
+
+    fn timestamp_ms(&self) -> u64 {
+        self.0.timestamp_ms()
+    }
+
+    fn timestamp(&self) -> f64 {
+        self.0.timestamp()
+    }
+
+    fn timer_names(&self) -> Vec<&str> {
+        self.0.timer_names()
+    }
+
+    fn timer_count(&self) -> usize {
+        self.0.timer_count()
+    }
+
+    fn timer_exists(&self, name: &Ustr) -> bool {
+        self.0.timer_exists(name)
+    }
+
+    fn register_default_handler(&mut self, callback: nautilus_common::timer::TimeEventCallback) {
+        self.0.register_default_handler(callback);
+    }
+
+    fn cancel_default_handler(&mut self) {
+        self.0.cancel_default_handler();
+    }
+
+    fn cancel_callbacks(&mut self) {
+        self.0.cancel_callbacks();
+    }
+
+    fn set_time_alert_ns(
+        &mut self,
+        name: &str,
+        alert_time_ns: UnixNanos,
+        callback: Option<nautilus_common::timer::TimeEventCallback>,
+        allow_past: Option<bool>,
+    ) -> anyhow::Result<()> {
+        self.0
+            .set_time_alert_ns(name, alert_time_ns, callback, allow_past)
+    }
+
+    fn set_timer_ns(
+        &mut self,
+        name: &str,
+        interval_ns: DurationNanos,
+        start_time_ns: Option<UnixNanos>,
+        stop_time_ns: Option<UnixNanos>,
+        callback: Option<nautilus_common::timer::TimeEventCallback>,
+        allow_past: Option<bool>,
+        fire_immediately: Option<bool>,
+    ) -> anyhow::Result<()> {
+        self.0.set_timer_ns(
+            name,
+            interval_ns,
+            start_time_ns,
+            stop_time_ns,
+            callback,
+            allow_past,
+            fire_immediately,
+        )
+    }
+
+    fn next_time_ns(&self, name: &str) -> Option<UnixNanos> {
+        self.0.next_time_ns(name)
+    }
+
+    fn cancel_timer(&mut self, name: &str) {
+        self.0.cancel_timer(name);
+    }
+
+    fn cancel_timers(&mut self) {
+        self.0.cancel_timers();
+    }
+
+    fn reset(&mut self) {
+        self.0.reset();
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum KeptRoute {
+    Plain,
+    Joined,
+    Merged,
+    ExternalClient,
+    JoinWithoutADeadline,
+    NotKept,
+}
+
+/// On an engine whose clock is not a `VirtualClock` (Tuesday 17:30 New York), a request keeping
+/// its builders is refused by name on every route before any of it runs: no client is asked and
+/// the requester gets the reason in one terminal. A joined request's own parameter refusal comes
+/// first; a request that does not keep its builders is dispatched as before.
 #[rstest]
-fn test_kept_dependent_handed_over_first_drives_its_kept_source_through_its_own_closes(
+#[case::plain(KeptRoute::Plain, Some("the engine's clock is not a `VirtualClock`"))]
+#[case::joined(KeptRoute::Joined, Some("the engine's clock is not a `VirtualClock`"))]
+#[case::merged(KeptRoute::Merged, Some("the engine's clock is not a `VirtualClock`"))]
+#[case::external_client(
+    KeptRoute::ExternalClient,
+    Some("the engine's clock is not a `VirtualClock`")
+)]
+#[case::join_without_a_deadline(
+    KeptRoute::JoinWithoutADeadline,
+    Some("it must give a `deadline` in UNIX nanoseconds")
+)]
+#[case::not_kept(KeptRoute::NotKept, None)]
+fn test_kept_request_on_a_clock_that_is_not_virtual_is_refused_by_name_before_any_route(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] route: KeptRoute,
+    #[case] reason: Option<&str>,
+) {
+    let _ = stub_msgbus;
+    let now = NY_2026_11_10_1730;
+    let session_opens = [NY_2026_11_08_1800, NY_2026_11_09_1800];
+    let mut wall_clock = WallClock(VirtualClock::new());
+    let _ = wall_clock.0.advance_time(UnixNanos::from(now), true);
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    let instrument_id = audusd_sim.id;
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+    let mut engine = DataEngine::new(
+        Rc::new(RefCell::new(wall_clock)) as Rc<RefCell<dyn Clock>>,
+        Rc::clone(&cache),
+        None,
+    );
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut engine,
+    );
+
+    let bar_type = bar_type_of(instrument_id, "1-TICK");
+    let kept = json!({
+        "bar_types": [bar_type.to_string()],
+        "update_subscriptions": true,
+    });
+    let params = match route {
+        KeptRoute::Plain | KeptRoute::ExternalClient => kept,
+        KeptRoute::Joined => joined_params(bar_type, now, &session_opens),
+        KeptRoute::Merged => json!({
+            "bar_types": [bar_type.to_string()],
+            "update_subscriptions": true,
+            "quotes": true,
+        }),
+        KeptRoute::JoinWithoutADeadline => {
+            let mut params = joined_params(bar_type, now, &session_opens);
+            params.as_object_mut().unwrap().remove("deadline");
+            params
+        }
+        KeptRoute::NotKept => json!({ "bar_types": [bar_type.to_string()] }),
+    };
+    if matches!(route, KeptRoute::ExternalClient) {
+        cache.borrow_mut().add_external_data_client(client_id);
+    }
+    let request = starting_at(
+        trades_request(vec![instrument_id], None, client_id, params),
+        session_opens[0],
+    );
+
+    let (result, failures) = execute_recording_failures(&mut engine, request);
+
+    match reason {
+        Some(reason) => {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(reason), "{error}");
+            assert_eq!(failures, vec![Some(error)]);
+            assert!(recorder.borrow().is_empty(), "{:?}", recorder.borrow());
+        }
+        None => {
+            result.unwrap();
+            assert!(failures.is_empty(), "{failures:?}");
+            assert_eq!(recorder.borrow().len(), 1);
+        }
+    }
+}
+
+/// A size-1 trade at 10:00:30 kept by a plain request for 3-MINUTE and 2-MINUTE bars through
+/// 10:01, both idle at 10:07, when ONE subscribe command names them in that order: they are
+/// adopted together and catch up in deadline order, the 10:02 bar before the 10:03 bar.
+#[rstest]
+fn test_one_subscribe_command_adopts_its_idle_kept_builders_together_in_deadline_order(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
@@ -12762,45 +12831,33 @@ fn test_kept_dependent_handed_over_first_drives_its_kept_source_through_its_own_
 ) {
     let _ = stub_msgbus;
     let id = audusd_sim.id;
-    let five = bar_type_of(id, "5-MINUTE");
-    let fifteen = BarType::from(format!("{id}-15-MINUTE-LAST-INTERNAL@5-MINUTE-INTERNAL").as_str());
+    let (two, three) = (bar_type_of(id, "2-MINUTE"), bar_type_of(id, "3-MINUTE"));
     let mut fixture = KeptFixture::new(
         audusd_sim,
         client_id,
         venue,
-        monday("10:16:00"),
-        &[five, fifteen.standard()],
+        monday("10:07:00"),
+        &[two, three],
     );
     let request = fixture
         .request(
-            &[five, fifteen],
+            &[three, two],
             KeptSpec {
                 plain: true,
-                ..kept_window(monday("10:00:00"), monday("10:04:00"))
+                ..kept_window(monday("10:00:00"), monday("10:01:00"))
             },
         )
         .unwrap();
-    fixture.answer(
-        request,
-        &[(monday("10:01:00"), 1, "a1"), (monday("10:03:00"), 2, "a2")],
-        None,
-    );
-
-    fixture.subscribe(fifteen, None);
-    fixture.subscribe(five, None);
-    fixture.live(monday("10:17:00"), 8, "l1");
-    fixture.advance(monday("10:30:00"));
+    fixture.answer(request, &[(monday("10:00:30"), 1, "a1")], None);
+    fixture.subscribe_all(&[three, two]);
 
     assert_eq!(
         fixture.delivered(),
         vec![
             kept_trade(0, "a1", &[0, 0]),
-            kept_trade(0, "a2", &[0, 0]),
             Kept::End(0, None),
-            published(fifteen, monday("10:15:00"), 3, &[1, 1]),
-            live_trade("l1", &[1, 1]),
-            published(five, monday("10:20:00"), 8, &[2, 1]),
-            published(fifteen, monday("10:30:00"), 8, &[2, 2]),
+            published(two, monday("10:02:00"), 1, &[1, 0]),
+            published(three, monday("10:03:00"), 1, &[1, 1]),
         ]
     );
 }

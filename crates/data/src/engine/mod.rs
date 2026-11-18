@@ -241,6 +241,10 @@ pub struct DataEngine {
     /// What the clean-up of a request whose builders are kept by request left to do for their
     /// subscriptions (see [`Release`]), until its terminal is out.
     pending_releases: AHashMap<UUID4, Release>,
+    /// The idle kept builders the subscriptions of the subscribe command being prepared adopt, to
+    /// be handed over together once its last member naming one is prepared (see
+    /// [`DataEngine::adopt_kept_builders`]); `None` outside such a command.
+    pending_adoptions: Option<Vec<BarType>>,
     /// Each joined request's deadline, from its dispatch until its completion or its expiry
     /// claims it.
     request_deadlines: AHashMap<UUID4, UnixNanos>,
@@ -338,6 +342,7 @@ impl DataEngine {
             request_replays: AHashMap::new(),
             kept_replays: Vec::new(),
             pending_releases: AHashMap::new(),
+            pending_adoptions: None,
             request_deadlines: AHashMap::new(),
             suppressed_legs: AHashSet::new(),
             late_envelopes: 0,
@@ -1029,8 +1034,32 @@ impl DataEngine {
         let mut groups: IndexMap<Option<Value>, Vec<SubscribeCommand>> = IndexMap::new();
         let mut result = Ok(());
 
-        for member in members {
-            let prepared = match self.prepare_subscribe_member(&member) {
+        // The idle kept builders the members adopt are handed over together once the last member
+        // naming one is prepared (see `adopt_kept_builders`)
+        let last_adopting = if self.pending_adoptions.is_none() {
+            members.iter().rposition(|member| {
+                member.bar_types().is_some_and(|bar_types| {
+                    bar_types
+                        .iter()
+                        .any(|bar_type| self.is_idle_kept_builder(*bar_type))
+                })
+            })
+        } else {
+            None
+        };
+        if last_adopting.is_some() {
+            self.pending_adoptions = Some(Vec::new());
+        }
+
+        for (index, member) in members.into_iter().enumerate() {
+            let prepared = self.prepare_subscribe_member(&member);
+            if Some(index) == last_adopting
+                && let Some(adopted) = self.pending_adoptions.take()
+            {
+                self.adopt_kept_builders(&adopted);
+            }
+
+            let prepared = match prepared {
                 Ok(Some(prepared)) => prepared,
                 Ok(None) => continue,
                 Err(e) => {
@@ -1683,6 +1712,8 @@ impl DataEngine {
         self.validate_catalog_update(&req)?;
         // An `interleave` request is admitted on its whole route before any of it runs
         self.admit_interleave(&req)?;
+        // A request keeping its builders is admitted on its route before any of it runs
+        self.admit_kept_route(&req)?;
 
         // A `quotes` request is admitted on its whole route and plan before any of it runs
         if carries_quotes(&req) {
