@@ -18,8 +18,7 @@
 pub mod cache;
 pub mod msgbus;
 pub mod queries;
-
-mod stream_fields;
+pub mod stream_fields;
 
 use std::{fmt::Write as _, time::Duration};
 

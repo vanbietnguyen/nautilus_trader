@@ -169,6 +169,16 @@ where
         return;
     }
 
+    // Numbered before encoding, so a publication that cannot be encoded leaves a hole
+    let reserved = external_egress.borrow().reserve_source(*topic);
+    let source = match reserved {
+        Ok(source) => source,
+        Err(e) => {
+            log::error!("{e}");
+            return;
+        }
+    };
+
     let payload =
         match codec::serialize_payload(encoding, payload_type, message, timestamps_as_iso8601) {
             Ok(payload) => payload,
@@ -188,7 +198,9 @@ where
     }
 
     // Serialization can close the original destination or replace it on the bus
-    external_egress.publish(BusMessage::new(*topic, payload_type, payload, encoding));
+    let mut message = BusMessage::new(*topic, payload_type, payload, encoding);
+    message.source = source;
+    external_egress.publish(message);
 }
 
 thread_local! {

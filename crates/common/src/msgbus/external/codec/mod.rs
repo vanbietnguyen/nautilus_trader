@@ -43,13 +43,26 @@ mod sbe;
 #[path = "sbe_unavailable.rs"]
 mod sbe;
 
+/// Why [`serialize_payload`] did not encode a payload.
 #[derive(Debug)]
-pub(super) enum PayloadCodecError {
+pub enum PayloadCodecError {
+    /// The encoding does not carry this payload type, so the payload is not published.
     Dropped(String),
+    /// Encoding failed for a payload type the encoding carries.
     Failed(String),
 }
 
-pub(super) fn serialize_payload<T>(
+/// Encodes `message` as the payload of an external bus entry of `payload_type`.
+///
+/// This is the payload encoder of the bus's way out: an entry another writer produces with it
+/// carries the same payload bytes the bus would publish for the same message and settings.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The encoding does not carry `payload_type` ([`PayloadCodecError::Dropped`]).
+/// - Encoding fails ([`PayloadCodecError::Failed`]).
+pub fn serialize_payload<T>(
     encoding: SerializationEncoding,
     payload_type: BusPayloadType,
     message: &T,

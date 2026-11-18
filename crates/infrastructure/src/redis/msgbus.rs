@@ -27,17 +27,36 @@
 //! `close_async()`. The synchronous `close()` uses `block_in_place` to
 //! bridge into the async shutdown path and must be called from outside any
 //! `current_thread` Tokio runtime.
+//!
+//! # Stream entries
+//!
+//! Each message is one stream entry, written with `XADD` on the key `<stream key>` or, with
+//! `stream_per_topic`, `<stream key>:<topic>`; [`stream_fields`](super::stream_fields) lists its
+//! fields. Every entry the message bus publishes through the backing carries its source:
+//! `publisher_id` (the trader ID), `instance_id` (the instance ID the backing was made with, one
+//! per program start) and `sequence`. The number counts from 1 per actual key, so two topics
+//! written on one key share one count and two keys do not, and a new backing starts again at 1
+//! under its own instance ID. It is reserved through [`MessageBusBacking::reserve_source`] before
+//! the message bus encodes the message, so a publication that is not encoded leaves a gap in the
+//! numbers. An entry keeps its number on every retry of its batch. Numbers that run out are
+//! refused, never wrapped. Heartbeat entries carry no source.
+//!
+//! The read side fills [`BusMessage::source`] from these fields, with the key the entry was read
+//! from as its stream. An entry without them reads as having no source.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque},
     fmt::Debug,
+    str::FromStr,
     sync::{
-        Arc,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
+use ahash::AHashMap;
 use bytes::Bytes;
 use futures::stream::Stream;
 use jiff::{Timestamp, tz::Offset};
@@ -46,8 +65,8 @@ use nautilus_common::{
     live::get_runtime,
     logging::{log_task_error, log_task_started, log_task_stopped},
     msgbus::{
-        BusMessage, BusPayloadType, MessageBusBacking, MessageBusBackingFactory, MessageBusConfig,
-        switchboard::CLOSE_TOPIC,
+        BusMessage, BusMessageSource, BusPayloadType, MessageBusBacking, MessageBusBackingFactory,
+        MessageBusConfig, switchboard::CLOSE_TOPIC,
     },
 };
 use nautilus_core::{
@@ -63,7 +82,10 @@ use ustr::Ustr;
 
 use super::{
     REDIS_MINID, REDIS_XTRIM, await_handle,
-    stream_fields::{PAYLOAD_KIND_FIELD, PAYLOAD_KIND_TYPED, bus_message_fields},
+    stream_fields::{
+        INSTANCE_ID_FIELD, PAYLOAD_KIND_FIELD, PAYLOAD_KIND_TYPED, PUBLISHER_ID_FIELD,
+        SEQUENCE_FIELD, bus_message_fields,
+    },
 };
 use crate::redis::{RedisConnectionConfig, create_redis_connection, get_stream_key};
 
@@ -265,6 +287,7 @@ pub struct RedisMessageBusBacking {
     stream_signal: Arc<AtomicBool>,
     heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
     heartbeat_signal: Arc<AtomicBool>,
+    sources: StreamSources,
 }
 
 impl Debug for RedisMessageBusBacking {
@@ -297,6 +320,7 @@ impl RedisMessageBusBacking {
         let external_streams = config.external_streams.clone().unwrap_or_default();
         let heartbeat_interval_secs = config.heartbeat_interval_secs;
         let publish = backing.clone();
+        let sources = StreamSources::new(trader_id, instance_id, &config);
 
         let (pub_tx, pub_rx) = tokio::sync::mpsc::unbounded_channel::<BusMessage>();
 
@@ -355,6 +379,7 @@ impl RedisMessageBusBacking {
             stream_signal,
             heartbeat_handle,
             heartbeat_signal,
+            sources,
         })
     }
 }
@@ -363,6 +388,12 @@ impl MessageBusBacking for RedisMessageBusBacking {
     /// Returns whether the message bus backing publishing channel is closed.
     fn is_closed(&self) -> bool {
         self.pub_tx.is_closed()
+    }
+
+    /// Reserves the source of the next entry written for `topic`: this backing's trader ID and
+    /// instance ID, the key the entry is written on, and the next number of that key.
+    fn reserve_source(&self, topic: Ustr) -> anyhow::Result<Option<BusMessageSource>> {
+        self.sources.reserve(topic).map(Some)
     }
 
     /// Queues a serialized bus message for external publication.
@@ -431,6 +462,66 @@ impl RedisMessageBusBacking {
         await_handle(self.pub_handle.take(), MSGBUS_PUBLISH).await;
         await_handle(self.stream_handle.take(), MSGBUS_STREAM).await;
         await_handle(self.heartbeat_handle.take(), MSGBUS_HEARTBEAT).await;
+    }
+}
+
+/// Gives the source of each entry one backing writes.
+///
+/// A source names the backing's trader ID and instance ID, the key the entry is written on, and
+/// its number: the last number of that key plus one, from 1. The last number of each key is kept
+/// for the backing's life, and a key whose numbers ran out refuses every later entry.
+#[derive(Debug)]
+struct StreamSources {
+    trader_id: TraderId,
+    instance_id: UUID4,
+    stream_key: String,
+    stream_per_topic: bool,
+    last_sequences: Mutex<AHashMap<Ustr, u64>>,
+}
+
+impl StreamSources {
+    fn new(trader_id: TraderId, instance_id: UUID4, config: &MessageBusConfig) -> Self {
+        Self {
+            trader_id,
+            instance_id,
+            stream_key: get_stream_key(trader_id, instance_id, config),
+            stream_per_topic: config.stream_per_topic,
+            last_sequences: Mutex::new(AHashMap::new()),
+        }
+    }
+
+    fn reserve(&self, topic: Ustr) -> anyhow::Result<BusMessageSource> {
+        let stream = Ustr::from(&stream_entry_key(
+            &self.stream_key,
+            self.stream_per_topic,
+            &topic,
+        ));
+        let mut last_sequences = self
+            .last_sequences
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let last = last_sequences.entry(stream).or_insert(0);
+        let sequence = last
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Stream '{stream}' has no sequence number left"))?;
+        *last = sequence;
+
+        Ok(BusMessageSource {
+            publisher_id: self.trader_id,
+            instance_id: self.instance_id,
+            stream,
+            sequence,
+        })
+    }
+}
+
+/// Returns the key an entry of `topic` is written on: `stream_key`, or with one stream per topic,
+/// `<stream_key>:<topic>`.
+fn stream_entry_key<'a>(stream_key: &'a str, stream_per_topic: bool, topic: &str) -> Cow<'a, str> {
+    if stream_per_topic {
+        Cow::Owned(format!("{stream_key}:{topic}"))
+    } else {
+        Cow::Borrowed(stream_key)
     }
 }
 
@@ -653,24 +744,8 @@ async fn write_buffer(
     pipe.atomic();
 
     for msg in messages {
-        let encoding = msg.encoding.to_string();
-        let items = bus_message_fields(msg, &encoding);
-        let stream_key = if stream_per_topic {
-            format!("{stream_key}:{}", msg.topic)
-        } else {
-            stream_key.to_string()
-        };
-
-        if let Some(maxlen) = autotrim_maxlen {
-            pipe.xadd_maxlen(
-                &stream_key,
-                streams::StreamMaxlen::Approx(maxlen),
-                "*",
-                items.as_slice(),
-            );
-        } else {
-            pipe.xadd(&stream_key, "*", items.as_slice());
-        }
+        let stream_key = stream_entry_key(stream_key, stream_per_topic, &msg.topic).into_owned();
+        add_stream_entry(&mut pipe, &stream_key, autotrim_maxlen, msg);
 
         if autotrim_duration.is_none() {
             continue; // Nothing else to do
@@ -707,6 +782,56 @@ async fn write_buffer(
     }
 
     pipe.query_async(conn).await
+}
+
+/// Writes `messages` as entries of the one stream `stream_key`, in one atomic `MULTI`/`EXEC`.
+///
+/// Each entry carries the fields of [`BusMessageFields`](super::stream_fields::BusMessageFields),
+/// the source as the message carries it, so the entries are those the message bus backing writes
+/// and a message written again keeps its number. With `maxlen`, each `XADD` trims the stream to
+/// about that many entries (`MAXLEN ~`).
+///
+/// # Errors
+///
+/// Returns an error if Redis does not acknowledge the transaction.
+pub async fn write_stream_entries<'a, C>(
+    con: &mut C,
+    stream_key: &str,
+    maxlen: Option<usize>,
+    messages: impl IntoIterator<Item = &'a BusMessage>,
+) -> redis::RedisResult<()>
+where
+    C: redis::aio::ConnectionLike,
+{
+    let mut pipe = redis::pipe();
+    pipe.atomic();
+
+    for msg in messages {
+        add_stream_entry(&mut pipe, stream_key, maxlen, msg);
+    }
+
+    pipe.query_async(con).await
+}
+
+fn add_stream_entry(
+    pipe: &mut redis::Pipeline,
+    stream_key: &str,
+    maxlen: Option<usize>,
+    msg: &BusMessage,
+) {
+    let encoding = msg.encoding.to_string();
+    let fields = bus_message_fields(msg, &encoding);
+
+    if let Some(maxlen) = maxlen {
+        pipe.xadd_maxlen_map(
+            stream_key,
+            streams::StreamMaxlen::Approx(maxlen),
+            "*",
+            fields,
+        );
+    } else {
+        pipe.xadd_map(stream_key, "*", fields);
+    }
 }
 
 /// Where a Redis stream read starts: each stream delivers the entries after this position.
@@ -822,7 +947,7 @@ pub async fn stream_messages_from(
                             for (id, array) in stream_msg {
                                 last_ids.insert(stream_key.clone(), id.clone());
 
-                                match decode_bus_message(array) {
+                                match decode_stream_entry(stream_key, array) {
                                     Ok(msg) => {
                                         if let Err(e) = tx.send(msg).await {
                                             log::debug!("Channel closed: {e:?}");
@@ -964,6 +1089,61 @@ async fn wait_for_stream_signal(stream_signal: &Arc<AtomicBool>) {
 
     while !stream_signal.load(Ordering::Relaxed) {
         check_timer.tick().await;
+    }
+}
+
+// The entry's message with its source, whose stream is the key the entry was read from
+fn decode_stream_entry(stream_key: &str, stream_msg: &redis::Value) -> anyhow::Result<BusMessage> {
+    let mut message = decode_bus_message(stream_msg)?;
+    message.source = decode_bus_message_source(stream_key, stream_msg)?;
+    Ok(message)
+}
+
+// An entry without source fields was written by an older writer and has no source
+fn decode_bus_message_source(
+    stream_key: &str,
+    stream_msg: &redis::Value,
+) -> anyhow::Result<Option<BusMessageSource>> {
+    let redis::Value::Array(fields) = stream_msg else {
+        anyhow::bail!("Invalid stream message format: {stream_msg:?}");
+    };
+
+    let mut publisher_id: Option<&str> = None;
+    let mut instance_id: Option<&str> = None;
+    let mut sequence: Option<&str> = None;
+
+    for pair in fields.as_chunks::<2>().0 {
+        let redis::Value::BulkString(key) = &pair[0] else {
+            anyhow::bail!("Invalid stream field key: {stream_msg:?}");
+        };
+        let slot = match key.as_slice() {
+            key if key == PUBLISHER_ID_FIELD.as_bytes() => &mut publisher_id,
+            key if key == INSTANCE_ID_FIELD.as_bytes() => &mut instance_id,
+            key if key == SEQUENCE_FIELD.as_bytes() => &mut sequence,
+            _ => continue,
+        };
+        let redis::Value::BulkString(bytes) = &pair[1] else {
+            anyhow::bail!("Invalid source field format: {stream_msg:?}");
+        };
+        *slot = Some(
+            std::str::from_utf8(bytes)
+                .map_err(|e| anyhow::anyhow!("Error parsing source field: {e}"))?,
+        );
+    }
+
+    match (publisher_id, instance_id, sequence) {
+        (None, None, None) => Ok(None),
+        (Some(publisher_id), Some(instance_id), Some(sequence)) => Ok(Some(BusMessageSource {
+            publisher_id: TraderId::new_checked(publisher_id)
+                .map_err(|e| anyhow::anyhow!("Error parsing publisher ID: {e}"))?,
+            instance_id: UUID4::from_str(instance_id)
+                .map_err(|e| anyhow::anyhow!("Error parsing instance ID: {e}"))?,
+            stream: Ustr::from(stream_key),
+            sequence: sequence
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Error parsing sequence: {e}"))?,
+        })),
+        _ => anyhow::bail!("Stream message has an incomplete source: {stream_msg:?}"),
     }
 }
 
@@ -1120,8 +1300,18 @@ fn create_heartbeat_msg() -> BusMessage {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
-    use nautilus_common::{msgbus::external_io_from_backing, testing::wait_until_async};
-    use redis::Value;
+    use std::{cell::RefCell, rc::Rc};
+
+    use nautilus_common::{
+        msgbus::{
+            MessageBus, external_egress_from_backing, external_io_from_backing, get_message_bus,
+            publish_any, publish_quote, set_message_bus,
+        },
+        testing::{wait_until, wait_until_async},
+    };
+    use nautilus_core::UnixNanos;
+    use nautilus_model::data::{CustomData, CustomDataTrait, DataType, HasTsInit, QuoteTick};
+    use redis::{ToRedisArgs, Value};
     use rstest::*;
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -1819,6 +2009,471 @@ mod tests {
         assert!(ingress.take_receiver().is_err());
     }
 
+    #[rstest]
+    #[case::one_key(false, ["trader-TESTER-007:stream"; 3], [1, 2, 3])]
+    #[case::key_per_topic(
+        true,
+        [
+            "trader-TESTER-007:stream:data.quotes.A",
+            "trader-TESTER-007:stream:data.quotes.A",
+            "trader-TESTER-007:stream:data.quotes.B",
+        ],
+        [1, 2, 1]
+    )]
+    fn test_way_out_numbers_entries_from_one_per_actual_key(
+        #[case] stream_per_topic: bool,
+        #[case] expected_keys: [&str; 3],
+        #[case] expected_sequences: [u64; 3],
+    ) {
+        let fake = get_runtime().block_on(FakeRedis::start("unused"));
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        let instance_id = UUID4::new();
+        let config = MessageBusConfig {
+            stream_per_topic,
+            ..Default::default()
+        };
+        install_way_out(&fake, instance_id, config);
+
+        publish_quote("data.quotes.A".into(), &QuoteTick::default());
+        publish_quote("data.quotes.A".into(), &QuoteTick::default());
+        publish_quote("data.quotes.B".into(), &QuoteTick::default());
+        wait_until(|| fake.written().len() == 3, Duration::from_secs(5));
+        close_way_out();
+
+        let written = fake.written();
+        let keys: Vec<&str> = written.iter().map(|xadd| xadd.key.as_str()).collect();
+        let topics: Vec<Option<String>> = written.iter().map(|xadd| xadd.field("topic")).collect();
+        let sequences: Vec<u64> = written.iter().map(FakeXadd::sequence).collect();
+        assert_eq!(keys, expected_keys);
+        assert_eq!(
+            topics,
+            ["data.quotes.A", "data.quotes.A", "data.quotes.B"]
+                .map(|topic| Some(topic.to_string()))
+        );
+        assert_eq!(sequences, expected_sequences);
+        for xadd in &written {
+            assert_eq!(
+                xadd.field(PUBLISHER_ID_FIELD).as_deref(),
+                Some("TESTER-007")
+            );
+            assert_eq!(
+                xadd.field(INSTANCE_ID_FIELD).as_deref(),
+                Some(instance_id.as_str())
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_way_out_leaves_a_gap_for_a_publication_that_cannot_be_encoded() {
+        let fake = get_runtime().block_on(FakeRedis::start("unused"));
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        let config = MessageBusConfig {
+            stream_per_topic: false,
+            ..Default::default()
+        };
+        install_way_out(&fake, UUID4::new(), config);
+        let unencodable = CustomData::new(
+            Arc::new(UnencodableData),
+            DataType::new("UnencodableData", None, None),
+        );
+
+        publish_quote("data.quotes.A".into(), &QuoteTick::default());
+        publish_any("data.custom".into(), &unencodable);
+        publish_quote("data.quotes.A".into(), &QuoteTick::default());
+        wait_until(|| fake.written().len() == 2, Duration::from_secs(5));
+        close_way_out();
+
+        let written = fake.written();
+        let sequences: Vec<u64> = written.iter().map(FakeXadd::sequence).collect();
+        assert_eq!(sequences, [1, 3]);
+        assert!(
+            written
+                .iter()
+                .all(|xadd| xadd.field("topic").as_deref() == Some("data.quotes.A"))
+        );
+    }
+
+    #[rstest]
+    fn test_way_out_entry_keeps_its_number_when_its_batch_is_retried() {
+        let fake = get_runtime().block_on(FakeRedis::start(
+            "LOADING Redis is loading the dataset in memory",
+        ));
+        let config = MessageBusConfig {
+            stream_per_topic: false,
+            ..Default::default()
+        };
+        install_way_out(&fake, UUID4::new(), config);
+
+        publish_quote("data.quotes.A".into(), &QuoteTick::default());
+        wait_until(
+            || fake.aborted.load(Ordering::SeqCst) > 0,
+            Duration::from_secs(5),
+        );
+        publish_quote("data.quotes.B".into(), &QuoteTick::default());
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        wait_until(|| fake.written().len() == 2, Duration::from_secs(5));
+        close_way_out();
+
+        let written = fake.written();
+        let first_attempts: Vec<u64> = fake
+            .attempted
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|xadd| xadd.field("topic").as_deref() == Some("data.quotes.A"))
+            .map(FakeXadd::sequence)
+            .collect();
+        let sequences: Vec<u64> = written.iter().map(FakeXadd::sequence).collect();
+        assert!(first_attempts.len() >= 2);
+        assert!(first_attempts.iter().all(|&sequence| sequence == 1));
+        assert_eq!(sequences, [1, 2]);
+        assert_eq!(written[0].field("topic").as_deref(), Some("data.quotes.A"));
+    }
+
+    #[rstest]
+    fn test_new_backing_numbers_from_one_under_its_own_instance() {
+        let fake = get_runtime().block_on(FakeRedis::start("unused"));
+        let trader_id = TraderId::from("TESTER-007");
+        let config = MessageBusConfig {
+            stream_per_topic: false,
+            ..Default::default()
+        };
+        let (first_instance, second_instance) = (UUID4::new(), UUID4::new());
+        let mut first =
+            RedisMessageBusBacking::new(trader_id, first_instance, config.clone(), fake.config())
+                .unwrap();
+        let topic = Ustr::from("data.quotes.A");
+
+        let first_sources = [
+            first.reserve_source(topic).unwrap().unwrap(),
+            first.reserve_source(topic).unwrap().unwrap(),
+        ];
+        first.close();
+        let second =
+            RedisMessageBusBacking::new(trader_id, second_instance, config, fake.config()).unwrap();
+        let second_source = second.reserve_source(topic).unwrap().unwrap();
+
+        let stream = Ustr::from("trader-TESTER-007:stream");
+        assert_eq!(
+            first_sources,
+            [1, 2].map(|sequence| BusMessageSource {
+                publisher_id: trader_id,
+                instance_id: first_instance,
+                stream,
+                sequence,
+            })
+        );
+        assert_eq!(
+            second_source,
+            BusMessageSource {
+                publisher_id: trader_id,
+                instance_id: second_instance,
+                stream,
+                sequence: 1,
+            }
+        );
+    }
+
+    #[rstest]
+    fn test_stream_sources_refuse_numbers_that_run_out() {
+        let sources = StreamSources::new(
+            TraderId::from("TESTER-007"),
+            UUID4::new(),
+            &MessageBusConfig {
+                stream_per_topic: false,
+                ..Default::default()
+            },
+        );
+        let topic = Ustr::from("data.quotes.A");
+        sources
+            .last_sequences
+            .lock()
+            .unwrap()
+            .insert(Ustr::from("trader-TESTER-007:stream"), u64::MAX - 1);
+
+        let last = sources.reserve(topic).unwrap();
+        let refused = sources.reserve(topic).unwrap_err();
+        let refused_again = sources.reserve(topic).unwrap_err();
+
+        assert_eq!(last.sequence, u64::MAX);
+        assert_eq!(
+            refused.to_string(),
+            "Stream 'trader-TESTER-007:stream' has no sequence number left"
+        );
+        assert_eq!(refused_again.to_string(), refused.to_string());
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_stream_entries_writes_the_entries_of_the_backing_on_an_explicit_key() {
+        let fake = FakeRedis::start("unused").await;
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        let mut con = create_redis_connection("test", &fake.config())
+            .await
+            .unwrap();
+        let sources = StreamSources::new(
+            TraderId::from("READER-007"),
+            UUID4::new(),
+            &MessageBusConfig {
+                stream_per_topic: false,
+                ..Default::default()
+            },
+        );
+        let messages: Vec<BusMessage> = ["asks.first", "asks.second"]
+            .map(|topic| {
+                let mut message = BusMessage::with_str_topic(
+                    topic,
+                    BusPayloadType::RequestCommand,
+                    Bytes::from(topic),
+                    SerializationEncoding::MsgPack,
+                );
+                message.source = Some(sources.reserve(Ustr::from(topic)).unwrap());
+                message
+            })
+            .to_vec();
+
+        write_stream_entries(&mut con, "trader-DATA-007:asks", Some(100_000), &messages)
+            .await
+            .unwrap();
+        write_stream_entries(&mut con, "trader-DATA-007:asks", None, &messages[1..])
+            .await
+            .unwrap();
+
+        let written = fake.written();
+        let expected_fields = |message: &BusMessage| {
+            let source = message.source.unwrap();
+            vec![
+                ("topic".to_string(), message.topic.as_bytes().to_vec()),
+                ("type".to_string(), b"RequestCommand".to_vec()),
+                ("payload".to_string(), message.payload.to_vec()),
+                ("encoding".to_string(), b"MsgPack".to_vec()),
+                (
+                    PAYLOAD_KIND_FIELD.to_string(),
+                    PAYLOAD_KIND_TYPED.as_bytes().to_vec(),
+                ),
+                (PUBLISHER_ID_FIELD.to_string(), b"READER-007".to_vec()),
+                (
+                    INSTANCE_ID_FIELD.to_string(),
+                    source.instance_id.as_str().as_bytes().to_vec(),
+                ),
+                (
+                    SEQUENCE_FIELD.to_string(),
+                    source.sequence.to_string().into_bytes(),
+                ),
+            ]
+        };
+        assert_eq!(written.len(), 3);
+        assert!(
+            written
+                .iter()
+                .all(|xadd| xadd.key == "trader-DATA-007:asks")
+        );
+        assert_eq!(
+            written
+                .iter()
+                .map(|xadd| xadd.maxlen.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("100000"), Some("100000"), None]
+        );
+        assert_eq!(written[0].fields, expected_fields(&messages[0]));
+        assert_eq!(written[1].fields, expected_fields(&messages[1]));
+        assert_eq!(written[2].fields, expected_fields(&messages[1]));
+        assert_eq!(
+            written.iter().map(FakeXadd::sequence).collect::<Vec<_>>(),
+            [1, 2, 2]
+        );
+    }
+
+    #[rstest]
+    fn test_decode_stream_entry_reads_the_source_written_and_its_key() {
+        let mut message = BusMessage::with_str_topic(
+            "data.quotes.A",
+            BusPayloadType::QuoteTick,
+            Bytes::from_static(b"quote"),
+            SerializationEncoding::Json,
+        );
+        let source = BusMessageSource {
+            publisher_id: TraderId::from("TESTER-007"),
+            instance_id: UUID4::new(),
+            stream: Ustr::from("trader-TESTER-007:stream"),
+            sequence: 37,
+        };
+        message.source = Some(source);
+        let fields = bus_message_fields(&message, "json").to_redis_args();
+        let stream_msg = Value::Array(fields.into_iter().map(Value::BulkString).collect());
+
+        let decoded = decode_stream_entry("trader-TESTER-007:stream", &stream_msg).unwrap();
+        let read_elsewhere = decode_stream_entry("trader-OTHER-001:stream", &stream_msg).unwrap();
+
+        assert_eq!(decoded.topic, message.topic);
+        assert_eq!(decoded.payload_type, message.payload_type);
+        assert_eq!(decoded.payload, message.payload);
+        assert_eq!(decoded.source, Some(source));
+        assert_eq!(
+            read_elsewhere.source.unwrap().stream,
+            Ustr::from("trader-OTHER-001:stream")
+        );
+    }
+
+    #[rstest]
+    fn test_decode_stream_entry_without_source_fields_has_no_source() {
+        let stream_msg = Value::Array(vec![
+            Value::BulkString(b"topic".to_vec()),
+            Value::BulkString(b"data.quotes.A".to_vec()),
+            Value::BulkString(b"type".to_vec()),
+            Value::BulkString(b"QuoteTick".to_vec()),
+            Value::BulkString(b"payload".to_vec()),
+            Value::BulkString(b"quote".to_vec()),
+            Value::BulkString(b"encoding".to_vec()),
+            Value::BulkString(b"json".to_vec()),
+        ]);
+
+        let decoded = decode_stream_entry("trader-TESTER-007:stream", &stream_msg).unwrap();
+
+        assert_eq!(decoded.topic, Ustr::from("data.quotes.A"));
+        assert_eq!(decoded.source, None);
+    }
+
+    #[rstest]
+    #[case::incomplete(&[(SEQUENCE_FIELD, "1")], "Stream message has an incomplete source")]
+    #[case::bad_sequence(
+        &[(PUBLISHER_ID_FIELD, "TESTER-007"), (INSTANCE_ID_FIELD, FAKE_INSTANCE_ID), (SEQUENCE_FIELD, "-1")],
+        "Error parsing sequence"
+    )]
+    #[case::bad_instance(
+        &[(PUBLISHER_ID_FIELD, "TESTER-007"), (INSTANCE_ID_FIELD, "start"), (SEQUENCE_FIELD, "1")],
+        "Error parsing instance ID"
+    )]
+    fn test_decode_stream_entry_rejects_an_invalid_source(
+        #[case] source_fields: &[(&str, &str)],
+        #[case] expected_error: &str,
+    ) {
+        let mut fields = vec![
+            Value::BulkString(b"topic".to_vec()),
+            Value::BulkString(b"data.quotes.A".to_vec()),
+            Value::BulkString(b"payload".to_vec()),
+            Value::BulkString(b"quote".to_vec()),
+        ];
+        for (field, value) in source_fields {
+            fields.push(Value::BulkString(field.as_bytes().to_vec()));
+            fields.push(Value::BulkString(value.as_bytes().to_vec()));
+        }
+
+        let error = decode_stream_entry("trader-TESTER-007:stream", &Value::Array(fields))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.starts_with(expected_error), "{error}");
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stream_messages_fill_each_source_with_the_key_read() {
+        let stream_keys = vec![
+            "trader-PUBLISHER-007:stream".to_string(),
+            "trader-PUBLISHER-007:asks".to_string(),
+        ];
+        let fake = FakeRedisStreams::start(&stream_keys, 2).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BusMessage>(10);
+        let stream_signal = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(stream_messages_from(
+            tx,
+            fake.config(),
+            stream_keys.clone(),
+            StreamStart::Beginning,
+            Arc::clone(&stream_signal),
+        ));
+
+        let mut sources = Vec::new();
+        for _ in 0..4 {
+            let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                message.topic.as_str(),
+                message.source.unwrap().stream.as_str()
+            );
+            sources.push(message.source.unwrap());
+        }
+        stream_signal.store(true, Ordering::Relaxed);
+        handle.await.unwrap().unwrap();
+
+        sources.sort_by_key(|source| (source.stream, source.sequence));
+        let expected: Vec<BusMessageSource> = [
+            ("trader-PUBLISHER-007:asks", 1),
+            ("trader-PUBLISHER-007:asks", 2),
+            ("trader-PUBLISHER-007:stream", 1),
+            ("trader-PUBLISHER-007:stream", 2),
+        ]
+        .map(|(stream, sequence)| BusMessageSource {
+            publisher_id: TraderId::from(FAKE_PUBLISHER_ID),
+            instance_id: UUID4::from_str(FAKE_INSTANCE_ID).unwrap(),
+            stream: Ustr::from(stream),
+            sequence,
+        })
+        .to_vec();
+        assert_eq!(sources, expected);
+    }
+
+    /// Installs a Redis backing for `fake`, as trader `TESTER-007` with `instance_id`, as this
+    /// thread's message bus way out.
+    fn install_way_out(fake: &FakeRedis, instance_id: UUID4, config: MessageBusConfig) {
+        let backing = RedisMessageBusBacking::new(
+            TraderId::from("TESTER-007"),
+            instance_id,
+            config,
+            fake.config(),
+        )
+        .unwrap();
+        let mut bus = MessageBus::default();
+        bus.set_external_egress(
+            external_egress_from_backing(Box::new(backing)),
+            SerializationEncoding::Json,
+        );
+        set_message_bus(Rc::new(RefCell::new(bus)));
+    }
+
+    fn close_way_out() {
+        get_message_bus().borrow_mut().close().unwrap();
+    }
+
+    /// Custom data whose JSON encoding always fails.
+    #[derive(Debug)]
+    struct UnencodableData;
+
+    impl HasTsInit for UnencodableData {
+        fn ts_init(&self) -> UnixNanos {
+            UnixNanos::default()
+        }
+    }
+
+    impl CustomDataTrait for UnencodableData {
+        fn type_name(&self) -> &'static str {
+            "UnencodableData"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn ts_event(&self) -> UnixNanos {
+            UnixNanos::default()
+        }
+
+        fn to_json(&self) -> anyhow::Result<String> {
+            anyhow::bail!("UnencodableData has no JSON form")
+        }
+
+        fn clone_arc(&self) -> Arc<dyn CustomDataTrait> {
+            Arc::new(Self)
+        }
+
+        fn eq_arc(&self, other: &dyn CustomDataTrait) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
     fn backing_with_stream_receiver(
         stream_rx: tokio::sync::mpsc::Receiver<BusMessage>,
     ) -> RedisMessageBusBacking {
@@ -1833,6 +2488,11 @@ mod tests {
             stream_signal: Arc::new(AtomicBool::new(false)),
             heartbeat_handle: None,
             heartbeat_signal: Arc::new(AtomicBool::new(false)),
+            sources: StreamSources::new(
+                TraderId::from("tester-001"),
+                UUID4::new(),
+                &MessageBusConfig::default(),
+            ),
         }
     }
 
@@ -1846,12 +2506,16 @@ mod tests {
     }
 
     /// A loopback RESP server standing in for Redis, which answers every queued `XADD` with
-    /// `queued_error` until `accept_writes` is set, so each `EXEC` aborts with `EXECABORT`.
+    /// `queued_error` until `accept_writes` is set, so each `EXEC` aborts with `EXECABORT`. It
+    /// records every `XADD` it receives in `attempted`, and those of committed transactions in
+    /// `written`.
     struct FakeRedis {
         port: u16,
         accept_writes: Arc<AtomicBool>,
         aborted: Arc<AtomicUsize>,
         committed: Arc<AtomicUsize>,
+        attempted: Arc<std::sync::Mutex<Vec<FakeXadd>>>,
+        written: Arc<std::sync::Mutex<Vec<FakeXadd>>>,
     }
 
     impl FakeRedis {
@@ -1861,24 +2525,35 @@ mod tests {
             let accept_writes = Arc::new(AtomicBool::new(false));
             let aborted = Arc::new(AtomicUsize::new(0));
             let committed = Arc::new(AtomicUsize::new(0));
+            let attempted = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let written = Arc::new(std::sync::Mutex::new(Vec::new()));
 
             let accept_writes_clone = Arc::clone(&accept_writes);
             let aborted_clone = Arc::clone(&aborted);
             let committed_clone = Arc::clone(&committed);
+            let attempted_clone = Arc::clone(&attempted);
+            let written_clone = Arc::clone(&written);
 
             tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
                     let accept_writes = Arc::clone(&accept_writes_clone);
                     let aborted = Arc::clone(&aborted_clone);
                     let committed = Arc::clone(&committed_clone);
+                    let attempted = Arc::clone(&attempted_clone);
+                    let written = Arc::clone(&written_clone);
 
                     tokio::spawn(async move {
                         let (read, mut write) = socket.into_split();
                         let mut reader = tokio::io::BufReader::new(read);
                         let mut queued = 0;
                         let mut queue_failed = false;
+                        let mut queued_xadds = Vec::new();
 
                         while let Some(command) = read_resp_command(&mut reader).await {
+                            if command[0].eq_ignore_ascii_case(b"XADD") {
+                                attempted.lock().unwrap().push(FakeXadd::parse(&command));
+                            }
+
                             let reply = match command[0].to_ascii_uppercase().as_slice() {
                                 b"INFO" => {
                                     let info = "redis_version:8.0.0\r\n";
@@ -1887,10 +2562,12 @@ mod tests {
                                 b"MULTI" => {
                                     queued = 0;
                                     queue_failed = false;
+                                    queued_xadds.clear();
                                     "+OK\r\n".to_string()
                                 }
                                 b"XADD" if accept_writes.load(Ordering::SeqCst) => {
                                     queued += 1;
+                                    queued_xadds.push(FakeXadd::parse(&command));
                                     "+QUEUED\r\n".to_string()
                                 }
                                 b"XADD" => {
@@ -1904,6 +2581,7 @@ mod tests {
                                 }
                                 b"EXEC" => {
                                     committed.fetch_add(1, Ordering::SeqCst);
+                                    written.lock().unwrap().append(&mut queued_xadds);
                                     format!("*{queued}\r\n{}", "$3\r\n0-1\r\n".repeat(queued))
                                 }
                                 _ => "+OK\r\n".to_string(),
@@ -1922,6 +2600,8 @@ mod tests {
                 accept_writes,
                 aborted,
                 committed,
+                attempted,
+                written,
             }
         }
 
@@ -1931,7 +2611,57 @@ mod tests {
                 ..Default::default()
             }
         }
+
+        fn written(&self) -> Vec<FakeXadd> {
+            self.written.lock().unwrap().clone()
+        }
     }
+
+    /// One `XADD key [MAXLEN ~ n] * field value ...` a [`FakeRedis`] received.
+    #[derive(Clone, Debug)]
+    struct FakeXadd {
+        key: String,
+        maxlen: Option<String>,
+        fields: Vec<(String, Vec<u8>)>,
+    }
+
+    impl FakeXadd {
+        fn parse(command: &[Vec<u8>]) -> Self {
+            let text = |arg: &Vec<u8>| String::from_utf8(arg.clone()).unwrap();
+            let (maxlen, id_at) = if command[2].eq_ignore_ascii_case(b"MAXLEN") {
+                assert_eq!(command[3], b"~");
+                (Some(text(&command[4])), 5)
+            } else {
+                (None, 2)
+            };
+            assert_eq!(command[id_at], b"*");
+
+            Self {
+                key: text(&command[1]),
+                maxlen,
+                fields: command[id_at + 1..]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|[field, value]| (text(field), value.clone()))
+                    .collect(),
+            }
+        }
+
+        fn field(&self, name: &str) -> Option<String> {
+            self.fields
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, value)| String::from_utf8(value.clone()).unwrap())
+        }
+
+        fn sequence(&self) -> u64 {
+            self.field(SEQUENCE_FIELD).unwrap().parse().unwrap()
+        }
+    }
+
+    const FAKE_PUBLISHER_ID: &str = "PUBLISHER-007";
+    const FAKE_INSTANCE_ID: &str = "2d89666b-1a1e-4a75-b193-4eb3b454c757";
 
     /// The entries of each stream of a [`FakeRedisStreams`], as `(n, payload)` of the entry `<n>-0`.
     type FakeStreams = Vec<Vec<(usize, String)>>;
@@ -1945,8 +2675,8 @@ mod tests {
     }
 
     /// A loopback RESP server standing in for Redis, which holds streams of entries `<n>-0`
-    /// carrying the stream key as topic and `n` as payload, answers `XREAD` as Redis does, and
-    /// records each read.
+    /// carrying the stream key as topic, `n` as payload and the source of [`FAKE_PUBLISHER_ID`],
+    /// [`FAKE_INSTANCE_ID`] and number `n`, answers `XREAD` as Redis does, and records each read.
     struct FakeRedisStreams {
         port: u16,
         streams: Arc<std::sync::Mutex<FakeStreams>>,
@@ -2066,10 +2796,21 @@ mod tests {
             replied[stream] = entries.len();
             write!(reply, "*2\r\n{}*{}\r\n", bulk(key), entries.len()).unwrap();
             for (n, payload) in entries {
-                let fields = [bulk("topic"), bulk(key), bulk("payload"), bulk(payload)];
+                let fields = [
+                    bulk("topic"),
+                    bulk(key),
+                    bulk("payload"),
+                    bulk(payload),
+                    bulk(PUBLISHER_ID_FIELD),
+                    bulk(FAKE_PUBLISHER_ID),
+                    bulk(INSTANCE_ID_FIELD),
+                    bulk(FAKE_INSTANCE_ID),
+                    bulk(SEQUENCE_FIELD),
+                    bulk(&n.to_string()),
+                ];
                 write!(
                     reply,
-                    "*2\r\n{}*4\r\n{}",
+                    "*2\r\n{}*10\r\n{}",
                     bulk(&format!("{n}-0")),
                     fields.concat()
                 )

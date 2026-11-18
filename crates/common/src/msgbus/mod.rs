@@ -85,7 +85,10 @@ pub use self::{
     },
     config::MessageBusConfig,
     core::{MessageBus, Subscription},
-    external::{current_external_source, republish_pending_external_response},
+    external::{
+        codec::{PayloadCodecError, serialize_payload},
+        current_external_source, republish_pending_external_response,
+    },
     message::{BusMessage, BusMessageSource, BusPayloadCategory, BusPayloadType},
     mstr::{Endpoint, MStr, Pattern, Topic},
     switchboard::MessagingSwitchboard,

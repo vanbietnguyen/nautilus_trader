@@ -22,7 +22,9 @@
 //!
 //! - `MessageBusBackingFactory` creates concrete backing technology for a bus runtime.
 //! - `MessageBusBacking` owns the runtime facade used by core bus wiring.
-//! - `MessageBusExternalEgress` accepts outbound messages from the local bus.
+//! - `MessageBusExternalEgress` accepts outbound messages from the local bus. Its `reserve_source`
+//!   asks the backing for the source of the next entry it writes for a topic, so the bus numbers a
+//!   publication before it encodes it.
 //! - `MessageBusExternalIngress` exposes the inbound external stream receiver.
 //! - `external_egress_from_backing` adapts a backing into an egress surface.
 //! - `external_io_from_backing` adapts one backing into shared egress and ingress surfaces.
@@ -35,9 +37,10 @@ use std::{
 
 use nautilus_core::UUID4;
 use nautilus_model::identifiers::TraderId;
+use ustr::Ustr;
 
 use super::config::MessageBusConfig;
-use crate::msgbus::BusMessage;
+use crate::msgbus::{BusMessage, BusMessageSource};
 
 /// Receiver for external message bus ingress publications.
 #[cfg(feature = "live")]
@@ -70,6 +73,24 @@ pub trait MessageBusBacking {
     /// Returns `true` if the backing has been closed.
     fn is_closed(&self) -> bool;
 
+    /// Reserves the source of the next entry this backing writes for `topic`.
+    ///
+    /// The bus calls this once for each publication it forwards, before it encodes the message,
+    /// and sets the returned source on the message it then publishes. Only the backing knows the
+    /// stream an entry of `topic` is written on, so it gives the number. A publication that is then
+    /// not published keeps its number unused.
+    ///
+    /// The default returns `None`: a backing that does not number its entries publishes them
+    /// without a source, as every backing did before this call existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backing cannot give another number for the stream of `topic`.
+    fn reserve_source(&self, topic: Ustr) -> anyhow::Result<Option<BusMessageSource>> {
+        let _ = topic;
+        Ok(None)
+    }
+
     /// Queues a serialized bus message for external egress.
     fn publish(&self, message: BusMessage);
 
@@ -96,6 +117,24 @@ pub trait MessageBusBacking {
 pub trait MessageBusExternalEgress {
     /// Returns `true` if egress has been closed.
     fn is_closed(&self) -> bool;
+
+    /// Reserves the source of the next entry this egress writes for `topic`.
+    ///
+    /// The bus calls this once for each publication it forwards, before it encodes the message,
+    /// and sets the returned source on the message it then publishes. Only the backing behind the
+    /// egress knows the stream an entry of `topic` is written on, so it gives the number. A
+    /// publication that is then not published keeps its number unused.
+    ///
+    /// The default returns `None`: an egress that does not number its entries publishes them
+    /// without a source, as every egress did before this call existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the egress cannot give another number for the stream of `topic`.
+    fn reserve_source(&self, topic: Ustr) -> anyhow::Result<Option<BusMessageSource>> {
+        let _ = topic;
+        Ok(None)
+    }
 
     /// Queues a serialized bus message for external egress.
     fn publish(&self, message: BusMessage);
@@ -167,6 +206,10 @@ struct BackingExternalEgress {
 impl MessageBusExternalEgress for BackingExternalEgress {
     fn is_closed(&self) -> bool {
         self.backing.borrow().is_closed()
+    }
+
+    fn reserve_source(&self, topic: Ustr) -> anyhow::Result<Option<BusMessageSource>> {
+        self.backing.borrow().reserve_source(topic)
     }
 
     fn publish(&self, message: BusMessage) {

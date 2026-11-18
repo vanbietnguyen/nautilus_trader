@@ -31,13 +31,11 @@ use nautilus_core::UUID4;
 use nautilus_infrastructure::redis::{
     get_stream_key,
     msgbus::{RedisMessageBusBacking, RedisMessageBusConfig},
+    stream_fields,
 };
 use nautilus_model::identifiers::TraderId;
 use redis::AsyncCommands;
 use ustr::Ustr;
-
-#[path = "../src/redis/stream_fields.rs"]
-mod stream_fields;
 
 const MESSAGE_BATCH_SIZE: u64 = 16;
 
