@@ -378,18 +378,22 @@ impl DataEngine {
     }
 
     pub(super) fn cleanup_request_bar_aggregators(&mut self, request_id: &UUID4) -> bool {
-        self.release_request_bar_aggregators(request_id, None)
+        self.release_request_bar_aggregators(request_id, None, None)
     }
 
     /// Cleans up the request's aggregators like [`Self::cleanup_request_bar_aggregators`], each
     /// joined builder releasing its held live trades through its own copy of `joined`.
     ///
+    /// With `bars`, the undelivered bars of an interleaving request, its builders release their
+    /// held live trades together, trade by trade (see
+    /// [`Self::release_held_trades_trade_by_trade`]); otherwise one builder after the other.
     /// An interleaving request's entry still held here goes with them, undelivered: only
     /// [`Self::finish_interleaved`], which takes the entry first, delivers its bars.
     fn release_request_bar_aggregators(
         &mut self,
         request_id: &UUID4,
         joined: Option<JoinedRelease>,
+        bars: Option<&RefCell<Vec<Bar>>>,
     ) -> bool {
         self.interleaved_requests.remove(request_id);
 
@@ -398,6 +402,10 @@ impl DataEngine {
         };
 
         let aggregator_request_id = state.aggregator_request_id(*request_id);
+
+        if let Some(bars) = bars {
+            self.release_held_trades_trade_by_trade(&state, aggregator_request_id, joined, bars);
+        }
 
         // Finish each source before the aggregators that depend on it, so the bars from its
         // replayed live data reach dependents still in historical mode
@@ -500,7 +508,78 @@ impl DataEngine {
                 DataResponse::Trades(r) => joined_release(&state, &r.data),
                 _ => None,
             };
-            self.release_request_bar_aggregators(&correlation_id, joined);
+            self.release_request_bar_aggregators(&correlation_id, joined, None);
+        }
+    }
+
+    /// Releases the live trades the builders of an interleaving request held while its answer
+    /// was in flight, as live would have fed them: each held trade, in arrival order, to every
+    /// builder that held it, the builders in the request's order (live's, see
+    /// [`live_delivery_order`]). The bars one trade completes go to the end of `bars` by the
+    /// rule of [`Self::respond_interleaved_trades`]: a `RANGE_INCLUSIVE` bar after the others.
+    ///
+    /// Each builder takes its own held trades through its own copy of `joined`, as when it
+    /// releases alone. Admission leaves the request one instrument, so every builder holds the
+    /// trades of one topic from its subscription to this release: a builder subscribed later
+    /// holds the last of the trades the first one holds. Takes the trade warm-ups it releases;
+    /// any other is left to [`Self::finish_historical_bar_aggregator`].
+    fn release_held_trades_trade_by_trade(
+        &mut self,
+        state: &RequestBarAggregation,
+        aggregator_request_id: Option<UUID4>,
+        joined: Option<JoinedRelease>,
+        bars: &RefCell<Vec<Bar>>,
+    ) {
+        if !state.update_subscriptions {
+            return;
+        }
+
+        let mut builders = Vec::new();
+
+        for bar_type in &state.bar_types {
+            let key = bar_aggregator_key(*bar_type, aggregator_request_id);
+            if !self.bar_aggregator_handlers.contains_key(&key) {
+                continue;
+            }
+
+            let Some(aggregator) = self.bar_aggregators.get(&key).map(Rc::clone) else {
+                continue;
+            };
+            let Some(copies) = self
+                .bar_aggregator_warmups
+                .get(&key)
+                .and_then(|warmup| warmup.release_trades(joined, key.0))
+            else {
+                continue;
+            };
+            self.bar_aggregator_warmups.remove(&key);
+            builders.push((aggregator, copies));
+        }
+
+        let longest = builders
+            .iter()
+            .map(|(_, copies)| copies.len())
+            .max()
+            .unwrap_or_default();
+
+        for index in 0..longest {
+            let start = bars.borrow().len();
+
+            for (aggregator, copies) in &builders {
+                // A builder subscribed later did not hold the first trades
+                let Some(own) = (index + copies.len()).checked_sub(longest) else {
+                    continue;
+                };
+                if let Some(Some(copy)) = copies.get(own) {
+                    aggregator.borrow_mut().handle_trade(*copy);
+                }
+            }
+
+            let completed = bars.borrow_mut().split_off(start);
+            let (after, before): (Vec<Bar>, Vec<Bar>) = completed
+                .into_iter()
+                .partition(is_delivered_after_its_trade);
+            bars.borrow_mut().extend(before.into_iter().chain(after));
         }
     }
 
@@ -539,7 +618,7 @@ impl DataEngine {
             let completed = std::mem::take(&mut *bars.borrow_mut());
             let (after, before): (Vec<Bar>, Vec<Bar>) = completed
                 .into_iter()
-                .partition(|bar| bar.bar_type.spec().aggregation == BarAggregation::RangeInclusive);
+                .partition(is_delivered_after_its_trade);
 
             send_interleaved_bars(&self.cache, resp, &mut pending, before);
             pending.push(*trade);
@@ -589,7 +668,7 @@ impl DataEngine {
             .remove(&request_id)
             .unwrap_or_default();
         let joined = closing.as_ref().and_then(|closing| closing.joined);
-        self.release_request_bar_aggregators(&request_id, joined);
+        self.release_request_bar_aggregators(&request_id, joined, Some(&interleaved.bars));
         let remaining = std::mem::take(&mut *interleaved.bars.borrow_mut());
 
         let terminal = if let Some(ClosingPart {
@@ -1528,6 +1607,12 @@ fn live_delivery_order(bar_type: &BarType) -> (bool, String) {
     (!bar_type.spec().is_time_aggregated(), bar_type.to_string())
 }
 
+/// Returns whether a bar an interleaving request's trade completes is delivered after that trade:
+/// a `RANGE_INCLUSIVE` bar, which contains it; every other bar is delivered before it.
+fn is_delivered_after_its_trade(bar: &Bar) -> bool {
+    bar.bar_type.spec().aggregation == BarAggregation::RangeInclusive
+}
+
 /// Live data held back for a bar aggregator that is still replaying a historical request.
 #[derive(Debug)]
 pub(super) enum BarAggregatorWarmup {
@@ -1559,6 +1644,25 @@ impl BarAggregatorWarmup {
                 .release()
                 .into_iter()
                 .for_each(|trade| aggregator.handle_trade(trade)),
+        }
+    }
+
+    /// Ends a trade warm-up and returns the builder's copy of each held trade in arrival order,
+    /// as [`Self::release_joined`] (with `joined`) or [`Self::release`] would feed them, `None`
+    /// where the cut drops one; `None` for a warm-up of bars or quotes, which stays held.
+    pub(super) fn release_trades(
+        &self,
+        joined: Option<JoinedRelease>,
+        bar_type: BarType,
+    ) -> Option<Vec<Option<TradeTick>>> {
+        match (self, joined) {
+            (Self::JoinedTrade(buffer, slot), Some(release)) => {
+                Some(buffer.release_joined_copies(slot, release, bar_type))
+            }
+            (Self::Trade(buffer) | Self::JoinedTrade(buffer, _), _) => {
+                Some(buffer.release().into_iter().map(Some).collect())
+            }
+            (Self::Bar(_) | Self::Quote(_), _) => None,
         }
     }
 

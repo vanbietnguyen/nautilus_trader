@@ -166,10 +166,27 @@ impl WarmupBuffer<TradeTick> {
     pub(super) fn release_joined(
         &self,
         joined: &JoinedSlot,
-        mut release: JoinedRelease,
+        release: JoinedRelease,
         aggregator: &mut dyn BarAggregator,
         bar_type: BarType,
     ) {
+        for copy in self
+            .release_joined_copies(joined, release, bar_type)
+            .into_iter()
+            .flatten()
+        {
+            aggregator.handle_trade(copy);
+        }
+    }
+
+    /// Ends a joined warm-up like [`Self::release_joined`], but returns the builder's copy of
+    /// each held trade in arrival order, `None` where the cut drops it, for its caller to feed.
+    pub(super) fn release_joined_copies(
+        &self,
+        joined: &JoinedSlot,
+        mut release: JoinedRelease,
+        bar_type: BarType,
+    ) -> Vec<Option<TradeTick>> {
         let held = self.release();
         release.counts.held = held.len() as u64;
 
@@ -180,12 +197,7 @@ impl WarmupBuffer<TradeTick> {
             );
         }
 
-        for trade in &held {
-            if let Some(copy) = release.admit(trade) {
-                aggregator.handle_trade(copy);
-            }
-        }
-
+        let copies = held.iter().map(|trade| release.admit(trade)).collect();
         let counts = release.counts;
 
         log::info!(
@@ -199,6 +211,7 @@ impl WarmupBuffer<TradeTick> {
         );
 
         *joined.0.borrow_mut() = Some(release);
+        copies
     }
 }
 
