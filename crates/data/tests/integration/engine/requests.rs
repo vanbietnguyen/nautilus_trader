@@ -11989,6 +11989,59 @@ fn test_held_back_subscription_drops_a_held_trade_the_answer_already_holds(
     );
 }
 
+/// A kept 5-MINUTE request through 16:59:59.999, given its 16:58 trade; while its answer is
+/// unfinished, a subscription to the same standard bar type built from 1-MINUTE-EXTERNAL bars
+/// reuses the kept builder. A source bar stamped 17:00 (size 8) arriving before the answer's
+/// remaining 16:59 trade is held until the hand-over: the builder takes the 16:59 trade, not
+/// dropping it as older than the source bar, and then the held source bar, so the 17:00 bar,
+/// still open at the answer's end, counts 1 + 2 + 8.
+#[rstest]
+fn test_composite_subscription_reusing_a_kept_builder_holds_its_source_bars_until_the_hand_over(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let five = bar_type_of(id, "5-MINUTE");
+    let composite = BarType::from(format!("{five}@1-MINUTE-EXTERNAL").as_str());
+    assert_eq!(composite.standard(), five);
+    let now = monday("17:00:30");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, now, &[five]);
+    let spec = KeptSpec {
+        start: Some(monday("16:55:00")),
+        end: Some(monday("17:00:00") - 1_000_000),
+        ..KeptSpec::default()
+    };
+    let request = fixture.request(&[five], spec).unwrap();
+    fixture.answer_part(request, &[(monday("16:58:00"), 1, "a1")]);
+    fixture.subscribe(composite, None);
+    let source_bar = Bar::new(
+        composite.composite(),
+        Price::from("1.00000"),
+        Price::from("1.00000"),
+        Price::from("1.00000"),
+        Price::from("1.00000"),
+        Quantity::from(8),
+        UnixNanos::from(monday("17:00:00")),
+        UnixNanos::from(monday("17:00:00")),
+    );
+    fixture.engine.process_data(Data::Bar(source_bar));
+    fixture.answer(request, &[(monday("16:59:00"), 2, "a2")], None);
+    fixture.advance(monday("17:05:00"));
+
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            kept_trade(0, "a1", &[0]),
+            kept_trade(0, "a2", &[0]),
+            Kept::End(0, None),
+            published(five, monday("17:00:00"), 11, &[1]),
+        ]
+    );
+}
+
 /// The command an actor sends to unsubscribe `bar_type` at the fixture's clock.
 fn unsubscribe(fixture: &mut KeptFixture, bar_type: BarType) {
     let now = fixture.clock.borrow().timestamp_ns();
