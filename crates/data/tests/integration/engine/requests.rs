@@ -475,23 +475,30 @@ fn test_request_scoped_time_bar_aggregation_handles_trade_response(
         )
     };
 
-    data_engine.response(DataResponse::Trades(TradesResponse::new(
-        request_id,
-        client_id,
-        instrument_id,
-        vec![
-            make_trade(0, "historical-1"),
-            make_trade(1_000_000_000, "historical-2"),
-        ],
+    // A completed envelope certifies that the answer holds every record of its window
+    data_engine.response_envelope(DataResponseEnvelope::new(
+        DataResponse::Trades(TradesResponse::new(
+            request_id,
+            client_id,
+            instrument_id,
+            vec![
+                make_trade(0, "historical-1"),
+                make_trade(1_000_000_000, "historical-2"),
+            ],
+            None,
+            None,
+            UnixNanos::from(1_000_000_000),
+            Some(params),
+        )),
+        true,
         None,
-        None,
-        UnixNanos::from(1_000_000_000),
-        Some(params),
-    )));
+    ));
 
-    // The close at the last trade's stamp stays armed, and a bare response does not certify
-    // that it holds every record of the window, so nothing fires after its last record
-    assert_eq!(cache.borrow().bar(&bar_type).map(|bar| bar.ts_event), None);
+    // The close at the last trade's stamp stays armed until the end, the dispatch time (1 s)
+    assert_eq!(
+        cache.borrow().bar(&bar_type).map(|bar| bar.ts_event),
+        Some(UnixNanos::from(1_000_000_000))
+    );
     assert!(saver.get_messages().is_empty());
 }
 

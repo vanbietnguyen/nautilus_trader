@@ -872,8 +872,6 @@ impl DataEngine {
             let cache = Rc::clone(&self.cache);
             let interleaved = self.interleaved_requests.get(&request_id);
             let interleaved_bars = interleaved.map(|interleaved| Rc::clone(&interleaved.bars));
-            // A replay's builder computes as a subscription's, not in historical mode
-            let historical = !self.request_replays.contains_key(&request_id);
 
             let handler: Box<dyn FnMut(Bar)> = Box::new(move |bar: Bar| {
                 // Request-generated bars are delivered only through the cache, or as response
@@ -890,9 +888,8 @@ impl DataEngine {
                 }
             });
 
-            aggregator
-                .borrow_mut()
-                .set_historical_mode(historical, handler);
+            // A replay's builder computes as a subscription's, not in historical mode
+            aggregator.borrow_mut().set_historical_mode(false, handler);
         }
     }
 
@@ -2327,7 +2324,7 @@ impl DataEngine {
             return Ok(());
         }
 
-        self.setup_bar_aggregator(bar_type, false, request_id)?;
+        self.setup_bar_aggregator(bar_type, request_id)?;
 
         aggregator.borrow_mut().set_is_running(true);
 
@@ -2404,13 +2401,14 @@ impl DataEngine {
         None
     }
 
-    /// Sets up a bar aggregator.
-    ///
-    /// This method handles historical mode, message bus subscriptions, and time bar aggregator setup.
+    /// Sets up a bar aggregator as a live subscription's: the publishing output handler (see
+    /// [`Self::engine_bar_handler`]), then, for a time bar or a `RANGE` bar, its timer started on
+    /// the engine clock, and, for a subscription's builder (no `request_id`), its link to the
+    /// builder of its time bar source (see [`Self::connect_time_bar_sources`]). A request's
+    /// builders are set up on its replay instead (see [`RequestReplay`]).
     pub(super) fn setup_bar_aggregator(
         &self,
         bar_type: BarType,
-        historical: bool,
         request_id: Option<UUID4>,
     ) -> anyhow::Result<()> {
         let key = bar_aggregator_key(bar_type, request_id);
@@ -2419,39 +2417,18 @@ impl DataEngine {
             anyhow::anyhow!("Cannot setup bar aggregator: no aggregator found for {bar_type}")
         })?;
 
-        // Set historical mode and handler
-        let handler = self.engine_bar_handler(bar_type, !historical);
-        aggregator
-            .borrow_mut()
-            .set_historical_mode(historical, handler);
+        let handler = self.engine_bar_handler(bar_type, true);
+        aggregator.borrow_mut().set_historical_mode(false, handler);
 
-        // For TimeBarAggregator, set clock and start timer
-        if bar_type.spec().is_time_aggregated() {
-            use nautilus_common::clock::VirtualClock;
-
-            if historical {
-                // Each aggregator gets its own independent clock
-                let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
-                aggregator.borrow_mut().set_clock(test_clock);
-                // Set weak reference for historical mode (start_timer called later from preprocess_historical_events)
-                // Store weak reference so start_timer can use it when called later
-                let aggregator_weak = Rc::downgrade(aggregator);
-                aggregator.borrow_mut().set_aggregator_weak(aggregator_weak);
-            } else {
-                aggregator.borrow_mut().set_clock(Rc::clone(&self.clock));
-                aggregator
-                    .borrow_mut()
-                    .start_timer(Some(Rc::clone(aggregator)));
-            }
-        } else if bar_type.spec().aggregation == BarAggregation::Range && !historical {
-            // Range aggregators arm their completion alerts on the engine clock
+        // Time bars close, and range bars arm their completion alerts, on the engine clock
+        if has_timer(&bar_type) {
             aggregator.borrow_mut().set_clock(Rc::clone(&self.clock));
             aggregator
                 .borrow_mut()
                 .start_timer(Some(Rc::clone(aggregator)));
         }
 
-        if !historical && request_id.is_none() {
+        if request_id.is_none() {
             self.connect_time_bar_sources(bar_type);
         }
 

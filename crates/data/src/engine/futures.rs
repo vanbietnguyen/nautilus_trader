@@ -474,7 +474,7 @@ impl DataEngine {
             return Ok(());
         }
 
-        self.setup_bar_aggregator(target_bar_type, false, None)?;
+        self.setup_bar_aggregator(target_bar_type, None)?;
 
         let now_ns = self.clock.borrow().timestamp_ns().as_u64();
 

@@ -1291,20 +1291,43 @@ fn test_request_time_bar_boundary_finalizes_sources_before_dependents(
     })
     .collect();
 
-    engine.response(DataResponse::Trades(TradesResponse::new(
-        request_id,
-        client_id,
-        instrument_id,
-        trades,
+    // A completed envelope certifies that the answer holds every record of its window
+    engine.response_envelope(DataResponseEnvelope::new(
+        DataResponse::Trades(TradesResponse::new(
+            request_id,
+            client_id,
+            instrument_id,
+            trades,
+            None,
+            None,
+            UnixNanos::from(12_000_000_000),
+            None,
+        )),
+        true,
         None,
-        None,
-        UnixNanos::from(12_000_000_000),
-        None,
-    )));
+    ));
 
-    // The 12 s closes are at the last trade's stamp and stay armed: a bare response does not
-    // certify that it holds every record of the window, so nothing fires after its last record
-    assert_eq!(cache.borrow().bars(&target.standard()), None);
+    // The end, the dispatch time (12 s), fires the 12 s closes: the 1-second source first, so
+    // its 12 s bar (102, 103) is in the 2-second bar, with the 11 s bar (100, 101)
+    let ts_event = if interval == BarIntervalType::LeftOpen {
+        12_000_000_000
+    } else {
+        10_000_000_000
+    };
+    let expected = Bar::new(
+        target.standard(),
+        Price::from("100.00000"),
+        Price::from("103.00000"),
+        Price::from("100.00000"),
+        Price::from("103.00000"),
+        Quantity::from(4),
+        UnixNanos::from(ts_event),
+        UnixNanos::from(12_000_000_000),
+    );
+    assert_eq!(
+        cache.borrow().bars(&target.standard()),
+        Some(vec![expected])
+    );
 }
 
 #[rstest]
