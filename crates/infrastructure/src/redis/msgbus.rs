@@ -59,17 +59,19 @@
 //! the message bus encodes the message, so a publication that is not encoded leaves a gap in the
 //! numbers. An entry keeps its number on every retry of its batch. Numbers that run out are
 //! refused, never wrapped. The message bus passes the numbers of one key to the backing in the
-//! order it reserved them: a publication made while another of the same key is encoded waits behind
-//! it. A heartbeat entry is numbered on its own key, `<stream key>:health:heartbeat`, before its
-//! payload is made: a backing with heartbeats and one key for all topics is refused at
-//! construction, because the heartbeat task numbers on its own thread, and a heartbeat numbered
-//! while the message bus encodes an entry of that key could reach the publish task before it.
+//! order it reserved them: it refuses, before numbering it, a publication made while it encodes
+//! another for this backing. A heartbeat entry is numbered on its own key,
+//! `<stream key>:health:heartbeat`, before its payload is made: a backing with heartbeats and one
+//! key for all topics is refused at construction, because the heartbeat task numbers on its own
+//! thread, and a heartbeat numbered while the message bus encodes an entry of that key could reach
+//! the publish task before it.
 //!
 //! The read side fills [`BusMessage::source`] from these fields, with the key the entry was read
 //! from as its stream. An entry without them reads as having no source.
 
 use std::{
     borrow::Cow,
+    cell::Cell,
     collections::{HashMap, VecDeque},
     fmt::{Debug, Display},
     str::FromStr,
@@ -319,7 +321,6 @@ pub struct RedisMessageBusBacking {
     heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
     heartbeat_signal: Arc<AtomicBool>,
     sources: StreamSources,
-    reserved_at: Mutex<ReservationTimes>,
 }
 
 impl Debug for RedisMessageBusBacking {
@@ -423,7 +424,6 @@ impl RedisMessageBusBacking {
             heartbeat_handle,
             heartbeat_signal,
             sources,
-            reserved_at: Mutex::default(),
         })
     }
 }
@@ -439,34 +439,14 @@ impl MessageBusBacking for RedisMessageBusBacking {
     ///
     /// The entry's age runs from this call.
     fn reserve_source(&self, topic: Ustr) -> anyhow::Result<Option<BusMessageSource>> {
-        let mut reserved_at = self
-            .reserved_at
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
         let source = self.sources.reserve(topic)?;
-        reserved_at.stamp(&source, tokio::time::Instant::now());
+        RESERVED_AT.set(Some((source, tokio::time::Instant::now())));
         Ok(Some(source))
     }
 
     /// Queues a serialized bus message for external publication.
-    ///
-    /// A message numbered by [`Self::reserve_source`] is aged from its reservation, and dropped and
-    /// counted as discarded when it is past [`MAX_PENDING_AGE`] or its reservation is gone.
     fn publish(&self, message: BusMessage) {
-        let now = tokio::time::Instant::now();
-        let sent = match message.source {
-            Some(source) => {
-                let reserved_at = self
-                    .reserved_at
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take(&source, now);
-                self.pub_tx.send_from(message, reserved_at, now)
-            }
-            None => self.pub_tx.send_from(message, Some(now), now),
-        };
-
-        if let Err(e) = sent {
+        if let Err(e) = self.pub_tx.send(message) {
             log::error!("Failed to send message: {e}");
         }
     }
@@ -584,69 +564,13 @@ impl StreamSources {
     }
 }
 
-/// When each number [`RedisMessageBusBacking::reserve_source`] gave and no published entry has yet
-/// taken was reserved, by key in number order, so an entry's age runs from its reservation.
-///
-/// A reservation leaves when its entry is published, when an entry numbered after it on its key is
-/// published first (its entry was not encoded or was dropped while held, a hole), or once it is
-/// past [`MAX_PENDING_AGE`] at any later reservation or publication, whose entry is then dropped if
-/// it still arrives. So it holds at most the reservations of the last [`MAX_PENDING_AGE`] whose
-/// entries have not arrived, and a key with none has no place in it.
-#[derive(Debug, Default)]
-struct ReservationTimes(AHashMap<Ustr, VecDeque<(u64, tokio::time::Instant)>>);
-
-impl ReservationTimes {
-    fn stamp(&mut self, source: &BusMessageSource, now: tokio::time::Instant) {
-        self.prune(now);
-        self.0
-            .entry(source.stream)
-            .or_default()
-            .push_back((source.sequence, now));
-    }
-
-    /// Takes when `source` was reserved, removing the earlier reservations of its key; `None` when
-    /// its reservation is gone.
-    fn take(
-        &mut self,
-        source: &BusMessageSource,
-        now: tokio::time::Instant,
-    ) -> Option<tokio::time::Instant> {
-        self.prune(now);
-        let times = self.0.get_mut(&source.stream)?;
-
-        while times
-            .front()
-            .is_some_and(|&(sequence, _)| sequence < source.sequence)
-        {
-            times.pop_front();
-        }
-        let reserved_at = times
-            .front()
-            .filter(|&&(sequence, _)| sequence == source.sequence)
-            .map(|&(_, reserved_at)| reserved_at);
-
-        if reserved_at.is_some() {
-            times.pop_front();
-        }
-
-        if times.is_empty() {
-            self.0.remove(&source.stream);
-        }
-        reserved_at
-    }
-
-    /// Removes every reservation past [`MAX_PENDING_AGE`] at `now`, and each key left with none.
-    fn prune(&mut self, now: tokio::time::Instant) {
-        self.0.retain(|_, times| {
-            while times
-                .front()
-                .is_some_and(|&(_, reserved_at)| reserved_at + MAX_PENDING_AGE <= now)
-            {
-                times.pop_front();
-            }
-            !times.is_empty()
-        });
-    }
+thread_local! {
+    /// The source this thread last reserved through [`RedisMessageBusBacking::reserve_source`], and
+    /// when, from which its entry is aged when it arrives. A thread has at most one numbered entry
+    /// between its reservation and its admission, since the message bus refuses a publication made
+    /// while it encodes one, so a reservation whose entry never arrives is overwritten by the next.
+    static RESERVED_AT: Cell<Option<(BusMessageSource, tokio::time::Instant)>> =
+        const { Cell::new(None) };
 }
 
 /// Returns the key an entry of `topic` is written on: `stream_key`, or with one stream per topic,
@@ -671,10 +595,10 @@ const MAX_PENDING_ENTRIES: usize = 100_000;
 /// message bus numbered from the reservation of its number, on the monotonic clock.
 ///
 /// An older message not yet sent is dropped and counted as discarded, at admission when it arrives
-/// older. Expiry takes the oldest admitted first, so an entry admitted behind younger entries of
-/// other keys stays past it until they expire, by less than the time from its reservation to its
-/// admission. A batch being written whose oldest message reaches it is abandoned whole, without
-/// another attempt, and counted as uncertain. Provisional until measured.
+/// older, and is never written. Entries can be admitted out of the order of their ages, so one can
+/// stay pending past it behind younger ones, and is dropped when the publish task takes it into a
+/// batch. A batch being written is abandoned whole at the first of its messages to reach it,
+/// without another attempt, and counted as uncertain. Provisional until measured.
 const MAX_PENDING_AGE: Duration = Duration::from_secs(180);
 
 /// Longest wait of the publish task between two connect or write attempts, and of the stream task
@@ -707,23 +631,20 @@ struct PendingEntries {
 impl PendingEntries {
     /// Admits `message` at `now`, aged from `accepted`, taking out the oldest messages not yet
     /// taken into a batch beyond [`MAX_PENDING_ENTRIES`] with the batch being written, and returns
-    /// them for the caller to destroy once it no longer holds these entries. A message without
-    /// `accepted`, or past [`MAX_PENDING_AGE`] from it, is taken out instead.
+    /// them for the caller to destroy once it no longer holds these entries. A message past
+    /// [`MAX_PENDING_AGE`] from `accepted` is taken out instead.
     ///
     /// Each admission adds one message, so at most one is taken out.
     fn admit(
         &mut self,
         message: BusMessage,
-        accepted: Option<tokio::time::Instant>,
+        accepted: tokio::time::Instant,
         now: tokio::time::Instant,
     ) -> Vec<PendingMessage> {
-        let Some(accepted) = accepted.filter(|&accepted| now < accepted + MAX_PENDING_AGE) else {
+        if accepted + MAX_PENDING_AGE <= now {
             self.discarded += 1;
-            return vec![PendingMessage {
-                accepted: now,
-                message,
-            }];
-        };
+            return vec![PendingMessage { accepted, message }];
+        }
         self.buffer.push_back(PendingMessage { accepted, message });
 
         let excess = (self.buffer.len() + self.batch_len)
@@ -779,8 +700,10 @@ fn publish_channel() -> (PublishSender, PublishReceiver) {
 }
 
 impl PublishSender {
-    /// Admits `message`, its age running from this call; the close message stops admission
-    /// instead.
+    /// Admits `message`, its age running from this call, or from its reservation when it is the
+    /// entry this thread last numbered through [`RedisMessageBusBacking::reserve_source`]; one past
+    /// [`MAX_PENDING_AGE`] is dropped and counted as discarded, and the close message stops
+    /// admission instead.
     ///
     /// # Errors
     ///
@@ -788,22 +711,11 @@ impl PublishSender {
     fn send(&self, message: BusMessage) -> Result<(), tokio::sync::mpsc::error::SendError<()>> {
         // Its age runs from the call, not from when the lock is free
         let now = tokio::time::Instant::now();
-        self.send_from(message, Some(now), now)
-    }
+        let accepted = RESERVED_AT
+            .get()
+            .filter(|&(source, _)| message.source == Some(source))
+            .map_or(now, |(_, reserved_at)| reserved_at);
 
-    /// Admits `message` at `now`, its age running from `accepted`, as [`Self::send`] does; one
-    /// without `accepted`, or past [`MAX_PENDING_AGE`] from it, is dropped and counted as
-    /// discarded.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error, and admits nothing, if the publish task has ended.
-    fn send_from(
-        &self,
-        message: BusMessage,
-        accepted: Option<tokio::time::Instant>,
-        now: tokio::time::Instant,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<()>> {
         if self.wake.is_closed() {
             return Err(tokio::sync::mpsc::error::SendError(()));
         }
@@ -1143,11 +1055,13 @@ impl StreamWriter {
         cleared
     }
 
-    /// Returns when the oldest pending message reaches [`MAX_PENDING_AGE`].
+    /// Returns when the oldest message of the batch being written, or else the first pending
+    /// message, reaches [`MAX_PENDING_AGE`].
     fn next_expiry(&self) -> Option<tokio::time::Instant> {
         self.batch
-            .first()
+            .iter()
             .map(|pending| pending.accepted)
+            .min()
             .or_else(|| {
                 self.entries()
                     .buffer
@@ -1158,7 +1072,7 @@ impl StreamWriter {
     }
 
     /// Drops what is pending past [`MAX_PENDING_AGE`] at `now`: the messages not yet sent, counted
-    /// as discarded, and a batch being written whose oldest message is past it, whole, counted as
+    /// as discarded, and a batch being written with any message past it, whole, counted as
     /// uncertain.
     ///
     /// The messages not yet sent are taken out a batch's worth per hold of the shared entries and
@@ -1185,7 +1099,7 @@ impl StreamWriter {
 
         let is_expired = |pending: &PendingMessage| pending.accepted + MAX_PENDING_AGE <= now;
 
-        if !self.batch.first().is_some_and(is_expired) {
+        if !self.batch.iter().any(is_expired) {
             return false;
         }
 
@@ -1213,16 +1127,24 @@ impl StreamWriter {
         };
 
         if self.batch.is_empty() && write_due {
-            // Nothing past the age bound is taken, whenever its timer fires
-            self.expire(tokio::time::Instant::now());
+            // Nothing past the age bound is taken, whenever its timer fires, and wherever it waits
+            let now = tokio::time::Instant::now();
+            self.expire(now);
 
-            let batch: Vec<PendingMessage> = {
+            let (expired, batch) = {
                 let mut entries = self.entries();
                 let count = entries.buffer.len().min(PUBLISH_BATCH_SIZE);
-                let batch: Vec<PendingMessage> = entries.buffer.drain(..count).collect();
+                let (expired, batch): (Vec<PendingMessage>, Vec<PendingMessage>) = entries
+                    .buffer
+                    .drain(..count)
+                    .partition(|pending| pending.accepted + MAX_PENDING_AGE <= now);
                 entries.batch_len = batch.len();
-                batch
+                (expired, batch)
             };
+
+            if !expired.is_empty() {
+                self.discard(expired.len());
+            }
             self.batch = batch;
         }
 
@@ -2274,8 +2196,9 @@ mod tests {
 
     use nautilus_common::{
         msgbus::{
-            MessageBus, external_egress_from_backing, external_io_from_backing, get_message_bus,
-            publish_any, publish_quote, set_message_bus,
+            MessageBus, ShareableMessageHandler, external_egress_from_backing,
+            external_io_from_backing, get_message_bus, publish_any, publish_quote, set_message_bus,
+            subscribe_any,
         },
         testing::{wait_until, wait_until_async},
     };
@@ -3915,16 +3838,43 @@ mod tests {
         );
     }
 
-    // Data of depth 2 publishes depth 1 while it is encoded, which publishes depth 0, all on one
-    // key; a quote follows. Without the hold the entries reach Redis as 3, 2, 1, 4.
+    // The outer publication is numbered 1 and the one its encoding makes is refused before it is
+    // numbered, so the next publication of the nested topic takes the next number of its key
     #[rstest]
-    #[case::outer_encoded(false, &[1, 2, 3, 4], &[Some(2), Some(1), Some(0), None])]
-    #[case::outer_not_encoded(true, &[2, 3, 4], &[Some(1), Some(0), None])]
-    fn test_way_out_writes_publications_made_while_encoding_after_the_one_encoded(
-        #[case] outer_fails: bool,
+    #[case::same_stream(false, "data.nested.same", "data.nested.same", &[1, 2])]
+    #[case::another_stream(true, "data.nested.outer", "data.nested.other", &[1, 1])]
+    fn test_way_out_refuses_a_publication_made_while_encoding_a_numbered_one(
+        #[case] stream_per_topic: bool,
+        #[case] outer: &'static str,
+        #[case] nested: &'static str,
         #[case] expected_sequences: &[u64],
-        #[case] expected_depths: &[Option<u64>],
     ) {
+        capture_logs();
+        let fake = get_runtime().block_on(FakeRedis::start("unused"));
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        let config = MessageBusConfig {
+            stream_per_topic,
+            ..Default::default()
+        };
+        install_way_out(&fake, UUID4::new(), config);
+
+        publish_any(outer.into(), &NestingData::nesting(nested).custom());
+        publish_quote(nested.into(), &QuoteTick::default());
+        wait_until(|| fake.written_len() >= 2, Duration::from_secs(5));
+        close_way_out();
+
+        let written = fake.written();
+        let topics: Vec<Option<String>> = written.iter().map(|xadd| xadd.field("topic")).collect();
+        assert_eq!(fake.written_sequences(), expected_sequences);
+        assert_eq!(topics, [Some(outer.to_string()), Some(nested.to_string())]);
+        assert_eq!(nesting_depth(&written[0]), Some(1));
+        assert_eq!(error_lines(&thread_logs()), [refusal_line(outer, nested)]);
+    }
+
+    // A handler of the refused publication publishes again, still inside the outer encoding
+    #[rstest]
+    fn test_way_out_refuses_every_publication_made_while_encoding_a_numbered_one() {
+        capture_logs();
         let fake = get_runtime().block_on(FakeRedis::start("unused"));
         fake.accept_writes.store(true, Ordering::SeqCst);
         let config = MessageBusConfig {
@@ -3932,24 +3882,68 @@ mod tests {
             ..Default::default()
         };
         install_way_out(&fake, UUID4::new(), config);
-
-        publish_any("data.custom".into(), &NestingData::custom(2, outer_fails));
-        publish_quote("data.quotes.A".into(), &QuoteTick::default());
-        wait_until(
-            || fake.written_len() == expected_sequences.len(),
-            Duration::from_secs(5),
+        subscribe_any(
+            "data.three.b".into(),
+            ShareableMessageHandler::from_any(|_: &dyn std::any::Any| {
+                publish_quote("data.three.c".into(), &QuoteTick::default());
+            }),
+            None,
         );
+
+        publish_any(
+            "data.three.a".into(),
+            &NestingData::nesting("data.three.b").custom(),
+        );
+        publish_quote("data.three.a".into(), &QuoteTick::default());
+        wait_until(|| fake.written_len() >= 2, Duration::from_secs(5));
         close_way_out();
 
-        let depths: Vec<Option<u64>> = fake.written().iter().map(nesting_depth).collect();
-        assert_eq!(fake.written_sequences(), expected_sequences);
-        assert_eq!(depths, expected_depths);
+        assert_eq!(fake.written_sequences(), [1, 2]);
+        assert_eq!(nesting_depth(&fake.written()[0]), Some(1));
+        assert_eq!(
+            error_lines(&thread_logs()),
+            [
+                refusal_line("data.three.a", "data.three.c"),
+                refusal_line("data.three.a", "data.three.b"),
+            ]
+        );
     }
 
-    // Number 1's encoding publishes 100,001 entries on its key, numbered 2 to 100,002 and held
-    // behind it: one past the hold's bound for each of the last two, which drop 2 and 3
+    // Number 1's encoding has its nested publication refused, then fails: 1 is a hole, and the
+    // next encoding is numbered and refuses its own nested publication again
     #[rstest]
-    fn test_way_out_drops_the_oldest_held_entries_beyond_the_hold_and_warns_once() {
+    fn test_way_out_ends_the_refusal_with_an_encoding_that_fails() {
+        capture_logs();
+        let fake = get_runtime().block_on(FakeRedis::start("unused"));
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        let config = MessageBusConfig {
+            stream_per_topic: false,
+            ..Default::default()
+        };
+        install_way_out(&fake, UUID4::new(), config);
+        let nesting = NestingData::nesting("data.failing");
+
+        let failing = NestingData {
+            fails: true,
+            ..nesting
+        };
+        publish_any("data.failing".into(), &failing.custom());
+        publish_any("data.failing".into(), &nesting.custom());
+        publish_quote("data.failing".into(), &QuoteTick::default());
+        wait_until(|| fake.written_len() >= 2, Duration::from_secs(5));
+        close_way_out();
+
+        let refusals: Vec<String> = error_lines(&thread_logs())
+            .into_iter()
+            .filter(|line| line.starts_with("Refused"))
+            .collect();
+        assert_eq!(fake.written_sequences(), [2, 3]);
+        assert_eq!(nesting_depth(&fake.written()[0]), Some(1));
+        assert_eq!(refusals, [refusal_line("data.failing", "data.failing")]);
+    }
+
+    #[rstest]
+    fn test_way_out_logs_the_first_refusal_of_a_pair_of_topics_only() {
         capture_logs();
         let fake = get_runtime().block_on(FakeRedis::start("unused"));
         fake.accept_writes.store(true, Ordering::SeqCst);
@@ -3959,34 +3953,66 @@ mod tests {
         };
         install_way_out(&fake, UUID4::new(), config);
 
-        publish_any("data.custom".into(), &NestingData::wide(100_001));
-        wait_until(|| fake.written_len() >= 100_000, Duration::from_secs(120));
+        let many = NestingData {
+            publications: 1_000,
+            ..NestingData::nesting("data.many")
+        };
+        publish_any("data.many".into(), &many.custom());
+        publish_quote("data.many".into(), &QuoteTick::default());
+        wait_until(|| fake.written_len() >= 2, Duration::from_secs(5));
         close_way_out();
 
-        let written = fake.written();
-        let warnings: Vec<String> = thread_logs()
-            .into_iter()
-            .filter(|(level, _)| *level == log::Level::Warn)
-            .map(|(_, line)| line)
-            .collect();
+        assert_eq!(fake.written_sequences(), [1, 2]);
         assert_eq!(
-            fake.written_sequences(),
-            std::iter::once(1).chain(4..=100_002).collect::<Vec<u64>>()
-        );
-        assert_eq!(nesting_depth(&written[0]), Some(1));
-        assert!(
-            written[1..]
-                .iter()
-                .all(|xadd| nesting_depth(xadd) == Some(0))
-        );
-        assert_eq!(
-            warnings,
-            [
-                "Dropped 2 publications held while a publication on 'data.custom' was encoded, beyond 100000 held; their numbers are holes"
-            ]
+            error_lines(&thread_logs()),
+            [refusal_line("data.many", "data.many")]
         );
     }
 
+    // The heartbeat's first tick is at once, and two more fall within a 2.5 s encoding
+    #[rstest]
+    fn test_way_out_takes_heartbeats_while_the_message_bus_encodes() {
+        capture_logs();
+        let fake = get_runtime().block_on(FakeRedis::start("unused"));
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        let config = MessageBusConfig {
+            stream_per_topic: true,
+            heartbeat_interval_secs: Some(1),
+            ..Default::default()
+        };
+        install_way_out(&fake, UUID4::new(), config);
+        let is_slow = |xadd: &FakeXadd| xadd.field("topic").as_deref() == Some("data.slow");
+
+        wait_until(|| fake.written_len() == 1, Duration::from_secs(5));
+        let slow = NestingData {
+            publications: 0,
+            encoding_time: Duration::from_millis(2_500),
+            ..NestingData::nesting("data.slow")
+        };
+        publish_any("data.slow".into(), &slow.custom());
+        wait_until(
+            || fake.written().iter().any(is_slow),
+            Duration::from_secs(5),
+        );
+        close_way_out();
+
+        let written = fake.written();
+        let slow_at = written.iter().position(is_slow).unwrap();
+        let heartbeats: Vec<u64> = written
+            .iter()
+            .filter(|xadd| !is_slow(xadd))
+            .map(FakeXadd::sequence)
+            .collect();
+        assert!(slow_at >= 3, "{slow_at}");
+        assert_eq!(written[slow_at].sequence(), 1);
+        assert_eq!(
+            heartbeats,
+            (1..=heartbeats.len() as u64).collect::<Vec<u64>>()
+        );
+        assert_eq!(error_lines(&thread_logs()), Vec::<String>::new());
+    }
+
+    // Reserved at 0 s, its encoding ends and it is admitted at 181 s
     #[rstest]
     #[tokio::test(start_paused = true)]
     async fn test_backing_drops_an_entry_reserved_past_the_age_bound_when_it_arrives() {
@@ -3994,7 +4020,7 @@ mod tests {
         let _clock = ManualClock::hold();
         let fake = FakeRedis::start("unused").await;
         fake.accept_writes.store(true, Ordering::SeqCst);
-        let (backing, handle) = backing_publishing_to(&fake, false);
+        let (backing, handle) = backing_publishing_to(&fake, MessageBusConfig::default());
 
         let late = numbered_by(&backing, "data.quotes.A");
         drive(Duration::from_secs(181)).await;
@@ -4012,66 +4038,81 @@ mod tests {
             fake.write_records(&logs),
             [("degraded".to_string(), false, 1, 0)]
         );
-        assert!(backing.reserved_at.lock().unwrap().0.is_empty());
     }
 
-    // An encoding that fails publishes nothing, so its number's reservation never meets its entry
+    // The bus's entry is reserved at 0 s and admitted at 179 s behind a heartbeat admitted at
+    // 100 s; the write at 200 s takes the heartbeat and drops the bus's entry
     #[rstest]
     #[tokio::test(start_paused = true)]
-    async fn test_backing_forgets_the_reservation_of_an_entry_never_published() {
+    async fn test_publish_task_drops_an_entry_past_the_age_bound_behind_a_younger_one() {
         capture_logs();
         let _clock = ManualClock::hold();
         let fake = FakeRedis::start("unused").await;
         fake.accept_writes.store(true, Ordering::SeqCst);
-        let (backing, handle) = backing_publishing_to(&fake, true);
-        let reservations = |backing: &RedisMessageBusBacking| {
-            let reserved_at = backing.reserved_at.lock().unwrap();
-            let mut keys: Vec<(String, usize)> = reserved_at
-                .0
-                .iter()
-                .map(|(key, times)| (key.to_string(), times.len()))
-                .collect();
-            keys.sort();
-            keys
+        let config = MessageBusConfig {
+            buffer_interval_ms: Some(200_000),
+            ..Default::default()
         };
+        let (backing, handle) = backing_publishing_to(&fake, config);
 
-        // Passed over by the next number of its key
-        drop(numbered_by(&backing, "data.quotes.A"));
-        let after_failed = reservations(&backing);
-        backing.publish(numbered_by(&backing, "data.quotes.A"));
-        let after_next = reservations(&backing);
-
-        // The last of its key, gone once past the age bound
-        drop(numbered_by(&backing, "data.quotes.A"));
-        drive(Duration::from_secs(180)).await;
-        let other = numbered_by(&backing, "data.quotes.B");
-        let after_bound = reservations(&backing);
-        backing.publish(other);
-        drive_until(|| fake.written_len() == 2, Duration::from_secs(5)).await;
+        let bus = numbered_by(&backing, "data.quotes.A");
+        drive(Duration::from_secs(100)).await;
+        backing.pub_tx.send(heartbeat_of(&backing)).unwrap();
+        drive(Duration::from_secs(79)).await;
+        backing.publish(bus);
+        drive(Duration::from_secs(30)).await;
         backing.pub_tx.send(BusMessage::new_close()).unwrap();
         settle_until(|| handle.is_finished()).await;
         let result = handle.await.unwrap();
 
-        let keys: Vec<String> = fake.written().iter().map(|xadd| xadd.key.clone()).collect();
+        let logs = thread_logs();
+        let topics: Vec<Option<String>> = fake
+            .written()
+            .iter()
+            .map(|xadd| xadd.field("topic"))
+            .collect();
         assert!(result.is_ok());
+        assert_eq!(topics, [Some(HEARTBEAT_TOPIC.to_string())]);
         assert_eq!(
-            after_failed,
-            [("trader-TESTER-007:stream:data.quotes.A".to_string(), 1)]
-        );
-        assert!(after_next.is_empty(), "{after_next:?}");
-        assert_eq!(
-            after_bound,
-            [("trader-TESTER-007:stream:data.quotes.B".to_string(), 1)]
-        );
-        assert!(reservations(&backing).is_empty());
-        assert_eq!(fake.written_sequences(), [2, 1]);
-        assert_eq!(
-            keys,
+            fake.write_records(&logs),
             [
-                "trader-TESTER-007:stream:data.quotes.A",
-                "trader-TESTER-007:stream:data.quotes.B",
+                ("degraded".to_string(), false, 1, 0),
+                ("connected".to_string(), true, 1, 0),
             ]
         );
+    }
+
+    // A batch taken at 130 s holds a heartbeat admitted at 100 s and the bus's entry reserved at
+    // 0 s and admitted at 129 s; Redis takes no write until 185 s
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_publish_task_abandons_a_batch_at_the_first_age_bound_of_its_entries() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let fake = FakeRedis::start("LOADING Redis is loading the dataset in memory").await;
+        let config = MessageBusConfig {
+            buffer_interval_ms: Some(130_000),
+            ..Default::default()
+        };
+        let (backing, handle) = backing_publishing_to(&fake, config);
+
+        let bus = numbered_by(&backing, "data.quotes.A");
+        drive(Duration::from_secs(100)).await;
+        backing.pub_tx.send(heartbeat_of(&backing)).unwrap();
+        drive(Duration::from_secs(29)).await;
+        backing.publish(bus);
+        drive(Duration::from_secs(56)).await;
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        drive(Duration::from_secs(5)).await;
+        backing.pub_tx.send(BusMessage::new_close()).unwrap();
+        settle_until(|| handle.is_finished()).await;
+        let result = handle.await.unwrap();
+
+        let logs = thread_logs();
+        assert!(result.is_ok());
+        assert_eq!(fake.written_len(), 0);
+        assert!(logs.iter().any(|(level, line)| *level == log::Level::Warn
+            && line.starts_with("Abandoned a batch of 2 stream entries")));
     }
 
     #[rstest]
@@ -5126,34 +5167,31 @@ mod tests {
         }
     }
 
-    /// Custom data whose JSON encoding first publishes, on `data.custom`, `publications` times the
-    /// same data one depth less, then fails when `fails` is set.
-    #[derive(Debug)]
+    /// Custom data whose JSON encoding first publishes on `nested_topic`, `publications` times, the
+    /// same data one depth less, then takes `encoding_time` and fails when `fails` is set.
+    #[derive(Clone, Copy, Debug)]
     struct NestingData {
         depth: u64,
-        fails: bool,
+        nested_topic: &'static str,
         publications: u64,
+        encoding_time: Duration,
+        fails: bool,
     }
 
     impl NestingData {
-        fn custom(depth: u64, fails: bool) -> CustomData {
-            Self::data(depth, fails, 1)
+        /// Data of depth 1 that publishes data of depth 0 on `nested_topic` while it is encoded.
+        fn nesting(nested_topic: &'static str) -> Self {
+            Self {
+                depth: 1,
+                nested_topic,
+                publications: 1,
+                encoding_time: Duration::ZERO,
+                fails: false,
+            }
         }
 
-        /// Data of depth 1 that publishes `publications` data of depth 0 while it is encoded.
-        fn wide(publications: u64) -> CustomData {
-            Self::data(1, false, publications)
-        }
-
-        fn data(depth: u64, fails: bool, publications: u64) -> CustomData {
-            CustomData::new(
-                Arc::new(Self {
-                    depth,
-                    fails,
-                    publications,
-                }),
-                DataType::new("NestingData", None, None),
-            )
+        fn custom(self) -> CustomData {
+            CustomData::new(Arc::new(self), DataType::new("NestingData", None, None))
         }
     }
 
@@ -5179,19 +5217,21 @@ mod tests {
         fn to_json(&self) -> anyhow::Result<String> {
             if let Some(depth) = self.depth.checked_sub(1) {
                 for _ in 0..self.publications {
-                    publish_any("data.custom".into(), &Self::custom(depth, false));
+                    let nested = Self {
+                        depth,
+                        fails: false,
+                        ..*self
+                    };
+                    publish_any(self.nested_topic.into(), &nested.custom());
                 }
             }
+            std::thread::sleep(self.encoding_time);
             anyhow::ensure!(!self.fails, "NestingData has no JSON form");
             Ok(json!({ "depth": self.depth }).to_string())
         }
 
         fn clone_arc(&self) -> Arc<dyn CustomDataTrait> {
-            Arc::new(Self {
-                depth: self.depth,
-                fails: self.fails,
-                publications: self.publications,
-            })
+            Arc::new(*self)
         }
 
         fn eq_arc(&self, other: &dyn CustomDataTrait) -> bool {
@@ -5224,7 +5264,6 @@ mod tests {
                 UUID4::new(),
                 &MessageBusConfig::default(),
             ),
-            reserved_at: Mutex::default(),
         }
     }
 
@@ -5271,23 +5310,26 @@ mod tests {
         })
     }
 
-    /// Returns a backing for trader `TESTER-007` whose publish task, spawned on this runtime,
-    /// writes to `fake`, with a key per topic when `stream_per_topic`.
+    /// Returns a backing for trader `TESTER-007` with `config` whose publish task, spawned on this
+    /// runtime, writes to `fake`.
     fn backing_publishing_to(
         fake: &FakeRedis,
-        stream_per_topic: bool,
+        config: MessageBusConfig,
     ) -> (
         RedisMessageBusBacking,
         tokio::task::JoinHandle<anyhow::Result<()>>,
     ) {
         let (pub_tx, rx) = publish_channel();
-        let handle = spawn_publisher(fake, rx, stream_per_topic, None);
         let trader_id = TraderId::from("TESTER-007");
         let instance_id = UUID4::new();
-        let config = MessageBusConfig {
-            stream_per_topic,
-            ..Default::default()
-        };
+        let sources = StreamSources::new(trader_id, instance_id, &config);
+        let handle = tokio::spawn(publish_messages(
+            rx,
+            trader_id,
+            instance_id,
+            config,
+            fake.config(),
+        ));
         let backing = RedisMessageBusBacking {
             trader_id,
             instance_id,
@@ -5298,10 +5340,27 @@ mod tests {
             stream_signal: Arc::new(AtomicBool::new(false)),
             heartbeat_handle: None,
             heartbeat_signal: Arc::new(AtomicBool::new(false)),
-            sources: StreamSources::new(trader_id, instance_id, &config),
-            reserved_at: Mutex::default(),
+            sources,
         };
         (backing, handle)
+    }
+
+    /// Returns a heartbeat numbered by `backing`, as its heartbeat task numbers it.
+    fn heartbeat_of(backing: &RedisMessageBusBacking) -> BusMessage {
+        create_heartbeat_msg(
+            backing
+                .sources
+                .reserve(Ustr::from(HEARTBEAT_TOPIC))
+                .unwrap(),
+        )
+    }
+
+    /// Returns the line that logs the first refusal of a publication on `nested` made while a
+    /// publication on `outer` is encoded.
+    fn refusal_line(outer: &str, nested: &str) -> String {
+        format!(
+            "Refused the publication on '{nested}' made while a publication on '{outer}' was encoded for a numbered stream: a serializer must not publish; every later one of this pair is refused without a line"
+        )
     }
 
     /// Returns a message on `topic` numbered by `backing`, as the message bus numbers it before

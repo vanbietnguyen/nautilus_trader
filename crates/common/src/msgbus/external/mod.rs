@@ -15,19 +15,15 @@
 
 //! External message bus stream encoding and republishing.
 //!
-//! A numbered publication made while another of its stream is encoded on the same thread is held
-//! behind it until that encoding ends, so the stream's numbers reach the way out in the order they
-//! were reserved. One thread holds at most `MAX_HELD_ENTRIES`: beyond it the oldest held entry
-//! whose encoding has ended is dropped, a hole in its stream's numbers, and the drops of one outer
-//! publication are logged as one warning. These drops are not in the backing's count of discarded
-//! entries: the way out reaches the backing only by publishing, and a dropped entry is not
-//! published.
+//! A publication made on a thread while it encodes another for a way out that numbers its entries
+//! (a type whose serializer publishes) is refused by that way out before a number is reserved, so
+//! the numbers of a stream reach the way out in the order they were reserved; its delivery inside
+//! the program is untouched. The first refusal of each pair of topics is logged at error level.
 
 use std::{
     any::Any,
-    cell::{Cell, RefCell},
-    collections::VecDeque,
-    rc::Rc,
+    cell::Cell,
+    sync::{Mutex, PoisonError},
 };
 
 use anyhow::Context;
@@ -51,7 +47,6 @@ use super::{
         publish_order_event, publish_portfolio_snapshot, publish_position_event, publish_quote,
         publish_trade, send_account_state, send_data,
     },
-    backing::MessageBusExternalEgress,
     get_message_bus,
     mstr::{MStr, Topic},
     switchboard::{
@@ -183,6 +178,11 @@ where
         return;
     }
 
+    if let Some(outer) = NUMBERED_ENCODING.get() {
+        refuse_nested_publication(outer, *topic);
+        return;
+    }
+
     // Numbered before encoding, so a publication that cannot be encoded leaves a hole
     let reserved = external_egress.borrow().reserve_source(*topic);
     let source = match reserved {
@@ -193,9 +193,7 @@ where
         }
     };
 
-    // A numbered publication this encoding makes on the same stream waits behind this one
-    let held = source.map(|source| EncodingEntry::hold(&external_egress, source, *topic));
-
+    let numbered_encoding = source.map(|_| NumberedEncoding::start(*topic));
     let payload =
         match codec::serialize_payload(encoding, payload_type, message, timestamps_as_iso8601) {
             Ok(payload) => payload,
@@ -208,158 +206,72 @@ where
                 return;
             }
         };
-
-    // Serialization can close the original destination or replace it on the bus
-    let mut message = BusMessage::new(*topic, payload_type, payload, encoding);
-    message.source = source;
-
-    if let Some(held) = held {
-        held.encoded(message);
-        return;
-    }
+    drop(numbered_encoding);
 
     let external_egress = external_egress.borrow();
     if external_egress.is_closed() {
         return;
     }
 
+    // Serialization can close the original destination or replace it on the bus
+    let mut message = BusMessage::new(*topic, payload_type, payload, encoding);
+    message.source = source;
     external_egress.publish(message);
 }
 
-/// Most numbered publications one thread holds at once, the one being encoded included.
-///
-/// It mirrors the Redis backing's bound on pending stream entries (100,000), which the way out
-/// cannot read: the backing is in a crate that depends on this one. Beyond it the oldest held entry
-/// whose encoding has ended is dropped.
-const MAX_HELD_ENTRIES: usize = 100_000;
+/// Most pairs of topics whose first refusal is logged. The first new pair past them is logged with
+/// a last line saying so, and no later new pair is logged.
+const MAX_LOGGED_REFUSALS: usize = 64;
+
+/// The pairs of topics, the publication being encoded and the one refused, whose refusal was
+/// logged in this process.
+static LOGGED_REFUSALS: Mutex<Vec<(Ustr, Ustr)>> = Mutex::new(Vec::new());
 
 thread_local! {
-    /// This thread's numbered publications in the order their numbers were reserved, each from its
-    /// reservation until its encoding has ended and no earlier one of its stream is held.
-    static HELD_ENTRIES: RefCell<VecDeque<HeldEntry>> = const { RefCell::new(VecDeque::new()) };
-
-    /// Encoded publications this thread dropped from its held entries and has not yet logged.
-    static HELD_DROPPED: Cell<usize> = const { Cell::new(0) };
+    /// The topic of the publication this thread encodes for a way out that numbered it.
+    static NUMBERED_ENCODING: Cell<Option<Ustr>> = const { Cell::new(None) };
 }
 
-/// A numbered publication held so that its stream's numbers reach the way out in the order they
-/// were reserved.
-struct HeldEntry {
-    egress: Rc<RefCell<Box<dyn MessageBusExternalEgress>>>,
-    source: BusMessageSource,
-    /// The encoded message; `None` while encoding, and a hole once encoding has ended.
-    message: Option<BusMessage>,
-    encoding: bool,
-}
+/// Marks this thread as encoding a numbered publication of a topic until it is dropped, which
+/// every exit of the encoding does, an unwinding panic included.
+struct NumberedEncoding;
 
-impl HeldEntry {
-    fn is_same_stream(&self, source: &BusMessageSource) -> bool {
-        self.source.publisher_id == source.publisher_id
-            && self.source.instance_id == source.instance_id
-            && self.source.stream == source.stream
+impl NumberedEncoding {
+    fn start(topic: Ustr) -> Self {
+        NUMBERED_ENCODING.set(Some(topic));
+        Self
     }
 }
 
-/// The place of a numbered publication of a topic among this thread's held entries while it is
-/// encoded.
-///
-/// A numbered publication that its encoding makes on the same stream is reserved after it and
-/// held behind it, so the numbers of one stream reach the way out in the order they were reserved.
-/// Dropping this ends the encoding, a hole unless [`Self::encoded`] gave its message, and publishes
-/// every held entry no earlier entry of its stream still holds, in reservation order. Entries are
-/// held only while an encoding on this thread runs, so none is held once the outer publication
-/// returns, and at most [`MAX_HELD_ENTRIES`] are held at once: beyond it the oldest whose encoding
-/// has ended is dropped, and the outer publication logs how many it dropped.
-struct EncodingEntry(BusMessageSource, Ustr);
-
-impl EncodingEntry {
-    fn hold(
-        egress: &Rc<RefCell<Box<dyn MessageBusExternalEgress>>>,
-        source: BusMessageSource,
-        topic: Ustr,
-    ) -> Self {
-        HELD_ENTRIES.with_borrow_mut(|held| {
-            held.push_back(HeldEntry {
-                egress: Rc::clone(egress),
-                source,
-                message: None,
-                encoding: true,
-            });
-
-            if held.len() > MAX_HELD_ENTRIES
-                && let Some(index) = held.iter().position(|entry| !entry.encoding)
-                && held
-                    .remove(index)
-                    .is_some_and(|entry| entry.message.is_some())
-            {
-                HELD_DROPPED.set(HELD_DROPPED.get() + 1);
-            }
-        });
-        Self(source, topic)
-    }
-
-    fn encoded(self, message: BusMessage) {
-        HELD_ENTRIES.with_borrow_mut(|held| {
-            if let Some(entry) = self.find(held) {
-                entry.message = Some(message);
-            }
-        });
-    }
-
-    /// Encodings nest, so this one is the last entry still encoding.
-    fn find<'a>(&self, held: &'a mut VecDeque<HeldEntry>) -> Option<&'a mut HeldEntry> {
-        held.iter_mut()
-            .rev()
-            .find(|entry| entry.encoding && entry.source == self.0)
-    }
-}
-
-impl Drop for EncodingEntry {
+impl Drop for NumberedEncoding {
     fn drop(&mut self) {
-        // Only this end can release entries, and only on its stream, so while an earlier entry of
-        // its stream is still encoding nothing is released and the held entries are not searched
-        let releases = HELD_ENTRIES.with_borrow_mut(|held| {
-            if let Some(entry) = self.find(held) {
-                entry.encoding = false;
-            }
-            held.iter()
-                .find(|entry| entry.is_same_stream(&self.0))
-                .is_none_or(|first| !first.encoding)
-        });
-
-        while releases && let Some(entry) = HELD_ENTRIES.with_borrow_mut(take_released_entry) {
-            let Some(message) = entry.message else {
-                continue;
-            };
-            let egress = entry.egress.borrow();
-            if !egress.is_closed() {
-                egress.publish(message);
-            }
-        }
-
-        // The outer publication's end, once nothing is encoding
-        if HELD_DROPPED.get() > 0
-            && HELD_ENTRIES.with_borrow(|held| !held.iter().any(|entry| entry.encoding))
-        {
-            log::warn!(
-                "Dropped {} publications held while a publication on '{}' was encoded, beyond {MAX_HELD_ENTRIES} held; their numbers are holes",
-                HELD_DROPPED.replace(0),
-                self.1,
-            );
-        }
+        NUMBERED_ENCODING.set(None);
     }
 }
 
-/// Removes the first held entry whose encoding has ended and before which no entry of its stream
-/// is held.
-fn take_released_entry(held: &mut VecDeque<HeldEntry>) -> Option<HeldEntry> {
-    let index = (0..held.len()).find(|&index| {
-        !held[index].encoding
-            && !held
-                .range(..index)
-                .any(|earlier| earlier.is_same_stream(&held[index].source))
-    })?;
-    held.remove(index)
+/// Refuses a publication on `topic` made while a publication on `outer` is encoded for a way out
+/// that numbers its entries, logging the first refusal of each pair of topics at error level.
+fn refuse_nested_publication(outer: Ustr, topic: Ustr) {
+    let logged = {
+        let mut logged = LOGGED_REFUSALS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if logged.len() > MAX_LOGGED_REFUSALS || logged.contains(&(outer, topic)) {
+            return;
+        }
+        logged.push((outer, topic));
+        logged.len()
+    };
+
+    if logged > MAX_LOGGED_REFUSALS {
+        log::error!(
+            "Refused the publication on '{topic}' made while a publication on '{outer}' was encoded for a numbered stream; past {MAX_LOGGED_REFUSALS} pairs of topics, no later refusal is logged"
+        );
+    } else {
+        log::error!(
+            "Refused the publication on '{topic}' made while a publication on '{outer}' was encoded for a numbered stream: a serializer must not publish; every later one of this pair is refused without a line"
+        );
+    }
 }
 
 thread_local! {
