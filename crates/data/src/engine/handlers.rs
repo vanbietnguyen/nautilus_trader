@@ -387,7 +387,6 @@ impl Handler<TradeTick> for JoinedTradeHandler {
 pub(super) struct BarBarHandler {
     aggregator: WeakCell<Box<dyn BarAggregator>>,
     bar_type: BarType,
-    warmup: Option<WarmupBuffer<Bar>>,
 }
 
 impl BarBarHandler {
@@ -395,14 +394,7 @@ impl BarBarHandler {
         Self {
             aggregator: WeakCell::from(Rc::downgrade(aggregator)),
             bar_type,
-            warmup: None,
         }
-    }
-
-    /// Holds incoming data in `warmup` until the buffer is released.
-    pub(super) fn with_warmup(mut self, warmup: Option<WarmupBuffer<Bar>>) -> Self {
-        self.warmup = warmup;
-        self
     }
 }
 
@@ -412,10 +404,6 @@ impl Handler<Bar> for BarBarHandler {
     }
 
     fn handle(&self, bar: &Bar) {
-        if self.warmup.as_ref().is_some_and(|warmup| warmup.hold(bar)) {
-            return;
-        }
-
         if let Some(agg) = self.aggregator.upgrade() {
             agg.borrow_mut().handle_bar(*bar);
         }

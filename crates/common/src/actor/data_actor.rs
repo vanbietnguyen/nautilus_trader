@@ -3179,8 +3179,9 @@ pub trait DataActor {
     /// to their bar types takes them over. They compute as above, on a clock of their own; such
     /// a request must give a `start`, name one instrument, no `limit`, no filter expression, no
     /// `point_data`, no bar type built from another bar and no bar type its own records do not
-    /// feed (`LAST` bars of its instrument on a trades request, others of it on a quotes request,
-    /// none on a bars request), and not be a continuous-future request, on an engine
+    /// feed (`LAST` bars of its instrument on a trades request, `BID`, `ASK` and `MID` bars on a
+    /// quotes request; no other kind of request keeps builders), and not be a continuous-future
+    /// request, on an engine
     /// whose clock is a `VirtualClock` (a backtest's); any other is refused before dispatch, with
     /// one terminal envelope naming the case. A request none of whose aggregators exists starts
     /// them, their clock at its `start`. A request whose aggregators are exactly those one earlier kept request left, none

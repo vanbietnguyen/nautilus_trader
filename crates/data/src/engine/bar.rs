@@ -153,7 +153,7 @@ pub(super) enum Release {
 pub(super) struct Restart {
     /// Each builder's copy of each held trade, in the request's order.
     held_trades: Vec<(BarType, Vec<Option<TradeTick>>)>,
-    /// Each restarted bar type with its held quotes or bars, sources first.
+    /// Each restarted bar type with its held quotes, sources first.
     restarted: Vec<(BarType, Option<BarAggregatorWarmup>)>,
 }
 
@@ -164,13 +164,12 @@ enum HeldRecord {
     /// Each builder's copy of one held trade, in the order live gave them the copies.
     Trade(u64, Vec<(BarType, TradeTick)>),
     Quote(u64, BarType, QuoteTick),
-    Bar(u64, BarType, Bar),
 }
 
 impl HeldRecord {
     const fn arrival(&self) -> u64 {
         match self {
-            Self::Trade(arrival, _) | Self::Quote(arrival, ..) | Self::Bar(arrival, ..) => *arrival,
+            Self::Trade(arrival, _) | Self::Quote(arrival, ..) => *arrival,
         }
     }
 
@@ -184,7 +183,6 @@ impl HeldRecord {
                 .max()
                 .unwrap_or_default(),
             Self::Quote(_, _, quote) => quote.ts_init,
-            Self::Bar(_, _, bar) => bar.ts_init,
         }
     }
 }
@@ -1252,7 +1250,7 @@ impl DataEngine {
     /// Feeds the new builders of `restart` (see [`Restart`]) the live records held for them, as
     /// live feeds them: the held trades trade by trade across bar types in the request's order
     /// (see [`Self::take_held_trades`]), each trade's deferred `RANGE_INCLUSIVE` bars published
-    /// after it; then any held quotes or bars one builder after the other, sources first.
+    /// after it; then any held quotes one builder after the other, sources first.
     fn feed_restarted(&self, restart: Restart) {
         let Restart {
             held_trades,
@@ -1421,7 +1419,7 @@ impl DataEngine {
     /// [`BarAggregatorWarmup`]) as one list in arrival order (see [`WarmupBuffer`]), across
     /// builders and kinds: each held trade once, with every builder's copy of it through its own
     /// copy of `joined` (see [`Self::take_held_trades`]), in the order live gave them the copies;
-    /// each held quote and bar. A copy stamped at or before `covered`, the coverage of the
+    /// each held quote. A copy stamped at or before `covered`, the coverage of the
     /// answer the builders leave, is dropped: the answer held it.
     fn take_held_records(
         &mut self,
@@ -1488,13 +1486,6 @@ impl DataEngine {
                         .filter(|(_, quote)| !owned(quote.ts_init))
                         .map(|(arrival, quote)| HeldRecord::Quote(arrival, *bar_type, quote)),
                 ),
-                BarAggregatorWarmup::Bar(buffer) => records.extend(
-                    buffer
-                        .release_with_arrivals()
-                        .into_iter()
-                        .filter(|(_, bar)| !owned(bar.ts_init))
-                        .map(|(arrival, bar)| HeldRecord::Bar(arrival, *bar_type, bar)),
-                ),
                 BarAggregatorWarmup::Trade(buffer)
                 | BarAggregatorWarmup::JoinedTrade(buffer, _) => records.extend(
                     buffer
@@ -1548,11 +1539,6 @@ impl DataEngine {
                 HeldRecord::Quote(_, bar_type, quote) => {
                     if let Some(aggregator) = aggregator(bar_type) {
                         aggregator.borrow_mut().handle_quote(quote);
-                    }
-                }
-                HeldRecord::Bar(_, bar_type, bar) => {
-                    if let Some(aggregator) = aggregator(bar_type) {
-                        aggregator.borrow_mut().handle_bar(bar);
                     }
                 }
             }
@@ -2413,12 +2399,10 @@ impl DataEngine {
             let warmup;
 
             if bar_type.is_composite() {
+                // Never deferred: a kept request names no composite (see `admit_kept_route`)
                 let topic = switchboard::get_bars_topic(bar_type.composite());
-                let buffer = defer.then(WarmupBuffer::new);
-                let handler = TypedHandler::new(
-                    BarBarHandler::new(&aggregator, bar_type_std).with_warmup(buffer.clone()),
-                );
-                warmup = buffer.map(BarAggregatorWarmup::Bar);
+                let handler = TypedHandler::new(BarBarHandler::new(&aggregator, bar_type_std));
+                warmup = None;
                 msgbus::subscribe_bars(topic.into(), handler.clone(), None);
                 subscriptions.push(BarAggregatorSubscription::Bar { topic, handler });
             } else if bar_type.spec().price_type == PriceType::Last {
@@ -3033,7 +3017,6 @@ fn is_delivered_after_its_trade(bar: &Bar) -> bool {
 /// Live data held back for a builder a kept request (`update_subscriptions`) is still running.
 #[derive(Debug)]
 pub(super) enum BarAggregatorWarmup {
-    Bar(WarmupBuffer<Bar>),
     Trade(WarmupBuffer<TradeTick>),
     Quote(WarmupBuffer<QuoteTick>),
     /// A joined warm-up's held trades, and the slot through which its handler takes later trades
@@ -3045,10 +3028,6 @@ impl BarAggregatorWarmup {
     /// Ends the warm-up and feeds the held data to `aggregator` in arrival order.
     pub(super) fn release(&self, aggregator: &mut dyn BarAggregator) {
         match self {
-            Self::Bar(buffer) => buffer
-                .release()
-                .into_iter()
-                .for_each(|bar| aggregator.handle_bar(bar)),
             Self::Trade(buffer) => buffer
                 .release()
                 .into_iter()
@@ -3067,7 +3046,6 @@ impl BarAggregatorWarmup {
     /// Returns the arrival of each record held (see [`WarmupBuffer`]), in arrival order.
     pub(super) fn arrivals(&self) -> Vec<u64> {
         match self {
-            Self::Bar(buffer) => buffer.arrivals(),
             Self::Trade(buffer) | Self::JoinedTrade(buffer, _) => buffer.arrivals(),
             Self::Quote(buffer) => buffer.arrivals(),
         }
@@ -3076,7 +3054,6 @@ impl BarAggregatorWarmup {
     /// Ends the warm-up and drops what it held: whoever held into it holds nothing more.
     pub(super) fn discard(&self) {
         match self {
-            Self::Bar(buffer) => drop(buffer.release()),
             Self::Trade(buffer) | Self::JoinedTrade(buffer, _) => drop(buffer.release()),
             Self::Quote(buffer) => drop(buffer.release()),
         }
@@ -3084,8 +3061,8 @@ impl BarAggregatorWarmup {
 
     /// Ends a trade warm-up and returns the builder's copy of each held trade in arrival order,
     /// through `joined`'s cut and floor (see [`JoinedRelease`]) or as [`Self::release`] would
-    /// feed them, `None` where the cut drops one; `None` for a warm-up of bars or quotes, which
-    /// stays held.
+    /// feed them, `None` where the cut drops one; `None` for a warm-up of quotes, which stays
+    /// held.
     pub(super) fn release_trades(
         &self,
         joined: Option<JoinedRelease>,
@@ -3098,7 +3075,7 @@ impl BarAggregatorWarmup {
             (Self::Trade(buffer) | Self::JoinedTrade(buffer, _), _) => {
                 Some(buffer.release().into_iter().map(Some).collect())
             }
-            (Self::Bar(_) | Self::Quote(_), _) => None,
+            (Self::Quote(_), _) => None,
         }
     }
 }
