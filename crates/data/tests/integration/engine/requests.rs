@@ -13683,3 +13683,244 @@ fn test_kept_bars_request_is_refused_by_name(
     );
     assert!(fixture.client_commands(0).is_empty());
 }
+
+/// The third read's sequence, by a real actor A: at 12:00:00 its R1 asks 5-MINUTE bars kept by
+/// request over 10:00 to 10:07:59.999999999; at 12:00:01 A subscribes 5-MINUTE, held back while
+/// R1 runs; at 12:00:02 A, its only subscriber, unsubscribes it or is disposed. A still holds R1,
+/// so it releases it; R1 succeeds at 12:00:03 and its builder is removed at its end: at 12:00:04
+/// a fresh request from 10:00 is admitted.
+#[rstest]
+#[case::unsubscribe(ActorRelease::Unsubscribe)]
+#[case::dispose(ActorRelease::Dispose)]
+fn test_actor_subscribing_forgets_no_kept_request_so_its_release_before_the_hand_over_removes_the_builder(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] release: ActorRelease,
+) {
+    let _ = stub_msgbus;
+    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[]);
+    let mut actor = fixture.actor("KEPT-A");
+    let first = fixture.actor_request(
+        &mut actor,
+        &[five],
+        kept_window(monday("10:00:00"), monday("10:08:00")),
+    );
+
+    fixture.advance(monday("12:00:01"));
+    actor.subscribe_bars(five, Some(client_id), None);
+    fixture.pump();
+    fixture.advance(monday("12:00:02"));
+    release.apply(&mut actor, five, client_id);
+    fixture.pump();
+    fixture.advance(monday("12:00:03"));
+    fixture.answer(
+        first,
+        &[(monday("10:01:00"), 1, "a1"), (monday("10:06:00"), 2, "a2")],
+        None,
+    );
+    fixture.advance(monday("12:00:04"));
+    let fresh = fixture.request(&[five], kept_window(monday("10:00:00"), monday("10:15:00")));
+
+    assert!(fresh.is_ok(), "{fresh:?}");
+}
+
+/// The third read's mixed command: 2-MINUTE and 3-MINUTE kept through 10:00:59.999999999, one
+/// size-1 trade at 10:00:30. At 10:07 one command subscribes [2-MINUTE, 6-MINUTE@2-MINUTE,
+/// 3-MINUTE]: the kept builders are adopted and caught up (10:02 and 10:03) before the composite
+/// is prepared, so its interval from 10:06 holds no catch-up bar and it publishes nothing at
+/// 10:12.
+#[rstest]
+fn test_composite_in_a_command_adopting_its_kept_source_takes_none_of_the_catch_up_bars(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (two, three) = (bar_type_of(id, "2-MINUTE"), bar_type_of(id, "3-MINUTE"));
+    let six = BarType::from(format!("{id}-6-MINUTE-LAST-INTERNAL@2-MINUTE-INTERNAL").as_str());
+    let mut fixture = KeptFixture::new(
+        audusd_sim,
+        client_id,
+        venue,
+        monday("10:07:00"),
+        &[two, six, three],
+    );
+    let request = fixture
+        .request(
+            &[two, three],
+            KeptSpec {
+                plain: true,
+                ..kept_window(monday("10:00:00"), monday("10:01:00"))
+            },
+        )
+        .unwrap();
+    fixture.answer(request, &[(monday("10:00:30"), 1, "a1")], None);
+
+    fixture.subscribe_all(&[two, six, three]);
+    fixture.advance(monday("10:13:00"));
+
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            kept_trade(0, "a1", &[0, 0, 0]),
+            Kept::End(0, None),
+            published(two, monday("10:02:00"), 1, &[1, 0, 0]),
+            published(three, monday("10:03:00"), 1, &[1, 0, 1]),
+        ]
+    );
+}
+
+/// A quote feeds only `BID`, `ASK` and `MID` bars and a trade only `LAST` bars: a kept quotes or
+/// trades request naming a `MARK` bar is refused by name before dispatch.
+#[rstest]
+#[case::quotes(true)]
+#[case::trades(false)]
+fn test_kept_request_naming_a_mark_bar_is_refused_by_name(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] quotes: bool,
+) {
+    let _ = stub_msgbus;
+    let mark = BarType::from("AUD/USD.SIM-5-MINUTE-MARK-INTERNAL");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[]);
+    let spec = KeptSpec {
+        plain: true,
+        quotes,
+        ..kept_window(monday("10:00:00"), monday("10:08:00"))
+    };
+
+    let error = fixture.request(&[mark], spec).unwrap_err();
+
+    assert!(
+        error.contains("its own records do not feed")
+            && error.contains("neither trades nor quotes feed its price type"),
+        "{error}"
+    );
+    assert!(fixture.client_commands(0).is_empty());
+}
+
+/// Only a trades request and a quotes request feed bar builders: a book deltas request naming
+/// 5-MINUTE bars kept by request over 10:00 to 10:07:59.999999999 is refused by name before
+/// dispatch.
+#[rstest]
+fn test_kept_book_deltas_request_is_refused_by_name(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let five = bar_type_of(id, "5-MINUTE");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[]);
+    let at = |ns: u64| Some(UnixNanos::from(ns).to_datetime_utc());
+
+    let result =
+        fixture
+            .engine
+            .execute_request(RequestCommand::BookDeltas(RequestBookDeltas::new(
+                id,
+                at(monday("10:00:00")),
+                at(monday("10:08:00") - 1),
+                None,
+                Some(client_id),
+                UUID4::new(),
+                monday("12:00:00").into(),
+                Some(params_from_json(json!({
+                    "bar_types": [five.to_string()],
+                    "update_subscriptions": true,
+                }))),
+            )));
+
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.contains("its own records do not feed")
+            && error.contains("only a trades request or a quotes request feeds bar builders"),
+        "{error}"
+    );
+    assert!(fixture.client_commands(0).is_empty());
+}
+
+/// An actor whose stop handler fails (see
+/// `test_actor_whose_stop_handler_fails_still_releases_its_kept_requests`).
+#[derive(Debug)]
+struct FailingStopRequester {
+    core: DataActorCore,
+}
+
+nautilus_actor!(FailingStopRequester);
+impl DataActor for FailingStopRequester {
+    fn on_stop(&mut self) -> anyhow::Result<()> {
+        anyhow::bail!("the stop handler failed")
+    }
+}
+
+/// An actor's release at its stop does not depend on its stop handler: A's R1 keeps 5-MINUTE
+/// bars over 10:00 to 10:07:59.999999999; A's stop handler fails, and A still releases R1, so a
+/// fresh request from 10:00 is admitted.
+#[rstest]
+fn test_actor_whose_stop_handler_fails_still_releases_its_kept_requests(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let five = bar_type_of(id, "5-MINUTE");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
+    let queued = Rc::clone(&fixture.queued);
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: DataCommand| queued.borrow_mut().push(command)),
+    );
+    let mut actor = FailingStopRequester {
+        core: DataActorCore::new(DataActorConfig {
+            actor_id: Some(ActorId::from("KEPT-A")),
+            ..Default::default()
+        }),
+    };
+    actor
+        .register(
+            TraderId::test_default(),
+            Rc::clone(&fixture.clock) as Rc<RefCell<dyn Clock>>,
+            Rc::clone(&fixture.cache),
+        )
+        .unwrap();
+    let at = |ns: u64| Some(UnixNanos::from(ns).to_datetime_utc());
+    let request_id = actor
+        .request_trades(
+            id,
+            at(monday("10:00:00")),
+            at(monday("10:08:00") - 1),
+            None,
+            Some(client_id),
+            Some(params_from_json(json!({
+                "bar_types": [five.to_string()],
+                "update_subscriptions": true,
+            }))),
+        )
+        .unwrap();
+    fixture.requests.push(request_id);
+    fixture.pump();
+    fixture.answer(
+        0,
+        &[(monday("10:01:00"), 1, "a1"), (monday("10:06:00"), 2, "a2")],
+        None,
+    );
+
+    actor.start().unwrap();
+    let stopped = actor.stop();
+    fixture.pump();
+    let fresh = fixture.request(&[five], kept_window(monday("10:00:00"), monday("10:15:00")));
+
+    assert!(stopped.is_err(), "{stopped:?}");
+    assert!(fresh.is_ok(), "{fresh:?}");
+}

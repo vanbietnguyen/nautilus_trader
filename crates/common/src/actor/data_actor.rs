@@ -3202,7 +3202,9 @@ pub trait DataActor {
     /// close, then the aggregator continues on the engine clock with its pending close or
     /// `RANGE` boundary as armed (one at the engine clock's time fires there once, after the
     /// records stamped then); nothing is flushed. The aggregators one subscribe command takes
-    /// over catch up together, in close order; those a later command takes over catch up alone.
+    /// over catch up together, in close order, before its other bar types are prepared, so a
+    /// composite built from one of them is not given their catch-up bars; those a later command
+    /// takes over catch up alone.
     /// Made while the answer is in flight, a subscription is held back: its
     /// live records are held and, when the request succeeds, the ones stamped after its coverage
     /// (the answer holds every record up to it) are fed to the aggregators as the answer's are
@@ -3217,15 +3219,17 @@ pub trait DataActor {
     /// join's cut and floor, move its clock on before the takeover.
     ///
     /// A kept aggregator is claimed by the request that started or last continued it, not by an
-    /// actor. The actor records the ID of every such request it sends, by bar type, until it
-    /// subscribes that bar type, and releases them, each as its own command
-    /// ([`ReleaseKeptBars`]), at [`Self::unsubscribe_bars`] of the bar type, when it stops, and
-    /// at its reset and disposal. The engine acts only on the claiming request's ID: an idle
-    /// aggregator of the released bar type is removed (the replay goes with its last one); one
-    /// that request still runs is removed at its end, after its answer, unless a subscription held
-    /// back on it takes it over then; any other ID is ignored. A refused request claims nothing.
-    /// An unsubscribe never removes a kept aggregator: a held-back subscription's releases only
-    /// that subscription. An aggregator a subscription took over, no release touches.
+    /// actor. The actor records the ID of every such request it sends, by bar type, and keeps it
+    /// until it releases it, as its own command ([`ReleaseKeptBars`]), at
+    /// [`Self::unsubscribe_bars`] of the bar type, when it stops (whatever its stop handler
+    /// returns), and at its reset and disposal; subscribing forgets none of them. The engine acts
+    /// only on the claiming request's ID: an idle aggregator of the released bar type is removed
+    /// (the replay goes with its last one); one that request still runs is removed at its end,
+    /// after its answer, unless a subscription held back on it takes it over then; any other ID
+    /// is ignored. A refused request claims nothing. An unsubscribe never removes a kept
+    /// aggregator: a held-back subscription's releases only that subscription. An aggregator a
+    /// subscription took over, no release touches: the IDs the actor still holds for it are
+    /// ignored.
     ///
     /// With `params["interleave"] = true` and `params["bar_types"]`, the engine answers the
     /// trades together with the bars it builds from them, in the order a subscriber running
@@ -3541,10 +3545,10 @@ where
     }
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
-        DataActor::on_stop(self)?;
-        // A stopped actor holds no builder kept by request
+        let result = DataActor::on_stop(self);
+        // A stopping actor holds no builder kept by request, whatever its stop handler returns
         self.core().release_kept_requests();
-        Ok(())
+        result
     }
 
     fn on_resume(&mut self) -> anyhow::Result<()> {
@@ -3597,7 +3601,7 @@ pub struct DataActorCore {
     warning_events: AHashSet<String>, // TODO: TBD
     requests: RefCell<RequestLifecycle>,
     /// The ID of every request keeping bar builders by request (`update_subscriptions`) this
-    /// actor sent, by bar type, since it last released them or subscribed that bar type: each is
+    /// actor sent, by bar type, since it last released them (a subscription forgets none): each is
     /// released at [`Self::unsubscribe_bars`] of its bar type, and all at
     /// [`Self::unsubscribe_all`] and when the actor stops (see [`ReleaseKeptBars`]).
     kept_requests: RefCell<IndexMap<BarType, Vec<UUID4>>>,
@@ -4331,8 +4335,8 @@ impl DataActorCore {
     ///
     /// Called on disposal so retirement leaves no handler which would resolve an actor that
     /// deregistration has already removed. The ID of every request keeping bar builders by request
-    /// (`update_subscriptions`) the actor sent since it last released them or subscribed their bar
-    /// type is released too, a request still in flight included (see [`ReleaseKeptBars`]).
+    /// (`update_subscriptions`) the actor sent since it last released them is released too, a
+    /// request still in flight included (see [`ReleaseKeptBars`]).
     pub(crate) fn unsubscribe_all(&mut self) {
         let mut commands = Vec::new();
 
@@ -5460,10 +5464,6 @@ impl DataActorCore {
                 handler.clone(),
                 DataCommand::Subscribe(SubscribeCommand::Bars(member)),
             ) {
-                // A builder of it the actor kept by request is taken over: no release touches it
-                self.kept_requests
-                    .borrow_mut()
-                    .shift_remove(&bar_type.standard());
                 acquired.push(*bar_type);
             }
         }
@@ -6286,7 +6286,7 @@ impl DataActorCore {
     /// Unsubscribes the actor from bars using each type's retained route.
     ///
     /// The ID of every request keeping bar builders by request (`update_subscriptions`) the actor
-    /// sent for the bar type since it last released them or subscribed it is released too, each
+    /// sent for the bar type since it last released them is released too, each
     /// as its own command (see [`ReleaseKeptBars`]): the engine removes the kept builder only for
     /// the request that started or last continued its replay (one still in flight at its end),
     /// and ignores any other. The unsubscribe itself never removes a kept builder.

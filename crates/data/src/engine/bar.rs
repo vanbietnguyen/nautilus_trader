@@ -120,7 +120,10 @@ pub(super) struct RequestReplay {
 /// [`DataEngine::release_kept_builders`]), or the idle builders one subscribe command adopts (see
 /// [`DataEngine::adopt_kept_builders`]). They leave the replay together, on one clock of their
 /// own (see [`DataEngine::hand_over_clock`]), and catch up together, in deadline order (time,
-/// then timer name). A builder adopted by a later subscribe command catches up alone.
+/// then timer name). A builder adopted by a later subscribe command catches up alone. The
+/// command's other bar types are prepared after the idle builders it adopts have caught up, so
+/// a composite among them takes none of their catch-up bars; a composite subscribed in an earlier
+/// command does take them.
 #[derive(Debug)]
 #[must_use]
 pub(super) struct HandOver {
@@ -2830,10 +2833,10 @@ fn why_not_fed_by_trades(bar_type: &BarType, instrument_id: InstrumentId) -> Opt
 }
 
 /// Returns why the builder of `bar_type` is not fed by the records `req` asks, or `None` when it
-/// is: a trades request's trades feed `LAST` bars of its instruments (its quotes, when it carries
-/// them, the others); a quotes request's quotes feed the bars of its instruments that are not
-/// `LAST`; a bars request's bars feed only bars built from other bars. Any other kind is not
-/// judged here.
+/// is: only a trades request and a quotes request feed bar builders. A trades request's trades
+/// feed the `LAST` bars of its instruments (its quotes, when it carries them, the others below);
+/// a quotes request's quotes feed their `BID`, `ASK` and `MID` bars; a bars request's bars feed
+/// only bars built from other bars; the records of any other kind feed none.
 fn why_not_fed_by_own_records(req: &RequestCommand, bar_type: &BarType) -> Option<&'static str> {
     let (instrument_ids, feeds_last, feeds_quotes) = match req {
         RequestCommand::Trades(r) => (&r.instrument_ids, true, carries_quotes(req)),
@@ -2841,17 +2844,23 @@ fn why_not_fed_by_own_records(req: &RequestCommand, bar_type: &BarType) -> Optio
         RequestCommand::Bars(_) => {
             return Some("a bars request feeds only bars built from other bars");
         }
-        _ => return None,
+        _ => {
+            return Some("only a trades request or a quotes request feeds bar builders");
+        }
     };
 
     if !instrument_ids.contains(&bar_type.instrument_id()) {
-        Some("it is of another instrument")
-    } else if bar_type.spec().price_type == PriceType::Last && !feeds_last {
-        Some("it is built from trades and the request asks quotes")
-    } else if bar_type.spec().price_type != PriceType::Last && !feeds_quotes {
-        Some("it is built from quotes and the request asks trades")
-    } else {
-        None
+        return Some("it is of another instrument");
+    }
+    match bar_type.spec().price_type {
+        PriceType::Last if !feeds_last => {
+            Some("it is built from trades and the request asks quotes")
+        }
+        PriceType::Bid | PriceType::Ask | PriceType::Mid if !feeds_quotes => {
+            Some("it is built from quotes and the request asks trades")
+        }
+        PriceType::Last | PriceType::Bid | PriceType::Ask | PriceType::Mid => None,
+        PriceType::Mark => Some("neither trades nor quotes feed its price type"),
     }
 }
 

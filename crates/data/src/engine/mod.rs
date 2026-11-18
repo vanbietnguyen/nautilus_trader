@@ -1041,32 +1041,43 @@ impl DataEngine {
         let mut groups: IndexMap<Option<Value>, Vec<SubscribeCommand>> = IndexMap::new();
         let mut result = Ok(());
 
-        // The idle kept builders the members adopt are handed over together once the last member
-        // naming one is prepared (see `adopt_kept_builders`)
-        let last_adopting = if self.pending_adoptions.is_none() {
-            members.iter().rposition(|member| {
-                member.bar_types().is_some_and(|bar_types| {
-                    bar_types
-                        .iter()
-                        .any(|bar_type| self.is_idle_kept_builder(*bar_type))
-                })
+        // The members naming an idle kept builder are prepared first, and the builders they adopt
+        // handed over together and caught up once the last of them is prepared (see
+        // `adopt_kept_builders`); the other members are prepared after, so none of them, such as
+        // a composite built from an adopted builder, takes those builders' catch-up bars
+        let adopting: Vec<bool> = members
+            .iter()
+            .map(|member| {
+                self.pending_adoptions.is_none()
+                    && member.bar_types().is_some_and(|bar_types| {
+                        bar_types
+                            .iter()
+                            .any(|bar_type| self.is_idle_kept_builder(*bar_type))
+                    })
             })
-        } else {
-            None
-        };
+            .collect();
+        let last_adopting = adopting.iter().rposition(|adopts| *adopts);
         if last_adopting.is_some() {
             self.pending_adoptions = Some(Vec::new());
         }
 
-        for (index, member) in members.into_iter().enumerate() {
-            let prepared = self.prepare_subscribe_member(&member);
+        let mut prepared_members: Vec<Option<anyhow::Result<Option<SubscribeCommand>>>> =
+            members.iter().map(|_| None).collect();
+        let adopting_first = (0..members.len())
+            .filter(|index| adopting[*index])
+            .chain((0..members.len()).filter(|index| !adopting[*index]));
+        for index in adopting_first {
+            prepared_members[index] = Some(self.prepare_subscribe_member(&members[index]));
             if Some(index) == last_adopting
                 && let Some(adopted) = self.pending_adoptions.take()
             {
                 self.adopt_kept_builders(&adopted);
             }
+        }
 
-            let prepared = match prepared {
+        // Grouped in the command's member order
+        for (member, prepared) in members.into_iter().zip(prepared_members) {
+            let prepared = match prepared.expect("every member is prepared") {
                 Ok(Some(prepared)) => prepared,
                 Ok(None) => continue,
                 Err(e) => {
