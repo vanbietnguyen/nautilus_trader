@@ -2592,6 +2592,11 @@ impl LiveNode {
         let readiness_result = self.await_engines_disconnected(deadline).await;
         let kernel_result = self.kernel.finalize_stop().await;
 
+        // Last, on every path: the clients' and the kernel's last records are on the way out
+        if let Err(e) = msgbus::get_message_bus().borrow_mut().close() {
+            errors.push(format!("failed while closing the message bus: {e}"));
+        }
+
         self.handle.set_stopped();
 
         if !unresolved_submissions.is_empty() {

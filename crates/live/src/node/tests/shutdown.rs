@@ -14,7 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 use nautilus_common::{
-    clients::ExecutionReportTask,
+    clients::{DataClient, ExecutionReportTask},
     component::component_state,
     enums::ComponentState,
     messages::{
@@ -23,6 +23,7 @@ use nautilus_common::{
     },
     msgbus::stubs::get_any_saving_handler,
 };
+use nautilus_data::DataClientAdapter;
 #[cfg(feature = "python")]
 use pyo3::{prelude::*, types::PyDict};
 
@@ -827,4 +828,232 @@ asyncio.run(exercise())
             .call_method0("dispose")
             .unwrap();
     });
+}
+
+/// The steps of a stop as the node's way out and its client see them, in order.
+type StopSteps = Arc<Mutex<Vec<String>>>;
+
+/// The topic the client publishes on while it disconnects.
+const DISCONNECT_TOPIC: &str = "data.quotes.DISCONNECT";
+
+/// The topic the client publishes on when the kernel's finalize stops it.
+const FINALIZE_TOPIC: &str = "data.quotes.FINALIZE";
+
+/// A node whose way out records its steps, with an inbound key listed when `inbound` is set, and
+/// one data client that publishes while it disconnects, failing its disconnect when
+/// `fail_disconnect` is set.
+fn stop_recording_node(inbound: bool, fail_disconnect: bool) -> (LiveNode, StopSteps) {
+    let steps = StopSteps::default();
+    let config = LiveNodeConfig {
+        msgbus: inbound.then(|| MessageBusConfig {
+            external_streams: Some(vec!["operator".to_string()]),
+            ..Default::default()
+        }),
+        exec_engine: crate::config::LiveExecutionEngineConfig {
+            reconciliation: false,
+            ..Default::default()
+        },
+        delay_post_stop: Duration::ZERO,
+        timeout_disconnection: Duration::from_millis(500),
+        ..Default::default()
+    };
+    let node = LiveNodeBuilder::from_config(config)
+        .unwrap()
+        .with_external_msgbus_factory(Box::new(StopRecordingBackingFactory {
+            steps: steps.clone(),
+        }))
+        .build()
+        .unwrap();
+    let client = StopRecordingClient {
+        steps: steps.clone(),
+        connected: true,
+        fail_disconnect,
+    };
+    node.kernel.data_engine.borrow_mut().register_client(
+        DataClientAdapter::new(client.client_id(), None, false, false, Box::new(client)),
+        None,
+    );
+    (node, steps)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_stop_with_inbound_key_writes_record_published_during_disconnect() {
+    let (mut node, steps) = stop_recording_node(true, false);
+
+    node.finalize_stop().await.unwrap();
+    let seen = steps.lock().clone();
+    node.dispose();
+
+    assert!(
+        seen.contains(&format!("published {DISCONNECT_TOPIC}")),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_stop_without_inbound_key_closes_way_out() {
+    let (mut node, steps) = stop_recording_node(false, false);
+
+    node.finalize_stop().await.unwrap();
+    let seen = steps.lock().clone();
+    node.dispose();
+
+    assert!(seen.contains(&"closed".to_string()), "{seen:?}");
+}
+
+/// The steps of a stop with an inbound key listed: the read stopped, the client disconnected,
+/// its record and the kernel's written, then the way out closed.
+fn stop_steps() -> Vec<String> {
+    vec![
+        "read stopped".to_string(),
+        "client disconnected".to_string(),
+        format!("published {DISCONNECT_TOPIC}"),
+        format!("published {FINALIZE_TOPIC}"),
+        "closed".to_string(),
+    ]
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_stop_stops_read_then_disconnects_then_closes_way_out() {
+    let (mut node, steps) = stop_recording_node(true, false);
+
+    node.finalize_stop().await.unwrap();
+    let seen = steps.lock().clone();
+    node.dispose();
+
+    assert_eq!(seen, stop_steps());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_stop_closes_way_out_when_disconnect_fails() {
+    let (mut node, steps) = stop_recording_node(true, true);
+
+    let error = node.finalize_stop().await.unwrap_err();
+    let seen = steps.lock().clone();
+    node.dispose();
+
+    assert!(
+        error
+            .to_string()
+            .contains("Failed to disconnect data clients: STOP-RECORDING"),
+        "{error}"
+    );
+    assert_eq!(seen, stop_steps());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_dispose_after_stop_closes_way_out_once() {
+    let (mut node, steps) = stop_recording_node(true, false);
+
+    node.finalize_stop().await.unwrap();
+    node.dispose();
+    let seen = steps.lock().clone();
+
+    assert_eq!(seen, stop_steps());
+}
+
+struct StopRecordingBackingFactory {
+    steps: StopSteps,
+}
+
+impl Debug for StopRecordingBackingFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(StopRecordingBackingFactory))
+            .finish_non_exhaustive()
+    }
+}
+
+impl MessageBusBackingFactory for StopRecordingBackingFactory {
+    fn create(
+        &self,
+        _trader_id: TraderId,
+        _instance_id: UUID4,
+        _config: MessageBusConfig,
+    ) -> anyhow::Result<Box<dyn MessageBusBacking>> {
+        Ok(Box::new(StopRecordingBacking {
+            steps: self.steps.clone(),
+            closed: false,
+        }))
+    }
+}
+
+struct StopRecordingBacking {
+    steps: StopSteps,
+    closed: bool,
+}
+
+impl MessageBusBacking for StopRecordingBacking {
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    fn publish(&self, message: BusMessage) {
+        self.steps
+            .lock()
+            .push(format!("published {}", message.topic));
+    }
+
+    fn stop_read(&mut self) {
+        self.steps.lock().push("read stopped".to_string());
+    }
+
+    fn close(&mut self) {
+        self.closed = true;
+        self.steps.lock().push("closed".to_string());
+    }
+}
+
+#[derive(Debug)]
+struct StopRecordingClient {
+    steps: StopSteps,
+    connected: bool,
+    fail_disconnect: bool,
+}
+
+#[async_trait::async_trait(?Send)]
+impl DataClient for StopRecordingClient {
+    fn client_id(&self) -> ClientId {
+        ClientId::from("STOP-RECORDING")
+    }
+
+    fn venue(&self) -> Option<Venue> {
+        None
+    }
+
+    fn start(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    // The kernel's finalize stops the engines' clients, so this record is the kernel's
+    fn stop(&mut self) -> anyhow::Result<()> {
+        msgbus::publish_quote(FINALIZE_TOPIC.into(), &QuoteTick::default());
+        Ok(())
+    }
+
+    fn reset(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn dispose(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+
+    fn is_disconnected(&self) -> bool {
+        !self.connected
+    }
+
+    async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.steps.lock().push("client disconnected".to_string());
+        msgbus::publish_quote(DISCONNECT_TOPIC.into(), &QuoteTick::default());
+        self.connected = false;
+
+        if self.fail_disconnect {
+            anyhow::bail!("disconnect refused");
+        }
+        Ok(())
+    }
 }

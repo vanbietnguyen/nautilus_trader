@@ -104,6 +104,13 @@ pub trait MessageBusBacking {
         anyhow::bail!("external ingress receiver unavailable")
     }
 
+    /// Stops the inbound read and nothing else: publications are still written until
+    /// [`Self::close`].
+    ///
+    /// The default does nothing: a backing with no read of its own has nothing to stop.
+    #[cfg(feature = "live")]
+    fn stop_read(&mut self) {}
+
     /// Closes the backing and releases any owned resources.
     fn close(&mut self);
 }
@@ -179,6 +186,9 @@ pub fn external_egress_from_backing(
 }
 
 /// Splits a message bus backing into external egress and ingress surfaces.
+///
+/// Closing the ingress stops only the backing's read ([`MessageBusBacking::stop_read`]); closing
+/// the egress closes the backing.
 #[cfg(feature = "live")]
 #[must_use]
 pub fn external_io_from_backing(
@@ -188,13 +198,15 @@ pub fn external_io_from_backing(
     Box<dyn MessageBusExternalIngress>,
 ) {
     let backing = Rc::new(RefCell::new(backing));
-    let closed = Rc::new(Cell::new(false));
     (
         Box::new(BackingExternalEgress {
             backing: backing.clone(),
-            closed: closed.clone(),
+            closed: Rc::new(Cell::new(false)),
         }),
-        Box::new(BackingExternalIngress { backing, closed }),
+        Box::new(BackingExternalIngress {
+            backing,
+            read_stopped: Cell::new(false),
+        }),
     )
 }
 
@@ -226,13 +238,13 @@ impl MessageBusExternalEgress for BackingExternalEgress {
 #[cfg(feature = "live")]
 struct BackingExternalIngress {
     backing: SharedMessageBusBacking,
-    closed: SharedMessageBusCloseState,
+    read_stopped: Cell<bool>,
 }
 
 #[cfg(feature = "live")]
 impl MessageBusExternalIngress for BackingExternalIngress {
     fn is_closed(&self) -> bool {
-        self.backing.borrow().is_closed()
+        self.read_stopped.get() || self.backing.borrow().is_closed()
     }
 
     fn take_receiver(&mut self) -> anyhow::Result<MessageBusExternalReceiver> {
@@ -240,8 +252,8 @@ impl MessageBusExternalIngress for BackingExternalIngress {
     }
 
     fn close(&mut self) {
-        if !self.closed.replace(true) {
-            self.backing.borrow_mut().close();
+        if !self.read_stopped.replace(true) {
+            self.backing.borrow_mut().stop_read();
         }
     }
 }

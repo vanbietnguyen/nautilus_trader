@@ -41,6 +41,7 @@
 //! sent, so no entry is delivered twice (see [`stream_messages_from`]). The backing starts its
 //! stream task again within a second if it ever ends without the stop, after the same last
 //! entries and on the same channel, and starts its reads at the time the task first started.
+//! [`MessageBusBacking::stop_read`] stops the stream task alone: publications are still written.
 //!
 //! Handles are stored as `Option<JoinHandle>` for idempotent shutdown via
 //! `close_async()`. The synchronous `close()` uses `block_in_place` to
@@ -453,6 +454,15 @@ impl MessageBusBacking for RedisMessageBusBacking {
 
     fn take_receiver(&mut self) -> anyhow::Result<tokio::sync::mpsc::Receiver<BusMessage>> {
         self.get_stream_receiver()
+    }
+
+    /// Stops the stream read: sets its stop, so the stream task and the task that starts it
+    /// again end within one read's bound ([`MAX_STREAM_READ`]), and returns without waiting for
+    /// them. The publish and heartbeat tasks go on.
+    fn stop_read(&mut self) {
+        if !self.stream_signal.swap(true, Ordering::Relaxed) {
+            log::debug!("Stopping the stream read");
+        }
     }
 
     /// Closes the message bus backing.
@@ -5047,6 +5057,59 @@ mod tests {
         assert_eq!(message.payload, Bytes::from("after the error"));
         assert_eq!(written.len(), 1);
         assert_eq!(written[0].field("payload").as_deref(), Some("test_payload"));
+    }
+
+    #[rstest]
+    fn test_backing_stop_read_ends_the_read_and_keeps_the_way_out_open() {
+        let stream_keys = vec!["trader-PUBLISHER-007:stream".to_string()];
+        let fake = get_runtime().block_on(FakeRedisStreams::start(&stream_keys, 0));
+        let config = MessageBusConfig {
+            external_streams: Some(stream_keys),
+            ..Default::default()
+        };
+        let mut backing = RedisMessageBusBacking::new(
+            TraderId::from("TESTER-007"),
+            UUID4::new(),
+            config,
+            fake.config(),
+        )
+        .unwrap();
+        let mut stream_rx = backing.get_stream_receiver().unwrap();
+        wait_until(
+            || !fake.reads.lock().unwrap().is_empty(),
+            Duration::from_secs(5),
+        );
+
+        let stopped_at = std::time::Instant::now();
+        backing.stop_read();
+        wait_until(
+            || backing.stream_handle.as_ref().unwrap().is_finished(),
+            MAX_STREAM_READ,
+        );
+        let ended_after = stopped_at.elapsed();
+        backing.stop_read();
+        // The backing read from the time it started, so the entry's ID is later
+        fake.append(realtime_ms_after(realtime_ms()), "after the stop");
+        let message = get_runtime().block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), stream_rx.recv()).await
+        });
+        backing.publish(fake_bus_message());
+        wait_until(
+            || !fake.written.lock().unwrap().is_empty(),
+            Duration::from_secs(5),
+        );
+        let closed = backing.is_closed();
+        let still_ended = backing.stream_handle.as_ref().unwrap().is_finished();
+        backing.close();
+
+        assert!(ended_after <= MAX_STREAM_READ, "{ended_after:?}");
+        assert!(still_ended);
+        assert!(
+            matches!(message, Ok(None)),
+            "the entry after the stop should not be delivered: {message:?}"
+        );
+        assert!(!closed);
+        assert_eq!(fake.written.lock().unwrap().len(), 1);
     }
 
     /// Spawns `stream_messages_from` on `stream_keys` of `fake`, starting after `start`.
