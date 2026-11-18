@@ -2360,14 +2360,15 @@ fn test_run_streaming_ends_engine_when_a_later_chunk_fails_to_load(
 }
 
 #[rstest]
-fn test_run_streaming_fails_when_replay_reaches_an_unreadable_later_file(
+fn test_run_streaming_fails_before_the_first_row_when_a_later_file_is_unreadable(
     crypto_perpetual_ethusdt: CryptoPerpetual,
 ) {
     let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
     let instrument_id = instrument.id();
 
-    // The first file fills more than two default catalog pages, so the second file opens only
-    // after the first page has replayed
+    // The first file fills more than two default catalog pages. The second file's footer cannot
+    // be read when the query is built, so it declares no start and opens before the first row:
+    // the run fails on the first pull, before any iteration
     let (temp_dir, catalog_path) = create_catalog_with_quotes(&instrument, 20_001, 1_000_000_000);
     let catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
     let later = UnixNanos::from(31_000_000_000_000);
@@ -2407,9 +2408,9 @@ fn test_run_streaming_fails_when_replay_reaches_an_unreadable_later_file(
 
     let engine = node.get_engine(&config_id).unwrap();
     assert!(result.is_err());
-    assert_eq!(engine.iteration(), 10_000);
-    assert!(engine.kernel().trader.borrow().is_stopped());
-    assert!(engine.get_result().run_finished.is_some());
+    assert_eq!(engine.iteration(), 0);
+    assert!(engine.get_result().run_started.is_none());
+    assert!(engine.get_result().run_finished.is_none());
 }
 
 #[rstest]
