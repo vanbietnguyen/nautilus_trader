@@ -468,11 +468,12 @@ impl DataEngine {
     /// A trades request that sets `quotes` misses every part of its window the catalog's trade
     /// files or its quote files do not cover (their union, adjacent parts joined); with no
     /// catalog covering any of the window (and no `skip_catalog_data`), the whole window for
-    /// both feeds. Each such part goes to its client for both feeds: a trades leg, then a quotes
-    /// leg over the same part, each keeping its rows only where the catalog lacks its own feed
-    /// (see [`RequestLeg::ClientFeed`]); the pipeline merges their rows with the catalog leg's
-    /// by `ts_init`. When no client resolves, a payload-free leg names the first such part and
-    /// the feeds the catalog lacks there, whether or not the request builds bars.
+    /// both feeds. Within each such part its client is asked each feed only where the catalog
+    /// lacks that feed: trades legs, then quotes legs, each keeping its rows only there (see
+    /// [`RequestLeg::ClientFeed`]), so no row of a feed the catalog holds is asked, delivered
+    /// or written back (`update_catalog`) again; the pipeline merges their rows with the
+    /// catalog leg's by `ts_init`. When no client resolves, a payload-free leg names the first
+    /// such part and the feeds the catalog lacks there, whether or not the request builds bars.
     fn plan_date_range_request(
         &mut self,
         req: &RequestCommand,
@@ -614,23 +615,33 @@ impl DataEngine {
             });
         }
 
-        for (start, end) in missing_intervals {
+        let leg_request = |(start, end): (u64, u64)| {
             let start = UnixNanos::from(start).to_datetime_utc();
             let end = UnixNanos::from(end).to_datetime_utc();
-            let request = with_dates_for_pipeline(req, Some(start), Some(end), now_ns);
+            with_dates_for_pipeline(req, Some(start), Some(end), now_ns)
+        };
+        for part in missing_intervals {
             let Some(quotes_missing) = &quotes_missing else {
-                plan.push(RequestLeg::Client(request));
+                plan.push(RequestLeg::Client(leg_request(part)));
                 continue;
             };
-            let quotes = client_quotes_leg(&request);
-            plan.push(RequestLeg::ClientFeed {
-                request,
-                missing: trades_missing.clone(),
-            });
-            plan.extend(quotes.map(|request| RequestLeg::ClientFeed {
-                request,
-                missing: quotes_missing.clone(),
-            }));
+
+            // Each feed is asked only over its own gaps in the part, so no client row is one the
+            // catalog holds, delivered or written back
+            for interval in intervals_within(&trades_missing, part) {
+                plan.push(RequestLeg::ClientFeed {
+                    request: leg_request(interval),
+                    missing: trades_missing.clone(),
+                });
+            }
+            for interval in intervals_within(quotes_missing, part) {
+                plan.extend(client_quotes_leg(&leg_request(interval)).map(|request| {
+                    RequestLeg::ClientFeed {
+                        request,
+                        missing: quotes_missing.clone(),
+                    }
+                }));
+            }
         }
 
         plan.extend(uncovered);
@@ -1621,10 +1632,10 @@ enum RequestLeg {
         unavailable: Vec<(UnixNanos, UnixNanos)>,
     },
     Client(RequestCommand),
-    /// A client leg of a `quotes` request for one feed, over a part of the window where the
-    /// catalog lacks either feed: its rows are kept only inside `missing`, the intervals
-    /// (inclusive, in order) where the catalog lacks this feed, so the catalog's rows of a feed
-    /// it covers there are not delivered twice (see [`DataEngine::keep_client_feed_rows`]).
+    /// A client leg of a `quotes` request for one feed, over an interval where the catalog lacks
+    /// that feed: its rows are kept only inside `missing`, the intervals (inclusive, in order)
+    /// where the catalog lacks this feed, so a row the client stamps outside them is not
+    /// delivered (see [`DataEngine::keep_client_feed_rows`]).
     ClientFeed {
         request: RequestCommand,
         missing: Vec<(u64, u64)>,
@@ -1698,6 +1709,15 @@ fn union_of_intervals(left: &[(u64, u64)], right: &[(u64, u64)]) -> Vec<(u64, u6
         }
     }
     union
+}
+
+/// Returns the parts of `intervals` (inclusive, in order) inside `part`, in order.
+fn intervals_within(intervals: &[(u64, u64)], (start, end): (u64, u64)) -> Vec<(u64, u64)> {
+    intervals
+        .iter()
+        .filter(|&&(first, last)| first <= end && start <= last)
+        .map(|&(first, last)| (first.max(start), last.min(end)))
+        .collect()
 }
 
 /// Returns the failure reason of a `quotes` request whose window's `part` no catalog file covers

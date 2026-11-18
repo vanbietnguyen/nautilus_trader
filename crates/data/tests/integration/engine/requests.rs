@@ -4270,6 +4270,106 @@ fn test_update_subscriptions_request_without_cut_warmup_releases_without_the_cut
     );
 }
 
+/// A joined request (2026-11-12 18:00 to 20:00 New York) for 1-MINUTE bars completes with a1 at
+/// 18:00:30 and keeps its builder; its answer fires no end of coverage. A kept request continuing
+/// that replay from the next nanosecond after its dispatch is refused by name, asks no client
+/// and changes nothing: a subscription then takes over the builder with a1's open bar, closed at
+/// 18:01 in its catch-up.
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_kept_request_continuing_a_joined_replay_is_refused_for_its_missing_end_of_coverage(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let minute = bar_type_of(fixture.instrument_id, "1-MINUTE");
+    let catalog_dir = CatalogTempDir::new("joined-no-coverage");
+    fixture.engine.borrow_mut().register_catalog(
+        Box::new(ParquetDataCatalog::new(
+            catalog_dir.path(),
+            None,
+            None,
+            None,
+            None,
+        )),
+        None,
+    );
+    let mut params = joined_params(minute, NY_2026_11_12_2000, &[NY_2026_11_12_1800]);
+    params["interleave"] = json!(false);
+    let joined = trades_request(vec![fixture.instrument_id], None, client_id, params);
+    let (result, failures) = execute_recording_failures(&mut fixture.engine.borrow_mut(), joined);
+    result.unwrap();
+    let tail_id = assert_replay_tail(&fixture, NY_2026_11_12_1800);
+    let a1 = release_trade(
+        fixture.instrument_id,
+        30 * NANOSECONDS_IN_SECOND,
+        30 * NANOSECONDS_IN_SECOND,
+        "1.0001",
+        "a1",
+    );
+    fixture
+        .engine
+        .borrow_mut()
+        .response_envelope(DataResponseEnvelope::new(
+            DataResponse::Trades(TradesResponse::new(
+                tail_id,
+                client_id,
+                fixture.instrument_id,
+                vec![a1],
+                Some(UnixNanos::from(NY_2026_11_12_1800)),
+                None,
+                UnixNanos::from(NY_2026_11_12_2000),
+                None,
+            )),
+            true,
+            None,
+        ));
+
+    let continuation = starting_at(
+        trades_request(
+            vec![fixture.instrument_id],
+            None,
+            client_id,
+            json!({ "bar_types": [minute.to_string()], "update_subscriptions": true }),
+        ),
+        NY_2026_11_12_2000 + 1,
+    );
+    let (refused, refusals) =
+        execute_recording_failures(&mut fixture.engine.borrow_mut(), continuation);
+    let commands = fixture.recorder.borrow().len();
+    fixture
+        .engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+            SubscribeBars::new(
+                minute,
+                Some(client_id),
+                None,
+                UUID4::new(),
+                UnixNanos::from(NY_2026_11_12_2000),
+                None,
+                None,
+            ),
+        )));
+
+    let error = refused.unwrap_err().to_string();
+    assert!(
+        error.starts_with("Cannot keep the bar builders of an `update_subscriptions` request"),
+        "{error}"
+    );
+    assert!(error.contains("fired no end of coverage"), "{error}");
+    assert_eq!(refusals, vec![Some(error)]);
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(commands, 1);
+    assert_eq!(
+        built_bars(&fixture, minute).first(),
+        Some(&at("1.0001", 60 * NANOSECONDS_IN_SECOND))
+    );
+}
+
 /// One envelope the bus delivered for a request: its payload, as the parts recorder sees it,
 /// and its completion and reason.
 #[derive(Debug, PartialEq)]
@@ -9632,8 +9732,8 @@ fn answer_leg(
 }
 
 /// A merged request whose trade file starts 31 ms after its window's start and ends 13 ms before
-/// its end, and whose quote file starts 5 ms after and ends 2 ms before: each edge goes to its
-/// client for both feeds; the answers, empty or not, are merged at their place, and once all
+/// its end, and whose quote file starts 5 ms after and ends 2 ms before: at each edge its client
+/// is asked each feed over that feed's own gap; the answers, empty or not, are merged at their place, and once all
 /// four have answered the end fires the 10:01 close.
 #[cfg(feature = "streaming")]
 #[rstest]
@@ -9663,15 +9763,13 @@ fn test_merged_request_asks_its_client_both_feeds_over_each_part_its_files_miss(
         .unwrap();
 
     let legs = client_legs(&fixture);
-    let first = (t("09:59:00"), t("09:59:00.031") - 1);
-    let last = (t("10:00:59.987") + 1, t("10:01:00"));
     assert_eq!(
         leg_windows(&legs),
         vec![
-            ("trades", first.0, first.1),
-            ("quotes", first.0, first.1),
-            ("trades", last.0, last.1),
-            ("quotes", last.0, last.1),
+            ("trades", t("09:59:00"), t("09:59:00.031") - 1),
+            ("quotes", t("09:59:00"), t("09:59:00.005") - 1),
+            ("trades", t("10:00:59.987") + 1, t("10:01:00")),
+            ("quotes", t("10:00:59.998") + 1, t("10:01:00")),
         ]
     );
     // Nothing goes out before every leg has answered
@@ -9715,11 +9813,11 @@ fn test_merged_request_asks_its_client_both_feeds_over_each_part_its_files_miss(
     assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
 }
 
-/// A gap in the quote files alone goes to the client for both feeds; the catalog's trade inside
+/// A gap in the quote files alone goes to the client for quotes alone; the catalog's trade inside
 /// it (t2, 10:00:06) is kept, and the client's quote (10:00:01) comes at its place.
 #[cfg(feature = "streaming")]
 #[rstest]
-fn test_merged_request_asks_its_client_both_feeds_over_a_gap_in_its_quote_files_alone(
+fn test_merged_request_asks_its_client_quotes_alone_over_a_gap_in_its_quote_files_alone(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
@@ -9747,25 +9845,24 @@ fn test_merged_request_asks_its_client_both_feeds_over_a_gap_in_its_quote_files_
         .unwrap();
 
     let legs = client_legs(&fixture);
-    let gap = (t("10:00:00"), t("10:00:30") - 1);
     assert_eq!(
         leg_windows(&legs),
-        vec![("trades", gap.0, gap.1), ("quotes", gap.0, gap.1)]
+        vec![("quotes", t("10:00:00"), t("10:00:30") - 1)]
     );
-    answer_leg(&fixture, legs[1], &[t("10:00:01")], &[]);
-    answer_leg(&fixture, legs[0], &[], &[]);
+    answer_leg(&fixture, legs[0], &[t("10:00:01")], &[]);
 
     assert_eq!(delivered.take(), edge_answer(minute));
     assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
 }
 
-/// The review's example: trades covered through 10:01, quotes missing from 10:00 to 10:00:30,
-/// and the catalog's trade t2 at 10:00:06. A client that answers t2 to the trades ask of that
-/// part has it dropped, as the catalog's files cover trades there: t2 is delivered once and its
-/// 10:01 bar has volume 1, not 2.
+/// The review's example with catalog write-back (`update_catalog`): trades covered through 10:01,
+/// quotes missing from 10:00 to 10:00:30, and the catalog's trade t2 at 10:00:06. The client is
+/// asked quotes alone over that part (a client holding t2 would answer it to a trades ask), so
+/// only its quote is written back: a second request over the window is answered by the catalog
+/// alone, t2 once and its 10:01 bar of volume 1, not 2.
 #[cfg(feature = "streaming")]
 #[rstest]
-fn test_merged_request_keeps_a_clients_rows_of_a_feed_only_where_the_catalog_lacks_that_feed(
+fn test_merged_request_with_update_catalog_writes_back_only_the_feed_its_catalog_lacks(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
@@ -9784,19 +9881,51 @@ fn test_merged_request_keeps_a_clients_rows_of_a_feed_only_where_the_catalog_lac
             (t("10:00:30"), t("10:01:00")),
         ],
     );
-    let request = edge_request(&fixture, minute);
-    let delivered = tap_merged(&fixture, *request.request_id(), &[minute]);
-    fixture
-        .engine
-        .borrow_mut()
-        .execute_request(request)
-        .unwrap();
+    let request = || {
+        let params = json!({
+            "bar_types": [minute.to_string()],
+            "update_subscriptions": false,
+            "interleave": true,
+            "quotes": true,
+            "update_catalog": true,
+        });
+        windowed_trades_request(&fixture, edge_window(), params)
+    };
+    let without_counts = |delivered: Vec<Merged>| -> Vec<Merged> {
+        delivered
+            .into_iter()
+            .map(|merged| match merged {
+                Merged::Quotes(ts, _) => Merged::Quotes(ts, Vec::new()),
+                Merged::Trades(ids, _) => Merged::Trades(ids, Vec::new()),
+                Merged::Bar(bar_type, ts, volume, _) => {
+                    Merged::Bar(bar_type, ts, volume, Vec::new())
+                }
+                Merged::End(reason) => Merged::End(reason),
+            })
+            .collect()
+    };
 
+    let first = request();
+    let first_delivered = tap_merged(&fixture, *first.request_id(), &[minute]);
+    fixture.engine.borrow_mut().execute_request(first).unwrap();
     let legs = client_legs(&fixture);
-    answer_leg(&fixture, legs[1], &[t("10:00:01")], &[]);
-    answer_leg(&fixture, legs[0], &[], &[(t("10:00:06"), "t2")]);
+    for &leg in &legs {
+        answer_leg(&fixture, leg, &[t("10:00:01")], &[(t("10:00:06"), "t2")]);
+    }
+    let second = request();
+    let second_delivered = tap_merged(&fixture, *second.request_id(), &[minute]);
+    fixture.engine.borrow_mut().execute_request(second).unwrap();
 
-    assert_eq!(delivered.take(), edge_answer(minute));
+    assert_eq!(
+        leg_windows(&legs),
+        vec![("quotes", t("10:00:00"), t("10:00:30") - 1)]
+    );
+    assert_eq!(first_delivered.take(), edge_answer(minute));
+    assert_eq!(client_legs(&fixture).len(), legs.len());
+    assert_eq!(
+        without_counts(second_delivered.take()),
+        without_counts(edge_answer(minute))
+    );
     assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
 }
 
