@@ -3120,7 +3120,8 @@ pub trait DataActor {
     /// order: by `ts_init`, a quote before a trade at an equal stamp. The answer arrives as typed
     /// parts under the request's ID, one per run of quotes or of trades, in that order
     /// (`on_historical_quotes`, `on_historical_trades`); the last part is a trades part, empty
-    /// when the order ends with quotes, and it completes the request. Without the parameter, or
+    /// when the order ends with quotes, and it completes the request. With `interleave` (below),
+    /// a run of quotes is also split where a bar goes out between two of its quotes. Without the parameter, or
     /// with `false`, the request is answered as before.
     ///
     /// The engine refuses such a request before dispatching anything, with one terminal
@@ -3171,11 +3172,15 @@ pub trait DataActor {
     /// before it fires, in time order, two at one instant in timer name order (`RANGE` before
     /// time bars, time bars in bar type order), and its bar comes before the trade; a close at
     /// a trade's own instant fires after every trade of that instant, so that trade is in the
-    /// closing bar. When the answer completes with no failure reason and the request names no
-    /// `limit`, the closes up to `min(end, the engine clock's time when the request was
-    /// dispatched)` (that time without an `end`) fire after the last trade, each bar a part of
-    /// its own, and none later. An answer with a failure reason, or a request with a `limit`,
-    /// fires no close after its last trade.
+    /// closing bar. With `quotes` the same step comes before each quote: the bars due strictly
+    /// before a quote come before it, each a part of its own, so a run of quotes is split
+    /// there, and a close at a quote's own instant fires after it. The quotes build no bar
+    /// (every bar type admitted is fed by trades): they only move the request's clock. When
+    /// the answer completes with no failure reason and the request names no `limit`, the
+    /// closes up to `min(end, the engine clock's time when the request was dispatched)` (that
+    /// time without an `end`) fire after the last trade (with `quotes`, after the last quote or
+    /// trade), each bar a part of its own, and none later. An answer with a failure reason, or
+    /// a request with a `limit`, fires no close after its last trade.
     ///
     /// Bars of different types that one trade completes come in the order live publishes them,
     /// whatever the order of `bar_types`: with `update_subscriptions`, time bars first (their
@@ -3188,8 +3193,8 @@ pub trait DataActor {
     /// trade or of a bar finds in the cache exactly the bars delivered before it. Trades enter the cache as for
     /// an ordinary trades request, when the engine receives the envelope holding them, before
     /// its first part is delivered: a handler may find later trades of that envelope in the
-    /// cache (with `quotes`, later trades of the same run; a run of quotes enters the cache just
-    /// before its part). Without `bar_types`, or with an empty list, the parameter is
+    /// cache (with `quotes`, later trades of the same run; the quotes of a quotes part enter the
+    /// cache just before it). Without `bar_types`, or with an empty list, the parameter is
     /// not read, whatever its value, and changes nothing, on a request of any kind; without
     /// the parameter, or with `false`, the request is answered as before.
     ///
@@ -3226,10 +3231,9 @@ pub trait DataActor {
     /// clock while the answer is in flight. Time bars, and a `RANGE` bar completed by its daily
     /// boundary, are built at the next trade after their close, not when the close passes, so
     /// at the end of the answer history can differ from live, and two time bar types whose
-    /// closes interleave come one type after the other, not in close order. With `quotes`, bars
-    /// are placed at trades only: a close between two trades goes out before the later trade,
-    /// after the quotes between them. A part of the window that no source covers is not a
-    /// failure.
+    /// closes interleave come one type after the other, not in close order; with `quotes`, such
+    /// a bar goes out before that next trade, after the quotes before it. A part of the window
+    /// that no source covers is not a failure.
     ///
     /// # Errors
     ///

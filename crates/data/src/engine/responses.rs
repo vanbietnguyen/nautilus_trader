@@ -359,7 +359,8 @@ pub(super) fn quote_and_trade_runs(
     Ok(parts)
 }
 
-fn quotes_part(resp: &QuotesResponse, data: Vec<QuoteTick>) -> QuotesResponse {
+/// Builds a quotes part of a merged answer, carrying the quotes response's identity and window.
+pub(super) fn quotes_part(resp: &QuotesResponse, data: Vec<QuoteTick>) -> QuotesResponse {
     QuotesResponse::new(
         resp.correlation_id,
         resp.client_id,

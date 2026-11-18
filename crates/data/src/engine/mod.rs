@@ -2447,17 +2447,21 @@ impl DataEngine {
     ///
     /// The parts take the ordinary route: trades parts feed the request's aggregators (through
     /// the interleaved path when the request interleaves); quotes parts reach only its
-    /// non-`LAST` aggregators. Each part is one envelope through the response route and one
-    /// handler call, and the parts number the runs of quotes plus the runs of trades: about
-    /// twice the runs of trades, so a window whose quotes and trades alternate tick by tick
-    /// sends about two parts per trade.
+    /// non-`LAST` aggregators. When the request interleaves with its own replay, a run of
+    /// quotes is split where a close is due between two of its quotes, and the bars go out
+    /// there (see [`Self::send_interleaved_quotes`]). Each part is one envelope through the
+    /// response route and one handler call, and the parts number the runs of quotes plus the
+    /// runs of trades (plus, when interleaving, the splits and the bars): about twice the runs
+    /// of trades, so a window whose quotes and trades alternate tick by tick sends about two
+    /// parts per trade.
     ///
     /// Memory, per request (the parts are new buffers, not views of the answer): the catalog
     /// leg's query holds the window's quotes in their own buffer beside its trades until the
     /// pipeline completes; the rebuild and the trim keep views of the leg's buffers (one leg;
     /// a sorted copy only if its rows come unsorted) and the replay shares them; then
     /// [`quote_and_trade_runs`] copies every quote and trade once more into its parts, and every
-    /// part exists before the first is sent. The peak is therefore about twice the window's
+    /// part exists before the first is sent (a split run is copied once more, stretch by
+    /// stretch, as it is sent). The peak is therefore about twice the window's
     /// quote and trade rows, plus per part a response with a clone of the request's params
     /// (and, for a quotes part, of its instrument IDs). The window is the caller's: nothing
     /// here bounds it to one session. Part counts, wall time and memory of a real session are
@@ -2493,7 +2497,12 @@ impl DataEngine {
         };
 
         for part in parts {
-            self.process_response_envelope(DataResponseEnvelope::new(part, false, None));
+            match part {
+                DataResponse::Quotes(run) => self.send_interleaved_quotes(trades, run),
+                part => {
+                    self.process_response_envelope(DataResponseEnvelope::new(part, false, None));
+                }
+            }
         }
 
         Ok(last)

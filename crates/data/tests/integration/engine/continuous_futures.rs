@@ -502,15 +502,47 @@ fn test_continuous_future_request_inserts_history_behind_newer_live_bar(
         child.params,
     )));
 
+    // The second segment is answered too, so the replay reaches the parent's end
+    let child = recorded_bars_request(&recorder, 1);
+    assert_eq!(
+        child.single_bar_type().unwrap(),
+        BarType::from("ESM24.GLBX-1-MINUTE-LAST-EXTERNAL")
+    );
+    data_engine.response(DataResponse::Bars(BarsResponse::new(
+        child.request_id,
+        client_id,
+        child.single_bar_type().unwrap(),
+        vec![make_bar(
+            child.single_bar_type().unwrap(),
+            "96.00",
+            "96.00",
+            "96.00",
+            "96.00",
+            1,
+            minute(2),
+        )],
+        None,
+        None,
+        UnixNanos::from(minute(2)),
+        child.params,
+    )));
+
     // the requested history is inserted behind the newer live bar
     let stamps: Vec<_> = cache
         .borrow()
         .bars(&standard)
         .map(|bars| bars.iter().map(|bar| bar.ts_event).collect())
         .unwrap_or_default();
-    // The close at the last bar's stamp stays armed until the next segment's first bar, and the
-    // first close, at the replay's start, is empty
-    assert_eq!(stamps, vec![UnixNanos::from(minute(3))]);
+    // The first segment's bars close at 1 minute, before the second segment's bar; the parent's
+    // end (2 minutes) closes that one
+    assert_eq!(
+        stamps,
+        vec![
+            UnixNanos::from(minute(3)),
+            UnixNanos::from(minute(2)),
+            UnixNanos::from(minute(1)),
+        ],
+    );
 }
 
 #[rstest]

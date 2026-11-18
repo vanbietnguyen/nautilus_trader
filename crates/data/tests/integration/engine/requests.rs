@@ -416,7 +416,8 @@ fn test_request_scoped_time_bar_aggregation_handles_trade_response(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    // The engine clock reads the time the answer carries, so its end covers the last trade
+    let clock = data_engine_clock_at(1_000_000_000);
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let instrument_id = audusd_sim.id;
@@ -488,9 +489,11 @@ fn test_request_scoped_time_bar_aggregation_handles_trade_response(
         Some(params),
     )));
 
-    // The close at the last trade's stamp stays armed, and with no `end` nothing after the
-    // dispatch time (the engine clock, 0) fires when the answer completes
-    assert_eq!(cache.borrow().bar(&bar_type).map(|bar| bar.ts_event), None);
+    // The close at the last trade's stamp stays armed until the end, the dispatch time (1 s)
+    assert_eq!(
+        cache.borrow().bar(&bar_type).map(|bar| bar.ts_event),
+        Some(UnixNanos::from(1_000_000_000))
+    );
     assert!(saver.get_messages().is_empty());
 }
 
@@ -8906,4 +8909,456 @@ fn test_plain_request_without_an_end_fires_nothing_after_its_dispatch_time(
             flat("2024-01-08T10:07:00Z"),
         ]]
     );
+}
+
+/// What the requester of an interleaving `quotes` request with its own replay is given, part by
+/// part: a quotes part (its quotes' `ts_init`), a trades part (its trade IDs) or a bars part
+/// (its bar, with its volume), each with what the cache holds at its callback (the bars of
+/// every watched bar type, then the instrument's quotes); then the request's end, with its
+/// failure reason.
+#[cfg(feature = "streaming")]
+#[derive(Clone, Debug, PartialEq)]
+enum Merged {
+    Quotes(Vec<UnixNanos>, Vec<usize>),
+    Trades(Vec<TradeId>, Vec<usize>),
+    Bar(BarType, UnixNanos, Quantity, Vec<usize>),
+    End(Option<String>),
+}
+
+#[cfg(feature = "streaming")]
+fn merged_quotes(ts: &[u64], cached: &[usize]) -> Merged {
+    Merged::Quotes(at_ns(ts), cached.to_vec())
+}
+
+#[cfg(feature = "streaming")]
+fn merged_trades(ids: &[&str], cached: &[usize]) -> Merged {
+    Merged::Trades(trade_ids(ids), cached.to_vec())
+}
+
+#[cfg(feature = "streaming")]
+fn merged_bar(bar_type: BarType, ts: u64, volume: u64, cached: &[usize]) -> Merged {
+    Merged::Bar(
+        bar_type.standard(),
+        UnixNanos::from(ts),
+        Quantity::from(volume),
+        cached.to_vec(),
+    )
+}
+
+/// One catalog run over `window` holding quotes at `quotes` (one bid and ask) and `trades`.
+#[cfg(feature = "streaming")]
+fn merged_run<'a>(
+    window: (u64, u64),
+    quotes: &'a [(u64, &'a str, &'a str)],
+    trades: &'a [(u64, &'a str)],
+) -> QuotedRun<'a> {
+    QuotedRun {
+        interval: window,
+        quotes,
+        trades,
+    }
+}
+
+/// Executes an interleaving `quotes` trades request for `bar_types` over `window` (no
+/// `update_subscriptions`), answered by a made-up catalog of `runs`, and returns what its
+/// requester was given.
+#[cfg(feature = "streaming")]
+fn run_merged(
+    fixture: &JoinFixture,
+    label: &str,
+    bar_types: &[BarType],
+    window: (u64, u64),
+    runs: &[QuotedRun],
+) -> Vec<Merged> {
+    let _catalog_dir = register_quoted_catalog(fixture, label, runs);
+    let params = json!({
+        "bar_types": bar_types.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "update_subscriptions": false,
+        "interleave": true,
+        "quotes": true,
+    });
+    let request = windowed_trades_request(fixture, window, params);
+    let request_id = *request.request_id();
+
+    let cache = Rc::clone(fixture.engine.borrow().cache());
+    let instrument_id = fixture.instrument_id;
+    let watched = bar_types.to_vec();
+    let delivered = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&delivered);
+    let handler = TypedHandler::from(move |envelope: &DataResponseEnvelope| {
+        let mut cached = cached_bars(&cache, &watched);
+        cached.push(cache.borrow().quote_count(&instrument_id));
+
+        match envelope.response() {
+            Some(DataResponse::Quotes(resp)) => recorded.borrow_mut().push(Merged::Quotes(
+                resp.data.iter().map(|quote| quote.ts_init).collect(),
+                cached,
+            )),
+            Some(DataResponse::Trades(resp)) => recorded.borrow_mut().push(Merged::Trades(
+                resp.data.iter().map(|trade| trade.trade_id).collect(),
+                cached,
+            )),
+            Some(DataResponse::Bars(resp)) => {
+                for bar in resp.data.iter() {
+                    recorded.borrow_mut().push(Merged::Bar(
+                        bar.bar_type,
+                        bar.ts_event,
+                        bar.volume,
+                        cached.clone(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+
+        if envelope.completed() {
+            recorded
+                .borrow_mut()
+                .push(Merged::End(envelope.failure_reason().map(str::to_owned)));
+        }
+    });
+    msgbus::register_response_handler(&request_id, handler);
+
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+    delivered.take()
+}
+
+/// A quote at one bid and ask, stamped `ts`.
+#[cfg(feature = "streaming")]
+const fn quote_at(ts: u64) -> (u64, &'static str, &'static str) {
+    (ts, "1.0000", "1.0002")
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_merged_answer_sends_a_bar_before_the_first_quote_after_its_close(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let minute = bar_type_of(fixture.instrument_id, "1-MINUTE");
+    let t = |time: &str| utc_ns(&format!("2024-01-08T{time}Z"));
+    let window = (t("09:59:00"), t("10:01:00"));
+
+    let delivered = run_merged(
+        &fixture,
+        "merged-bar-before-quote",
+        &[minute],
+        window,
+        &[merged_run(
+            window,
+            &[
+                quote_at(t("09:59:10")),
+                quote_at(t("10:00:01")),
+                quote_at(t("10:00:03")),
+            ],
+            &[(t("09:59:30"), "t1"), (t("10:00:06"), "t2")],
+        )],
+    );
+
+    // A continuous run delivers the 10:00 bar, then the 10:00:01 quote, then t2; the quote run
+    // has no close between its quotes, so it stays one part; each quote enters the cache with
+    // its part
+    assert_eq!(
+        delivered,
+        vec![
+            merged_quotes(&[t("09:59:10")], &[0, 1]),
+            merged_trades(&["t1"], &[0, 1]),
+            merged_bar(minute, t("10:00:00"), 1, &[1, 1]),
+            merged_quotes(&[t("10:00:01"), t("10:00:03")], &[1, 3]),
+            merged_trades(&["t2"], &[1, 3]),
+            merged_bar(minute, t("10:01:00"), 1, &[2, 3]),
+            merged_trades(&[], &[2, 3]),
+            Merged::End(None),
+        ]
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_merged_answer_quote_at_a_close_comes_before_the_closing_bar(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let minute = bar_type_of(fixture.instrument_id, "1-MINUTE");
+    let t = |time: &str| utc_ns(&format!("2024-01-08T{time}Z"));
+    let window = (t("09:59:00"), t("10:00:30"));
+
+    let delivered = run_merged(
+        &fixture,
+        "merged-quote-at-a-close",
+        &[minute],
+        window,
+        &[merged_run(
+            window,
+            &[quote_at(t("10:00:00")), quote_at(t("10:00:02"))],
+            &[(t("09:59:30"), "t1"), (t("10:00:06"), "t2")],
+        )],
+    );
+
+    // The close at the quote's own stamp stays armed: the quote, then the bar, before the next
+    // later record (the 10:00:02 quote), so the run of quotes is split there
+    assert_eq!(
+        delivered,
+        vec![
+            merged_trades(&["t1"], &[0, 0]),
+            merged_quotes(&[t("10:00:00")], &[0, 1]),
+            merged_bar(minute, t("10:00:00"), 1, &[1, 1]),
+            merged_quotes(&[t("10:00:02")], &[1, 2]),
+            merged_trades(&["t2"], &[1, 2]),
+            Merged::End(None),
+        ]
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_merged_answer_quote_at_the_range_boundary_comes_before_the_range_then_the_time_bar(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let (five, range) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "10-RANGE"));
+    let t = |time: &str| new_york(&format!("2024-01-08T{time}"));
+    let window = (t("17:50:00"), t("18:02:00"));
+
+    let delivered = run_merged(
+        &fixture,
+        "merged-quote-at-the-boundary",
+        &[five, range],
+        window,
+        &[merged_run(
+            window,
+            &[quote_at(t("18:00:00")), quote_at(t("18:01:00"))],
+            &[
+                (t("17:52:00"), "a"),
+                (t("17:56:00"), "b"),
+                (t("18:01:30"), "c"),
+            ],
+        )],
+    );
+
+    // No trade at 18:00: the quote stamped there, then the range bar its boundary completes, then
+    // the 5-minute bar closing at the same instant (timer name order), then the next quote
+    assert_eq!(
+        delivered,
+        vec![
+            merged_trades(&["a"], &[0, 0, 0]),
+            merged_bar(five, t("17:55:00"), 1, &[1, 0, 0]),
+            merged_trades(&["b"], &[1, 0, 0]),
+            merged_quotes(&[t("18:00:00")], &[1, 0, 1]),
+            merged_bar(range, t("18:00:00"), 2, &[1, 1, 1]),
+            merged_bar(five, t("18:00:00"), 1, &[2, 1, 1]),
+            merged_quotes(&[t("18:01:00")], &[2, 1, 2]),
+            merged_trades(&["c"], &[2, 1, 2]),
+            Merged::End(None),
+        ]
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_merged_answer_splits_a_run_of_quotes_at_each_close_of_two_time_bar_types(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let (two, three) = (bar_type_of(id, "2-MINUTE"), bar_type_of(id, "3-MINUTE"));
+    let t = |time: &str| utc_ns(&format!("2024-01-08T{time}Z"));
+    let window = (t("10:00:00"), t("10:07:30"));
+
+    let delivered = run_merged(
+        &fixture,
+        "merged-run-across-closes",
+        &[three, two],
+        window,
+        &[merged_run(
+            window,
+            &[
+                quote_at(t("10:01:30")),
+                quote_at(t("10:02:30")),
+                quote_at(t("10:03:30")),
+                quote_at(t("10:04:30")),
+                quote_at(t("10:06:30")),
+            ],
+            &[(t("10:00:30"), "t1"), (t("10:07:00"), "t2")],
+        )],
+    );
+
+    // One run of quotes, split at each close where it falls: 2-MINUTE 10:02, 3-MINUTE 10:03,
+    // 2-MINUTE 10:04 (flat), and at 10:06 both, 2-MINUTE first (timer name order)
+    assert_eq!(
+        delivered,
+        vec![
+            merged_trades(&["t1"], &[0, 0, 0]),
+            merged_quotes(&[t("10:01:30")], &[0, 0, 1]),
+            merged_bar(two, t("10:02:00"), 1, &[0, 1, 1]),
+            merged_quotes(&[t("10:02:30")], &[0, 1, 2]),
+            merged_bar(three, t("10:03:00"), 1, &[1, 1, 2]),
+            merged_quotes(&[t("10:03:30")], &[1, 1, 3]),
+            merged_bar(two, t("10:04:00"), 0, &[1, 2, 3]),
+            merged_quotes(&[t("10:04:30")], &[1, 2, 4]),
+            merged_bar(two, t("10:06:00"), 0, &[1, 3, 4]),
+            merged_bar(three, t("10:06:00"), 0, &[2, 3, 4]),
+            merged_quotes(&[t("10:06:30")], &[2, 3, 5]),
+            merged_trades(&["t2"], &[2, 3, 5]),
+            Merged::End(None),
+        ]
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_merged_answer_quotes_before_the_first_trade_start_no_bar_and_keep_the_start_grid(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let id = fixture.instrument_id;
+    let (day, two_day) = (bar_type_of(id, "1-DAY"), bar_type_of(id, "2-DAY"));
+    let t = |civil: &str| utc_ns(&format!("2024-01-{civil}Z"));
+    let window = (t("08T00:00:00"), t("10T12:00:00"));
+
+    let delivered = run_merged(
+        &fixture,
+        "merged-quotes-before-the-first-trade",
+        &[day, two_day],
+        window,
+        &[merged_run(
+            window,
+            &[
+                quote_at(t("08T10:00:00")),
+                quote_at(t("09T10:00:00")),
+                quote_at(t("10T00:00:01")),
+            ],
+            &[(t("09T12:00:00"), "t1"), (t("10T01:00:00"), "t2")],
+        )],
+    );
+
+    // Monday's quotes and Tuesday's first quote cross the 1-DAY close of Tuesday 00:00 before
+    // any trade: no bar. The 2-DAY grid starts at the request's start (Monday), so both bars
+    // close Wednesday 00:00, before Wednesday's quote, 1-DAY first (timer name order)
+    assert_eq!(
+        delivered,
+        vec![
+            merged_quotes(&[t("08T10:00:00"), t("09T10:00:00")], &[0, 0, 2]),
+            merged_trades(&["t1"], &[0, 0, 2]),
+            merged_bar(day, t("10T00:00:00"), 1, &[1, 0, 2]),
+            merged_bar(two_day, t("10T00:00:00"), 1, &[1, 1, 2]),
+            merged_quotes(&[t("10T00:00:01")], &[1, 1, 3]),
+            merged_trades(&["t2"], &[1, 1, 3]),
+            Merged::End(None),
+        ]
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_merged_answer_quotes_after_the_last_trade_take_their_bars_and_the_end_fires_the_rest(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let minute = bar_type_of(fixture.instrument_id, "1-MINUTE");
+    let t = |time: &str| utc_ns(&format!("2024-01-08T{time}Z"));
+    let window = (t("10:00:00"), t("10:04:00"));
+
+    let delivered = run_merged(
+        &fixture,
+        "merged-quotes-after-the-last-trade",
+        &[minute],
+        window,
+        &[merged_run(
+            window,
+            &[quote_at(t("10:01:30")), quote_at(t("10:02:30"))],
+            &[(t("10:00:30"), "t1")],
+        )],
+    );
+
+    // Each quote after t1 comes after the bars due before it; the end (10:04) fires the 10:03
+    // and 10:04 closes after the last quote, before the empty last trades part
+    assert_eq!(
+        delivered,
+        vec![
+            merged_trades(&["t1"], &[0, 0]),
+            merged_bar(minute, t("10:01:00"), 1, &[1, 0]),
+            merged_quotes(&[t("10:01:30")], &[1, 1]),
+            merged_bar(minute, t("10:02:00"), 0, &[2, 1]),
+            merged_quotes(&[t("10:02:30")], &[2, 2]),
+            merged_bar(minute, t("10:03:00"), 0, &[3, 2]),
+            merged_bar(minute, t("10:04:00"), 0, &[4, 2]),
+            merged_trades(&[], &[4, 2]),
+            Merged::End(None),
+        ]
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_merged_answer_that_fails_fires_no_end_of_coverage_and_ends_once(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let minute = bar_type_of(fixture.instrument_id, "1-MINUTE");
+    let t = |time: &str| utc_ns(&format!("2024-01-08T{time}Z"));
+    let window = (t("10:00:00"), t("10:04:00"));
+
+    // The trades cover the window; the quotes miss 10:02:00 to 10:02:59
+    let delivered = run_merged(
+        &fixture,
+        "merged-failed",
+        &[minute],
+        window,
+        &[
+            merged_run(window, &[], &[(t("10:00:30"), "t1"), (t("10:03:30"), "t2")]),
+            merged_run(
+                (t("10:00:00"), t("10:02:00") - 1),
+                &[quote_at(t("10:01:30"))],
+                &[],
+            ),
+            merged_run(
+                (t("10:03:00"), t("10:04:00")),
+                &[quote_at(t("10:03:10"))],
+                &[],
+            ),
+        ],
+    );
+
+    // As before: no part, no bar of the closes the trades span or of the end, one terminal
+    let reason = format!(
+        "Catalog catalog_0 does not cover the quotes of AUD/USD.SIM from {} to {}",
+        t("10:02:00"),
+        t("10:03:00") - 1
+    );
+    assert_eq!(delivered, vec![Merged::End(Some(reason))]);
 }

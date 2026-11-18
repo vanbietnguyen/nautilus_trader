@@ -1024,6 +1024,10 @@ fn test_request_time_bar_boundary_assignment(
     let client_id = client_id();
     let instrument_id = audusd_sim.id;
     let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    // The engine clock reads the request's own time when it is dispatched
+    let _ = clock
+        .borrow_mut()
+        .advance_time(UnixNanos::from(12_000_000_000), true);
     let cache = Rc::new(RefCell::new(Cache::default()));
     cache
         .borrow_mut()
@@ -1165,32 +1169,36 @@ fn test_request_time_bar_boundary_assignment(
         }
     }
 
-    // The close at the last samples' stamp stays armed, so they are in the closing bar with
-    // either interval type, and it fires only before a later sample: with no `end`, nothing after
-    // the dispatch time (the engine clock, 0) fires when the answer completes
-    let bars = cache.borrow().bars(&bar_type);
-    if !advance {
-        assert_eq!(bars, None);
-        return;
-    }
-
-    let ts_event = if interval == BarIntervalType::LeftOpen {
-        11_000_000_000
+    // The samples stamped at the 11 s close are in the bar closing then with either interval type
+    // (the close stays armed until a later sample or the end). The end, the dispatch time (12 s),
+    // fires the 12 s close: the advance sample's bar, or a flat bar without it
+    let (last, volume) = if advance {
+        ("103.00000", 1)
     } else {
-        10_000_000_000
+        ("102.00000", 0)
     };
-
-    let expected = Bar::new(
-        bar_type,
-        Price::from("100.00000"),
-        Price::from("102.00000"),
-        Price::from("100.00000"),
-        Price::from("102.00000"),
-        Quantity::from(3),
-        UnixNanos::from(ts_event),
-        UnixNanos::from(11_000_000_000),
-    );
-    assert_eq!(bars, Some(vec![expected]));
+    let closing_at = |open: &str, high: &str, close: &str, volume: u64, close_ns: u64| {
+        let ts_event = if interval == BarIntervalType::LeftOpen {
+            close_ns
+        } else {
+            close_ns - 1_000_000_000
+        };
+        Bar::new(
+            bar_type,
+            Price::from(open),
+            Price::from(high),
+            Price::from(open),
+            Price::from(close),
+            Quantity::from(volume),
+            UnixNanos::from(ts_event),
+            UnixNanos::from(close_ns),
+        )
+    };
+    let expected = vec![
+        closing_at(last, last, last, volume, 12_000_000_000),
+        closing_at("100.00000", "102.00000", "102.00000", 3, 11_000_000_000),
+    ];
+    assert_eq!(cache.borrow().bars(&bar_type), Some(expected));
 }
 
 #[rstest]
@@ -1206,6 +1214,10 @@ fn test_request_time_bar_boundary_finalizes_sources_before_dependents(
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
     let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    // The engine clock reads the request's own time when it is dispatched
+    let _ = clock
+        .borrow_mut()
+        .advance_time(UnixNanos::from(12_000_000_000), true);
     let cache = Rc::new(RefCell::new(Cache::default()));
     cache
         .borrow_mut()
@@ -1290,9 +1302,27 @@ fn test_request_time_bar_boundary_finalizes_sources_before_dependents(
         None,
     )));
 
-    // The 2-second close at the last trade's stamp stays armed, and with no `end` nothing after
-    // the dispatch time (the engine clock, 0) fires when the answer completes
-    assert_eq!(cache.borrow().bars(&target.standard()), None);
+    // The end, the dispatch time (12 s), fires the 12 s closes: the 1-second source first, so
+    // its 12 s bar (102, 103) is in the 2-second bar, with the 11 s bar (100, 101)
+    let ts_event = if interval == BarIntervalType::LeftOpen {
+        12_000_000_000
+    } else {
+        10_000_000_000
+    };
+    let expected = Bar::new(
+        target.standard(),
+        Price::from("100.00000"),
+        Price::from("103.00000"),
+        Price::from("100.00000"),
+        Price::from("103.00000"),
+        Quantity::from(4),
+        UnixNanos::from(ts_event),
+        UnixNanos::from(12_000_000_000),
+    );
+    assert_eq!(
+        cache.borrow().bars(&target.standard()),
+        Some(vec![expected])
+    );
 }
 
 #[rstest]

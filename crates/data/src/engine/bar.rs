@@ -21,7 +21,8 @@ use nautilus_common::{
     cache::Cache,
     clock::{Clock, VirtualClock},
     messages::data::{
-        BarsResponse, DataResponseEnvelope, SubscribeBars, SubscribeCommand, TradesResponse,
+        BarsResponse, DataResponseEnvelope, QuotesResponse, SubscribeBars, SubscribeCommand,
+        TradesResponse,
     },
     msgbus::{self, MStr, Topic, TypedHandler},
 };
@@ -45,7 +46,7 @@ use super::{
     has_continuous_future_params, has_time_range_pipeline_params, log_error_on_cache_insert,
     process_engine_bar, request_bar_aggregation_from_params, request_params,
     requests::{INTERLEAVE, INTERLEAVE_REFUSED, time_zone_from_params},
-    responses::parent_request_window,
+    responses::{parent_request_window, quotes_part},
     switchboard,
 };
 
@@ -839,7 +840,8 @@ impl DataEngine {
     ///
     /// Trades feed the request aggregators one at a time; admission leaves only bar types its
     /// trades feed (see [`Self::admit_interleave`]). Without `update_subscriptions`, before each
-    /// trade the request's replay fires the closes due strictly before it (see
+    /// trade (and, in a merged answer, before each quote: see [`Self::send_interleaved_quotes`])
+    /// the request's replay fires the closes due strictly before it (see
     /// [`Self::replay_until`]): time bars and `RANGE` bars completed at their daily boundary go
     /// out before the trade, in the order of their closes. A bar a trade completes is delivered
     /// before that trade, except a `RANGE_INCLUSIVE` bar, which contains its completing trade and
@@ -904,6 +906,64 @@ impl DataEngine {
         )
         .with_correlation_id(*envelope.correlation_id());
         msgbus::send_response_envelope(&last);
+    }
+
+    /// Sends `quotes`, one run of quotes of a `quotes` request's merged answer (see
+    /// [`Self::send_quote_parts`]), through the ordinary response route.
+    ///
+    /// For an interleaving request with its own replay the run is split where a close is due:
+    /// before each quote, as before a trade (see [`Self::respond_interleaved_trades`]), the
+    /// request's replay fires the closes due strictly before the quote's `ts_init` (see
+    /// [`Self::replay_until`]), and their bars go out before the quote, each a part of its own
+    /// with the identity of the answer's `trades` and entering the cache as it is sent (see
+    /// [`send_interleaved_bars`]); the quotes before them are sent first, as one part. A close
+    /// at the quote's own instant stays armed, so the quote comes before the bar closing then,
+    /// as a backtest runs a timer due at a datum's stamp after that datum. Otherwise the quotes
+    /// go out as before: in their order, each stretch one quotes part through the route, which
+    /// caches it. Any other request's run goes out whole.
+    ///
+    /// The quotes feed none of the request's builders: admission leaves only bar types its
+    /// trades feed (see [`Self::admit_interleave`]), so a quote moves the request's time and
+    /// changes no bar.
+    pub(super) fn send_interleaved_quotes(
+        &mut self,
+        trades: &TradesResponse,
+        quotes: QuotesResponse,
+    ) {
+        let request_id = quotes.correlation_id;
+        let bars = self
+            .interleaved_requests
+            .get(&request_id)
+            .filter(|_| self.request_replays.contains_key(&request_id))
+            .map(|interleaved| Rc::clone(&interleaved.bars));
+
+        let Some(bars) = bars else {
+            let part = DataResponse::Quotes(quotes);
+            self.process_response_envelope(DataResponseEnvelope::new(part, false, None));
+            return;
+        };
+
+        let mut run = Vec::new();
+
+        for quote in quotes.data.iter() {
+            // The closes of the request's replay due before the quote, each bar before it
+            self.replay_until(request_id, quote.ts_init);
+            let fired = std::mem::take(&mut *bars.borrow_mut());
+
+            if !fired.is_empty() {
+                if !run.is_empty() {
+                    let part = DataResponse::Quotes(quotes_part(&quotes, std::mem::take(&mut run)));
+                    self.process_response_envelope(DataResponseEnvelope::new(part, false, None));
+                }
+                send_interleaved_bars(&self.cache, trades, &mut Vec::new(), fired);
+            }
+            run.push(*quote);
+        }
+
+        if !run.is_empty() {
+            let part = DataResponse::Quotes(quotes_part(&quotes, run));
+            self.process_response_envelope(DataResponseEnvelope::new(part, false, None));
+        }
     }
 
     /// Ends an interleaving request: on its completed answer (`closing`), on a payload-free
