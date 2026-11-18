@@ -15,7 +15,11 @@
 
 //! External message bus stream encoding and republishing.
 
-use std::{any::Any, cell::Cell};
+use std::{
+    any::Any,
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use anyhow::Context;
 use nautilus_model::{
@@ -38,6 +42,7 @@ use super::{
         publish_order_event, publish_portfolio_snapshot, publish_position_event, publish_quote,
         publish_trade, send_account_state, send_data,
     },
+    backing::MessageBusExternalEgress,
     get_message_bus,
     mstr::{MStr, Topic},
     switchboard::{
@@ -179,6 +184,9 @@ where
         }
     };
 
+    // A numbered publication this encoding makes on the same stream waits behind this one
+    let held = source.map(|source| EncodingEntry::hold(&external_egress, source));
+
     let payload =
         match codec::serialize_payload(encoding, payload_type, message, timestamps_as_iso8601) {
             Ok(payload) => payload,
@@ -192,15 +200,119 @@ where
             }
         };
 
+    // Serialization can close the original destination or replace it on the bus
+    let mut message = BusMessage::new(*topic, payload_type, payload, encoding);
+    message.source = source;
+
+    if let Some(held) = held {
+        held.encoded(message);
+        return;
+    }
+
     let external_egress = external_egress.borrow();
     if external_egress.is_closed() {
         return;
     }
 
-    // Serialization can close the original destination or replace it on the bus
-    let mut message = BusMessage::new(*topic, payload_type, payload, encoding);
-    message.source = source;
     external_egress.publish(message);
+}
+
+thread_local! {
+    /// This thread's numbered publications in the order their numbers were reserved, each from its
+    /// reservation until its encoding has ended and no earlier one of its stream is held.
+    static HELD_ENTRIES: RefCell<Vec<HeldEntry>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A numbered publication held so that its stream's numbers reach the way out in the order they
+/// were reserved.
+struct HeldEntry {
+    egress: Rc<RefCell<Box<dyn MessageBusExternalEgress>>>,
+    source: BusMessageSource,
+    /// The encoded message; `None` while encoding, and a hole once encoding has ended.
+    message: Option<BusMessage>,
+    encoding: bool,
+}
+
+impl HeldEntry {
+    fn is_same_stream(&self, source: &BusMessageSource) -> bool {
+        self.source.publisher_id == source.publisher_id
+            && self.source.instance_id == source.instance_id
+            && self.source.stream == source.stream
+    }
+}
+
+/// The place of a numbered publication among this thread's held entries while it is encoded.
+///
+/// A numbered publication that its encoding makes on the same stream is reserved after it and
+/// held behind it, so the numbers of one stream reach the way out in the order they were reserved.
+/// Dropping this ends the encoding, a hole unless [`Self::encoded`] gave its message, and publishes
+/// every held entry no earlier entry of its stream still holds, in reservation order. Entries are
+/// held only while an encoding on this thread runs, so they are at most the publications made
+/// inside one publication's encoding, and none is held once that publication returns.
+struct EncodingEntry(BusMessageSource);
+
+impl EncodingEntry {
+    fn hold(
+        egress: &Rc<RefCell<Box<dyn MessageBusExternalEgress>>>,
+        source: BusMessageSource,
+    ) -> Self {
+        HELD_ENTRIES.with_borrow_mut(|held| {
+            held.push(HeldEntry {
+                egress: Rc::clone(egress),
+                source,
+                message: None,
+                encoding: true,
+            });
+        });
+        Self(source)
+    }
+
+    fn encoded(self, message: BusMessage) {
+        HELD_ENTRIES.with_borrow_mut(|held| {
+            if let Some(entry) = self.find(held) {
+                entry.message = Some(message);
+            }
+        });
+    }
+
+    /// Encodings nest, so this one is the last entry still encoding.
+    fn find<'a>(&self, held: &'a mut [HeldEntry]) -> Option<&'a mut HeldEntry> {
+        held.iter_mut()
+            .rev()
+            .find(|entry| entry.encoding && entry.source == self.0)
+    }
+}
+
+impl Drop for EncodingEntry {
+    fn drop(&mut self) {
+        HELD_ENTRIES.with_borrow_mut(|held| {
+            if let Some(entry) = self.find(held) {
+                entry.encoding = false;
+            }
+        });
+
+        while let Some(entry) = HELD_ENTRIES.with_borrow_mut(take_released_entry) {
+            let Some(message) = entry.message else {
+                continue;
+            };
+            let egress = entry.egress.borrow();
+            if !egress.is_closed() {
+                egress.publish(message);
+            }
+        }
+    }
+}
+
+/// Removes the first held entry whose encoding has ended and before which no entry of its stream
+/// is held.
+fn take_released_entry(held: &mut Vec<HeldEntry>) -> Option<HeldEntry> {
+    let index = (0..held.len()).find(|&index| {
+        !held[index].encoding
+            && !held[..index]
+                .iter()
+                .any(|earlier| earlier.is_same_stream(&held[index].source))
+    })?;
+    Some(held.remove(index))
 }
 
 thread_local! {

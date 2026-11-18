@@ -51,7 +51,11 @@
 //! under its own instance ID. It is reserved through [`MessageBusBacking::reserve_source`] before
 //! the message bus encodes the message, so a publication that is not encoded leaves a gap in the
 //! numbers. An entry keeps its number on every retry of its batch. Numbers that run out are
-//! refused, never wrapped. Heartbeat entries carry no source.
+//! refused, never wrapped. A heartbeat entry takes its number from the same count, before its
+//! payload is made. The message bus passes the numbers of one key to the backing in the order it
+//! reserved them: a publication made while another of the same key is encoded waits behind it. The
+//! heartbeat task numbers on its own thread, so on a key it shares with the message bus a heartbeat
+//! numbered while the message bus encodes an entry can reach the publish task before that entry.
 //!
 //! The read side fills [`BusMessage::source`] from these fields, with the key the entry was read
 //! from as its stream. An entry without them reads as having no source.
@@ -373,9 +377,16 @@ impl RedisMessageBusBacking {
         let heartbeat_handle = if let Some(heartbeat_interval_secs) = heartbeat_interval_secs {
             let signal = Arc::clone(&heartbeat_signal);
             let pub_tx_clone = pub_tx.clone();
+            let heartbeat_sources = sources.clone();
 
             Some(get_runtime().spawn(async move {
-                run_heartbeat(heartbeat_interval_secs, signal, pub_tx_clone).await;
+                run_heartbeat(
+                    heartbeat_interval_secs,
+                    signal,
+                    pub_tx_clone,
+                    heartbeat_sources,
+                )
+                .await;
             }))
         } else {
             None
@@ -481,14 +492,15 @@ impl RedisMessageBusBacking {
 ///
 /// A source names the backing's trader ID and instance ID, the key the entry is written on, and
 /// its number: the last number of that key plus one, from 1. The last number of each key is kept
-/// for the backing's life, and a key whose numbers ran out refuses every later entry.
-#[derive(Debug)]
+/// for the backing's life, and a key whose numbers ran out refuses every later entry. Clones share
+/// the last numbers, so the heartbeat task numbers its entries from the backing's count.
+#[derive(Clone, Debug)]
 struct StreamSources {
     trader_id: TraderId,
     instance_id: UUID4,
     stream_key: String,
     stream_per_topic: bool,
-    last_sequences: Mutex<AHashMap<Ustr, u64>>,
+    last_sequences: Arc<Mutex<AHashMap<Ustr, u64>>>,
 }
 
 impl StreamSources {
@@ -498,7 +510,7 @@ impl StreamSources {
             instance_id,
             stream_key: get_stream_key(trader_id, instance_id, config),
             stream_per_topic: config.stream_per_topic,
-            last_sequences: Mutex::new(AHashMap::new()),
+            last_sequences: Arc::new(Mutex::new(AHashMap::new())),
         }
     }
 
@@ -1891,6 +1903,7 @@ async fn run_heartbeat(
     heartbeat_interval_secs: u16,
     signal: Arc<AtomicBool>,
     pub_tx: PublishSender,
+    sources: StreamSources,
 ) {
     log_task_started("heartbeat");
     log::debug!("Heartbeat at {heartbeat_interval_secs} second intervals");
@@ -1912,10 +1925,15 @@ async fn run_heartbeat(
 
         tokio::select! {
             _ = heartbeat_timer.tick() => {
-                let heartbeat = create_heartbeat_msg();
-                if let Err(e) = pub_tx.send(heartbeat) {
-                    // We expect an error if the channel is closed during shutdown
-                    log::debug!("Error sending heartbeat: {e}");
+                // Numbered before its payload is made, like every entry of the stream
+                match sources.reserve(Ustr::from(HEARTBEAT_TOPIC)) {
+                    Ok(source) => {
+                        if let Err(e) = pub_tx.send(create_heartbeat_msg(source)) {
+                            // We expect an error if the channel is closed during shutdown
+                            log::debug!("Error sending heartbeat: {e}");
+                        }
+                    }
+                    Err(e) => log::error!("{e}"),
                 }
             },
             _ = check_timer.tick() => {}
@@ -1925,19 +1943,21 @@ async fn run_heartbeat(
     log_task_stopped("heartbeat");
 }
 
-fn create_heartbeat_msg() -> BusMessage {
+fn create_heartbeat_msg(source: BusMessageSource) -> BusMessage {
     let payload = Bytes::from(
         Timestamp::now()
             .display_with_offset(Offset::UTC)
             .to_string()
             .into_bytes(),
     );
-    BusMessage::with_str_topic(
+    let mut message = BusMessage::with_str_topic(
         HEARTBEAT_TOPIC,
         BusPayloadType::Custom(Ustr::default()),
         payload,
         SerializationEncoding::default(),
-    )
+    );
+    message.source = Some(source);
+    message
 }
 
 #[cfg(test)]
@@ -3334,6 +3354,97 @@ mod tests {
         );
     }
 
+    // Data of depth 2 publishes depth 1 while it is encoded, which publishes depth 0, all on one
+    // key; a quote follows. Without the hold the entries reach Redis as 3, 2, 1, 4.
+    #[rstest]
+    #[case::outer_encoded(false, &[1, 2, 3, 4], &[Some(2), Some(1), Some(0), None])]
+    #[case::outer_not_encoded(true, &[2, 3, 4], &[Some(1), Some(0), None])]
+    fn test_way_out_writes_publications_made_while_encoding_after_the_one_encoded(
+        #[case] outer_fails: bool,
+        #[case] expected_sequences: &[u64],
+        #[case] expected_depths: &[Option<u64>],
+    ) {
+        let fake = get_runtime().block_on(FakeRedis::start("unused"));
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        let config = MessageBusConfig {
+            stream_per_topic: false,
+            ..Default::default()
+        };
+        install_way_out(&fake, UUID4::new(), config);
+
+        publish_any("data.custom".into(), &NestingData::custom(2, outer_fails));
+        publish_quote("data.quotes.A".into(), &QuoteTick::default());
+        wait_until(
+            || fake.written_len() == expected_sequences.len(),
+            Duration::from_secs(5),
+        );
+        close_way_out();
+
+        let depths: Vec<Option<u64>> = fake.written().iter().map(nesting_depth).collect();
+        assert_eq!(fake.written_sequences(), expected_sequences);
+        assert_eq!(depths, expected_depths);
+    }
+
+    #[rstest]
+    #[case::heartbeats_on(Some(1), &[HEARTBEAT_TOPIC, "data.quotes.A"])]
+    #[case::heartbeats_off(None, &["data.quotes.A"])]
+    fn test_way_out_numbers_a_heartbeat_from_the_count_of_its_publications(
+        #[case] heartbeat_interval_secs: Option<u16>,
+        #[case] expected_topics: &[&str],
+    ) {
+        let fake = get_runtime().block_on(FakeRedis::start("unused"));
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        let instance_id = UUID4::new();
+        let config = MessageBusConfig {
+            stream_per_topic: false,
+            heartbeat_interval_secs,
+            ..Default::default()
+        };
+        install_way_out(&fake, instance_id, config);
+
+        // The heartbeat's first tick is at once
+        wait_until(
+            || fake.written_len() == expected_topics.len() - 1,
+            Duration::from_secs(5),
+        );
+        publish_quote("data.quotes.A".into(), &QuoteTick::default());
+        wait_until(
+            || fake.written_len() >= expected_topics.len(),
+            Duration::from_secs(5),
+        );
+        close_way_out();
+
+        // A later heartbeat may follow before the close
+        let written = fake.written();
+        let topics: Vec<Option<String>> = written[..expected_topics.len()]
+            .iter()
+            .map(|xadd| xadd.field("topic"))
+            .collect();
+        let sequences: Vec<u64> = written.iter().map(FakeXadd::sequence).collect();
+        assert_eq!(
+            topics,
+            expected_topics
+                .iter()
+                .map(|topic| Some((*topic).to_string()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            sequences,
+            (1..=u64::try_from(written.len()).unwrap()).collect::<Vec<_>>()
+        );
+        for xadd in &written {
+            assert_eq!(xadd.key, "trader-TESTER-007:stream");
+            assert_eq!(
+                xadd.field(PUBLISHER_ID_FIELD).as_deref(),
+                Some("TESTER-007")
+            );
+            assert_eq!(
+                xadd.field(INSTANCE_ID_FIELD).as_deref(),
+                Some(instance_id.as_str())
+            );
+        }
+    }
+
     #[rstest]
     fn test_way_out_entry_keeps_its_number_when_its_batch_is_retried() {
         let fake = get_runtime().block_on(FakeRedis::start(
@@ -4071,6 +4182,68 @@ mod tests {
         fn eq_arc(&self, other: &dyn CustomDataTrait) -> bool {
             other.as_any().is::<Self>()
         }
+    }
+
+    /// Custom data whose JSON encoding first publishes, on `data.custom`, the same data one depth
+    /// less, then fails when `fails` is set.
+    #[derive(Debug)]
+    struct NestingData {
+        depth: u64,
+        fails: bool,
+    }
+
+    impl NestingData {
+        fn custom(depth: u64, fails: bool) -> CustomData {
+            CustomData::new(
+                Arc::new(Self { depth, fails }),
+                DataType::new("NestingData", None, None),
+            )
+        }
+    }
+
+    impl HasTsInit for NestingData {
+        fn ts_init(&self) -> UnixNanos {
+            UnixNanos::default()
+        }
+    }
+
+    impl CustomDataTrait for NestingData {
+        fn type_name(&self) -> &'static str {
+            "NestingData"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn ts_event(&self) -> UnixNanos {
+            UnixNanos::default()
+        }
+
+        fn to_json(&self) -> anyhow::Result<String> {
+            if let Some(depth) = self.depth.checked_sub(1) {
+                publish_any("data.custom".into(), &Self::custom(depth, false));
+            }
+            anyhow::ensure!(!self.fails, "NestingData has no JSON form");
+            Ok(json!({ "depth": self.depth }).to_string())
+        }
+
+        fn clone_arc(&self) -> Arc<dyn CustomDataTrait> {
+            Arc::new(Self {
+                depth: self.depth,
+                fails: self.fails,
+            })
+        }
+
+        fn eq_arc(&self, other: &dyn CustomDataTrait) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
+    /// Returns the depth of the [`NestingData`] an entry carries, if it carries one.
+    fn nesting_depth(xadd: &FakeXadd) -> Option<u64> {
+        let payload: serde_json::Value = serde_json::from_str(&xadd.field("payload")?).ok()?;
+        payload["payload"]["depth"].as_u64()
     }
 
     fn backing_with_stream_receiver(
@@ -5993,9 +6166,14 @@ mod serial_tests {
     async fn test_heartbeat_task() {
         let (tx, rx) = publish_channel();
         let signal = Arc::new(AtomicBool::new(false));
+        let sources = StreamSources::new(
+            TraderId::from("tester-001"),
+            UUID4::new(),
+            &MessageBusConfig::default(),
+        );
 
         // Start the heartbeat task with a short interval
-        let handle = tokio::spawn(run_heartbeat(1, Arc::clone(&signal), tx));
+        let handle = tokio::spawn(run_heartbeat(1, Arc::clone(&signal), tx, sources));
 
         let heartbeat = receive_admitted_bus_message(&rx, Duration::from_secs(2)).await;
 
