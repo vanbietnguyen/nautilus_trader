@@ -466,11 +466,13 @@ impl DataEngine {
     /// is answered by its catalog leg alone, as before.
     ///
     /// A trades request that sets `quotes` misses every part of its window the catalog's trade
-    /// files or its quote files do not cover (their union, adjacent parts joined). Each such
-    /// part goes to its client for both feeds: a trades leg, then a quotes leg over the same
-    /// part; the pipeline merges their rows with the catalog leg's by `ts_init`. When no client
-    /// resolves, a payload-free leg names the first such part and the feeds the catalog lacks
-    /// there, whether or not the request builds bars.
+    /// files or its quote files do not cover (their union, adjacent parts joined); with no
+    /// catalog covering any of the window (and no `skip_catalog_data`), the whole window for
+    /// both feeds. Each such part goes to its client for both feeds: a trades leg, then a quotes
+    /// leg over the same part, each keeping its rows only where the catalog lacks its own feed
+    /// (see [`RequestLeg::ClientFeed`]); the pipeline merges their rows with the catalog leg's
+    /// by `ts_init`. When no client resolves, a payload-free leg names the first such part and
+    /// the feeds the catalog lacks there, whether or not the request builds bars.
     fn plan_date_range_request(
         &mut self,
         req: &RequestCommand,
@@ -550,9 +552,11 @@ impl DataEngine {
             missing_intervals = query_interval;
         }
 
-        // A `quotes` request's client parts are where the catalog lacks either feed
+        // A `quotes` request's client parts are where the catalog lacks either feed: with no
+        // catalog leg, the whole window for both
         let quotes_missing = match winning_catalog {
-            Some(name) if sets_quotes(req) && !skip_catalog_data => {
+            _ if !sets_quotes(req) || skip_catalog_data => None,
+            Some(name) => {
                 let quotes_key =
                     RequestCatalogKey::new(NautilusDataType::QuoteTick, key.identifier.clone());
                 Some(catalog_missing_intervals(
@@ -564,7 +568,7 @@ impl DataEngine {
                     &quotes_key,
                 )?)
             }
-            _ => None,
+            None => Some(vec![(start_ns.as_u64(), end_ns.as_u64())]),
         };
         let mut trades_missing = Vec::new();
         if let Some(quotes_missing) = &quotes_missing {
@@ -614,13 +618,19 @@ impl DataEngine {
             let start = UnixNanos::from(start).to_datetime_utc();
             let end = UnixNanos::from(end).to_datetime_utc();
             let request = with_dates_for_pipeline(req, Some(start), Some(end), now_ns);
-            let quotes = if quotes_missing.is_some() {
-                client_quotes_leg(&request)
-            } else {
-                None
+            let Some(quotes_missing) = &quotes_missing else {
+                plan.push(RequestLeg::Client(request));
+                continue;
             };
-            plan.push(RequestLeg::Client(request));
-            plan.extend(quotes.map(RequestLeg::Client));
+            let quotes = client_quotes_leg(&request);
+            plan.push(RequestLeg::ClientFeed {
+                request,
+                missing: trades_missing.clone(),
+            });
+            plan.extend(quotes.map(|request| RequestLeg::ClientFeed {
+                request,
+                missing: quotes_missing.clone(),
+            }));
         }
 
         plan.extend(uncovered);
@@ -869,8 +879,9 @@ impl DataEngine {
     /// `schema`, its instruments, and then the legs of its plan. The one admitted shape is a
     /// single-instrument date-range request whose plan has one catalog leg over the whole
     /// window, from the catalog that won on trades coverage, and for each part of the window
-    /// that catalog does not cover in either feed a trades and a quotes leg its client serves
-    /// (see [`Self::plan_date_range_request`]).
+    /// that catalog does not cover in either feed a trades and a quotes leg its client serves;
+    /// or, when no catalog covers any of the window, a trades and a quotes leg over the whole
+    /// window (see [`Self::plan_date_range_request`]).
     ///
     /// # Errors
     ///
@@ -881,8 +892,8 @@ impl DataEngine {
     /// - It sets continuous-future or time-range pipeline params (the pipeline answers child
     ///   requests, not one time order).
     /// - Its plan has no catalog leg (no catalog registered, a `schema`, `skip_catalog_data`,
-    ///   no catalog covering any of the window) or a joined request's replay tail, which every
-    ///   join plans.
+    ///   or for a joined request no catalog covering any of the window) or a joined request's
+    ///   replay tail, which every join plans.
     /// - It does not name exactly one instrument (a batch).
     /// - Its plan cannot be made.
     ///
@@ -934,7 +945,11 @@ impl DataEngine {
         }
 
         let plan = if let Some(join) = join {
-            self.plan_join(req, &join.session_opens)?.legs
+            let plan = self.plan_join(req, &join.session_opens)?.legs;
+            if let Some(reason) = quotes_plan_refusal(&plan) {
+                anyhow::bail!("{QUOTES_REFUSED}: {reason}");
+            }
+            plan
         } else {
             if has_time_range_pipeline_params(params) {
                 anyhow::bail!(
@@ -966,14 +981,41 @@ impl DataEngine {
             let Some(key) = request_identifier(req) else {
                 anyhow::bail!("{QUOTES_REFUSED}: its plan has no catalog leg");
             };
-            self.plan_date_range_request(req, &key)?
+            let plan = self.plan_date_range_request(req, &key)?;
+            // With `skip_catalog_data` it has no catalog leg; with no catalog covering any of
+            // the window its client serves it whole (see `plan_date_range_request`)
+            if request_params(req)
+                .and_then(|p| p.get_bool(PARAM_SKIP_CATALOG_DATA))
+                .unwrap_or(false)
+            {
+                anyhow::bail!("{QUOTES_REFUSED}: its plan has no catalog leg");
+            }
+            plan
         };
 
-        if let Some(reason) = quotes_plan_refusal(&plan) {
-            anyhow::bail!("{QUOTES_REFUSED}: {reason}");
+        Ok(plan)
+    }
+
+    /// Keeps the rows of `envelope`, an answer to a client leg of a `quotes` request for one
+    /// feed (see [`RequestLeg::ClientFeed`]), only inside the intervals where the catalog lacks
+    /// that feed; the leg's terminal ends its entry. Any other envelope is returned as it is.
+    pub(super) fn keep_client_feed_rows(
+        &mut self,
+        mut envelope: DataResponseEnvelope,
+    ) -> DataResponseEnvelope {
+        let leg_id = *envelope.correlation_id();
+        let Some(missing) = self.client_feed_missing.get(&leg_id) else {
+            return envelope;
+        };
+
+        if let Some(response) = envelope.response_mut() {
+            keep_rows_in_intervals(response, missing);
         }
 
-        Ok(plan)
+        if envelope.completed() {
+            self.client_feed_missing.remove(&leg_id);
+        }
+        envelope
     }
 
     fn dispatch_request_plan(
@@ -1057,6 +1099,10 @@ impl DataEngine {
                         })
                 }
                 RequestLeg::Client(request) => self.dispatch_request_to_client(request).map(|_| ()),
+                RequestLeg::ClientFeed { request, missing } => {
+                    self.client_feed_missing.insert(request_id, missing);
+                    self.dispatch_request_to_client(request).map(|_| ())
+                }
                 RequestLeg::Response(response) => {
                     self.payload_response(response);
                     Ok(())
@@ -1575,6 +1621,14 @@ enum RequestLeg {
         unavailable: Vec<(UnixNanos, UnixNanos)>,
     },
     Client(RequestCommand),
+    /// A client leg of a `quotes` request for one feed, over a part of the window where the
+    /// catalog lacks either feed: its rows are kept only inside `missing`, the intervals
+    /// (inclusive, in order) where the catalog lacks this feed, so the catalog's rows of a feed
+    /// it covers there are not delivered twice (see [`DataEngine::keep_client_feed_rows`]).
+    ClientFeed {
+        request: RequestCommand,
+        missing: Vec<(u64, u64)>,
+    },
     Response(DataResponse),
     /// A payload-free leg that completes at once with `reason`, carried into the parent's
     /// failure reason.
@@ -1587,7 +1641,9 @@ enum RequestLeg {
 impl RequestLeg {
     fn request_id(&self) -> UUID4 {
         match self {
-            Self::Catalog { request, .. } | Self::Client(request) => *request.request_id(),
+            Self::Catalog { request, .. }
+            | Self::Client(request)
+            | Self::ClientFeed { request, .. } => *request.request_id(),
             Self::Response(response) => *response.correlation_id(),
             Self::Terminal { request_id, .. } => *request_id,
         }
@@ -1600,12 +1656,9 @@ struct JoinPlan {
     missing_sessions: Vec<UnixNanos>,
 }
 
-/// Returns why the plan of a `quotes` request cannot carry the instrument's quotes, or `None`
-/// when it has a catalog leg and no replay tail.
-///
-/// A part of the window the catalog does not cover goes to the client for both feeds (see
-/// [`DataEngine::plan_date_range_request`]), but a plan with no catalog leg, or with the join's
-/// replay tail of the current session (trades only), is not served.
+/// Returns why the plan of a joined `quotes` request cannot carry the instrument's quotes, or
+/// `None` when it has a catalog leg and no replay tail: a plan with no catalog leg, or with the
+/// join's replay tail of the current session (trades only), is not served.
 fn quotes_plan_refusal(plan: &[RequestLeg]) -> Option<String> {
     let mut reasons = Vec::new();
     if !plan
@@ -1689,6 +1742,36 @@ fn client_quotes_leg(trades: &RequestCommand) -> Option<RequestCommand> {
         ts_init: cmd.ts_init,
         params: cmd.params.clone(),
     }))
+}
+
+/// Keeps the quotes or trades of `response` whose `ts_init` falls in one of `intervals`
+/// (inclusive, in order); any other response is left as it is.
+fn keep_rows_in_intervals(response: &mut DataResponse, intervals: &[(u64, u64)]) {
+    let inside = |ts_init: UnixNanos| {
+        let after = intervals.partition_point(|&(first, _)| first <= ts_init.as_u64());
+        after > 0 && ts_init.as_u64() <= intervals[after - 1].1
+    };
+    match response {
+        DataResponse::Quotes(response) => {
+            response.data = response
+                .data
+                .iter()
+                .filter(|quote| inside(quote.ts_init))
+                .copied()
+                .collect::<Vec<_>>()
+                .into();
+        }
+        DataResponse::Trades(response) => {
+            response.data = response
+                .data
+                .iter()
+                .filter(|trade| inside(trade.ts_init))
+                .copied()
+                .collect::<Vec<_>>()
+                .into();
+        }
+        _ => {}
+    }
 }
 
 /// Drops the trades whose `ts_init` falls in one of the `unavailable` spans.

@@ -1308,15 +1308,14 @@ fn test_request_time_bar_boundary_finalizes_sources_before_dependents(
 }
 
 #[rstest]
-#[case::right_open(BarIntervalType::RightOpen, ("102.00000", 3, 10_000_000_000), ("103.00000", 1, 11_000_000_000))]
-#[case::left_open(BarIntervalType::LeftOpen, ("102.00000", 3, 11_000_000_000), ("103.00000", 1, 12_000_000_000))]
+#[case::right_open(BarIntervalType::RightOpen, ("102.00000", 2, 11_000_000_000))]
+#[case::left_open(BarIntervalType::LeftOpen, ("102.00000", 2, 12_000_000_000))]
 fn test_request_time_bar_boundary_replays_warmup_before_final_close(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
     venue: Venue,
     #[case] interval: BarIntervalType,
-    #[case] historical_fields: (&str, u64, u64),
     #[case] live_fields: (&str, u64, u64),
 ) {
     let _ = stub_msgbus;
@@ -1399,20 +1398,10 @@ fn test_request_time_bar_boundary_replays_warmup_before_final_close(
         None,
     )));
 
-    let (historical_close, historical_volume, historical_ts) = historical_fields;
-
-    let historical = Bar::new(
-        bar_type,
-        Price::from("100.00000"),
-        Price::from(historical_close),
-        Price::from("100.00000"),
-        Price::from(historical_close),
-        Quantity::from(historical_volume),
-        UnixNanos::from(historical_ts),
-        UnixNanos::from(11_000_000_000),
-    );
-    assert_eq!(cache.borrow().bar(&bar_type), Some(&historical));
-    assert_eq!(saver.get_messages(), vec![historical]);
+    // A bare response certifies no coverage, so the kept builder is removed as on a failure:
+    // nothing is handed over, and the subscription gets a new builder fed the held warm-up trade
+    assert_eq!(cache.borrow().bar(&bar_type), None);
+    assert!(saver.get_messages().is_empty());
 
     let live = make_trade(instrument_id, "103.00000", 1, "live", 11_750_000_000);
     engine.process_data(Data::Trade(live));
@@ -1437,8 +1426,9 @@ fn test_request_time_bar_boundary_replays_warmup_before_final_close(
         UnixNanos::from(12_000_000_000),
     );
     let bars: Vec<_> = cache.borrow().bars(&bar_type).unwrap();
-    assert_eq!(bars, vec![expected, historical]);
-    assert_eq!(saver.get_messages(), vec![historical, expected]);
+    // The held warm-up trade is in the bar before its close, with the live trade
+    assert_eq!(bars, vec![expected]);
+    assert_eq!(saver.get_messages(), vec![expected]);
 }
 
 #[rstest]

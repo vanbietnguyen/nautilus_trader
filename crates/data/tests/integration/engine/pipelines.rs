@@ -1039,21 +1039,25 @@ fn test_time_range_pipeline_updates_parent_request_bar_aggregation(
     assert!(!child_params.contains_key("time_range_generator"));
     assert!(!child_params.contains_key("bar_types"));
 
-    data_engine.response(time_range_trade_response(
-        &child,
-        instrument_id,
-        client_id,
-        2,
-        vec![
-            make_trade(instrument_id, "0.65000", 1000, "time-range-1", 0),
-            make_trade(
-                instrument_id,
-                "0.65010",
-                1000,
-                "time-range-2",
-                1_000_000_000,
-            ),
-        ],
+    data_engine.response_envelope(DataResponseEnvelope::new(
+        time_range_trade_response(
+            &child,
+            instrument_id,
+            client_id,
+            2,
+            vec![
+                make_trade(instrument_id, "0.65000", 1000, "time-range-1", 0),
+                make_trade(
+                    instrument_id,
+                    "0.65010",
+                    1000,
+                    "time-range-2",
+                    1_000_000_000,
+                ),
+            ],
+        ),
+        true,
+        None,
     ));
 
     // The parent's terminal fires the closes through its end, 2 s

@@ -72,16 +72,20 @@ fn test_continuous_future_time_bars_preserve_boundary_ticks_across_segments(
         make_trade(pre_id, "100.00", 2, "pre-open", 10_500_000_000),
         make_trade(pre_id, "101.00", 3, "pre-close", 11_000_000_000),
     ];
-    engine.response(DataResponse::Trades(TradesResponse::new(
-        child.request_id,
-        client_id,
-        pre_id,
-        trades,
+    engine.response_envelope(DataResponseEnvelope::new(
+        DataResponse::Trades(TradesResponse::new(
+            child.request_id,
+            client_id,
+            pre_id,
+            trades,
+            None,
+            None,
+            UnixNanos::from(11_000_000_000),
+            child.params,
+        )),
+        true,
         None,
-        None,
-        UnixNanos::from(11_000_000_000),
-        child.params,
-    )));
+    ));
     assert_eq!(cache.borrow().bars(&bar_type), None);
     assert_eq!(saver.get_messages().len(), 0);
 
@@ -115,16 +119,20 @@ fn test_continuous_future_time_bars_preserve_boundary_ticks_across_segments(
     assert_eq!(saver.get_messages().len(), 0);
 
     let trade = make_trade(post_id, "99.00", 7, "post-last", 12_000_000_000);
-    engine.response(DataResponse::Trades(TradesResponse::new(
-        child.request_id,
-        client_id,
-        post_id,
-        vec![trade],
+    engine.response_envelope(DataResponseEnvelope::new(
+        DataResponse::Trades(TradesResponse::new(
+            child.request_id,
+            client_id,
+            post_id,
+            vec![trade],
+            None,
+            None,
+            UnixNanos::from(12_000_000_000),
+            child.params,
+        )),
+        true,
         None,
-        None,
-        UnixNanos::from(12_000_000_000),
-        child.params,
-    )));
+    ));
 
     let last = Bar::new(
         bar_type,
@@ -222,24 +230,28 @@ fn test_continuous_future_request_adjusts_external_bars_across_transitions(
             .and_then(|params| params.get_str("continuous_future_parent_request_id")),
         Some(parent_id_str.as_str()),
     );
-    data_engine.response(DataResponse::Bars(BarsResponse::new(
-        child.request_id,
-        client_id,
-        child.single_bar_type().unwrap(),
-        vec![make_bar(
+    data_engine.response_envelope(DataResponseEnvelope::new(
+        DataResponse::Bars(BarsResponse::new(
+            child.request_id,
+            client_id,
             child.single_bar_type().unwrap(),
-            "100.00",
-            "101.00",
-            "99.00",
-            "100.50",
-            1,
-            minute(1),
-        )],
+            vec![make_bar(
+                child.single_bar_type().unwrap(),
+                "100.00",
+                "101.00",
+                "99.00",
+                "100.50",
+                1,
+                minute(1),
+            )],
+            None,
+            None,
+            UnixNanos::from(minute(1)),
+            child.params,
+        )),
+        true,
         None,
-        None,
-        UnixNanos::from(minute(1)),
-        child.params,
-    )));
+    ));
     // The close at the bar's stamp stays armed until the next segment's first bar
     assert_eq!(
         cache
@@ -254,24 +266,28 @@ fn test_continuous_future_request_adjusts_external_bars_across_transitions(
         child.single_bar_type().unwrap(),
         BarType::from("ESM24.GLBX-1-MINUTE-LAST-EXTERNAL")
     );
-    data_engine.response(DataResponse::Bars(BarsResponse::new(
-        child.request_id,
-        client_id,
-        child.single_bar_type().unwrap(),
-        vec![make_bar(
+    data_engine.response_envelope(DataResponseEnvelope::new(
+        DataResponse::Bars(BarsResponse::new(
+            child.request_id,
+            client_id,
             child.single_bar_type().unwrap(),
-            "96.00",
-            "97.00",
-            "95.50",
-            "96.50",
-            2,
-            minute(2),
-        )],
+            vec![make_bar(
+                child.single_bar_type().unwrap(),
+                "96.00",
+                "97.00",
+                "95.50",
+                "96.50",
+                2,
+                minute(2),
+            )],
+            None,
+            None,
+            UnixNanos::from(minute(2)),
+            child.params,
+        )),
+        true,
         None,
-        None,
-        UnixNanos::from(minute(2)),
-        child.params,
-    )));
+    ));
     // The first segment's bar, closed before this segment's first bar, keeps its adjustment
     assert_eq!(
         cache
@@ -286,24 +302,28 @@ fn test_continuous_future_request_adjusts_external_bars_across_transitions(
         child.single_bar_type().unwrap(),
         BarType::from("ESU24.GLBX-1-MINUTE-LAST-EXTERNAL")
     );
-    data_engine.response(DataResponse::Bars(BarsResponse::new(
-        child.request_id,
-        client_id,
-        child.single_bar_type().unwrap(),
-        vec![make_bar(
+    data_engine.response_envelope(DataResponseEnvelope::new(
+        DataResponse::Bars(BarsResponse::new(
+            child.request_id,
+            client_id,
             child.single_bar_type().unwrap(),
-            "106.00",
-            "107.00",
-            "105.50",
-            "106.50",
-            3,
-            minute(3),
-        )],
+            vec![make_bar(
+                child.single_bar_type().unwrap(),
+                "106.00",
+                "107.00",
+                "105.50",
+                "106.50",
+                3,
+                minute(3),
+            )],
+            None,
+            None,
+            UnixNanos::from(minute(3)),
+            child.params,
+        )),
+        true,
         None,
-        None,
-        UnixNanos::from(minute(3)),
-        child.params,
-    )));
+    ));
 
     let cached_bar = cache
         .borrow()
@@ -472,35 +492,39 @@ fn test_continuous_future_request_inserts_history_behind_newer_live_bar(
         child.single_bar_type().unwrap(),
         BarType::from("ESH24.GLBX-1-MINUTE-LAST-EXTERNAL")
     );
-    data_engine.response(DataResponse::Bars(BarsResponse::new(
-        child.request_id,
-        client_id,
-        child.single_bar_type().unwrap(),
-        vec![
-            make_bar(
-                child.single_bar_type().unwrap(),
-                "100.00",
-                "100.00",
-                "100.00",
-                "100.00",
-                1,
-                minute(0),
-            ),
-            make_bar(
-                child.single_bar_type().unwrap(),
-                "101.00",
-                "101.00",
-                "101.00",
-                "101.00",
-                1,
-                minute(1),
-            ),
-        ],
+    data_engine.response_envelope(DataResponseEnvelope::new(
+        DataResponse::Bars(BarsResponse::new(
+            child.request_id,
+            client_id,
+            child.single_bar_type().unwrap(),
+            vec![
+                make_bar(
+                    child.single_bar_type().unwrap(),
+                    "100.00",
+                    "100.00",
+                    "100.00",
+                    "100.00",
+                    1,
+                    minute(0),
+                ),
+                make_bar(
+                    child.single_bar_type().unwrap(),
+                    "101.00",
+                    "101.00",
+                    "101.00",
+                    "101.00",
+                    1,
+                    minute(1),
+                ),
+            ],
+            None,
+            None,
+            UnixNanos::from(minute(1)),
+            child.params,
+        )),
+        true,
         None,
-        None,
-        UnixNanos::from(minute(1)),
-        child.params,
-    )));
+    ));
 
     // The second segment is answered too, so the replay reaches the parent's end
     let child = recorded_bars_request(&recorder, 1);
@@ -508,24 +532,28 @@ fn test_continuous_future_request_inserts_history_behind_newer_live_bar(
         child.single_bar_type().unwrap(),
         BarType::from("ESM24.GLBX-1-MINUTE-LAST-EXTERNAL")
     );
-    data_engine.response(DataResponse::Bars(BarsResponse::new(
-        child.request_id,
-        client_id,
-        child.single_bar_type().unwrap(),
-        vec![make_bar(
+    data_engine.response_envelope(DataResponseEnvelope::new(
+        DataResponse::Bars(BarsResponse::new(
+            child.request_id,
+            client_id,
             child.single_bar_type().unwrap(),
-            "96.00",
-            "96.00",
-            "96.00",
-            "96.00",
-            1,
-            minute(2),
-        )],
+            vec![make_bar(
+                child.single_bar_type().unwrap(),
+                "96.00",
+                "96.00",
+                "96.00",
+                "96.00",
+                1,
+                minute(2),
+            )],
+            None,
+            None,
+            UnixNanos::from(minute(2)),
+            child.params,
+        )),
+        true,
         None,
-        None,
-        UnixNanos::from(minute(2)),
-        child.params,
-    )));
+    ));
 
     // the requested history is inserted behind the newer live bar
     let stamps: Vec<_> = cache
@@ -604,24 +632,28 @@ fn test_continuous_future_request_applies_ratio_to_external_bars(
         .unwrap();
 
     let child = recorded_bars_request(&recorder, 0);
-    data_engine.response(DataResponse::Bars(BarsResponse::new(
-        child.request_id,
-        client_id,
-        child.single_bar_type().unwrap(),
-        vec![make_bar(
+    data_engine.response_envelope(DataResponseEnvelope::new(
+        DataResponse::Bars(BarsResponse::new(
+            child.request_id,
+            client_id,
             child.single_bar_type().unwrap(),
-            "100.00",
-            "101.00",
-            "99.00",
-            "100.50",
-            1,
-            minute(1),
-        )],
+            vec![make_bar(
+                child.single_bar_type().unwrap(),
+                "100.00",
+                "101.00",
+                "99.00",
+                "100.50",
+                1,
+                minute(1),
+            )],
+            None,
+            None,
+            UnixNanos::from(minute(1)),
+            child.params,
+        )),
+        true,
         None,
-        None,
-        UnixNanos::from(minute(1)),
-        child.params,
-    )));
+    ));
     // The close at the bar's stamp stays armed until the next segment's first bar
     assert_eq!(
         cache
@@ -632,24 +664,28 @@ fn test_continuous_future_request_applies_ratio_to_external_bars(
     );
 
     let child = recorded_bars_request(&recorder, 1);
-    data_engine.response(DataResponse::Bars(BarsResponse::new(
-        child.request_id,
-        client_id,
-        child.single_bar_type().unwrap(),
-        vec![make_bar(
+    data_engine.response_envelope(DataResponseEnvelope::new(
+        DataResponse::Bars(BarsResponse::new(
+            child.request_id,
+            client_id,
             child.single_bar_type().unwrap(),
-            "55.00",
-            "56.00",
-            "54.50",
-            "55.50",
-            2,
-            minute(2),
-        )],
+            vec![make_bar(
+                child.single_bar_type().unwrap(),
+                "55.00",
+                "56.00",
+                "54.50",
+                "55.50",
+                2,
+                minute(2),
+            )],
+            None,
+            None,
+            UnixNanos::from(minute(2)),
+            child.params,
+        )),
+        true,
         None,
-        None,
-        UnixNanos::from(minute(2)),
-        child.params,
-    )));
+    ));
 
     let cached_bar = cache
         .borrow()

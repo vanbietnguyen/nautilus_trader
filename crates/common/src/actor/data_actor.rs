@@ -3130,17 +3130,17 @@ pub trait DataActor {
     /// The engine refuses such a request before dispatching anything, with one terminal
     /// envelope naming the reason, when: `quotes` is not a boolean; the client is external; the
     /// request is a leg of a `RequestJoin`; it sets continuous-future, time-range, `cut_warmup`,
-    /// `schema` or `skip_catalog_data` params; no catalog is registered, none covers any of its
-    /// window, or the engine is built without `streaming`; or it names more than one
-    /// instrument.
+    /// `schema` or `skip_catalog_data` params; no catalog is registered, or the engine is built
+    /// without `streaming`; or it names more than one instrument.
     ///
     /// Coverage is the catalog's file intervals, not the rows they hold. Each part of the window
     /// the catalog's trade files or its quote files do not cover is asked of the request's
     /// client for both feeds, a trades request and a quotes request over that part; their rows
     /// are merged with the catalog's in the same order, and the request completes once every
-    /// one of them has answered. Over such a part the catalog's rows of a feed its files do
-    /// cover there are kept, so a client that also answers that feed there has its rows
-    /// delivered beside them. When no client resolves, the request fails: its reason names the
+    /// one of them has answered. When no catalog covers any of the window, the whole window is
+    /// such a part. Over such a part the catalog's rows are kept, and a client's rows of a feed
+    /// only where the catalog's files lack that feed, so no record is delivered twice. When no
+    /// client resolves, the request fails: its reason names the
     /// first such part and the feeds the catalog lacks there, the records that exist are still
     /// delivered, and no close fires after the last of them. A client that fails either ask
     /// fails the request with its reason, the same way.
@@ -3169,13 +3169,13 @@ pub trait DataActor {
     /// exist are still delivered, and no close fires after the last of them. A client's answer,
     /// empty or not, is a source. A request that names a `limit` or a filter expression
     /// (`filter_expr`), or that its client answers with a bare response (`DataEngine::response`,
-    /// which certifies no coverage), completes with no failure reason and closes nothing after
-    /// its last record.
+    /// which certifies no coverage; for a time-range pipeline, to any of its child requests),
+    /// completes with no failure reason and closes nothing after its last record.
     ///
     /// With `params["update_subscriptions"] = true` the request's aggregators are kept under
     /// their bar types and outlive it, so a later request can continue them and a subscription
     /// to their bar types takes them over. They compute as above, on a clock of their own; such
-    /// a request must give a `start` and name no `limit`. A request none of whose aggregators
+    /// a request must give a `start` and name no `limit` and no filter expression. A request none of whose aggregators
     /// exists starts them, their clock at its `start`. A request whose aggregators are exactly
     /// those one earlier kept request left, none subscribed and none in use by a request in
     /// flight, continues them on their clock when its `start` is the next nanosecond after that
@@ -3184,9 +3184,10 @@ pub trait DataActor {
     /// (one at that very nanosecond fires after the records stamped then) and a calendar grid pass
     /// from one request to the next, and every bar goes to the continuing request's answer. Any
     /// other such request is refused before dispatch, with one terminal envelope naming the
-    /// case, and changes nothing. A request whose answer fired no close after its last record
-    /// (above) leaves aggregators no request can continue. A request that fails or expires
-    /// removes its aggregators. Between requests nothing drives them and no bar goes anywhere.
+    /// case, and changes nothing. A joined request (`cut_warmup`, below), whose answer fires no
+    /// close after its last record, leaves aggregators no request can continue. A request that
+    /// fails or expires, or that is answered by a bare response (above), removes its
+    /// aggregators. Between requests nothing drives them and no bar goes anywhere.
     ///
     /// A subscription to a kept bar type takes its aggregator over. Made after the answer, the
     /// closes due before the engine clock's time are published to it, stamped at their own
@@ -3197,8 +3198,8 @@ pub trait DataActor {
     /// coverage (the answer holds every trade up to it) are fed to the aggregator as the
     /// answer's trades are (the closes due before each fire first, their bars still the
     /// answer's), trade by trade across bar types, then the aggregator is taken over as above.
-    /// When the request fails or expires instead, the subscription gets a new aggregator,
-    /// started then and fed the held trades. A joined request (`cut_warmup`) closes nothing after
+    /// When the request fails, expires or is answered by a bare response instead, the
+    /// subscription gets a new aggregator, started then and fed the held trades. A joined request (`cut_warmup`) closes nothing after
     /// its last trade: its held live trades, through the join's cut and floor, move its clock on
     /// before the takeover. [`Self::unsubscribe_bars`] for a bar type kept and not subscribed
     /// since removes its aggregator; made while a request runs it, that request runs to its end,
@@ -3316,8 +3317,9 @@ pub trait DataActor {
     /// (`continuous_future_transitions`) runs one such clock across its segments; a segment
     /// change only sets the price adjustment applied to the records fed after it, so a bar open
     /// at the change continues; the closes up to its end fire once, when its last segment
-    /// completes with no failure reason. As for a trades request, a `limit` or a filter
-    /// expression leaves nothing closed after its last record.
+    /// completes with no failure reason. As for a trades request, a `limit`, a filter
+    /// expression or a bare response (to the request, or to one of its segments' child
+    /// requests) leaves nothing closed after its last record.
     ///
     /// # Errors
     ///

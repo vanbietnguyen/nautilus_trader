@@ -834,7 +834,7 @@ fn test_update_subscriptions_request_aggregator_replays_live_quotes_after_respon
         RequestQuotes::new(
             instrument_id,
             Some(UnixNanos::from(t0 - 300 * SEC).to_datetime_utc()),
-            None,
+            Some(UnixNanos::from(t0 - 1).to_datetime_utc()),
             None,
             Some(client_id),
             request_id,
@@ -874,16 +874,20 @@ fn test_update_subscriptions_request_aggregator_replays_live_quotes_after_respon
     let history: Vec<QuoteTick> = (1..=30)
         .map(|i| make_quote(t0 - 300 * SEC + i * 10 * SEC - 1, "0.65000", "0.65010"))
         .collect();
-    data_engine.response(DataResponse::Quotes(QuotesResponse::new(
-        request_id,
-        client_id,
-        instrument_id,
-        history,
+    data_engine.response_envelope(DataResponseEnvelope::new(
+        DataResponse::Quotes(QuotesResponse::new(
+            request_id,
+            client_id,
+            instrument_id,
+            history,
+            None,
+            None,
+            UnixNanos::from(t0 + 30 * SEC),
+            Some(params),
+        )),
+        true,
         None,
-        None,
-        UnixNanos::from(t0 + 30 * SEC),
-        Some(params),
-    )));
+    ));
 
     // The held quote closes the last historical bar and the stale quote is not applied
     let cache_ref = cache.borrow();
@@ -1073,7 +1077,7 @@ fn test_update_subscriptions_request_chain_replays_live_quotes_before_dependents
         RequestQuotes::new(
             instrument_id,
             Some(UnixNanos::from(boundary - 300 * SEC).to_datetime_utc()),
-            None,
+            Some(UnixNanos::from(boundary - 60 * SEC).to_datetime_utc()),
             None,
             Some(client_id),
             request_id,
@@ -1113,16 +1117,20 @@ fn test_update_subscriptions_request_chain_replays_live_quotes_before_dependents
     data_engine.process_data(Data::Quote(make_quote(boundary + 5 * SEC)));
     assert!(cache.borrow().bar(&composite.standard()).is_none());
 
-    data_engine.response(DataResponse::Quotes(QuotesResponse::new(
-        request_id,
-        client_id,
-        instrument_id,
-        Vec::new(),
+    data_engine.response_envelope(DataResponseEnvelope::new(
+        DataResponse::Quotes(QuotesResponse::new(
+            request_id,
+            client_id,
+            instrument_id,
+            Vec::new(),
+            None,
+            None,
+            UnixNanos::from(boundary + 10 * SEC),
+            Some(params),
+        )),
+        true,
         None,
-        None,
-        UnixNanos::from(boundary + 10 * SEC),
-        Some(params),
-    )));
+    ));
 
     // The held quotes replay through the source before the composite goes live
     let cache_ref = cache.borrow();
@@ -5970,15 +5978,13 @@ const QUOTES_REFUSED: &str = "Cannot answer the quotes of a `quotes` request";
 enum Unquotable {
     /// No catalog is registered: its client would answer it.
     NoCatalog,
-    /// The catalog holds nothing in the window: one client leg answers it.
-    CatalogOutsideTheWindow,
     /// It sets `skip_catalog_data`: one client leg answers it.
     SkipCatalogData,
     /// It sets a `schema`: its client answers it whole.
     Schema,
 }
 
-/// A catalog run outside the window `[1 000, 2 999]` of the refusal test.
+/// A catalog run outside every window of the tests that register it.
 #[cfg(feature = "streaming")]
 const OUTSIDE_THE_WINDOW: [QuotedRun<'static>; 1] = [QuotedRun {
     interval: (5_000, 5_999),
@@ -5991,10 +5997,6 @@ const OUTSIDE_THE_WINDOW: [QuotedRun<'static>; 1] = [QuotedRun {
 #[case::no_catalog(
     Unquotable::NoCatalog,
     "no catalog is registered, so its plan has no catalog leg"
-)]
-#[case::catalog_outside_the_window(
-    Unquotable::CatalogOutsideTheWindow,
-    "its plan has no catalog leg"
 )]
 #[case::skip_catalog_data(Unquotable::SkipCatalogData, "its plan has no catalog leg")]
 #[case::schema(
@@ -6013,7 +6015,6 @@ fn test_quotes_request_whose_plan_cannot_carry_quotes_is_refused_before_any_disp
     let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
     let runs: &[QuotedRun] = match plan {
         Unquotable::NoCatalog => &[],
-        Unquotable::CatalogOutsideTheWindow => &OUTSIDE_THE_WINDOW,
         Unquotable::SkipCatalogData | Unquotable::Schema => &COUNTEREXAMPLE,
     };
     let _catalog_dir =
@@ -9722,19 +9723,18 @@ fn test_merged_request_asks_its_client_both_feeds_over_each_part_its_files_miss(
     answer_leg(&fixture, legs[2], &[], &[]);
 
     let expected = if client_rows {
-        // The client's two quotes and its trade at their place, around the catalog's quote
+        // The client's quote before the quote file and its trade before the trade file at their
+        // place, around the catalog's quote; its quote at 09:59:00.020, which the quote file
+        // covers, is not kept
         vec![
-            merged_quotes(
-                &[t("09:59:00.002"), t("09:59:00.010"), t("09:59:00.020")],
-                &[0, 3],
-            ),
-            merged_trades(&["c1", "t1"], &[0, 3]),
-            merged_bar(minute, t("10:00:00"), 2, &[1, 3]),
-            merged_quotes(&[t("10:00:01")], &[1, 4]),
-            merged_trades(&["t2"], &[1, 4]),
-            merged_quotes(&[t("10:00:59.990")], &[1, 5]),
-            merged_bar(minute, t("10:01:00"), 1, &[2, 5]),
-            merged_trades(&[], &[2, 5]),
+            merged_quotes(&[t("09:59:00.002"), t("09:59:00.010")], &[0, 2]),
+            merged_trades(&["c1", "t1"], &[0, 2]),
+            merged_bar(minute, t("10:00:00"), 2, &[1, 2]),
+            merged_quotes(&[t("10:00:01")], &[1, 3]),
+            merged_trades(&["t2"], &[1, 3]),
+            merged_quotes(&[t("10:00:59.990")], &[1, 4]),
+            merged_bar(minute, t("10:01:00"), 1, &[2, 4]),
+            merged_trades(&[], &[2, 4]),
             Merged::End(None),
         ]
     } else {
@@ -9785,6 +9785,136 @@ fn test_merged_request_asks_its_client_both_feeds_over_a_gap_in_its_quote_files_
     answer_leg(&fixture, legs[0], &[], &[]);
 
     assert_eq!(delivered.take(), edge_answer(minute));
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+}
+
+/// The review's example: trades covered through 10:01, quotes missing from 10:00 to 10:00:30,
+/// and the catalog's trade t2 at 10:00:06. A client that answers t2 to the trades ask of that
+/// part has it dropped, as the catalog's files cover trades there: t2 is delivered once and its
+/// 10:01 bar has volume 1, not 2.
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_merged_request_keeps_a_clients_rows_of_a_feed_only_where_the_catalog_lacks_that_feed(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let minute = bar_type_of(fixture.instrument_id, "1-MINUTE");
+    let t = edge_ns;
+    let _catalog_dir = register_edge_catalog(
+        &fixture,
+        "merged-client-overlap",
+        edge_window(),
+        &[
+            (t("09:59:00"), t("10:00:00") - 1),
+            (t("10:00:30"), t("10:01:00")),
+        ],
+    );
+    let request = edge_request(&fixture, minute);
+    let delivered = tap_merged(&fixture, *request.request_id(), &[minute]);
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+
+    let legs = client_legs(&fixture);
+    answer_leg(&fixture, legs[1], &[t("10:00:01")], &[]);
+    answer_leg(&fixture, legs[0], &[], &[(t("10:00:06"), "t2")]);
+
+    assert_eq!(delivered.take(), edge_answer(minute));
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+}
+
+/// A merged request whose catalog covers none of its window (its files hold another window) is
+/// served by its client alone: a trades and a quotes leg over the whole window, their rows
+/// merged by `ts_init`, a quote before a trade at one stamp (10:00:06), and once both have
+/// answered the end fires the 10:01 close. With no client it fails naming the window and both
+/// feeds.
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_merged_request_its_catalog_covers_none_of_is_served_by_its_client_alone(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[values(true, false)] with_client: bool,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let minute = bar_type_of(fixture.instrument_id, "1-MINUTE");
+    let t = edge_ns;
+    let _catalog_dir =
+        register_quoted_catalog(&fixture, "merged-client-alone", &OUTSIDE_THE_WINDOW);
+    let request = edge_request(&fixture, minute);
+    let request = if with_client {
+        request
+    } else {
+        without_a_client(request)
+    };
+    let delivered = tap_merged(&fixture, *request.request_id(), &[minute]);
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+
+    let (start, end) = edge_window();
+    if !with_client {
+        assert!(fixture.recorder.borrow().is_empty());
+        assert_eq!(
+            delivered.take(),
+            vec![Merged::End(Some(uncovered_part(
+                start,
+                end,
+                "trades and quotes"
+            )))]
+        );
+        assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+        return;
+    }
+
+    let legs = client_legs(&fixture);
+    assert_eq!(
+        leg_windows(&legs),
+        vec![("trades", start, end), ("quotes", start, end)]
+    );
+    answer_leg(
+        &fixture,
+        legs[1],
+        &[
+            t("09:59:00.010"),
+            t("10:00:01"),
+            t("10:00:06"),
+            t("10:00:59.990"),
+        ],
+        &[],
+    );
+    assert!(delivered.borrow().is_empty());
+    answer_leg(
+        &fixture,
+        legs[0],
+        &[],
+        &[(t("09:59:30"), "t1"), (t("10:00:06"), "t2")],
+    );
+
+    assert_eq!(
+        delivered.take(),
+        vec![
+            merged_quotes(&[t("09:59:00.010")], &[0, 1]),
+            merged_trades(&["t1"], &[0, 1]),
+            merged_bar(minute, t("10:00:00"), 1, &[1, 1]),
+            merged_quotes(&[t("10:00:01"), t("10:00:06")], &[1, 3]),
+            merged_trades(&["t2"], &[1, 3]),
+            merged_quotes(&[t("10:00:59.990")], &[1, 4]),
+            merged_bar(minute, t("10:01:00"), 1, &[2, 4]),
+            merged_trades(&[], &[2, 4]),
+            Merged::End(None),
+        ]
+    );
     assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
 }
 
@@ -10444,6 +10574,129 @@ fn test_time_range_child_over_a_gap_no_client_resolves_fails_its_parent(
     );
 }
 
+/// The review's example: a time-range parent over 16:50 to 18:00 whose one child its client
+/// answers with a bare response, its last trade at 16:59:58. The child certifies no coverage, so
+/// the parent's end fires neither the 17:00 close nor the 18:00 `RANGE` boundary.
+#[rstest]
+fn test_time_range_parent_whose_child_is_answered_bare_fires_no_end_of_coverage(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (five, range) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "10-RANGE"));
+    let mut fixture = PlainFixture::new(
+        vec![InstrumentAny::CurrencyPair(audusd_sim)],
+        client_id,
+        venue,
+        without_flat_bars(),
+        new_york("2024-01-08T20:00:00"),
+        &[five, range],
+    );
+    fixture.execute(plain_trades_request(
+        id,
+        client_id,
+        UUID4::new(),
+        (
+            Some(new_york("2024-01-08T16:50:00")),
+            Some(new_york("2024-01-08T18:00:00") + 1),
+        ),
+        None,
+        plain_params(
+            &[five, range],
+            json!({ "time_range_generator": "", "durations_seconds": [7200] }),
+        ),
+    ));
+
+    let child = fixture.trades_requests()[0].request_id;
+    fixture.engine.response(trades_answer(
+        child,
+        client_id,
+        id,
+        &[
+            (new_york("2024-01-08T16:52:00"), "1.00000", 1),
+            (new_york("2024-01-08T16:57:00"), "1.00000", 2),
+            (new_york("2024-01-08T16:59:58"), "1.00000", 3),
+        ],
+    ));
+
+    assert_eq!(fixture.trades_requests().len(), 1);
+    // The 16:55 close fires before the 16:57 trade; neither 17:00 nor the 18:00 boundary fires
+    assert_eq!(
+        fixture.cached(),
+        vec![vec![(new_york("2024-01-08T16:55:00"), 1)], vec![]]
+    );
+    assert_eq!(fixture.ends(), vec![None]);
+}
+
+/// A continuous-future request across two segments (ESH24 to 10:03, then ESM24) whose children
+/// its client answers with bare responses: the 10:05 close fires before the 10:06 trade, and the
+/// parent's end (10:10) fires nothing after it.
+#[rstest]
+fn test_continuous_future_parent_whose_children_are_answered_bare_fires_no_end_of_coverage(
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+) {
+    let _ = stub_msgbus;
+    let target = BarType::from("ES.GLBX-5-MINUTE-LAST-INTERNAL");
+    let mut fixture = PlainFixture::new(
+        Vec::new(),
+        client_id,
+        Venue::from("GLBX"),
+        DataEngineConfig::default(),
+        utc_ns("2024-01-08T11:00:00Z"),
+        &[target],
+    );
+    let esh = add_es_contract(&fixture.cache, "ESH24.GLBX", "ESH24");
+    let esm = add_es_contract(&fixture.cache, "ESM24.GLBX", "ESM24");
+    let params = params_from_json(json!({
+        "continuous_future_adjustment_mode": "BACKWARD_SPREAD",
+        "continuous_future_transitions": [{
+            "transition_time_ns": utc_ns("2024-01-08T10:03:00Z"),
+            "pre_instrument_id": esh.to_string(),
+            "post_instrument_id": esm.to_string(),
+            "pre_price": "100.00",
+            "post_price": "95.00"
+        }]
+    }));
+    fixture.execute(RequestCommand::Bars(RequestBars::new(
+        target,
+        timestamp_of(Some(utc_ns("2024-01-08T10:00:00Z"))),
+        timestamp_of(Some(utc_ns("2024-01-08T10:10:00Z"))),
+        None,
+        Some(client_id),
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(params),
+    )));
+
+    let first = fixture.trades_requests()[0].request_id;
+    fixture.engine.response(trades_answer(
+        first,
+        fixture.client_id,
+        esh,
+        &[(utc_ns("2024-01-08T10:01:00Z"), "100.00", 1)],
+    ));
+    let second = fixture.trades_requests()[1].request_id;
+    fixture.engine.response(trades_answer(
+        second,
+        fixture.client_id,
+        esm,
+        &[
+            (utc_ns("2024-01-08T10:04:00Z"), "96.00", 2),
+            (utc_ns("2024-01-08T10:06:00Z"), "97.00", 4),
+        ],
+    ));
+
+    assert_eq!(
+        fixture.cached(),
+        vec![vec![(utc_ns("2024-01-08T10:05:00Z"), 3)]]
+    );
+    assert_eq!(fixture.ends(), vec![None]);
+}
+
 /// What a kept request's requester and the subscribers are given, in order, each with the
 /// number of bars of every watched bar type the cache holds at its callback: the trades and
 /// bars of the answer of the `n`th request and its end; a live trade on the trades topic; a
@@ -10491,6 +10744,7 @@ struct KeptSpec {
     end: Option<u64>,
     limit: Option<usize>,
     time_zone: Option<&'static str>,
+    filter_expr: Option<&'static str>,
 }
 
 /// The window from `start` to just before `next`, the next request's start.
@@ -10613,6 +10867,9 @@ impl KeptFixture {
         if let Some(time_zone) = spec.time_zone {
             params["time_zone"] = json!(time_zone);
         }
+        if let Some(filter_expr) = spec.filter_expr {
+            params["filter_expr"] = json!(filter_expr);
+        }
 
         let recorded = Rc::clone(&self.delivered);
         let cache = Rc::clone(&self.cache);
@@ -10676,6 +10933,13 @@ impl KeptFixture {
             None => envelope,
         };
         self.engine.response_envelope(envelope);
+    }
+
+    /// Answers the `request`th request with trades (`ts`, size, trade ID) at one price in a bare
+    /// response, as a client calling `DataEngine::response` does.
+    fn answer_bare(&mut self, request: usize, trades: &[(u64, u64, &str)]) {
+        let resp = self.trades_response(request, trades);
+        self.engine.response(DataResponse::Trades(resp));
     }
 
     fn trades_response(&self, request: usize, trades: &[(u64, u64, &str)]) -> TradesResponse {
@@ -10934,7 +11198,6 @@ enum Occupied {
     NotAllBuilders,
     Subscribed,
     InFlight,
-    NoCoverage,
 }
 
 #[rstest]
@@ -10942,7 +11205,6 @@ enum Occupied {
 #[case::not_all_builders(Occupied::NotAllBuilders, "are not all the builders of the replay")]
 #[case::subscribed(Occupied::Subscribed, "is already running for a subscription")]
 #[case::in_flight(Occupied::InFlight, "is in use by the request")]
-#[case::no_coverage(Occupied::NoCoverage, "fired no end of coverage")]
 fn test_kept_request_refused_by_name_for_builders_it_cannot_continue(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
@@ -10979,13 +11241,6 @@ fn test_kept_request_refused_by_name_for_builders_it_cannot_continue(
         }
         Occupied::InFlight => {
             fixture.request(&[five], window).unwrap();
-            vec![five]
-        }
-        Occupied::NoCoverage => {
-            let request = fixture.request(&[five], window).unwrap();
-            // A bare response certifies no coverage: no end fires, nothing to continue from
-            let resp = fixture.trades_response(request, &a1);
-            fixture.engine.response(DataResponse::Trades(resp));
             vec![five]
         }
     };
@@ -11564,6 +11819,154 @@ fn test_unsubscribing_a_kept_bar_type_while_its_request_runs_gives_a_held_back_s
     }
     unsubscribe(&mut fixture, five);
     fixture.answer(request, &[(monday("10:00:30"), 1, "a1")], None);
+    fixture.advance(monday("10:09:30"));
+    fixture.live(monday("10:09:30"), 16, "h4");
+    fixture.advance(monday("10:10:00"));
+
+    // No 5-MINUTE builder is left to continue: a request from 10:00 starts a new one
+    assert!(
+        fixture
+            .request(&[five], kept_window(monday("10:00:00"), monday("10:15:00")))
+            .is_ok()
+    );
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            live_trade("h1", &[0, 0]),
+            live_trade("h2", &[0, 0]),
+            live_trade("h3", &[0, 0]),
+            kept_trade(0, "a1", &[0, 0]),
+            Kept::End(0, None),
+            published(three, monday("10:09:00"), 14, &[1, 0]),
+            live_trade("h4", &[1, 0]),
+        ]
+    );
+}
+
+/// A kept request naming a filter expression is refused by name before dispatch, as one naming a
+/// `limit` is, and changes nothing: the next request continues the first one's open bar.
+#[rstest]
+fn test_kept_request_naming_a_filter_expression_is_refused_by_name_and_leaves_its_replay_as_it_was(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
+    first_kept_request(&mut fixture, five);
+    let next = kept_window(monday("10:08:00"), monday("10:15:00"));
+    let sent = fixture.client_commands(0).len();
+
+    let error = fixture
+        .request(
+            &[five],
+            KeptSpec {
+                filter_expr: Some("size > 0"),
+                ..next
+            },
+        )
+        .unwrap_err();
+    assert!(fixture.client_commands(sent).is_empty());
+    let continued = fixture.request(&[five], next).unwrap();
+    fixture.answer(continued, &[(monday("10:12:00"), 4, "b1")], None);
+
+    assert!(
+        error.starts_with("Cannot keep the bar builders of an `update_subscriptions` request"),
+        "{error}"
+    );
+    assert!(error.contains("it names a filter expression"), "{error}");
+    let mut expected = first_kept_answer(five);
+    expected.extend([
+        Kept::End(1, Some(error)),
+        kept_bar(2, five, monday("10:10:00"), 2, &[2]),
+        kept_trade(2, "b1", &[2]),
+        Kept::End(2, None),
+    ]);
+    assert_eq!(fixture.delivered(), expected);
+}
+
+/// A kept request answered by a bare response, which certifies no coverage, ends as a failed one
+/// does: its replay is removed, so the same window can be asked again and starts a new builder
+/// (the 10:10 bar holds c1 alone, not a2).
+#[rstest]
+fn test_kept_request_answered_by_a_bare_response_removes_its_replay_and_the_next_starts_a_new_one(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
+    let bare = fixture
+        .request(&[five], kept_window(monday("10:00:00"), monday("10:08:00")))
+        .unwrap();
+    fixture.answer_bare(
+        bare,
+        &[(monday("10:01:00"), 1, "a1"), (monday("10:06:00"), 2, "a2")],
+    );
+
+    let started = fixture
+        .request(&[five], kept_window(monday("10:00:00"), monday("10:15:00")))
+        .unwrap();
+    fixture.answer(
+        started,
+        &[(monday("10:07:00"), 4, "c1"), (monday("10:12:00"), 8, "c2")],
+        None,
+    );
+
+    assert_eq!(
+        fixture.delivered(),
+        vec![
+            kept_trade(0, "a1", &[0]),
+            kept_bar(0, five, monday("10:05:00"), 1, &[1]),
+            kept_trade(0, "a2", &[1]),
+            Kept::End(0, None),
+            kept_trade(1, "c1", &[1]),
+            kept_bar(1, five, monday("10:10:00"), 4, &[2]),
+            kept_trade(1, "c2", &[2]),
+            Kept::End(1, None),
+        ]
+    );
+}
+
+/// The same with a subscription held back on a builder of the request: nothing is handed over;
+/// the subscription gets a new builder, started at the request's end and fed its held trades,
+/// so its 10:09 bar holds h1, h2 and h3 (14) and not the answer's a1.
+#[rstest]
+fn test_kept_request_answered_by_a_bare_response_gives_a_held_back_subscription_a_new_builder(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let (three, five) = (bar_type_of(id, "3-MINUTE"), bar_type_of(id, "5-MINUTE"));
+    let mut fixture = KeptFixture::new(
+        audusd_sim,
+        client_id,
+        venue,
+        monday("10:08:00"),
+        &[three, five],
+    );
+    let request = fixture
+        .request(
+            &[three, five],
+            kept_window(monday("10:00:00"), monday("10:02:00")),
+        )
+        .unwrap();
+    fixture.subscribe(three, None);
+    for (ts, size, trade_id) in [
+        ("10:02:00", 2, "h1"),
+        ("10:04:00", 4, "h2"),
+        ("10:07:00", 8, "h3"),
+    ] {
+        fixture.live(monday(ts), size, trade_id);
+    }
+    fixture.answer_bare(request, &[(monday("10:00:30"), 1, "a1")]);
     fixture.advance(monday("10:09:30"));
     fixture.live(monday("10:09:30"), 16, "h4");
     fixture.advance(monday("10:10:00"));

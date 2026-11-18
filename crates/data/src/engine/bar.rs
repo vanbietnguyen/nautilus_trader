@@ -98,8 +98,9 @@ pub(super) struct RequestReplay {
     dispatched: UnixNanos,
     /// Whether its answer may not hold every record of its window, so its end of coverage fires
     /// nothing: the request named a `limit` or a filter expression (see
-    /// [`window_not_wholly_known`]), or its answer came as a bare response (see
-    /// [`DataEngine::response`]).
+    /// [`window_not_wholly_known`]), or its answer, or a pipeline child's, came as a bare
+    /// response (see [`DataEngine::mark_bare_response`]). A kept replay so marked is removed
+    /// when its request ends, not kept.
     partial: bool,
     /// Whether a kept builder of it was unsubscribed while its request was in flight (see
     /// [`DataEngine::unsubscribe_bars`]): the replay is removed when the request ends, not kept.
@@ -374,7 +375,7 @@ impl DataEngine {
     ///
     /// Returns an error if the request keeps its builders and: a bar type it asks is already
     /// running for a subscription; a request in flight has claimed one of its builders; it names
-    /// a `limit`; it has no `start`; some of its builders exist and some do not; one exists
+    /// a `limit` or a filter expression; it has no `start`; some of its builders exist and some do not; one exists
     /// that no kept replay holds; its builders are kept by two replays, or are not all the
     /// builders of their replay; that replay's last answer fired no end of coverage; or its
     /// `start` is before that replay's start, within its coverage, or after the next instant.
@@ -418,6 +419,11 @@ impl DataEngine {
         anyhow::ensure!(
             !names_a_limit(req),
             "{KEPT_REFUSED}: it names a `limit`, so its answer may stop before its window ends"
+        );
+        anyhow::ensure!(
+            !names_a_filter(req),
+            "{KEPT_REFUSED}: it names a filter expression (`filter_expr`), so its answer may hold \
+             only some records of its window"
         );
         let Some(start) = parent_request_window(Some(req)).0 else {
             anyhow::bail!(
@@ -533,10 +539,20 @@ impl DataEngine {
         }
     }
 
-    /// Marks the replay of `request_id`, if it has one, as answered by a bare response, which does
-    /// not certify that it holds every record of the window (see [`RequestReplay::partial`]).
+    /// Marks the replay that `request_id` feeds, if any, as answered by a bare response, which
+    /// does not certify that it holds every record of the window (see
+    /// [`RequestReplay::partial`]): the request's own, or for a child of a time-range or
+    /// continuous-future pipeline its parent's. A leg of a request's plan feeds no replay of its
+    /// own: its answer, empty or not, is a source.
     pub(super) fn mark_bare_response(&mut self, request_id: UUID4) {
-        if let Some(replay) = self.request_replays.get_mut(&request_id) {
+        let owner = self
+            .time_range_pipeline_parent_request_id
+            .get(&request_id)
+            .or_else(|| self.continuous_future_parent_request_id.get(&request_id))
+            .copied()
+            .unwrap_or(request_id);
+
+        if let Some(replay) = self.request_replays.get_mut(&owner) {
             replay.partial = true;
         }
     }
@@ -807,8 +823,10 @@ impl DataEngine {
     ///
     /// A request's own builders stop with it. Builders kept by request (`update_subscriptions`)
     /// stay on their replay after a success (see [`Self::release_kept_builders`]); after
-    /// anything else, or when one of them was unsubscribed while the request was in flight, the
-    /// replay is removed with them (see [`Self::remove_kept_builders`]). With
+    /// anything else, after an answer that may not hold every record of its window (a bare
+    /// response, see [`RequestReplay::partial`]), or when one of them was unsubscribed while the
+    /// request was in flight, the replay is removed with them (see
+    /// [`Self::remove_kept_builders`]). With
     /// `interleaved`, the entry of an interleaving request holding its undelivered bars, the bars
     /// its held live trades complete go there; the entry still held here goes with the builders,
     /// undelivered: only [`Self::finish_interleaved`], which takes the entry first, delivers its
@@ -831,7 +849,7 @@ impl DataEngine {
             let bars =
                 interleaved.map_or_else(Rc::default, |interleaved| Rc::clone(&interleaved.bars));
             match replay {
-                Some(replay) if succeeded && !replay.unsubscribed => {
+                Some(replay) if succeeded && !replay.partial && !replay.unsubscribed => {
                     self.release_kept_builders(&state, replay, joined, &bars);
                 }
                 replay => self.remove_kept_builders(&state, replay.as_ref()),
@@ -2434,10 +2452,15 @@ fn live_delivery_order(bar_type: &BarType) -> (bool, String) {
 /// aggregators are read), or a filter expression (`filter_expr`), so rows of its window are left
 /// out.
 fn window_not_wholly_known(req: &RequestCommand) -> bool {
-    let filter = request_params(req)
+    names_a_limit(req) || names_a_filter(req)
+}
+
+/// Returns whether `req` names a non-empty filter expression (`filter_expr`), so its answer may
+/// hold only some records of its window.
+fn names_a_filter(req: &RequestCommand) -> bool {
+    request_params(req)
         .and_then(|params| params.get_str(FILTER_EXPR))
-        .is_some_and(|filter_expr| !filter_expr.is_empty());
-    names_a_limit(req) || filter
+        .is_some_and(|filter_expr| !filter_expr.is_empty())
 }
 
 /// Returns whether `req` names a `limit` (only the kinds whose records feed aggregators are

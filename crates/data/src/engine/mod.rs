@@ -261,6 +261,10 @@ pub struct DataEngine {
     response_count: u64,
     #[cfg(feature = "streaming")]
     catalogs: CatalogMap,
+    /// The intervals where the catalog lacks the feed of each client leg of a `quotes` request
+    /// (by leg ID), from its dispatch until its terminal: its rows are kept only inside them.
+    #[cfg(feature = "streaming")]
+    client_feed_missing: AHashMap<UUID4, Vec<(u64, u64)>>,
     #[cfg(feature = "defi")]
     pub(crate) pool_updaters: AHashMap<InstrumentId, Rc<PoolUpdater>>,
     #[cfg(feature = "defi")]
@@ -349,6 +353,8 @@ impl DataEngine {
             response_count: 0,
             #[cfg(feature = "streaming")]
             catalogs: CatalogMap::new(),
+            #[cfg(feature = "streaming")]
+            client_feed_missing: AHashMap::new(),
             #[cfg(feature = "defi")]
             pool_updaters: AHashMap::new(),
             #[cfg(feature = "defi")]
@@ -599,6 +605,8 @@ impl DataEngine {
         self.request_pipeline_n_components.clear();
         self.request_pipeline_parent_request_id.clear();
         self.request_pipeline_responses.clear();
+        #[cfg(feature = "streaming")]
+        self.client_feed_missing.clear();
         self.time_range_pipeline_requests.clear();
         self.time_range_pipeline_parent_request_id.clear();
         self.parent_join_request_id.clear();
@@ -2037,7 +2045,10 @@ impl DataEngine {
     /// Payload-only replies do not certify coverage for catalog write-back. Use
     /// [`Self::response_envelope`] to report explicit source completion. Nor do they certify
     /// that they hold every record of the window: a request that builds bars on a replay of its
-    /// own and is answered this way closes nothing after its last record.
+    /// own, or a time-range or continuous-future pipeline one of whose children is answered this
+    /// way, closes nothing after its last record, and its builders kept by request
+    /// (`update_subscriptions`) are removed as on a failure. A leg of a request's plan answered
+    /// this way is a source as any other answer.
     pub fn response(&mut self, resp: DataResponse) {
         self.mark_bare_response(*resp.correlation_id());
         self.payload_response(resp);
@@ -2339,6 +2350,9 @@ impl DataEngine {
         let Some(&(parent_id, index)) = self.request_pipeline_parent_request_id.get(&leg_id) else {
             return Some(envelope);
         };
+
+        #[cfg(feature = "streaming")]
+        let envelope = self.keep_client_feed_rows(envelope);
 
         let completed = envelope.completed();
         let slots = self.request_pipeline_responses.get_mut(&parent_id)?;
