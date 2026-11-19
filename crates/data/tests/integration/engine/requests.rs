@@ -11378,6 +11378,404 @@ fn test_merged_request_over_a_window_its_files_wholly_cover_asks_its_client_noth
     assert!(fixture.recorder.borrow().is_empty());
 }
 
+/// One envelope of a `quotes` request, by row: its kind and its rows.
+#[cfg(feature = "streaming")]
+type RowPart = (&'static str, Vec<String>);
+
+/// What one envelope of a `quotes` request carried, by row: its quotes as `ts_init bid`, its trades
+/// by trade ID, its bars by `ts_event`, and, when it completed, `end` with its reason.
+#[cfg(feature = "streaming")]
+fn tap_rows(request_id: UUID4) -> Rc<RefCell<Vec<RowPart>>> {
+    let delivered = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&delivered);
+    let handler = TypedHandler::from(move |envelope: &DataResponseEnvelope| {
+        let part = match envelope.response() {
+            Some(DataResponse::Quotes(resp)) => Some((
+                "quotes",
+                resp.data
+                    .iter()
+                    .map(|quote| format!("{} {}", quote.ts_init, quote.bid_price))
+                    .collect(),
+            )),
+            Some(DataResponse::Trades(resp)) => Some((
+                "trades",
+                resp.data
+                    .iter()
+                    .map(|trade| trade.trade_id.to_string())
+                    .collect(),
+            )),
+            Some(DataResponse::Bars(resp)) => Some((
+                "bars",
+                resp.data
+                    .iter()
+                    .map(|bar| bar.ts_event.to_string())
+                    .collect(),
+            )),
+            _ => None,
+        };
+        recorded.borrow_mut().extend(part);
+
+        if envelope.completed() {
+            let reason = envelope.failure_reason().map(str::to_owned);
+            recorded
+                .borrow_mut()
+                .push(("end", reason.into_iter().collect()));
+        }
+    });
+    msgbus::register_response_handler(&request_id, handler);
+    delivered
+}
+
+/// Two quote files of one feed overlapping in time, each with a quote at 1 500 ns, and a trade at
+/// that stamp: today's catalog leg reads the quote directory as one table (the default
+/// `optimize_file_loading`), so both quotes go out in that table's order, the earlier-starting
+/// file's first although it was written last, then the trade. Pinned before the catalog leg reads
+/// per file.
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_quotes_request_over_overlapping_quote_files_answers_both_quotes_at_one_stamp_before_its_trade(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let instrument_id = fixture.instrument_id;
+    let catalog_dir = CatalogTempDir::new("quotes-overlapping-files");
+    let catalog = ParquetDataCatalog::new(catalog_dir.path(), None, None, None, None);
+    let at = |ts: u64| Some(UnixNanos::from(ts));
+    let quotes = |rows: &[(u64, &str)]| -> Vec<_> {
+        rows.iter()
+            .map(|&(ts, bid)| make_quote(instrument_id, bid, "1.0009", ts))
+            .collect()
+    };
+    // The later-starting file is written first, the earlier-starting one over it
+    catalog
+        .write_to_parquet(
+            &quotes(&[(1_500, "1.0003"), (2_500, "1.0004")]),
+            at(1_500),
+            at(2_999),
+            None,
+        )
+        .unwrap();
+    catalog
+        .write_to_parquet(
+            &quotes(&[(1_000, "1.0001"), (1_500, "1.0002")]),
+            at(1_000),
+            at(1_999),
+            Some(true),
+        )
+        .unwrap();
+    let trades: Vec<_> = [(1_200, "t1"), (1_500, "t2"), (2_700, "t3")]
+        .iter()
+        .map(|&(ts, id)| unsided_trade(instrument_id, ts, "1.0002", id))
+        .collect();
+    catalog
+        .write_to_parquet(&trades, at(1_000), at(2_999), None)
+        .unwrap();
+    fixture
+        .engine
+        .borrow_mut()
+        .register_catalog(Box::new(catalog), None);
+    let params = quoted_params(&fixture, QuotedBars::None, Some(true));
+    let request = windowed_trades_request(&fixture, (1_000, 2_999), params);
+    let delivered = tap_rows(*request.request_id());
+
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+
+    let rows = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(
+        delivered.take(),
+        vec![
+            ("quotes", rows(&["1000 1.0001"])),
+            ("trades", rows(&["t1"])),
+            ("quotes", rows(&["1500 1.0002", "1500 1.0003"])),
+            ("trades", rows(&["t2"])),
+            ("quotes", rows(&["2500 1.0004"])),
+            ("trades", rows(&["t3"])),
+            ("end", rows(&[])),
+        ]
+    );
+    assert!(fixture.recorder.borrow().is_empty());
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+}
+
+/// The identity one part of a `quotes` request's answer carries: its kind, correlation, client,
+/// instruments or bar type, window, `ts_init` and params.
+#[cfg(feature = "streaming")]
+#[derive(Clone, Debug, PartialEq)]
+struct PartIdentity {
+    kind: &'static str,
+    correlation_id: UUID4,
+    client_id: ClientId,
+    subject: String,
+    window: (Option<UnixNanos>, Option<UnixNanos>),
+    ts_init: UnixNanos,
+    params: Option<Value>,
+}
+
+/// Records the identity of every part the requester of `request_id` is sent.
+#[cfg(feature = "streaming")]
+fn tap_identities(request_id: UUID4) -> Rc<RefCell<Vec<PartIdentity>>> {
+    let delivered = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&delivered);
+    let params =
+        |params: Option<&Params>| params.map(|params| serde_json::to_value(params).unwrap());
+    let instruments = |ids: &[InstrumentId]| {
+        ids.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let handler = TypedHandler::from(move |envelope: &DataResponseEnvelope| {
+        let identity = match envelope.response() {
+            Some(DataResponse::Quotes(r)) => PartIdentity {
+                kind: "quotes",
+                correlation_id: r.correlation_id,
+                client_id: r.client_id,
+                subject: instruments(&r.instrument_ids),
+                window: (r.start, r.end),
+                ts_init: r.ts_init,
+                params: params(r.params.as_ref()),
+            },
+            Some(DataResponse::Trades(r)) => PartIdentity {
+                kind: "trades",
+                correlation_id: r.correlation_id,
+                client_id: r.client_id,
+                subject: instruments(&r.instrument_ids),
+                window: (r.start, r.end),
+                ts_init: r.ts_init,
+                params: params(r.params.as_ref()),
+            },
+            Some(DataResponse::Bars(r)) => PartIdentity {
+                kind: "bars",
+                correlation_id: r.correlation_id,
+                client_id: r.client_id,
+                subject: r.bar_type.to_string(),
+                window: (r.start, r.end),
+                ts_init: r.ts_init,
+                params: params(r.params.as_ref()),
+            },
+            other => panic!("a quotes, trades or bars part: {other:?}"),
+        };
+        recorded.borrow_mut().push(identity);
+    });
+    msgbus::register_response_handler(&request_id, handler);
+    delivered
+}
+
+/// Where a `quotes` request's rows come from in the identity test.
+#[cfg(feature = "streaming")]
+#[derive(Clone, Copy, Debug)]
+enum IdentitySource {
+    /// The catalog alone, building no bars.
+    Catalog,
+    /// The catalog alone, interleaving tick bars.
+    CatalogInterleaved,
+    /// The catalog and four client legs over the edges its files miss, interleaving minute bars;
+    /// each client leg answers with an identity of its own.
+    CatalogAndClient,
+}
+
+/// Every part of a `quotes` request's answer carries the identity of today's rebuilt answer: the
+/// request as its correlation, the first leg's client, instruments, `ts_init` and params (the
+/// catalog leg's: the request's params with `update_catalog` false), and the request's window,
+/// whichever leg its rows came from; a bars part carries the trades' identity with its bar type.
+/// No test compared these before; pinned before the parts are built from legs without rows.
+#[cfg(feature = "streaming")]
+#[rstest]
+#[case::catalog(IdentitySource::Catalog)]
+#[case::catalog_interleaved(IdentitySource::CatalogInterleaved)]
+#[case::catalog_and_client(IdentitySource::CatalogAndClient)]
+fn test_quotes_request_parts_each_carry_the_identity_of_its_rebuilt_answer(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] source: IdentitySource,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let minute = bar_type_of(fixture.instrument_id, "1-MINUTE");
+    let t = edge_ns;
+    let (_catalog_dir, window, params, bar_type) = match source {
+        IdentitySource::Catalog | IdentitySource::CatalogInterleaved => {
+            let bars = match source {
+                IdentitySource::Catalog => QuotedBars::None,
+                _ => QuotedBars::InterleavedTicks,
+            };
+            let dir = register_quoted_catalog(&fixture, "quotes-identity", &COUNTEREXAMPLE);
+            let params = quoted_params(&fixture, bars, Some(true));
+            (dir, (1_000, 2_999), params, fixture.bar_type)
+        }
+        IdentitySource::CatalogAndClient => {
+            let dir = register_edge_catalog(
+                &fixture,
+                "quotes-identity-client",
+                (t("09:59:00.031"), t("10:00:59.987")),
+                &[(t("09:59:00.005"), t("10:00:59.998"))],
+            );
+            let params = json!({
+                "bar_types": [minute.to_string()],
+                "update_subscriptions": false,
+                "interleave": true,
+                "quotes": true,
+            });
+            (dir, edge_window(), params, minute)
+        }
+    };
+    let request = windowed_trades_request(&fixture, window, params.clone());
+    let request_id = *request.request_id();
+    let delivered = tap_identities(request_id);
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+
+    if matches!(source, IdentitySource::CatalogAndClient) {
+        // Each client leg answers empty, with a client, `ts_init` and params of its own
+        let legs = client_legs(&fixture);
+        assert_eq!(legs.len(), 4);
+        for (kind, _, _, leg_id) in legs {
+            let (ts_init, client, leg_params) = (
+                UnixNanos::from(NY_2026_11_12_2000 + 1),
+                ClientId::new("LEG"),
+                Some(serde_json::from_value(json!({"answered_by": "client"})).unwrap()),
+            );
+            let response = if kind == "quotes" {
+                DataResponse::Quotes(QuotesResponse::new(
+                    leg_id,
+                    client,
+                    fixture.instrument_id,
+                    Vec::<QuoteTick>::new(),
+                    None,
+                    None,
+                    ts_init,
+                    leg_params,
+                ))
+            } else {
+                DataResponse::Trades(TradesResponse::new(
+                    leg_id,
+                    client,
+                    fixture.instrument_id,
+                    Vec::<TradeTick>::new(),
+                    None,
+                    None,
+                    ts_init,
+                    leg_params,
+                ))
+            };
+            fixture
+                .engine
+                .borrow_mut()
+                .response_envelope(DataResponseEnvelope::new(response, true, None));
+        }
+    }
+
+    let mut expected_params = params;
+    expected_params["update_catalog"] = json!(false);
+    let identity = |kind: &'static str| PartIdentity {
+        kind,
+        correlation_id: request_id,
+        client_id,
+        subject: match kind {
+            "bars" => bar_type.to_string(),
+            _ => fixture.instrument_id.to_string(),
+        },
+        window: (
+            Some(UnixNanos::from(window.0)),
+            Some(UnixNanos::from(window.1)),
+        ),
+        ts_init: UnixNanos::from(NY_2026_11_12_2000),
+        params: Some(expected_params.clone()),
+    };
+    let kinds: &[&'static str] = match source {
+        IdentitySource::Catalog => &[
+            "quotes", "trades", "quotes", "trades", "quotes", "trades", "quotes", "trades",
+        ],
+        IdentitySource::CatalogInterleaved => &[
+            "quotes", "bars", "trades", "bars", "trades", "quotes", "bars", "trades", "quotes",
+            "bars", "trades", "quotes", "bars", "trades",
+        ],
+        IdentitySource::CatalogAndClient => &[
+            "quotes", "trades", "bars", "quotes", "trades", "quotes", "bars", "trades",
+        ],
+    };
+    let expected: Vec<_> = kinds.iter().map(|&kind| identity(kind)).collect();
+    assert_eq!(delivered.take(), expected);
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+}
+
+/// A quote file that cannot be read when a `quotes` request is sent fails the catalog leg at
+/// dispatch: no part goes out, its trades included, and one failed terminal ends the request.
+/// Pinned before the catalog leg's files are read as the answer is sent.
+#[cfg(feature = "streaming")]
+#[rstest]
+#[case::builds_no_bars(QuotedBars::None)]
+#[case::interleaves_tick_bars(QuotedBars::InterleavedTicks)]
+fn test_quotes_request_whose_quote_file_is_unreadable_when_sent_fails_before_any_part(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] bars: QuotedBars,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let instrument_id = fixture.instrument_id;
+    let catalog_dir = CatalogTempDir::new("quotes-unreadable-file");
+    let catalog = ParquetDataCatalog::new(catalog_dir.path(), None, None, None, None);
+    let (start, end) = (Some(UnixNanos::from(1_000)), Some(UnixNanos::from(2_999)));
+    let quotes = [
+        make_quote(instrument_id, "1.0000", "1.0002", 1_000),
+        make_quote(instrument_id, "1.0001", "1.0003", 2_000),
+    ];
+    // The catalog names the file it wrote relative to its root
+    let written = catalog.write_to_parquet(&quotes, start, end, None).unwrap();
+    let quote_file = catalog_dir.path().join(written);
+    let trades = [
+        unsided_trade(instrument_id, 1_200, "1.0002", "t1"),
+        unsided_trade(instrument_id, 2_200, "1.0002", "t2"),
+    ];
+    catalog.write_to_parquet(&trades, start, end, None).unwrap();
+    assert!(quote_file.is_file(), "{}", quote_file.display());
+    std::fs::write(&quote_file, b"not parquet").unwrap();
+    fixture
+        .engine
+        .borrow_mut()
+        .register_catalog(Box::new(catalog), None);
+    let params = quoted_params(&fixture, bars, Some(true));
+    let request = windowed_trades_request(&fixture, (1_000, 2_999), params);
+
+    let delivered = run_quoted(&fixture, request);
+
+    // One terminal naming the read error, before any part
+    let [terminal] = delivered.as_slice() else {
+        panic!("one envelope: {delivered:?}");
+    };
+    assert_eq!(terminal.part, QuotedPart::Nothing);
+    assert!(terminal.completed);
+    let reason = terminal.failure.as_deref().unwrap_or_default();
+    assert!(reason.contains("Corrupt footer"), "{reason}");
+    assert_eq!(
+        fixture
+            .engine
+            .borrow()
+            .cache()
+            .borrow()
+            .quote_count(&instrument_id),
+        0
+    );
+    assert!(fixture.recorder.borrow().is_empty());
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+}
+
 /// The gap example on 2024-01-08 (UTC): a request over 09:56 to 10:05 whose catalog file ends at
 /// 09:59:59.999999999 and holds trades at 09:56:30, 09:57:30 and 09:58:30.
 #[cfg(feature = "streaming")]
