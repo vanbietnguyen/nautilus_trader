@@ -308,7 +308,8 @@ const MERGED_PART_ROWS: usize = 10_000;
 /// Sends the rows of `quote_sources` and `trade_sources` in one time order through `send` as
 /// typed parts, and returns the last run of trades, possibly empty, which completes the answer.
 ///
-/// Each source is one leg's rows and goes into the replay iterator on its own, by `ts_init`:
+/// Each source is one leg's rows, or one open catalog session of a catalog leg, and goes into the
+/// replay iterator on its own, by `ts_init`:
 /// every quotes source first, then every trades source, each feed's in slot order, so a quote
 /// comes before a trade at an equal stamp (the backtest's order), also where a source's next
 /// batch starts at that stamp, and rows of one feed at an equal stamp go in slot order. A run of
@@ -372,6 +373,10 @@ fn take_sorted_rows<T: Clone, K: Ord>(
 
     rows
 }
+
+/// A source of a merged answer that is not a leg's collected rows (an open catalog session), with
+/// its place among its feed's sources: the count of that feed's legs before its slot.
+pub(super) type PlacedSource = (usize, Box<dyn ReplaySource>);
 
 /// Makes each leg's collected rows, its one chunk, a source of the merge narrowed to
 /// `[start, end]` (see [`WindowSource`]).

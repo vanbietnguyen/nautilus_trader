@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::fmt::{Debug, Formatter};
+
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use indexmap::IndexMap;
@@ -37,7 +39,13 @@ use nautilus_model::{
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
 };
-use nautilus_persistence::catalog::traits::{CatalogInstrumentQuery, CatalogQuery, DataCatalog};
+use nautilus_persistence::{
+    backend::parquet::catalog::QUERY_OPTIMIZE_FILE_LOADING,
+    catalog::{
+        session::DataBatchQueryResult,
+        traits::{CatalogInstrumentQuery, CatalogQuery, DataCatalog},
+    },
+};
 use serde_json::Value;
 use ustr::Ustr;
 
@@ -48,8 +56,10 @@ use super::{
         has_continuous_future_params, request_params, sets_quotes, trading_days,
         uncovered_window_reason,
     },
+    responses::{PlacedSource, WindowSource, parent_request_window},
     time_range::has_time_range_pipeline_params,
 };
+use crate::replay::ReplaySource;
 
 const PARAM_SKIP_CATALOG_DATA: &str = "skip_catalog_data";
 pub(super) const PARAM_UPDATE_CATALOG: &str = "update_catalog";
@@ -1062,24 +1072,18 @@ impl DataEngine {
                     request,
                     catalog,
                     unavailable,
+                } if sets_quotes(&request) => {
+                    self.open_catalog_leg_sessions(&request, catalog, &unavailable)
+                }
+                RequestLeg::Catalog {
+                    request,
+                    catalog,
+                    unavailable,
                 } => self
                     .query_catalog_leg(&request, catalog)
-                    .and_then(|mut response| {
-                        let quotes = if sets_quotes(&request) {
-                            Some(self.query_catalog_leg_quotes(&request, catalog)?)
-                        } else {
-                            None
-                        };
-
+                    .map(|mut response| {
                         drop_rows_of_unavailable_days(&mut response, &unavailable);
-
-                        // The leg's quotes go into its slot first; its trades complete it
-                        if let Some(quotes) = quotes {
-                            self.response_envelope(DataResponseEnvelope::new(quotes, false, None));
-                        }
-
                         self.payload_response(response);
-                        Ok(())
                     }),
                 RequestLeg::Client(request) => self.dispatch_request_to_client(request).map(|_| ()),
                 RequestLeg::ClientFeed { request, missing } => {
@@ -1257,23 +1261,45 @@ impl DataEngine {
         }
     }
 
-    /// Returns the quotes of `leg`, a trades catalog leg that sets `quotes`: the instrument's
-    /// quotes in `catalog_name` over the leg's window, with the leg's request ID, so they enter
-    /// its slot. The parts its quote files do not cover were planned apart (see
-    /// [`Self::plan_date_range_request`]). Its metadata is derived from `leg` as
-    /// [`Self::query_catalog_leg`] derives it.
+    /// Opens the catalog sessions of `leg`, a trades catalog leg that sets `quotes`, and answers
+    /// its slot with their identity and no rows: the rows are read as the pipeline's answer is
+    /// sent (see [`CatalogLegSessions`]).
+    ///
+    /// It opens two per-file sessions of the instrument in `catalog_name` over the leg's window,
+    /// its trades then its quotes, with `optimize_file_loading` false: each lists its files now
+    /// and opens each file as it is reached, so a file a client leg writes back before the
+    /// answer is sent is not read. Each becomes a source narrowed to the parent's window (see
+    /// [`WindowSource`]) that reads its first chunk now, so a file unreadable when the request
+    /// is sent fails the leg before any part. The sources are kept under the parent before the
+    /// slot is answered, since answering it may complete the pipeline in the same call; then
+    /// the leg's quotes go into its slot and its trades complete it, each with the identity
+    /// [`Self::query_catalog_leg`] gives a catalog leg's answer.
     ///
     /// # Errors
     ///
-    /// Returns an error if `leg` is not a trades request or the query fails; the leg then fails.
-    fn query_catalog_leg_quotes(
+    /// Returns an error if `leg` is not a trades leg of a pipeline, it names unavailable days
+    /// (whose trades its sessions would not drop; only a join names them, and a join carrying
+    /// `quotes` is refused), or a session cannot be opened or its first chunk read. The leg then
+    /// fails, and the sessions opened are dropped.
+    fn open_catalog_leg_sessions(
         &mut self,
         leg: &RequestCommand,
         catalog_name: Ustr,
-    ) -> anyhow::Result<DataResponse> {
+        unavailable: &[(UnixNanos, UnixNanos)],
+    ) -> anyhow::Result<()> {
         let RequestCommand::Trades(cmd) = leg else {
-            anyhow::bail!("query_catalog_leg_quotes called with a non-trades leg {leg:?}");
+            anyhow::bail!("open_catalog_leg_sessions called with a non-trades leg {leg:?}");
         };
+        let &(parent_id, slot) = self
+            .request_pipeline_parent_request_id
+            .get(&cmd.request_id)
+            .context("a catalog leg is registered with its pipeline before it is sent")?;
+        anyhow::ensure!(
+            unavailable.is_empty(),
+            "{QUOTES_REFUSED}: its catalog leg names unavailable days, whose trades its \
+             sessions would not drop"
+        );
+
         let start_ns = request_start(leg)
             .map(datetime_to_unix_nanos_or_zero)
             .expect("catalog leg has bounded start");
@@ -1287,29 +1313,60 @@ impl DataEngine {
             .get_client(client_id.as_ref(), venue.as_ref())
             .map(|value| value.client_id());
 
-        let instrument_id = cmd.single_instrument_id()?;
-        let identifier = instrument_id.to_string();
+        let identifier = cmd.single_instrument_id()?.to_string();
+        let (start, end) =
+            parent_request_window(self.request_pipeline_parent_request.get(&parent_id));
         let catalog = self.catalogs.get_mut(&catalog_name).ok_or_else(|| {
             anyhow::anyhow!("Catalog {catalog_name} disappeared between intervals query and read")
         })?;
 
-        let data = quote_ticks_from_query_result(
-            catalog.query_batch(
-                &CatalogQuery::new(NautilusDataType::QuoteTick)
-                    .with_identifiers(Some(vec![identifier]))
-                    .with_range(Some(start_ns), Some(end_ns)),
-            )?,
-        )?;
-        Ok(DataResponse::Quotes(QuotesResponse::new(
+        let per_file = Params::new(IndexMap::from([(
+            QUERY_OPTIMIZE_FILE_LOADING.to_owned(),
+            Value::Bool(false),
+        )]));
+        let query = |data_type| {
+            CatalogQuery::new(data_type)
+                .with_identifiers(Some(vec![identifier.clone()]))
+                .with_range(Some(start_ns), Some(end_ns))
+                .with_params(Some(per_file.clone()))
+        };
+        let trades = catalog.query_batch_session(&query(NautilusDataType::TradeTick), None)?;
+        let quotes = catalog.query_batch_session(&query(NautilusDataType::QuoteTick), None)?;
+        let trades = WindowSource::new(session_chunks(trades), start, end)?;
+        let quotes = WindowSource::new(session_chunks(quotes), start, end)?;
+
+        self.catalog_leg_sessions.insert(
+            parent_id,
+            CatalogLegSessions {
+                slot,
+                quotes: Box::new(quotes),
+                trades: Box::new(trades),
+            },
+        );
+
+        let quotes = DataResponse::Quotes(QuotesResponse::new(
             cmd.request_id,
             resolve_response_client_id(cmd.client_id, used_client_id),
             cmd.instrument_ids.clone(),
-            data,
+            Vec::new(),
             Some(start_ns),
             Some(end_ns),
             ts_init,
             Some(catalog_response_params(cmd.params.as_ref())),
-        )))
+        ));
+        let trades = build_trades_catalog_response(
+            cmd,
+            Vec::<TradeTick>::new().into(),
+            start_ns,
+            end_ns,
+            used_client_id,
+            ts_init,
+        );
+
+        // The leg's quotes go into its slot first; its trades complete it
+        self.response_envelope(DataResponseEnvelope::new(quotes, false, None));
+        self.payload_response(trades);
+        Ok(())
     }
 
     fn dispatch_instrument_catalog_request(&mut self, req: RequestCommand) -> anyhow::Result<()> {
@@ -1608,6 +1665,54 @@ fn response_instrument_batches<T: Copy>(
 struct CatalogCoverage {
     catalog: Ustr,
     missing: Vec<(u64, u64)>,
+}
+
+/// The open catalog sessions of a `quotes` request's catalog leg, each a source of its merged
+/// answer that holds the chunk it reads (see [`DataEngine::open_catalog_leg_sessions`]). They
+/// are kept under the request from the leg's dispatch for as long as its slots: its completion
+/// or expiry takes them before anything is sent, and a `reset` or `dispose` drops them.
+pub(super) struct CatalogLegSessions {
+    /// The leg's slot among its request's.
+    slot: usize,
+    quotes: Box<dyn ReplaySource>,
+    trades: Box<dyn ReplaySource>,
+}
+
+impl CatalogLegSessions {
+    /// Returns its quotes and its trades sources, each placed in its feed's slot order: after
+    /// the responses of that feed `slots` hold before its slot.
+    pub(super) fn placed(
+        self,
+        slots: &[Option<Vec<DataResponseEnvelope>>],
+    ) -> (PlacedSource, PlacedSource) {
+        let before = slots[..self.slot]
+            .iter()
+            .flatten()
+            .flatten()
+            .filter_map(DataResponseEnvelope::response);
+        let (quotes, trades) = before.fold((0, 0), |(quotes, trades), response| match response {
+            DataResponse::Quotes(_) => (quotes + 1, trades),
+            DataResponse::Trades(_) => (quotes, trades + 1),
+            _ => (quotes, trades),
+        });
+
+        ((quotes, self.quotes), (trades, self.trades))
+    }
+}
+
+impl Debug for CatalogLegSessions {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(CatalogLegSessions))
+            .field("slot", &self.slot)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The chunks of a catalog session, in order.
+fn session_chunks(
+    mut session: DataBatchQueryResult,
+) -> impl Iterator<Item = anyhow::Result<DataBatch>> {
+    std::iter::from_fn(move || session.next_batch().transpose())
 }
 
 enum RequestLeg {

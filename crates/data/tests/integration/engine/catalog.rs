@@ -4374,3 +4374,946 @@ fn test_trade_schema_preserves_source_rows_and_catalog_isolation(
         );
     }
 }
+
+/// A trades request carrying `quotes` read through one counting catalog: its catalog leg opens
+/// two sessions when the request is sent and the merge reads them as it sends the answer.
+#[cfg(feature = "streaming")]
+mod quotes_sessions {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use anyhow::Context;
+    use nautilus_model::data::{DataBatch, NautilusDataType, NautilusRecordType};
+    use nautilus_persistence::{
+        backend::parquet::catalog::QUERY_OPTIMIZE_FILE_LOADING,
+        catalog::{
+            session::{DataBatchQuery, DataBatchQueryResult},
+            traits::{CatalogReader, CatalogWriter, RecordBatch},
+            types::{CatalogInstrumentQuery, CatalogQuery},
+        },
+    };
+
+    use super::*;
+
+    /// 2024-01-08T10:00:00Z.
+    const T0: u64 = 1_704_708_000_000_000_000;
+    const NOW: u64 = T0 + 3_600 * NANOSECONDS_IN_SECOND;
+    /// Every request's window: ninety seconds from `T0`.
+    const WINDOW: (u64, u64) = (T0, T0 + 90 * NANOSECONDS_IN_SECOND);
+    /// The rows of one page the counting catalog hands out.
+    const PAGE_ROWS: usize = 1_000;
+    /// The most rows one part of a merged answer carries.
+    const RUN_CAP: usize = 10_000;
+    /// The trades of `WINDOW` the catalog lacks in the tests that wait on a client leg.
+    const CLIENT_PART: (u64, u64) = (T0 + 80 * NANOSECONDS_IN_SECOND, WINDOW.1);
+
+    /// `T0` plus `seconds`.
+    const fn at_second(seconds: u64) -> u64 {
+        T0 + seconds * NANOSECONDS_IN_SECOND
+    }
+
+    /// `rows` stamps, one every `step` nanoseconds from `first`.
+    fn every(first: u64, step: u64, rows: u64) -> Vec<u64> {
+        (0..rows).map(|row| first + row * step).collect()
+    }
+
+    /// The counting catalog's reads and its requesters' deliveries, shared with its sessions.
+    #[derive(Clone, Debug, Default)]
+    struct Counts {
+        /// Rows its sessions handed out, page by page.
+        yielded: Arc<AtomicUsize>,
+        /// Quotes and trades the requesters' handlers were given, part by part.
+        delivered: Arc<AtomicUsize>,
+        /// The most rows yielded and not yet delivered when a page was handed out.
+        peak: Arc<AtomicUsize>,
+        /// Sessions dropped.
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Counts {
+        fn yield_page(&self, rows: usize) {
+            let yielded = self.yielded.fetch_add(rows, Ordering::Relaxed) + rows;
+            let held = yielded.saturating_sub(self.delivered.load(Ordering::Relaxed));
+            self.peak.fetch_max(held, Ordering::Relaxed);
+        }
+
+        fn deliver(&self, rows: usize) {
+            self.delivered.fetch_add(rows, Ordering::Relaxed);
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(Ordering::Relaxed)
+        }
+
+        fn dropped(&self) -> usize {
+            self.dropped.load(Ordering::Relaxed)
+        }
+    }
+
+    /// One feed of the counting catalog.
+    #[derive(Clone, Debug, Default)]
+    struct Feed {
+        /// Its rows' stamps, in order.
+        stamps: Vec<u64>,
+        /// The intervals of a request's window it does not cover.
+        missing: Vec<(u64, u64)>,
+        /// The rows its session hands out before the page after them fails.
+        fails_after: Option<usize>,
+    }
+
+    fn feed(stamps: Vec<u64>) -> Feed {
+        Feed {
+            stamps,
+            ..Feed::default()
+        }
+    }
+
+    /// A catalog that answers trades and quotes only through per-file sessions, each handing out
+    /// made-up rows of the instrument it is asked in pages of `PAGE_ROWS`, counted.
+    #[derive(Debug)]
+    struct CountingCatalog {
+        quotes: Feed,
+        trades: Feed,
+        counts: Counts,
+    }
+
+    impl CountingCatalog {
+        fn feed(&self, data_type: &NautilusDataType) -> anyhow::Result<(&'static str, &Feed)> {
+            match data_type {
+                NautilusDataType::QuoteTick => Ok(("quotes", &self.quotes)),
+                NautilusDataType::TradeTick => Ok(("trades", &self.trades)),
+                other => anyhow::bail!("the counting catalog holds no {other}"),
+            }
+        }
+    }
+
+    impl CatalogReader for CountingCatalog {
+        fn reset_session(&mut self) {}
+
+        fn instruments(
+            &mut self,
+            _: &CatalogInstrumentQuery,
+        ) -> anyhow::Result<Vec<InstrumentAny>> {
+            Ok(Vec::new())
+        }
+
+        fn query_batch(&mut self, query: &CatalogQuery) -> anyhow::Result<DataBatch> {
+            anyhow::bail!(
+                "the counting catalog answers {} only per file",
+                query.data_type
+            )
+        }
+
+        fn query_batch_session(
+            &mut self,
+            query: &CatalogQuery,
+            _: Option<usize>,
+        ) -> anyhow::Result<DataBatchQueryResult> {
+            let per_file = query
+                .params
+                .as_ref()
+                .and_then(|params| params.get_bool(QUERY_OPTIMIZE_FILE_LOADING));
+            anyhow::ensure!(
+                per_file == Some(false),
+                "a catalog leg's session must list its files when it is opened, received \
+                 {per_file:?}"
+            );
+            let identifier = query
+                .identifiers
+                .as_deref()
+                .and_then(<[String]>::first)
+                .context("a catalog leg names its instrument")?;
+            let (kind, feed) = self.feed(&query.data_type)?;
+
+            Ok(Box::new(CountingSession {
+                instrument_id: InstrumentId::from(identifier.as_str()),
+                kind,
+                stamps: feed.stamps.clone(),
+                fails_after: feed.fails_after,
+                next: 0,
+                counts: self.counts.clone(),
+            }))
+        }
+
+        fn get_missing_intervals_for_request(
+            &mut self,
+            _: UnixNanos,
+            _: UnixNanos,
+            data_type: NautilusDataType,
+            _: Option<&str>,
+        ) -> anyhow::Result<Vec<(u64, u64)>> {
+            Ok(self.feed(&data_type)?.1.missing.clone())
+        }
+    }
+
+    impl CatalogWriter for CountingCatalog {
+        fn write_instruments(&mut self, _: &[InstrumentAny]) -> anyhow::Result<()> {
+            anyhow::bail!("the counting catalog is read only")
+        }
+
+        fn write_data(
+            &mut self,
+            _: &[Data],
+            _: Option<UnixNanos>,
+            _: Option<UnixNanos>,
+            _: Option<Params>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("the counting catalog is read only")
+        }
+
+        fn write_records(
+            &mut self,
+            _: NautilusRecordType,
+            _: &[RecordBatch],
+            _: Option<Params>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("the counting catalog is read only")
+        }
+
+        fn record_empty_coverage(
+            &mut self,
+            _: NautilusDataType,
+            _: Option<&str>,
+            _: UnixNanos,
+            _: UnixNanos,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("the counting catalog is read only")
+        }
+    }
+
+    /// One session of the counting catalog: its feed's rows, made as each page is handed out.
+    struct CountingSession {
+        instrument_id: InstrumentId,
+        kind: &'static str,
+        stamps: Vec<u64>,
+        fails_after: Option<usize>,
+        next: usize,
+        counts: Counts,
+    }
+
+    impl DataBatchQuery for CountingSession {
+        fn next_batch(&mut self) -> anyhow::Result<Option<DataBatch>> {
+            if let Some(rows) = self.fails_after.filter(|rows| self.next >= *rows) {
+                anyhow::bail!(
+                    "the made-up {} page after row {rows} is unreadable",
+                    self.kind
+                );
+            }
+            let end = (self.next + PAGE_ROWS)
+                .min(self.stamps.len())
+                .min(self.fails_after.unwrap_or(usize::MAX));
+            let rows = self.next..end;
+
+            if rows.is_empty() {
+                return Ok(None);
+            }
+            self.next = end;
+            self.counts.yield_page(rows.len());
+
+            let instrument_id = self.instrument_id;
+            let page = rows.map(|row| (row, self.stamps[row]));
+            Ok(Some(if self.kind == "quotes" {
+                DataBatch::Quote(
+                    page.map(|(_, ts)| make_quote(instrument_id, "1.0000", "1.0002", ts))
+                        .collect::<Vec<_>>()
+                        .into(),
+                )
+            } else {
+                DataBatch::Trade(
+                    page.map(|(row, ts)| {
+                        make_trade(instrument_id, "1.0001", 1, &format!("t{row}"), ts)
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+                )
+            }))
+        }
+    }
+
+    impl Drop for CountingSession {
+        fn drop(&mut self) {
+            self.counts.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// One envelope a requester was sent: its quotes or trades by `ts_init`, its bars by
+    /// `ts_event`, and, when it completed, its end with its reason.
+    #[derive(Clone, Debug, PartialEq)]
+    enum Sent {
+        Quotes(Vec<u64>),
+        Trades(Vec<u64>),
+        Bars(Vec<u64>),
+        End(Option<String>),
+    }
+
+    /// The identity a quotes or trades part carries.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Identity {
+        correlation_id: UUID4,
+        client_id: ClientId,
+        instrument_ids: Vec<InstrumentId>,
+        window: (Option<UnixNanos>, Option<UnixNanos>),
+        ts_init: UnixNanos,
+        params: Option<Params>,
+    }
+
+    /// What a requester was sent, and each identity its parts carried, in order, a repeat of
+    /// the one before left out.
+    #[derive(Debug, Default)]
+    struct Tapped {
+        sent: Vec<Sent>,
+        identities: Vec<Identity>,
+    }
+
+    impl Tapped {
+        fn record(&mut self, sent: Sent, identity: Option<Identity>) {
+            self.sent.push(sent);
+
+            if let Some(identity) = identity
+                && self.identities.last() != Some(&identity)
+            {
+                self.identities.push(identity);
+            }
+        }
+    }
+
+    /// Records what the requester of `request_id` is sent, counting each part's quotes and trades
+    /// as delivered.
+    fn tap(request_id: UUID4, counts: &Counts) -> Rc<RefCell<Tapped>> {
+        let tapped = Rc::new(RefCell::new(Tapped::default()));
+        let recorded = Rc::clone(&tapped);
+        let counts = counts.clone();
+        let handler = TypedHandler::from(move |envelope: &DataResponseEnvelope| {
+            let mut tapped = recorded.borrow_mut();
+            match envelope.response() {
+                Some(DataResponse::Quotes(r)) => {
+                    counts.deliver(r.data.len());
+                    let identity = Identity {
+                        correlation_id: r.correlation_id,
+                        client_id: r.client_id,
+                        instrument_ids: r.instrument_ids.clone(),
+                        window: (r.start, r.end),
+                        ts_init: r.ts_init,
+                        params: r.params.clone(),
+                    };
+                    let stamps = r.data.iter().map(|quote| quote.ts_init.as_u64()).collect();
+                    tapped.record(Sent::Quotes(stamps), Some(identity));
+                }
+                Some(DataResponse::Trades(r)) => {
+                    counts.deliver(r.data.len());
+                    let identity = Identity {
+                        correlation_id: r.correlation_id,
+                        client_id: r.client_id,
+                        instrument_ids: r.instrument_ids.clone(),
+                        window: (r.start, r.end),
+                        ts_init: r.ts_init,
+                        params: r.params.clone(),
+                    };
+                    let stamps = r.data.iter().map(|trade| trade.ts_init.as_u64()).collect();
+                    tapped.record(Sent::Trades(stamps), Some(identity));
+                }
+                Some(DataResponse::Bars(r)) => {
+                    let stamps = r.data.iter().map(|bar| bar.ts_event.as_u64()).collect();
+                    tapped.record(Sent::Bars(stamps), None);
+                }
+                _ => {}
+            }
+
+            if envelope.completed() {
+                let reason = envelope.failure_reason().map(str::to_owned);
+                tapped.record(Sent::End(reason), None);
+            }
+        });
+        msgbus::register_response_handler(&request_id, handler);
+        tapped
+    }
+
+    /// A quotes part holding the quotes at `stamps`.
+    fn quotes_of(stamps: &[u64]) -> Sent {
+        Sent::Quotes(stamps.to_vec())
+    }
+
+    /// A trades part holding the trades at `stamps`.
+    fn trades_of(stamps: &[u64]) -> Sent {
+        Sent::Trades(stamps.to_vec())
+    }
+
+    /// An engine at `NOW` holding `instruments`, with a recording mock client and a counting
+    /// catalog of `quotes` and `trades`.
+    struct Fixture {
+        engine: DataEngine,
+        recorder: Rc<RefCell<Vec<DataCommand>>>,
+        client_id: ClientId,
+        venue: Venue,
+        counts: Counts,
+    }
+
+    impl Fixture {
+        fn new(
+            instruments: Vec<CurrencyPair>,
+            client_id: ClientId,
+            venue: Venue,
+            quotes: Feed,
+            trades: Feed,
+        ) -> Self {
+            let clock = Rc::new(RefCell::new(VirtualClock::new()));
+            let _ = clock.borrow_mut().advance_time(UnixNanos::from(NOW), true);
+            let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+            for instrument in instruments {
+                cache
+                    .borrow_mut()
+                    .add_instrument(InstrumentAny::CurrencyPair(instrument))
+                    .unwrap();
+            }
+            let mut engine = DataEngine::new(
+                Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+                Rc::clone(&cache),
+                None,
+            );
+            let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+            register_mock_client(
+                Rc::new(RefCell::new(VirtualClock::new())),
+                cache,
+                client_id,
+                venue,
+                None,
+                &recorder,
+                &mut engine,
+            );
+            let counts = Counts::default();
+            let catalog = CountingCatalog {
+                quotes,
+                trades,
+                counts: counts.clone(),
+            };
+            engine.register_catalog(Box::new(catalog), None);
+
+            Self {
+                engine,
+                recorder,
+                client_id,
+                venue,
+                counts,
+            }
+        }
+
+        /// Sends a trades request carrying `quotes` for `instrument_id` over `WINDOW` with
+        /// `params`, its requester tapped first; returns its ID and its tap.
+        fn request(
+            &mut self,
+            instrument_id: InstrumentId,
+            mut params: Value,
+        ) -> (UUID4, Rc<RefCell<Tapped>>) {
+            params["quotes"] = json!(true);
+            let at = |ns: u64| Some(UnixNanos::from(ns).to_datetime_utc());
+            let request = RequestTrades::new(
+                vec![instrument_id],
+                at(WINDOW.0),
+                at(WINDOW.1),
+                None,
+                Some(self.client_id),
+                UUID4::new(),
+                UnixNanos::default(),
+                Some(params_from_json(params)),
+            );
+            let request_id = request.request_id;
+            let tapped = tap(request_id, &self.counts);
+            self.engine
+                .execute_request(RequestCommand::Trades(request))
+                .unwrap();
+            (request_id, tapped)
+        }
+
+        /// The legs the client was asked, in order: each one's request ID and instrument, and
+        /// whether it asks quotes.
+        fn client_legs(&self) -> Vec<(UUID4, InstrumentId, bool)> {
+            self.recorder
+                .borrow()
+                .iter()
+                .filter_map(|command| match command {
+                    DataCommand::Request(RequestCommand::Trades(cmd)) => {
+                        Some((cmd.request_id, cmd.instrument_ids[0], false))
+                    }
+                    DataCommand::Request(RequestCommand::Quotes(cmd)) => {
+                        Some((cmd.request_id, cmd.instrument_ids[0], true))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Answers the client leg `leg` in one completed envelope with rows at `stamps`.
+        fn answer_leg(
+            &mut self,
+            (leg_id, instrument_id, quotes): (UUID4, InstrumentId, bool),
+            stamps: &[u64],
+        ) {
+            let ts_init = UnixNanos::from(NOW);
+            let response = if quotes {
+                let quotes: Vec<_> = stamps
+                    .iter()
+                    .map(|&ts| make_quote(instrument_id, "1.0000", "1.0002", ts))
+                    .collect();
+                DataResponse::Quotes(QuotesResponse::new(
+                    leg_id,
+                    self.client_id,
+                    instrument_id,
+                    quotes,
+                    None,
+                    None,
+                    ts_init,
+                    None,
+                ))
+            } else {
+                let trades: Vec<_> = stamps
+                    .iter()
+                    .map(|&ts| make_trade(instrument_id, "1.0001", 1, "c1", ts))
+                    .collect();
+                DataResponse::Trades(TradesResponse::new(
+                    leg_id,
+                    self.client_id,
+                    instrument_id,
+                    trades,
+                    None,
+                    None,
+                    ts_init,
+                    None,
+                ))
+            };
+            self.engine
+                .response_envelope(DataResponseEnvelope::new(response, true, None));
+        }
+    }
+
+    /// Two hundred thousand quotes and as many trades, one after the other: the requester gets
+    /// each row as its own part, in the generated order, under one identity, and one terminal.
+    /// Rows yielded and not yet delivered never exceed the run cap plus a page of each feed
+    /// whenever a page is handed out, where a session held whole would hold 400,000: two pages,
+    /// and the row of each the cutter has not yet sent, is all it reaches.
+    #[rstest]
+    fn test_quotes_request_reads_its_catalog_a_page_at_a_time_and_never_holds_a_session(
+        audusd_sim: CurrencyPair,
+        stub_msgbus: Rc<RefCell<MessageBus>>,
+        client_id: ClientId,
+        venue: Venue,
+    ) {
+        let _ = stub_msgbus;
+        let instrument_id = audusd_sim.id;
+        let rows = 200_000;
+        let mut fixture = Fixture::new(
+            vec![audusd_sim],
+            client_id,
+            venue,
+            feed(every(T0, 2, rows)),
+            feed(every(T0 + 1, 2, rows)),
+        );
+
+        let (request_id, tapped) = fixture.request(instrument_id, json!({}));
+
+        let mut expected = Vec::new();
+        for row in 0..rows {
+            expected.push(quotes_of(&[T0 + 2 * row]));
+            expected.push(trades_of(&[T0 + 2 * row + 1]));
+        }
+        expected.push(Sent::End(None));
+        let tapped = tapped.borrow();
+        let first_difference = tapped
+            .sent
+            .iter()
+            .zip(&expected)
+            .position(|(sent, expected)| sent != expected);
+        assert_eq!(
+            (first_difference, tapped.sent.len()),
+            (None, expected.len())
+        );
+        assert_eq!(
+            tapped.identities,
+            vec![Identity {
+                correlation_id: request_id,
+                client_id,
+                instrument_ids: vec![instrument_id],
+                window: (
+                    Some(UnixNanos::from(WINDOW.0)),
+                    Some(UnixNanos::from(WINDOW.1))
+                ),
+                ts_init: UnixNanos::from(NOW),
+                params: Some(params_from_json(
+                    json!({"quotes": true, "update_catalog": false})
+                )),
+            }]
+        );
+        assert!(fixture.counts.peak() <= RUN_CAP + 2 * PAGE_ROWS);
+        assert_eq!(fixture.counts.peak(), 2 * PAGE_ROWS + 1);
+        assert_eq!(fixture.counts.dropped(), 2);
+        assert_eq!(fixture.engine.request_pipeline_count(), 0);
+    }
+
+    /// A quote page that ends at stamp 9 and a next one starting at 10, the trades holding a
+    /// trade at 10: the quote at 10 goes out before the trade at 10.
+    #[rstest]
+    fn test_quotes_request_sends_a_quote_before_a_trade_at_the_stamp_its_next_catalog_page_starts(
+        audusd_sim: CurrencyPair,
+        stub_msgbus: Rc<RefCell<MessageBus>>,
+        client_id: ClientId,
+        venue: Venue,
+    ) {
+        let _ = stub_msgbus;
+        let instrument_id = audusd_sim.id;
+        let mut first_page = vec![T0 + 8; PAGE_ROWS - 1];
+        first_page.push(T0 + 9);
+        let mut quotes = first_page.clone();
+        quotes.extend([T0 + 10, T0 + 11]);
+        let mut fixture = Fixture::new(
+            vec![audusd_sim],
+            client_id,
+            venue,
+            feed(quotes),
+            feed(vec![T0 + 10]),
+        );
+
+        let (_, tapped) = fixture.request(instrument_id, json!({}));
+
+        let mut first_run = first_page;
+        first_run.push(T0 + 10);
+        assert_eq!(
+            tapped.borrow().sent,
+            vec![
+                Sent::Quotes(first_run),
+                trades_of(&[T0 + 10]),
+                quotes_of(&[T0 + 11]),
+                trades_of(&[]),
+                Sent::End(None),
+            ]
+        );
+    }
+
+    /// Two requests on two instruments, each waiting on its client leg with its catalog sessions
+    /// open, answered in reverse order: each answer is whole and in order, and each request's
+    /// sessions are dropped when it completes, the other's left open until its own completion.
+    #[rstest]
+    fn test_two_quotes_requests_keep_their_catalog_sessions_apart_and_each_answers_whole(
+        audusd_sim: CurrencyPair,
+        stub_msgbus: Rc<RefCell<MessageBus>>,
+        client_id: ClientId,
+        venue: Venue,
+    ) {
+        let _ = stub_msgbus;
+        let (first, second) = (audusd_sim.id, gbpusd_sim().id);
+        let trades = Feed {
+            missing: vec![CLIENT_PART],
+            ..feed(vec![at_second(2), at_second(4)])
+        };
+        let mut fixture = Fixture::new(
+            vec![audusd_sim, gbpusd_sim()],
+            client_id,
+            venue,
+            feed(vec![at_second(1), at_second(3), at_second(5)]),
+            trades,
+        );
+
+        let (_, first_tapped) = fixture.request(first, json!({}));
+        let (_, second_tapped) = fixture.request(second, json!({}));
+        let legs = fixture.client_legs();
+        assert_eq!(
+            legs.iter()
+                .map(|&(_, id, quotes)| (id, quotes))
+                .collect::<Vec<_>>(),
+            vec![(first, false), (second, false)]
+        );
+        assert_eq!(fixture.counts.dropped(), 0);
+
+        fixture.answer_leg(legs[1], &[at_second(85)]);
+        assert_eq!(fixture.counts.dropped(), 2);
+        assert!(first_tapped.borrow().sent.is_empty());
+        fixture.answer_leg(legs[0], &[at_second(85)]);
+
+        let answer = vec![
+            quotes_of(&[at_second(1)]),
+            trades_of(&[at_second(2)]),
+            quotes_of(&[at_second(3)]),
+            trades_of(&[at_second(4)]),
+            quotes_of(&[at_second(5)]),
+            trades_of(&[at_second(85)]),
+            Sent::End(None),
+        ];
+        for (tapped, instrument_id) in [(first_tapped, first), (second_tapped, second)] {
+            let tapped = tapped.borrow();
+            assert_eq!(tapped.sent, answer);
+            let subjects: Vec<_> = tapped
+                .identities
+                .iter()
+                .map(|identity| identity.instrument_ids.clone())
+                .collect();
+            assert_eq!(subjects, vec![vec![instrument_id]]);
+        }
+        assert_eq!(fixture.counts.dropped(), 4);
+        assert_eq!(fixture.engine.request_pipeline_count(), 0);
+    }
+
+    /// A kept, interleaved request whose quotes session fails after 5,000 rows, while a 3-TICK
+    /// subscription is held back on its builder: the parts before the failure go out, then one
+    /// failed terminal naming it; no bar of its end; its sessions dropped; and its builders are
+    /// removed, not handed over: the subscription's new builder takes only the held trades, so
+    /// its first bar closes at the third of them (its kept builder held two of the answer's).
+    #[rstest]
+    fn test_quotes_request_whose_catalog_read_fails_after_parts_were_sent_ends_once_and_hands_over_no_builder(
+        audusd_sim: CurrencyPair,
+        stub_msgbus: Rc<RefCell<MessageBus>>,
+        client_id: ClientId,
+        venue: Venue,
+    ) {
+        let _ = stub_msgbus;
+        let instrument_id = audusd_sim.id;
+        let millisecond = 1_000_000;
+        let quote_stamps = every(T0, millisecond, 10_000);
+        let trade_stamps = [999, 2_999, 7_999].map(|ms| T0 + ms * millisecond + millisecond / 2);
+        let quotes = Feed {
+            fails_after: Some(5_000),
+            ..feed(quote_stamps.clone())
+        };
+        let trades = Feed {
+            missing: vec![CLIENT_PART],
+            ..feed(trade_stamps.to_vec())
+        };
+        let mut fixture = Fixture::new(vec![audusd_sim], client_id, venue, quotes, trades);
+        let three = BarType::from(format!("{instrument_id}-3-TICK-LAST-INTERNAL").as_str());
+        let minute = BarType::from(format!("{instrument_id}-1-MINUTE-LAST-INTERNAL").as_str());
+        let published = Rc::new(RefCell::new(Vec::new()));
+        let recorded = Rc::clone(&published);
+        msgbus::subscribe_bars(
+            switchboard::get_bars_topic(three.standard()).into(),
+            TypedHandler::from(move |bar: &Bar| {
+                recorded
+                    .borrow_mut()
+                    .push((bar.ts_event.as_u64(), bar.volume));
+            }),
+            None,
+        );
+
+        let params = json!({
+            "bar_types": [three.to_string(), minute.to_string()],
+            "update_subscriptions": true,
+            "interleave": true,
+        });
+        let (_, tapped) = fixture.request(instrument_id, params);
+        let legs = fixture.client_legs();
+        fixture
+            .engine
+            .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+                SubscribeBars::new(
+                    three,
+                    Some(fixture.client_id),
+                    Some(fixture.venue),
+                    UUID4::new(),
+                    UnixNanos::from(NOW),
+                    None,
+                    None,
+                ),
+            )));
+        let live = |trade_id: &str, seconds: u64| {
+            Data::Trade(make_trade(
+                instrument_id,
+                "1.0001",
+                1,
+                trade_id,
+                at_second(seconds),
+            ))
+        };
+        fixture.engine.process_data(live("h1", 100));
+        fixture.engine.process_data(live("h2", 101));
+        fixture.answer_leg(legs[0], &[]);
+
+        let reason = "Cannot answer the quotes with the trades: the made-up quotes page after row \
+                      5000 is unreadable";
+        assert_eq!(
+            tapped.borrow().sent,
+            vec![
+                quotes_of(&quote_stamps[..1_000]),
+                trades_of(&trade_stamps[..1]),
+                quotes_of(&quote_stamps[1_000..3_000]),
+                trades_of(&trade_stamps[1..2]),
+                Sent::End(Some(reason.to_owned())),
+            ]
+        );
+        assert_eq!(fixture.counts.dropped(), 2);
+        assert_eq!(fixture.engine.request_pipeline_count(), 0);
+        assert!(published.borrow().is_empty());
+
+        fixture.engine.process_data(live("h3", 102));
+        assert_eq!(published.take(), vec![(at_second(102), Quantity::from(3))]);
+    }
+
+    /// How a request whose quotes session fails on its first page is answered.
+    #[derive(Clone, Copy, Debug)]
+    enum FirstPageFails {
+        /// Its catalog covers the window: no client leg.
+        CatalogAlone,
+        /// Its catalog lacks quotes over a part its client is asked, and its client answers a
+        /// quote there after the catalog leg failed: with no trades identity to rebuild, the
+        /// request ends with the failure and the client's quote is not delivered.
+        ClientAnswersAfterTheCatalogFailed,
+    }
+
+    /// A quotes session whose first page fails fails the catalog leg when the request is sent:
+    /// no part, one failed terminal, both sessions dropped.
+    #[rstest]
+    #[case::catalog_alone(FirstPageFails::CatalogAlone)]
+    #[case::client_answers_after_the_catalog_failed(
+        FirstPageFails::ClientAnswersAfterTheCatalogFailed
+    )]
+    fn test_quotes_request_whose_catalog_cannot_be_read_when_sent_fails_before_any_part(
+        audusd_sim: CurrencyPair,
+        stub_msgbus: Rc<RefCell<MessageBus>>,
+        client_id: ClientId,
+        venue: Venue,
+        #[case] shape: FirstPageFails,
+    ) {
+        let _ = stub_msgbus;
+        let instrument_id = audusd_sim.id;
+        let missing = match shape {
+            FirstPageFails::CatalogAlone => Vec::new(),
+            FirstPageFails::ClientAnswersAfterTheCatalogFailed => vec![CLIENT_PART],
+        };
+        let quotes = Feed {
+            stamps: vec![at_second(1), at_second(3)],
+            missing,
+            fails_after: Some(0),
+        };
+        let mut fixture = Fixture::new(
+            vec![audusd_sim],
+            client_id,
+            venue,
+            quotes,
+            feed(vec![at_second(2)]),
+        );
+
+        let (_, tapped) = fixture.request(instrument_id, json!({}));
+        assert_eq!(fixture.counts.dropped(), 2);
+
+        match shape {
+            FirstPageFails::CatalogAlone => assert!(fixture.client_legs().is_empty()),
+            FirstPageFails::ClientAnswersAfterTheCatalogFailed => {
+                let legs = fixture.client_legs();
+                assert_eq!(
+                    legs.iter()
+                        .map(|&(_, id, quotes)| (id, quotes))
+                        .collect::<Vec<_>>(),
+                    vec![(instrument_id, true)]
+                );
+                assert!(tapped.borrow().sent.is_empty());
+                fixture.answer_leg(legs[0], &[at_second(85)]);
+            }
+        }
+
+        let reason = "the made-up quotes page after row 0 is unreadable";
+        assert_eq!(
+            tapped.borrow().sent,
+            vec![Sent::End(Some(reason.to_owned()))]
+        );
+        assert_eq!(fixture.engine.request_pipeline_count(), 0);
+    }
+
+    /// A session of 25,000 quotes and no trade from the catalog: parts of 10,000, 10,000 and
+    /// 5,000 quotes, then the empty last trades part; the rows yielded and not yet delivered
+    /// stay within the run cap plus a page of each feed.
+    #[rstest]
+    fn test_quotes_request_over_quotes_alone_from_its_catalog_sends_parts_of_at_most_ten_thousand(
+        audusd_sim: CurrencyPair,
+        stub_msgbus: Rc<RefCell<MessageBus>>,
+        client_id: ClientId,
+        venue: Venue,
+    ) {
+        let _ = stub_msgbus;
+        let instrument_id = audusd_sim.id;
+        let stamps = every(T0, 1_000_000, 25_000);
+        let mut fixture = Fixture::new(
+            vec![audusd_sim],
+            client_id,
+            venue,
+            feed(stamps.clone()),
+            feed(Vec::new()),
+        );
+
+        let (_, tapped) = fixture.request(instrument_id, json!({}));
+
+        assert_eq!(
+            tapped.borrow().sent,
+            vec![
+                quotes_of(&stamps[..10_000]),
+                quotes_of(&stamps[10_000..20_000]),
+                quotes_of(&stamps[20_000..]),
+                trades_of(&[]),
+                Sent::End(None),
+            ]
+        );
+        assert!(fixture.counts.peak() <= RUN_CAP + 2 * PAGE_ROWS);
+        assert_eq!(fixture.counts.dropped(), 2);
+    }
+
+    /// What the engine is told while a request waits on its client leg.
+    #[derive(Clone, Copy, Debug)]
+    enum Interruption {
+        Reset,
+        Dispose,
+        Stop,
+    }
+
+    /// A request waiting on its client leg with its catalog sessions open: a `reset` or a
+    /// `dispose` drops both; after a `stop` they stay, and the client's answer completes the
+    /// request whole.
+    #[rstest]
+    #[case::reset(Interruption::Reset)]
+    #[case::dispose(Interruption::Dispose)]
+    #[case::stop(Interruption::Stop)]
+    fn test_quotes_request_catalog_sessions_are_dropped_by_reset_and_dispose_and_kept_by_stop(
+        audusd_sim: CurrencyPair,
+        stub_msgbus: Rc<RefCell<MessageBus>>,
+        client_id: ClientId,
+        venue: Venue,
+        #[case] interruption: Interruption,
+    ) {
+        let _ = stub_msgbus;
+        let instrument_id = audusd_sim.id;
+        let trades = Feed {
+            missing: vec![CLIENT_PART],
+            ..feed(vec![at_second(2)])
+        };
+        let mut fixture = Fixture::new(
+            vec![audusd_sim],
+            client_id,
+            venue,
+            feed(vec![at_second(1), at_second(3)]),
+            trades,
+        );
+        let (_, tapped) = fixture.request(instrument_id, json!({}));
+        let legs = fixture.client_legs();
+        assert_eq!(fixture.counts.dropped(), 0);
+        assert_eq!(fixture.engine.request_pipeline_count(), 1);
+
+        match interruption {
+            Interruption::Reset => fixture.engine.reset(),
+            Interruption::Dispose => fixture.engine.dispose(),
+            Interruption::Stop => {
+                fixture.engine.stop();
+                assert_eq!(fixture.counts.dropped(), 0);
+                fixture.answer_leg(legs[0], &[at_second(85)]);
+            }
+        }
+
+        let sent = match interruption {
+            Interruption::Reset | Interruption::Dispose => Vec::new(),
+            Interruption::Stop => vec![
+                quotes_of(&[at_second(1)]),
+                trades_of(&[at_second(2)]),
+                quotes_of(&[at_second(3)]),
+                trades_of(&[at_second(85)]),
+                Sent::End(None),
+            ],
+        };
+        assert_eq!(tapped.borrow().sent, sent);
+        assert_eq!(fixture.counts.dropped(), 2);
+        assert_eq!(fixture.engine.request_pipeline_count(), 0);
+    }
+}

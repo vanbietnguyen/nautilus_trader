@@ -148,14 +148,14 @@ use requests::{
     response_params, sets_cut_warmup, sets_quotes,
 };
 use responses::{
-    append_failure, keep_open_end, leg_sources, log_if_empty_response, parent_request_window,
-    quote_and_trade_runs, rebind_response_correlation, rebuild_pipeline_response, same_instrument,
-    take_merge_rows,
+    PlacedSource, append_failure, keep_open_end, leg_sources, log_if_empty_response,
+    parent_request_window, quote_and_trade_runs, rebind_response_correlation,
+    rebuild_pipeline_response, same_instrument, take_merge_rows,
 };
 use serde_json::Value;
 use spread_quote::SpreadQuoteState;
 #[cfg(feature = "streaming")]
-use streaming::CatalogMap;
+use streaming::{CatalogLegSessions, CatalogMap};
 use time_range::{
     TimeRangePipelineState, has_time_range_pipeline_params, is_time_range_pipeline_variant,
 };
@@ -276,6 +276,10 @@ pub struct DataEngine {
     /// (by leg ID), from its dispatch until its terminal: its rows are kept only inside them.
     #[cfg(feature = "streaming")]
     client_feed_missing: AHashMap<UUID4, Vec<(u64, u64)>>,
+    /// The open catalog sessions of each `quotes` request's catalog leg, keyed by the request,
+    /// for as long as its slots: taken when they are, dropped by `reset` or `dispose`.
+    #[cfg(feature = "streaming")]
+    catalog_leg_sessions: AHashMap<UUID4, CatalogLegSessions>,
     #[cfg(feature = "defi")]
     pub(crate) pool_updaters: AHashMap<InstrumentId, Rc<PoolUpdater>>,
     #[cfg(feature = "defi")]
@@ -371,6 +375,8 @@ impl DataEngine {
             catalogs: CatalogMap::new(),
             #[cfg(feature = "streaming")]
             client_feed_missing: AHashMap::new(),
+            #[cfg(feature = "streaming")]
+            catalog_leg_sessions: AHashMap::new(),
             #[cfg(feature = "defi")]
             pool_updaters: AHashMap::new(),
             #[cfg(feature = "defi")]
@@ -659,6 +665,8 @@ impl DataEngine {
         self.request_pipeline_responses.clear();
         #[cfg(feature = "streaming")]
         self.client_feed_missing.clear();
+        #[cfg(feature = "streaming")]
+        self.catalog_leg_sessions.clear();
         self.time_range_pipeline_requests.clear();
         self.time_range_pipeline_parent_request_id.clear();
         self.parent_join_request_id.clear();
@@ -2495,6 +2503,16 @@ impl DataEngine {
         slots: Vec<Option<Vec<DataResponseEnvelope>>>,
         first_reason: Option<&str>,
     ) -> DataResponseEnvelope {
+        // A `quotes` request's catalog leg's open sessions leave the engine first, before
+        // anything is sent; any return that does not merge them drops them
+        #[cfg(feature = "streaming")]
+        let catalog_leg = self
+            .catalog_leg_sessions
+            .remove(&parent_id)
+            .map(|sessions| sessions.placed(&slots));
+        #[cfg(not(feature = "streaming"))]
+        let catalog_leg = None;
+
         let mut failures = first_reason.into_iter().collect::<Vec<_>>();
         failures.extend(
             slots
@@ -2571,7 +2589,7 @@ impl DataEngine {
         if !quotes.is_empty()
             && let DataResponse::Trades(trades) = &rebuilt
         {
-            match self.send_quote_parts(parent_id, parent, trades, trade_rows, quotes, trim) {
+            match self.send_quote_parts(parent, trades, trade_rows, quotes, catalog_leg, trim) {
                 Ok(last) => rebuilt = DataResponse::Trades(last),
                 Err(e) => {
                     let mut reasons =
@@ -2591,13 +2609,16 @@ impl DataEngine {
     }
 
     /// Sends a `quotes` request's answer as typed parts in one time order, each run of quotes or
-    /// trades one part under `parent_id` sent as it is cut, and returns its last part: trades,
-    /// possibly empty, which completes the request.
+    /// trades one part under the request (the correlation of `trades`) sent as it is cut, and
+    /// returns its last part: trades, possibly empty, which completes the request.
     ///
     /// `trades` is the answer's identity, rebuilt from its trades legs with their rows taken out
     /// into `trade_rows`; the quotes legs' rows are taken out the same way before their identity
     /// is rebuilt. Each leg's rows are one source of the merge, narrowed to its feed's window
-    /// when `trim` is set (see [`quote_and_trade_runs`]).
+    /// when `trim` is set (see [`quote_and_trade_runs`]). The catalog leg answered its slot with
+    /// no rows: its open sessions, `catalog_leg` (its quotes, then its trades), are its sources,
+    /// each at its slot's place in its feed's order and narrowed to the request's window when
+    /// they were opened (see [`streaming::CatalogLegSessions`]).
     ///
     /// The parts take the ordinary route: trades parts feed the request's aggregators (through
     /// the interleaved path when the request interleaves); quotes parts reach only its
@@ -2611,33 +2632,36 @@ impl DataEngine {
     /// a longer run of one type is several parts.
     ///
     /// Memory, per request (the parts are new buffers, not views of the answer): the catalog
-    /// leg's query holds the window's quotes in their own buffer beside its trades until the
-    /// pipeline completes, as do its client legs' answers of the parts the catalog does not
-    /// cover; each leg's source keeps views of that leg's buffer (a sorted copy if its rows come
-    /// unsorted), with no merged copy of a feed; then [`quote_and_trade_runs`] copies each run
-    /// into its part and sends it as it is cut, so one part of at most 10,000 rows is held at a
-    /// time beside the answer (a split run is copied once more, stretch by stretch, as it is
-    /// sent). The peak is therefore about the window's quote and trade rows plus one part. The
-    /// window is the caller's: nothing here bounds it to one session. Part counts, wall time and
-    /// memory of a real session are unmeasured.
+    /// leg holds no rows of its window; each of its sessions holds the chunk it is read from
+    /// (10,000 rows, extended through every row of its last stamp) and its own read-ahead, and
+    /// a further chunk is read only when the merge reaches the end of the one before. Its client
+    /// legs' answers of the parts the catalog does not cover are held whole until the pipeline
+    /// completes, each leg's source keeping views of its rows (a sorted copy if they come
+    /// unsorted). [`quote_and_trade_runs`] copies each run into its part and sends it as it is
+    /// cut, so one part of at most 10,000 rows is held at a time (a split run is copied once
+    /// more, stretch by stretch, as it is sent), and a handler's return paces the reading of
+    /// the rows after its part. The peak is therefore about the client legs' rows, plus one
+    /// part, plus each session's chunk and read-ahead, whatever the window's size, while a
+    /// stamp's rows and a feed's overlapping files stay few. Part counts, wall time and memory
+    /// of a real session are unmeasured.
     ///
     /// # Errors
     ///
     /// Returns an error if the quotes cannot be rebuilt or a leg's source cannot be made (no
-    /// part is sent then) or the replay of quotes and trades fails (the parts sent before it
-    /// stay sent).
+    /// part is sent then) or the replay of quotes and trades fails, a session's read included
+    /// (the parts sent before it stay sent).
     fn send_quote_parts(
         &mut self,
-        parent_id: UUID4,
         parent: Option<&RequestCommand>,
         trades: &TradesResponse,
         trade_rows: Vec<DataBatch>,
         mut quotes: Vec<DataResponse>,
+        catalog_leg: Option<(PlacedSource, PlacedSource)>,
         trim: bool,
     ) -> anyhow::Result<TradesResponse> {
         let quote_rows = take_merge_rows(&mut quotes);
 
-        let Some(quotes) = rebuild_pipeline_response(parent_id, parent, quotes) else {
+        let Some(quotes) = rebuild_pipeline_response(trades.correlation_id, parent, quotes) else {
             anyhow::bail!("the quotes of its legs could not be rebuilt");
         };
 
@@ -2648,9 +2672,15 @@ impl DataEngine {
         // Each leg's rows are narrowed to its feed's window, as the rebuilt answer is trimmed
         let window = |start, end| if trim { (start, end) } else { (None, None) };
         let (start, end) = window(quotes.start, quotes.end);
-        let quote_sources = leg_sources(quote_rows, start, end)?;
+        let mut quote_sources = leg_sources(quote_rows, start, end)?;
         let (start, end) = window(trades.start, trades.end);
-        let trade_sources = leg_sources(trade_rows, start, end)?;
+        let mut trade_sources = leg_sources(trade_rows, start, end)?;
+
+        // The catalog leg's sessions are read in its slot's place, before its own empty rows
+        if let Some(((quotes_at, catalog_quotes), (trades_at, catalog_trades))) = catalog_leg {
+            quote_sources.insert(quotes_at, catalog_quotes);
+            trade_sources.insert(trades_at, catalog_trades);
+        }
 
         quote_and_trade_runs(
             &quotes,
