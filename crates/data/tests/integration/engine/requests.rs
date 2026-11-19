@@ -10798,6 +10798,102 @@ fn test_merged_answer_that_fails_fires_no_end_of_coverage_and_ends_once(
     assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
 }
 
+/// The stamps of a run of 25,000 rows of one type, one a millisecond from 10:00:45.0015 on
+/// 2024-01-08: the 1-MINUTE close of 10:01 falls between the 14,999th and the 15,000th.
+#[cfg(feature = "streaming")]
+fn long_run_stamps() -> Vec<u64> {
+    let first = utc_ns("2024-01-08T10:00:45.0015Z");
+    (0..25_000).map(|row| first + row * 1_000_000).collect()
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_merged_answer_of_a_session_of_quotes_alone_sends_parts_of_at_most_ten_thousand(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let minute = bar_type_of(fixture.instrument_id, "1-MINUTE");
+    let t = |time: &str| utc_ns(&format!("2024-01-08T{time}Z"));
+    let window = (t("10:00:00"), t("10:02:00"));
+    let stamps = long_run_stamps();
+    let quotes: Vec<_> = stamps.iter().copied().map(quote_at).collect();
+
+    // The trade file covers the window, its one trade is before it: the session is quotes alone
+    let delivered = run_merged(
+        &fixture,
+        "merged-long-quotes",
+        &[minute],
+        window,
+        &[
+            merged_run((t("09:59:00"), window.1), &[], &[(t("09:59:30"), "t0")]),
+            merged_run(window, &quotes, &[]),
+        ],
+    );
+
+    // One run of 25,000 quotes, cut at 10,000 rows, each part cached as it is sent (the cache
+    // keeps the last 10,000 quotes); no trade feeds a bar; the empty last trades part ends it
+    let quotes_part = |rows: &[u64]| Merged::Quotes(at_ns(rows), vec![0, 10_000]);
+    assert_eq!(
+        delivered,
+        vec![
+            quotes_part(&stamps[..10_000]),
+            quotes_part(&stamps[10_000..20_000]),
+            quotes_part(&stamps[20_000..]),
+            merged_trades(&[], &[0, 10_000]),
+            Merged::End(None),
+        ]
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_merged_answer_sends_a_run_of_trades_over_ten_thousand_as_parts_of_at_most_ten_thousand(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let minute = bar_type_of(fixture.instrument_id, "1-MINUTE");
+    let t = |time: &str| utc_ns(&format!("2024-01-08T{time}Z"));
+    let window = (t("10:00:00"), t("10:02:00"));
+    let stamps = long_run_stamps();
+    let ids: Vec<_> = (1..=stamps.len()).map(|row| format!("t{row}")).collect();
+    let ids: Vec<_> = ids.iter().map(String::as_str).collect();
+    let trades: Vec<_> = stamps.iter().copied().zip(ids.iter().copied()).collect();
+
+    let delivered = run_merged(
+        &fixture,
+        "merged-long-trades",
+        &[minute],
+        window,
+        &[merged_run(window, &[quote_at(t("10:00:10"))], &trades)],
+    );
+
+    // After the quote the session is one run of 25,000 trades: cut at 10,000 rows, and split
+    // at the 10:01 close as any run is; the last part completes the answer after the end's bar
+    let trades_part = |rows: &[&str], bars| Merged::Trades(trade_ids(rows), vec![bars, 1]);
+    assert_eq!(
+        delivered,
+        vec![
+            merged_quotes(&[t("10:00:10")], &[0, 1]),
+            trades_part(&ids[..10_000], 0),
+            trades_part(&ids[10_000..14_999], 0),
+            merged_bar(minute, t("10:01:00"), 14_999, &[1, 1]),
+            trades_part(&ids[14_999..20_000], 1),
+            trades_part(&ids[20_000..], 1),
+            merged_bar(minute, t("10:02:00"), 10_001, &[2, 1]),
+            merged_trades(&[], &[2, 1]),
+            Merged::End(None),
+        ]
+    );
+}
+
 /// 2024-01-08 (UTC): `time` that day, to the nanosecond.
 #[cfg(feature = "streaming")]
 fn edge_ns(time: &str) -> u64 {

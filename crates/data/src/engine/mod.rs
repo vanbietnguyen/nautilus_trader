@@ -2584,8 +2584,8 @@ impl DataEngine {
     }
 
     /// Sends a `quotes` request's answer as typed parts in one time order, each run of quotes or
-    /// trades one part under `parent_id`, and returns its last part: trades, possibly empty,
-    /// which completes the request.
+    /// trades one part under `parent_id` sent as it is cut, and returns its last part: trades,
+    /// possibly empty, which completes the request.
     ///
     /// The parts take the ordinary route: trades parts feed the request's aggregators (through
     /// the interleaved path when the request interleaves); quotes parts reach only its
@@ -2595,26 +2595,25 @@ impl DataEngine {
     /// response route and one handler call, and the parts number the runs of quotes plus the
     /// runs of trades (plus, when interleaving, the splits and the bars): about twice the runs
     /// of trades, so a window whose quotes and trades alternate tick by tick sends about two
-    /// parts per trade.
+    /// parts per trade. A run is cut at 10,000 rows as well (see [`quote_and_trade_runs`]), so
+    /// a longer run of one type is several parts.
     ///
     /// Memory, per request (the parts are new buffers, not views of the answer): the catalog
     /// leg's query holds the window's quotes in their own buffer beside its trades until the
     /// pipeline completes, as do its client legs' answers of the parts the catalog does not
     /// cover; the rebuild and the trim keep views of the leg's buffers (one leg with rows; with
     /// more, one merged copy per feed; a sorted copy if the rows come unsorted) and the replay
-    /// shares them; then
-    /// [`quote_and_trade_runs`] copies every quote and trade once more into its parts, and every
-    /// part exists before the first is sent (a split run is copied once more, stretch by
-    /// stretch, as it is sent). The peak is therefore about twice the window's
-    /// quote and trade rows, plus per part a response with a clone of the request's params
-    /// (and, for a quotes part, of its instrument IDs). The window is the caller's: nothing
-    /// here bounds it to one session. Part counts, wall time and memory of a real session are
-    /// unmeasured.
+    /// shares them; then [`quote_and_trade_runs`] copies each run into its part and sends it as
+    /// it is cut, so one part of at most 10,000 rows is held at a time beside the answer (a
+    /// split run is copied once more, stretch by stretch, as it is sent). The peak is therefore
+    /// about the window's quote and trade rows plus one part. The window is the caller's:
+    /// nothing here bounds it to one session. Part counts, wall time and memory of a real
+    /// session are unmeasured.
     ///
     /// # Errors
     ///
-    /// Returns an error if the quotes cannot be rebuilt or the replay of quotes and trades fails;
-    /// no part is sent then.
+    /// Returns an error if the quotes cannot be rebuilt (no part is sent then) or the replay of
+    /// quotes and trades fails (the parts sent before it stay sent).
     fn send_quote_parts(
         &mut self,
         parent_id: UUID4,
@@ -2635,21 +2634,12 @@ impl DataEngine {
             anyhow::bail!("its quotes were rebuilt as {}", quotes.kind());
         };
 
-        let mut parts = quote_and_trade_runs(&quotes, trades)?;
-        let Some(DataResponse::Trades(last)) = parts.pop() else {
-            anyhow::bail!("the replay of quotes and trades did not end with a trades part");
-        };
-
-        for part in parts {
-            match part {
-                DataResponse::Quotes(run) => self.send_interleaved_quotes(trades, run),
-                part => {
-                    self.process_response_envelope(DataResponseEnvelope::new(part, false, None));
-                }
+        quote_and_trade_runs(&quotes, trades, |part| match part {
+            DataResponse::Quotes(run) => self.send_interleaved_quotes(trades, run),
+            part => {
+                self.process_response_envelope(DataResponseEnvelope::new(part, false, None));
             }
-        }
-
-        Ok(last)
+        })
     }
 
     // Returns the snapshot replay failures of the legs it withheld, or `None` when the legs
