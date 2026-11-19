@@ -1520,6 +1520,113 @@ fn test_kept_continuous_future_request_is_refused_by_name_before_any_segment(
     }
 }
 
+/// A kept request leaves the ES.GLBX 5-MINUTE builder idle through 10:07:59.999999999, a2 (2) at
+/// 10:06 in its open bar. At 12:00 a continuous-future subscription to that bar type is refused
+/// as "in use": the client is asked nothing, and the request continuing the replay from 10:08 is
+/// admitted and closes a2's 2 at 10:10.
+#[rstest]
+fn test_continuous_future_subscription_over_an_idle_kept_builder_is_refused(
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+) {
+    let _ = stub_msgbus;
+    // 2024-01-08 10:00 New York, plus `minutes`
+    let at = |minutes: u64| (1_704_726_000 + minutes * 60) * NANOSECONDS_IN_SECOND;
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    let continuous_id = add_es_contract(&cache, "ES.GLBX", "ES");
+    let pre_id = add_es_contract(&cache, "ESH24.GLBX", "ESH24");
+    let post_id = add_es_contract(&cache, "ESM24.GLBX", "ESM24");
+    let (data_engine, _test_clock, recorder) =
+        register_continuous_future_subscription_engine(Rc::clone(&cache), at(120));
+    let five = BarType::from("ES.GLBX-5-MINUTE-LAST-INTERNAL");
+
+    let kept_request = |start: u64, next: u64, trades: &[(u64, u64, &str)]| {
+        let request_id = UUID4::new();
+        let bars = Rc::new(RefCell::new(Vec::new()));
+        let recorded = Rc::clone(&bars);
+        msgbus::register_response_handler(
+            &request_id,
+            TypedHandler::from(move |envelope: &DataResponseEnvelope| {
+                if let Some(DataResponse::Bars(resp)) = envelope.response() {
+                    recorded
+                        .borrow_mut()
+                        .extend(resp.data.iter().map(|bar| (bar.ts_event, bar.volume)));
+                }
+            }),
+        );
+        let params = params_from_json(json!({
+            "bar_types": [five.to_string()],
+            "update_subscriptions": true,
+            "interleave": true,
+        }));
+        let request = RequestTrades::new(
+            continuous_id,
+            Some(UnixNanos::from(start).to_datetime_utc()),
+            Some(UnixNanos::from(next - 1).to_datetime_utc()),
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::from(at(120)),
+            Some(params),
+        );
+        data_engine
+            .borrow_mut()
+            .execute_request(RequestCommand::Trades(request))?;
+        let trades: Vec<TradeTick> = trades
+            .iter()
+            .map(|(ts, size, trade_id)| make_trade(continuous_id, "100.00", *size, trade_id, *ts))
+            .collect();
+        let resp = TradesResponse::new(
+            request_id,
+            client_id,
+            continuous_id,
+            trades,
+            None,
+            None,
+            UnixNanos::from(at(120)),
+            None,
+        );
+        data_engine
+            .borrow_mut()
+            .response_envelope(DataResponseEnvelope::new(
+                DataResponse::Trades(resp),
+                true,
+                None,
+            ));
+        anyhow::Ok(bars.take())
+    };
+    kept_request(at(0), at(8), &[(at(1), 1, "a1"), (at(6), 2, "a2")]).unwrap();
+    let asked = recorder.borrow().len();
+
+    let sub = SubscribeBars::new(
+        five,
+        Some(client_id),
+        Some(Venue::from("GLBX")),
+        UUID4::new(),
+        UnixNanos::from(at(120)),
+        None,
+        Some(continuous_future_transitions_params(
+            at(180),
+            pre_id,
+            post_id,
+        )),
+    );
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::Bars(sub)));
+    let asked_by_subscription = recorder.borrow()[asked..].to_vec();
+    let continued = kept_request(at(8), at(15), &[(at(12), 4, "c1")]);
+
+    assert!(
+        asked_by_subscription.is_empty(),
+        "{asked_by_subscription:?}"
+    );
+    assert_eq!(
+        continued.unwrap(),
+        vec![(UnixNanos::from(at(10)), Quantity::from(2))]
+    );
+}
+
 #[rstest]
 fn test_continuous_future_params_require_request_bars(
     audusd_sim: CurrencyPair,
