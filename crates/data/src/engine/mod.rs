@@ -118,7 +118,7 @@ use nautilus_core::{
 use nautilus_model::defi::DefiData;
 use nautilus_model::{
     data::{
-        Bar, BarType, CustomData, Data, DataRef, DataType, FundingRateUpdate, HasTsInit,
+        Bar, BarType, CustomData, Data, DataBatch, DataRef, DataType, FundingRateUpdate, HasTsInit,
         IndexPriceUpdate, InstrumentClose, InstrumentStatus, MarkPriceUpdate, OrderBookDelta,
         OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
         option_chain::{OptionGreeks, StrikeRange},
@@ -148,8 +148,9 @@ use requests::{
     response_params, sets_cut_warmup, sets_quotes,
 };
 use responses::{
-    append_failure, keep_open_end, log_if_empty_response, parent_request_window,
+    append_failure, keep_open_end, leg_sources, log_if_empty_response, parent_request_window,
     quote_and_trade_runs, rebind_response_correlation, rebuild_pipeline_response, same_instrument,
+    take_merge_rows,
 };
 use serde_json::Value;
 use spread_quote::SpreadQuoteState;
@@ -2515,11 +2516,17 @@ impl DataEngine {
         }
 
         // The quotes a `quotes` request's catalog and client legs answered go out with its trades
-        let (quotes, legs) = if parent.is_some_and(sets_quotes) {
+        let (quotes, mut legs) = if parent.is_some_and(sets_quotes) {
             legs.into_iter()
                 .partition(|leg| matches!(leg, DataResponse::Quotes(_)))
         } else {
             (Vec::new(), legs)
+        };
+        // With quotes, each trades leg's rows go to the merge, and the rebuild makes the identity
+        let trade_rows = if quotes.is_empty() {
+            Vec::new()
+        } else {
+            take_merge_rows(&mut legs)
         };
 
         let (parent_start, parent_end) = parent_request_window(parent);
@@ -2564,7 +2571,7 @@ impl DataEngine {
         if !quotes.is_empty()
             && let DataResponse::Trades(trades) = &rebuilt
         {
-            match self.send_quote_parts(parent_id, parent, trades, quotes, trim) {
+            match self.send_quote_parts(parent_id, parent, trades, trade_rows, quotes, trim) {
                 Ok(last) => rebuilt = DataResponse::Trades(last),
                 Err(e) => {
                     let mut reasons =
@@ -2587,6 +2594,11 @@ impl DataEngine {
     /// trades one part under `parent_id` sent as it is cut, and returns its last part: trades,
     /// possibly empty, which completes the request.
     ///
+    /// `trades` is the answer's identity, rebuilt from its trades legs with their rows taken out
+    /// into `trade_rows`; the quotes legs' rows are taken out the same way before their identity
+    /// is rebuilt. Each leg's rows are one source of the merge, narrowed to its feed's window
+    /// when `trim` is set (see [`quote_and_trade_runs`]).
+    ///
     /// The parts take the ordinary route: trades parts feed the request's aggregators (through
     /// the interleaved path when the request interleaves); quotes parts reach only its
     /// non-`LAST` aggregators. When the request interleaves with its own replay, a run of
@@ -2601,45 +2613,57 @@ impl DataEngine {
     /// Memory, per request (the parts are new buffers, not views of the answer): the catalog
     /// leg's query holds the window's quotes in their own buffer beside its trades until the
     /// pipeline completes, as do its client legs' answers of the parts the catalog does not
-    /// cover; the rebuild and the trim keep views of the leg's buffers (one leg with rows; with
-    /// more, one merged copy per feed; a sorted copy if the rows come unsorted) and the replay
-    /// shares them; then [`quote_and_trade_runs`] copies each run into its part and sends it as
-    /// it is cut, so one part of at most 10,000 rows is held at a time beside the answer (a
-    /// split run is copied once more, stretch by stretch, as it is sent). The peak is therefore
-    /// about the window's quote and trade rows plus one part. The window is the caller's:
-    /// nothing here bounds it to one session. Part counts, wall time and memory of a real
-    /// session are unmeasured.
+    /// cover; each leg's source keeps views of that leg's buffer (a sorted copy if its rows come
+    /// unsorted), with no merged copy of a feed; then [`quote_and_trade_runs`] copies each run
+    /// into its part and sends it as it is cut, so one part of at most 10,000 rows is held at a
+    /// time beside the answer (a split run is copied once more, stretch by stretch, as it is
+    /// sent). The peak is therefore about the window's quote and trade rows plus one part. The
+    /// window is the caller's: nothing here bounds it to one session. Part counts, wall time and
+    /// memory of a real session are unmeasured.
     ///
     /// # Errors
     ///
-    /// Returns an error if the quotes cannot be rebuilt (no part is sent then) or the replay of
-    /// quotes and trades fails (the parts sent before it stay sent).
+    /// Returns an error if the quotes cannot be rebuilt or a leg's source cannot be made (no
+    /// part is sent then) or the replay of quotes and trades fails (the parts sent before it
+    /// stay sent).
     fn send_quote_parts(
         &mut self,
         parent_id: UUID4,
         parent: Option<&RequestCommand>,
         trades: &TradesResponse,
-        quotes: Vec<DataResponse>,
+        trade_rows: Vec<DataBatch>,
+        mut quotes: Vec<DataResponse>,
         trim: bool,
     ) -> anyhow::Result<TradesResponse> {
-        let Some(mut quotes) = rebuild_pipeline_response(parent_id, parent, quotes) else {
+        let quote_rows = take_merge_rows(&mut quotes);
+
+        let Some(quotes) = rebuild_pipeline_response(parent_id, parent, quotes) else {
             anyhow::bail!("the quotes of its legs could not be rebuilt");
         };
-
-        if trim {
-            quotes.trim_to_bounds();
-        }
 
         let DataResponse::Quotes(quotes) = quotes else {
             anyhow::bail!("its quotes were rebuilt as {}", quotes.kind());
         };
 
-        quote_and_trade_runs(&quotes, trades, |part| match part {
-            DataResponse::Quotes(run) => self.send_interleaved_quotes(trades, run),
-            part => {
-                self.process_response_envelope(DataResponseEnvelope::new(part, false, None));
-            }
-        })
+        // Each leg's rows are narrowed to its feed's window, as the rebuilt answer is trimmed
+        let window = |start, end| if trim { (start, end) } else { (None, None) };
+        let (start, end) = window(quotes.start, quotes.end);
+        let quote_sources = leg_sources(quote_rows, start, end)?;
+        let (start, end) = window(trades.start, trades.end);
+        let trade_sources = leg_sources(trade_rows, start, end)?;
+
+        quote_and_trade_runs(
+            &quotes,
+            trades,
+            quote_sources,
+            trade_sources,
+            |part| match part {
+                DataResponse::Quotes(run) => self.send_interleaved_quotes(trades, run),
+                part => {
+                    self.process_response_envelope(DataResponseEnvelope::new(part, false, None));
+                }
+            },
+        )
     }
 
     // Returns the snapshot replay failures of the legs it withheld, or `None` when the legs

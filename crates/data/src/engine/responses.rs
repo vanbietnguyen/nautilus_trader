@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::sync::Arc;
+use std::{iter::Fuse, ops::Range, sync::Arc};
 
 use nautilus_common::messages::data::{InstrumentsResponse, QuotesResponse, TradesResponse};
 use nautilus_model::data::{BatchView, DataBatch, QuoteTick};
@@ -24,7 +24,7 @@ use super::{
     NANOSECONDS_IN_DAY, OrderBook, OrderBookDeltas, RecordFlag, RequestCommand, UUID4, UnixNanos,
     bar::trades_part, type_name,
 };
-use crate::replay::{DataIterator, ReplayPoll};
+use crate::replay::{DataIterator, ReplayBatch, ReplayPoll, ReplaySource};
 
 impl DataEngine {
     // Replays a day-start snapshot forward to the request's original start: when the first delta
@@ -305,26 +305,173 @@ pub(super) fn keep_open_end(rebuilt: &mut DataResponse) {
 /// type that reaches it is sent as a part, and a new run starts.
 const MERGED_PART_ROWS: usize = 10_000;
 
-/// Sends `quotes` and `trades` in one time order through `send` as typed parts, and returns the
-/// last run of trades, possibly empty, which completes the answer.
+/// Sends the rows of `quote_sources` and `trade_sources` in one time order through `send` as
+/// typed parts, and returns the last run of trades, possibly empty, which completes the answer.
 ///
-/// Both go through the replay iterator by `ts_init`, the quotes added first so that a quote comes
-/// before a trade at an equal stamp (the backtest's order). A run of one type is cut where the
-/// type changes and where it reaches 10,000 rows; each run is sent as it is cut, so no two parts
-/// are held at once. Each part carries its response's identity and window.
+/// Each source is one leg's rows and goes into the replay iterator on its own, by `ts_init`:
+/// every quotes source first, then every trades source, each feed's in slot order, so a quote
+/// comes before a trade at an equal stamp (the backtest's order), also where a source's next
+/// batch starts at that stamp, and rows of one feed at an equal stamp go in slot order. A run of
+/// one type is cut where the type changes and where it reaches 10,000 rows; each run is sent as
+/// it is cut, so no two parts are held at once. Each part carries the identity and window of
+/// `quotes` or `trades`, whose rows are not read.
 ///
 /// # Errors
 ///
-/// Returns an error if the replay iterator fails; the parts sent before it stay sent.
+/// Returns an error if a source cannot be admitted or the replay iterator fails; the parts sent
+/// before it stay sent.
 pub(super) fn quote_and_trade_runs(
     quotes: &QuotesResponse,
     trades: &TradesResponse,
+    quote_sources: Vec<Box<dyn ReplaySource>>,
+    trade_sources: Vec<Box<dyn ReplaySource>>,
     send: impl FnMut(DataResponse),
 ) -> anyhow::Result<TradesResponse> {
     let mut replay = DataIterator::new();
-    replay.add_data_batch("quotes", DataBatch::Quote(quotes.data.clone()), true);
-    replay.add_data_batch("trades", DataBatch::Trade(trades.data.clone()), true);
+    let quote_sources = quote_sources.into_iter().map(|source| ("quotes", source));
+    let trade_sources = trade_sources.into_iter().map(|source| ("trades", source));
+
+    for (slot, (feed, source)) in quote_sources.chain(trade_sources).enumerate() {
+        replay.add_source(&format!("{feed}-{slot}"), source, true)?;
+    }
+
     cut_quote_and_trade_runs(&mut replay, quotes, trades, send)
+}
+
+/// Takes the rows out of the quotes and trades legs of a merged answer, in leg order, each leg's
+/// rows in the order the rebuild sorts them (by `ts_init`, then instrument; copied only when they
+/// come unsorted). Each leg is left with no rows, so the rebuild of the legs makes the answer's
+/// identity alone. Any other leg keeps its rows and adds none.
+pub(super) fn take_merge_rows(legs: &mut [DataResponse]) -> Vec<DataBatch> {
+    legs.iter_mut()
+        .filter_map(|leg| match leg {
+            DataResponse::Quotes(r) => {
+                Some(DataBatch::Quote(take_sorted_rows(&mut r.data, |row| {
+                    (row.ts_init, row.instrument_id)
+                })))
+            }
+            DataResponse::Trades(r) => {
+                Some(DataBatch::Trade(take_sorted_rows(&mut r.data, |row| {
+                    (row.ts_init, row.instrument_id)
+                })))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn take_sorted_rows<T: Clone, K: Ord>(
+    data: &mut BatchView<T>,
+    key: impl Fn(&T) -> K,
+) -> BatchView<T> {
+    let mut rows = std::mem::replace(data, Vec::new().into());
+
+    if !rows.is_sorted_by_key(&key) {
+        rows.make_mut().sort_by_key(key);
+    }
+
+    rows
+}
+
+/// Makes each leg's collected rows, its one chunk, a source of the merge narrowed to
+/// `[start, end]` (see [`WindowSource`]).
+///
+/// # Errors
+///
+/// Returns an error if a leg's first chunk cannot be read.
+pub(super) fn leg_sources(
+    rows: Vec<DataBatch>,
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+) -> anyhow::Result<Vec<Box<dyn ReplaySource>>> {
+    rows.into_iter()
+        .map(|rows| {
+            let source = WindowSource::new(std::iter::once(Ok(rows)), start, end)?;
+            Ok(Box::new(source) as Box<dyn ReplaySource>)
+        })
+        .collect()
+}
+
+/// One leg of a merged answer as a replay source: its chunks, each in `ts_init` order, narrowed
+/// to `[start, end]` as views of their rows (the rows the answer's trim keeps), a chunk left
+/// empty skipped. It reads its first nonempty chunk when it is made, so a leg that cannot be
+/// read fails before any part is sent, and passes a chunk's error on unchanged.
+pub(super) struct WindowSource<I: Iterator> {
+    chunks: Fuse<I>,
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+    first: Option<DataBatch>,
+}
+
+impl<I: Iterator<Item = anyhow::Result<DataBatch>>> WindowSource<I> {
+    /// Creates a source over `chunks`, reading up to its first chunk with a row in the window.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of a chunk read before a chunk with a row in the window.
+    pub(super) fn new(
+        chunks: I,
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+    ) -> anyhow::Result<Self> {
+        let mut source = Self {
+            chunks: chunks.fuse(),
+            start,
+            end,
+            first: None,
+        };
+        source.first = source.next_chunk()?;
+        Ok(source)
+    }
+
+    fn next_chunk(&mut self) -> anyhow::Result<Option<DataBatch>> {
+        for chunk in self.chunks.by_ref() {
+            let chunk = chunk?;
+            let rows = window_rows(&chunk, self.start, self.end);
+
+            if !rows.is_empty() {
+                return Ok(Some(chunk.slice(rows.start, rows.end)));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+impl<I: Iterator<Item = anyhow::Result<DataBatch>>> ReplaySource for WindowSource<I> {
+    fn poll_batch(&mut self) -> anyhow::Result<ReplayPoll<ReplayBatch>> {
+        let chunk = match self.first.take() {
+            Some(chunk) => Some(chunk),
+            None => self.next_chunk()?,
+        };
+
+        Ok(chunk.map_or(ReplayPoll::Complete, |chunk| {
+            ReplayPoll::Ready(ReplayBatch::Typed(chunk))
+        }))
+    }
+}
+
+// The rows of `chunk`, in `ts_init` order, from the first at or after `start` through the last
+// at or before `end`, found as the answer's trim finds them
+fn window_rows(
+    chunk: &DataBatch,
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+) -> Range<usize> {
+    let stamp_at = |index: usize| chunk.get(index).map(|row| row.ts_init());
+    let len = chunk.len();
+    let first = start.map_or(0, |start| {
+        (0..len)
+            .position(|index| stamp_at(index).is_some_and(|ts| ts >= start))
+            .unwrap_or(len)
+    });
+    let last = end.map_or(len, |end| {
+        (0..len)
+            .rposition(|index| stamp_at(index).is_some_and(|ts| ts <= end))
+            .map_or(0, |index| index + 1)
+    });
+
+    first..last.max(first)
 }
 
 // Takes `replay`'s rows in order, sending each run as it is cut (see `quote_and_trade_runs`)
@@ -540,7 +687,9 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     use nautilus_model::{
-        identifiers::ClientId,
+        data::TradeTick,
+        enums::AggressorSide,
+        identifiers::{ClientId, TradeId},
         types::{Price, Quantity},
     };
     use rstest::rstest;
@@ -645,6 +794,204 @@ mod tests {
             assert!(handed_out - sent_before <= MERGED_PART_ROWS + PAGE_ROWS);
             sent_before += rows.len();
         }
+    }
+
+    // A quote at `ts`, its slot carried as its `ts_event`
+    fn quote(ts: u64, slot: u64) -> QuoteTick {
+        QuoteTick::new(
+            InstrumentId::from("AUD/USD.SIM"),
+            Price::from("1.0000"),
+            Price::from("1.0002"),
+            Quantity::from(1),
+            Quantity::from(1),
+            UnixNanos::from(slot),
+            UnixNanos::from(ts),
+        )
+    }
+
+    // A trade at `ts`, its slot carried as its `ts_event`
+    fn trade(ts: u64, slot: u64) -> TradeTick {
+        TradeTick::new(
+            InstrumentId::from("AUD/USD.SIM"),
+            Price::from("1.0001"),
+            Quantity::from(1),
+            AggressorSide::Buy,
+            TradeId::new(ts.to_string()),
+            UnixNanos::from(slot),
+            UnixNanos::from(ts),
+        )
+    }
+
+    fn chunks(rows: Vec<DataBatch>) -> impl Iterator<Item = anyhow::Result<DataBatch>> + 'static {
+        rows.into_iter().map(Ok)
+    }
+
+    fn source(rows: Vec<DataBatch>) -> Box<dyn ReplaySource> {
+        Box::new(WindowSource::new(chunks(rows), None, None).unwrap())
+    }
+
+    // Each part as its type and its rows' (stamp, slot), the last trades run included
+    fn merged_parts(
+        quote_sources: Vec<Box<dyn ReplaySource>>,
+        trade_sources: Vec<Box<dyn ReplaySource>>,
+    ) -> Vec<(&'static str, Vec<(u64, u64)>)> {
+        let instrument_id = InstrumentId::from("AUD/USD.SIM");
+        let (client_id, ts_init) = (ClientId::new("SIM"), UnixNanos::default());
+        let quotes = QuotesResponse::new(
+            UUID4::new(),
+            client_id,
+            vec![instrument_id],
+            Vec::new(),
+            None,
+            None,
+            ts_init,
+            None,
+        );
+        let trades = TradesResponse::new(
+            quotes.correlation_id,
+            client_id,
+            vec![instrument_id],
+            Vec::new(),
+            None,
+            None,
+            ts_init,
+            None,
+        );
+        let trade_rows = |part: &TradesResponse| {
+            let rows = part.data.iter();
+            rows.map(|row| (row.ts_init.as_u64(), row.ts_event.as_u64()))
+                .collect()
+        };
+
+        let mut parts = Vec::new();
+        let last =
+            quote_and_trade_runs(
+                &quotes,
+                &trades,
+                quote_sources,
+                trade_sources,
+                |part| match part {
+                    DataResponse::Quotes(part) => {
+                        let rows = part.data.iter();
+                        let rows = rows.map(|row| (row.ts_init.as_u64(), row.ts_event.as_u64()));
+                        parts.push(("quotes", rows.collect()));
+                    }
+                    DataResponse::Trades(part) => parts.push(("trades", trade_rows(&part))),
+                    part => panic!("a quotes or trades part: {part:?}"),
+                },
+            )
+            .unwrap();
+        parts.push(("trades", trade_rows(&last)));
+        parts
+    }
+
+    #[rstest]
+    fn test_merged_answer_takes_a_quote_before_a_trade_at_the_stamp_its_next_batch_starts() {
+        // The quotes' first batch ends at 9; the trades already hold a trade at 10
+        let quotes = vec![
+            DataBatch::Quote(vec![quote(8, 1), quote(9, 1)].into()),
+            DataBatch::Quote(vec![quote(10, 1), quote(11, 1)].into()),
+        ];
+        let trades = vec![DataBatch::Trade(vec![trade(10, 1)].into())];
+
+        let parts = merged_parts(vec![source(quotes)], vec![source(trades)]);
+
+        assert_eq!(
+            parts,
+            [
+                ("quotes", vec![(8, 1), (9, 1), (10, 1)]),
+                ("trades", vec![(10, 1)]),
+                ("quotes", vec![(11, 1)]),
+                ("trades", vec![]),
+            ]
+        );
+    }
+
+    #[rstest]
+    fn test_merged_answer_sends_the_rows_of_one_feed_at_one_stamp_in_slot_order() {
+        // Two sources of each feed, as two files of it, each with a row at 5
+        let quote_sources = vec![
+            source(vec![DataBatch::Quote(
+                vec![quote(5, 1), quote(6, 1)].into(),
+            )]),
+            source(vec![DataBatch::Quote(vec![quote(5, 2)].into())]),
+        ];
+        let trade_sources = vec![
+            source(vec![DataBatch::Trade(vec![trade(5, 3)].into())]),
+            source(vec![DataBatch::Trade(vec![trade(5, 4)].into())]),
+        ];
+
+        let parts = merged_parts(quote_sources, trade_sources);
+
+        assert_eq!(
+            parts,
+            [
+                ("quotes", vec![(5, 1), (5, 2)]),
+                ("trades", vec![(5, 3), (5, 4)]),
+                ("quotes", vec![(6, 1)]),
+                ("trades", vec![]),
+            ]
+        );
+    }
+
+    #[rstest]
+    fn test_merged_answer_leaves_out_a_leg_empty_in_its_window() {
+        let window = (Some(UnixNanos::from(10)), Some(UnixNanos::from(20)));
+        let rows = |rows: Vec<QuoteTick>| vec![DataBatch::Quote(rows.into())];
+        let outside = rows(vec![quote(5, 1), quote(25, 1)]);
+        let inside = rows(vec![quote(9, 2), quote(10, 2), quote(20, 2), quote(21, 2)]);
+        let mut quote_sources = leg_sources(outside, window.0, window.1).unwrap();
+        quote_sources.extend(leg_sources(inside, window.0, window.1).unwrap());
+        let trades = vec![DataBatch::Trade(vec![trade(15, 3)].into())];
+        let trade_sources = leg_sources(trades, window.0, window.1).unwrap();
+
+        let parts = merged_parts(quote_sources, trade_sources);
+
+        assert_eq!(
+            parts,
+            [
+                ("quotes", vec![(10, 2)]),
+                ("trades", vec![(15, 3)]),
+                ("quotes", vec![(20, 2)]),
+                ("trades", vec![]),
+            ]
+        );
+    }
+
+    #[rstest]
+    fn test_window_source_skips_a_chunk_empty_in_its_window_and_completes() {
+        let page =
+            |stamps: [u64; 2]| DataBatch::Quote(stamps.map(|ts| quote(ts, 1)).to_vec().into());
+        let pages = vec![page([1, 2]), page([3, 4]), page([5, 6]), page([7, 8])];
+        let (start, end) = (Some(UnixNanos::from(4)), Some(UnixNanos::from(5)));
+        let mut source = WindowSource::new(chunks(pages), start, end).unwrap();
+
+        let mut stamps = Vec::new();
+        while let ReplayPoll::Ready(ReplayBatch::Typed(chunk)) = source.poll_batch().unwrap() {
+            let chunk = (0..chunk.len()).filter_map(|index| chunk.get(index));
+            stamps.push(chunk.map(|row| row.ts_init().as_u64()).collect::<Vec<_>>());
+        }
+
+        assert_eq!(stamps, [vec![4], vec![5]]);
+        assert!(matches!(source.poll_batch(), Ok(ReplayPoll::Complete)));
+    }
+
+    #[rstest]
+    fn test_window_source_passes_a_chunk_error_on_unchanged() {
+        let failing = || {
+            let page = DataBatch::Quote(vec![quote(1, 1)].into());
+            [Ok(page), Err(anyhow::anyhow!("page 2 cannot be decoded"))].into_iter()
+        };
+
+        let mut source = WindowSource::new(failing(), None, None).unwrap();
+        assert!(matches!(source.poll_batch(), Ok(ReplayPoll::Ready(_))));
+        let error = source.poll_batch().unwrap_err();
+        assert_eq!(error.to_string(), "page 2 cannot be decoded");
+
+        // Read before a row in the window, the error fails the source as it is made
+        let outside = Some(UnixNanos::from(2));
+        let error = WindowSource::new(failing(), outside, None).err().unwrap();
+        assert_eq!(error.to_string(), "page 2 cannot be decoded");
     }
 
     #[rstest]
