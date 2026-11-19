@@ -872,6 +872,30 @@ mod tests {
     }
 
     #[rstest]
+    fn test_merged_answer_leaves_out_a_leg_empty_in_its_window() {
+        let window = (Some(UnixNanos::from(10)), Some(UnixNanos::from(20)));
+        let rows = |rows: Vec<QuoteTick>| vec![DataBatch::Quote(rows.into())];
+        let outside = rows(vec![quote(5, 1), quote(25, 1)]);
+        let inside = rows(vec![quote(9, 2), quote(10, 2), quote(20, 2), quote(21, 2)]);
+        let mut quote_sources = leg_sources(outside, window.0, window.1).unwrap();
+        quote_sources.extend(leg_sources(inside, window.0, window.1).unwrap());
+        let trades = vec![DataBatch::Trade(vec![trade(15, 3)].into())];
+        let trade_sources = leg_sources(trades, window.0, window.1).unwrap();
+
+        let parts = merged_parts(quote_sources, trade_sources);
+
+        assert_eq!(
+            parts,
+            [
+                ("quotes", vec![(10, 2)]),
+                ("trades", vec![(15, 3)]),
+                ("quotes", vec![(20, 2)]),
+                ("trades", vec![]),
+            ]
+        );
+    }
+
+    #[rstest]
     fn test_window_source_skips_a_chunk_empty_in_its_window_and_completes() {
         let page =
             |stamps: [u64; 2]| DataBatch::Quote(stamps.map(|ts| quote(ts, 1)).to_vec().into());
