@@ -77,6 +77,7 @@ class Consumer(DataActor):
         super().__init__()
         self.instruments = []
         self.quotes = []
+        self.quote_received = asyncio.Event()
 
     def on_start(self) -> None:
         """
@@ -96,6 +97,7 @@ class Consumer(DataActor):
         Record sampled quotes.
         """
         self.quotes.append(quote)
+        self.quote_received.set()
 
 
 def test_discovery_replay_subscriptions_and_fresh_node_restart() -> None:  # noqa: C901 - One selection crosses both node lifecycles
@@ -151,6 +153,7 @@ def test_discovery_replay_subscriptions_and_fresh_node_restart() -> None:  # noq
             "min_request_interval_ms": 1,
             "max_retries": 0,
         }
+
         client = FinFeedHttpClient(FinFeedDataClientConfig(attempt_budget=2, **controls))
         try:
             instrument = await discovery["discover"](client)
@@ -169,6 +172,7 @@ def test_discovery_replay_subscriptions_and_fresh_node_restart() -> None:  # noq
                 attempt_budget=5,
                 **controls,
             )
+
             node = (
                 LiveNode.builder("FINFEED-NODE", TraderId("TESTER-001"), Environment.LIVE)
                 .with_reconciliation(False)
@@ -184,6 +188,7 @@ def test_discovery_replay_subscriptions_and_fresh_node_restart() -> None:  # noq
             node.add_actor(consumer)
             node.add_actor(historical)
             handle = node.handle()
+            cache = node.cache
             task = asyncio.create_task(node.run_async())
 
             try:
@@ -191,21 +196,19 @@ def test_discovery_replay_subscriptions_and_fresh_node_restart() -> None:  # noq
                     async with asyncio.timeout(10):
                         await historical.received.wait()
 
-                        while not consumer.instruments or not consumer.quotes:
-                            await asyncio.sleep(0.01)
+                        await consumer.quote_received.wait()
+                        quotes = cache.quotes(instrument.id)
                 finally:
                     handle.stop()
                     await asyncio.wait_for(task, timeout=10)
 
-                quotes = node.cache.quotes(instrument.id)
-                await asyncio.sleep(0.05)
                 results.append(
                     (
                         handle.state,
                         consumer,
                         historical,
                         quotes,
-                        node.cache.quotes(instrument.id),
+                        cache.quotes(instrument.id),
                     ),
                 )
             finally:
@@ -245,6 +248,7 @@ def test_discovery_replay_subscriptions_and_fresh_node_restart() -> None:  # noq
             "/v1/markets/POLYMARKET/active?limit=3&page=1",
             f"/v1/markets/POLYMARKET/{MARKET_ID}",
         ]
+
         expected_paths = [
             "/v1/exchanges",
             f"/v1/markets/POLYMARKET/{MARKET_ID}",
@@ -254,6 +258,7 @@ def test_discovery_replay_subscriptions_and_fresh_node_restart() -> None:  # noq
             "&time_end=2026-10-11T01%3A00%3A00.0000000Z&limit=10000",
             f"/v1/activity/POLYMARKET/{MARKET_ID}/latest?limit=3",
         ]
+
         assert len(paths) == 12
 
         for generation_paths in (paths[2:7], paths[7:]):
@@ -545,6 +550,7 @@ def test_retirement_preserves_shared_internal_bars_until_final_subscriber(pollin
             await asyncio.wait_for(task, timeout=10)
 
     asyncio.run(exercise())
+
     expected = [
         ("0.3100", "2.000002", 1_791_676_802_000_000_000),
         ("0.3200", "4.000004", 1_791_676_802_000_000_000),
@@ -697,6 +703,7 @@ def polling_node() -> Iterator[tuple[LiveNode, Queue, list]]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+
     config = FinFeedDataClientConfig(
         api_key="node-test-key",
         base_url_http=f"http://127.0.0.1:{server.server_port}/v1/",
@@ -707,6 +714,7 @@ def polling_node() -> Iterator[tuple[LiveNode, Queue, list]]:
         attempt_budget=16,
         max_retries=0,
     )
+
     node = (
         LiveNode.builder("FINFEED-POLLING", TraderId("TESTER-001"), Environment.LIVE)
         .with_reconciliation(False)
@@ -764,7 +772,6 @@ def test_failed_instrument_list_refresh_keeps_node_cache_ownership() -> None:
         return json.dumps(market).encode()
 
     replies = Queue()
-
     for status, body in [
         (200, (TEST_DATA / "exchanges.json").read_bytes()),
         (200, definition("alpha_NO", "101")),
@@ -818,6 +825,7 @@ def test_failed_instrument_list_refresh_keeps_node_cache_ownership() -> None:
             min_request_interval_ms=1,
             max_retries=0,
         )
+
         node = (
             LiveNode.builder("FINFEED-REFRESH", TraderId("TESTER-001"), Environment.LIVE)
             .with_reconciliation(False)
@@ -1170,6 +1178,7 @@ def test_historical_books_reach_actor_and_existing_book_consumer(  # noqa: C901 
         asyncio.run(exercise())
         assert handle.state == NodeState.STOPPED
         assert len(set(consumer.ids)) == 3
+
         expected = [
             (
                 {Decimal(".4"): Decimal(2), Decimal(".3"): Decimal(5)},
@@ -1194,8 +1203,10 @@ def test_historical_books_reach_actor_and_existing_book_consumer(  # noqa: C901 
 
         if 8 in tie_rows:
             ordering[2] = ordering[1]
+
         if 9 in tie_rows:
             ordering[3] = ordering[2]
+
         if receive_rows:
             ordering[1] = 1_791_676_802_000_003_000
 
@@ -1205,7 +1216,6 @@ def test_historical_books_reach_actor_and_existing_book_consumer(  # noqa: C901 
             snapshot = RecordFlag.F_SNAPSHOT.matches(group[0].flags)
             assert all(RecordFlag.F_SNAPSHOT.matches(delta.flags) == snapshot for delta in group)
             assert [delta.ts_init for delta in group] == [ordering[index]] * len(group)
-
             if snapshot:
                 assert group[0].action == BookAction.CLEAR
                 assert all(delta.action == BookAction.ADD for delta in group[1:])
@@ -1399,6 +1409,7 @@ def test_historical_book_example_uses_bounded_controls(monkeypatch) -> None:
     monkeypatch.setitem(example["main"].__globals__, "FinFeedDataClientConfig", capture_config)
     with pytest.raises(RuntimeError, match="Configuration captured before node construction"):
         asyncio.run(example["main"]())
+
     expected_controls = {
         "attempt_budget": 3,
         "http_timeout_secs": 60,
@@ -1409,6 +1420,7 @@ def test_historical_book_example_uses_bounded_controls(monkeypatch) -> None:
         "max_retries": 0,
         "connect_timeout_secs": 45,
     }
+
     assert len(configs) == 1
     assert {name: getattr(configs[0], name) for name in expected_controls} == expected_controls
     assert [(item.exchange_id, item.market_ids) for item in configs[0].instruments] == [

@@ -653,15 +653,13 @@ fn parse_multiplier(value: Option<f64>) -> Option<Quantity> {
 /// If `value` is `None`, then defaults to the UNIX epoch (0 nanoseconds).
 /// Timestamps before UNIX epoch (negative values) default to 0.
 fn parse_datetime_to_unix_nanos(value: Option<Timestamp>) -> UnixNanos {
-    value
-        .map(|dt| match u64::try_from(dt.as_nanosecond()) {
-            Ok(nanos) => UnixNanos::from(nanos),
-            Err(_) => {
-                log::warn!("Timestamp {dt} is outside the UnixNanos range, defaulting to 0");
-                UnixNanos::default()
-            }
-        })
-        .unwrap_or_default()
+    value.map_or_default(|dt| match u64::try_from(dt.as_nanosecond()) {
+        Ok(nanos) => UnixNanos::from(nanos),
+        Err(_) => {
+            log::warn!("Timestamp {dt} is outside the UnixNanos range, defaulting to 0");
+            UnixNanos::default()
+        }
+    })
 }
 
 /// Parses the settlement currency for the given Tardis instrument definition.
@@ -680,11 +678,15 @@ pub fn parse_settlement_currency(info: &TardisInstrumentInfo, is_inverse: bool) 
 
 #[cfg(test)]
 mod tests {
-    use nautilus_model::{identifiers::InstrumentId, instruments::Instrument};
+    use nautilus_model::{
+        enums::{ExerciseStyle, OptionKind, SettlementType},
+        identifiers::InstrumentId,
+        instruments::Instrument,
+    };
     use rstest::rstest;
 
     use super::*;
-    use crate::common::testing::load_test_json;
+    use crate::common::{enums::TardisExchange, testing::load_test_json};
 
     #[rstest]
     fn test_parse_instrument_spot() {
@@ -908,6 +910,26 @@ mod tests {
         assert_eq!(instrument.max_quantity(), None);
         assert_eq!(instrument.min_notional(), None);
         assert_eq!(instrument.max_notional(), None);
+    }
+
+    #[rstest]
+    fn test_parse_instrument_option_sets_terms_from_exchange() {
+        let json_data = load_test_json("instrument_option.json");
+        let mut info: TardisInstrumentInfo = serde_json::from_str(&json_data).unwrap();
+        info.exchange = TardisExchange::OkexOptions;
+
+        let instrument = parse_instrument_any(&info, None, Some(UnixNanos::default()), false)
+            .first()
+            .unwrap()
+            .clone();
+
+        let InstrumentAny::CryptoOption(option) = instrument else {
+            panic!("Expected CryptoOption, was {instrument:?}");
+        };
+
+        assert_eq!(option.option_kind, OptionKind::Put);
+        assert_eq!(option.exercise_style, Some(ExerciseStyle::European));
+        assert_eq!(option.settlement_type, Some(SettlementType::Cash));
     }
 
     #[rstest]

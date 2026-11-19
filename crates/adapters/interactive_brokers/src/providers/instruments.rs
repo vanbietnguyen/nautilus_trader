@@ -162,7 +162,8 @@ impl InteractiveBrokersInstrumentProvider {
         config.validate()?;
 
         let symbology = Symbology::new(config.symbology_method)
-            .with_futures_year_digits(config.futures_year_digits);
+            .with_futures_year_digits(config.futures_year_digits)
+            .with_share_class_space(config.share_class_space);
 
         Ok(Self {
             config,
@@ -174,38 +175,6 @@ impl InteractiveBrokersInstrumentProvider {
             price_magnifiers: Arc::new(DashMap::new()),
             startup_initialized: Arc::new(tokio::sync::Mutex::new(false)),
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn insert_test_instrument(
-        &self,
-        instrument: InstrumentAny,
-        contract_id: i32,
-        price_magnifier: i32,
-    ) {
-        let instrument_id = instrument.id();
-        self.instruments.insert(instrument_id, instrument);
-        self.contract_id_to_instrument_id
-            .insert(contract_id, instrument_id);
-        self.contracts.insert(
-            instrument_id,
-            Contract {
-                contract_id,
-                ..Default::default()
-            },
-        );
-
-        self.price_magnifiers.insert(instrument_id, price_magnifier);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn insert_test_contract_id_mapping(
-        &self,
-        contract_id: i32,
-        instrument_id: InstrumentId,
-    ) {
-        self.contract_id_to_instrument_id
-            .insert(contract_id, instrument_id);
     }
 
     /// Initialize the provider by loading cache if configured.
@@ -1680,7 +1649,7 @@ impl InteractiveBrokersInstrumentProvider {
             .instrument_id_from_contract(&details.contract, resolved_venue)
             .context("Failed to convert IB contract to instrument ID")?;
 
-        let instrument = match parse_ib_contract_to_instrument(details, instrument_id) {
+        let instrument = match self.parse_contract_detail(details, instrument_id) {
             Ok(instrument) => instrument,
             Err(e) => {
                 tracing::warn!(
@@ -2372,9 +2341,9 @@ impl InteractiveBrokersInstrumentProvider {
                         .context("Failed to convert leg contract to instrument ID")?;
 
                     // Parse and cache the leg instrument
-                    let leg_instrument =
-                        parse_ib_contract_to_instrument(leg_details, leg_instrument_id)
-                            .context("Failed to parse leg instrument")?;
+                    let leg_instrument = self
+                        .parse_contract_detail(leg_details, leg_instrument_id)
+                        .context("Failed to parse leg instrument")?;
 
                     self.instruments.insert(leg_instrument_id, leg_instrument);
                     self.contract_details
@@ -2679,6 +2648,22 @@ impl InteractiveBrokersInstrumentProvider {
         );
         Ok(true)
     }
+
+    fn parse_contract_detail(
+        &self,
+        details: &ibapi::contracts::ContractDetails,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<InstrumentAny> {
+        let mut instrument = parse_ib_contract_to_instrument(details, instrument_id)?;
+        if let InstrumentAny::OptionContract(option) = &mut instrument
+            && details.under_contract_id != 0
+        {
+            option.underlying_instrument_id =
+                self.get_instrument_id_by_contract_id(details.under_contract_id);
+        }
+
+        Ok(instrument)
+    }
 }
 
 #[cfg(test)]
@@ -2701,6 +2686,38 @@ mod tests {
 
     use super::*;
     use crate::common::contract_to_json_value;
+
+    impl InteractiveBrokersInstrumentProvider {
+        pub(crate) fn insert_test_instrument(
+            &self,
+            instrument: InstrumentAny,
+            contract_id: i32,
+            price_magnifier: i32,
+        ) {
+            let instrument_id = instrument.id();
+            self.instruments.insert(instrument_id, instrument);
+            self.contract_id_to_instrument_id
+                .insert(contract_id, instrument_id);
+            self.contracts.insert(
+                instrument_id,
+                Contract {
+                    contract_id,
+                    ..Default::default()
+                },
+            );
+
+            self.price_magnifiers.insert(instrument_id, price_magnifier);
+        }
+
+        pub(crate) fn insert_test_contract_id_mapping(
+            &self,
+            contract_id: i32,
+            instrument_id: InstrumentId,
+        ) {
+            self.contract_id_to_instrument_id
+                .insert(contract_id, instrument_id);
+        }
+    }
 
     struct TestStartupLoader {
         id_calls: AtomicUsize,
@@ -2808,6 +2825,53 @@ mod tests {
 
     fn create_test_instrument(instrument_id: InstrumentId) -> InstrumentAny {
         create_test_instrument_with_info(instrument_id, None)
+    }
+
+    #[rstest]
+    #[case::known_underlying(265_598, true)]
+    #[case::unknown_underlying(265_598, false)]
+    #[case::unset_underlying(0, true)]
+    fn test_option_underlying_uses_contract_id_mapping(
+        #[case] contract_id: i32,
+        #[case] known: bool,
+        #[values(false, true)] cache: bool,
+    ) {
+        let provider = InteractiveBrokersInstrumentProvider::new(Default::default()).unwrap();
+        let underlying_id = InstrumentId::from("AAPL.NASDAQ");
+
+        if known {
+            provider
+                .contract_id_to_instrument_id
+                .insert(contract_id, underlying_id);
+        }
+
+        let mut details = opra_option_contract_details(Contract::default());
+        details.under_contract_id = contract_id;
+        let option_id = provider
+            .instrument_id_from_contract(&details.contract, Venue::from("OPRA"))
+            .unwrap();
+
+        let instrument = if cache {
+            let cached_id = provider
+                .process_contract_detail(&details, Some(option_id.venue), false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(cached_id, option_id);
+            provider.find(&cached_id).unwrap()
+        } else {
+            provider.parse_contract_detail(&details, option_id).unwrap()
+        };
+
+        let InstrumentAny::OptionContract(option) = instrument else {
+            panic!("expected OptionContract, was {instrument:?}");
+        };
+
+        assert_eq!(
+            option.underlying_instrument_id,
+            (known && contract_id != 0).then_some(underlying_id)
+        );
+        assert_eq!(option.settlement_type, None);
+        assert_eq!(option.id, option_id);
     }
 
     #[rstest]

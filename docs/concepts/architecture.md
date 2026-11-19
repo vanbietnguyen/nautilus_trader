@@ -207,9 +207,8 @@ sequenceDiagram
 :::note
 For quotes, trades, and bars, the engine attempts cache insertion before publication:
 
-- A synchronous persistence or enqueue error prevents the in-memory insertion, but the engine logs the error
-  and still publishes the value. A published quote can thus be absent from the cache after a synchronous
-  insertion failure.
+- A synchronous persistence or enqueue error is logged without preventing the in-memory insertion or
+  publication. See the [cache persistence failure policy](cache.md#persistence-failure-policy).
 - Built-in database backings perform the actual write asynchronously, so a later database error does not roll
   back the cache insertion.
 
@@ -573,8 +572,8 @@ implementation.
 
 ### Infrastructure and runtimes
 
-- `network` and `cryptography`: Networking clients, transport support, signing, and cryptographic
-  providers.
+- `network` and `cryptography`: Networking clients, transport support, TLS configuration,
+  and cryptographic providers.
 - `infrastructure`, `persistence`, and `event_store`: Database backings, data catalogs, object
   storage, and event-store integration.
 - `system`: The kernel shared by backtest, sandbox, and live

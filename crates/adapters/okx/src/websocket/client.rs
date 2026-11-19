@@ -83,9 +83,10 @@ use super::{
 };
 use crate::common::{
     consts::{
-        OKX_NAUTILUS_BROKER_ID, OKX_SUPPORTED_ORDER_TYPES, OKX_SUPPORTED_TIME_IN_FORCE,
-        OKX_WS_PUBLIC_URL, OKX_WS_TOPIC_DELIMITER, okx_market_target_currency,
-        okx_reduce_only_wire_value, select_book_channel, spot_trade_quote_ccy_wire_value,
+        OKX_NAUTILUS_BROKER_ID, OKX_SUPPORTED_ORDER_TYPES, OKX_WS_PUBLIC_URL,
+        OKX_WS_TOPIC_DELIMITER, okx_market_target_currency, okx_reduce_only_wire_value,
+        select_book_channel, spot_trade_quote_ccy_wire_value, validate_order_time_in_force,
+        validate_regular_order_params,
     },
     credential::Credential,
     enums::{
@@ -244,6 +245,7 @@ pub struct OKXWebSocketClient {
     inst_id_code_cache: Arc<AtomicMap<Ustr, u64>>,
     trade_quote_ccy_lists: Arc<AtomicMap<Ustr, Vec<Ustr>>>,
     spot_trade_quote_ccy: Arc<Mutex<Option<Ustr>>>,
+    order_request_ttl_ms: Option<u64>,
     pub(crate) pending_orders: Arc<DashMap<String, PendingOrderInfo>>,
     pub(crate) pending_cancels: Arc<DashMap<String, PendingOrderInfo>>,
     pub(crate) pending_amends: Arc<DashMap<String, PendingOrderInfo>>,
@@ -375,6 +377,7 @@ impl OKXWebSocketClient {
             inst_id_code_cache: Arc::new(AtomicMap::new()),
             trade_quote_ccy_lists: Arc::new(AtomicMap::new()),
             spot_trade_quote_ccy: Arc::new(Mutex::new(None)),
+            order_request_ttl_ms: None,
             pending_orders: Arc::new(DashMap::new()),
             pending_cancels: Arc::new(DashMap::new()),
             pending_amends: Arc::new(DashMap::new()),
@@ -394,6 +397,22 @@ impl OKXWebSocketClient {
     pub fn with_socket_control(mut self, control: SocketControl) -> Self {
         self.socket_control = Some(Arc::new(control));
         self
+    }
+
+    /// Sets the TTL used to derive `expTime` on place and amend requests.
+    ///
+    /// Each request carries `expTime = now + ttl_ms`, computed when the request is built.
+    /// OKX does not process the request if its server time is past `expTime`. `None` omits
+    /// `expTime`.
+    #[must_use]
+    pub fn with_order_request_ttl_ms(mut self, ttl_ms: Option<u64>) -> Self {
+        self.order_request_ttl_ms = ttl_ms;
+        self
+    }
+
+    fn order_request_exp_time(&self) -> Option<String> {
+        self.order_request_ttl_ms
+            .map(|ttl_ms| self.clock.get_time_ms().saturating_add(ttl_ms).to_string())
     }
 
     /// Creates a new [`OKXWebSocketClient`] instance.
@@ -1454,8 +1473,9 @@ impl OKXWebSocketClient {
 
     /// Subscribes to trade data for an instrument.
     ///
-    /// When `aggregated` is `false`, subscribes to the `trades` channel (per-match updates).
-    /// When `aggregated` is `true`, subscribes to the `trades-all` channel (aggregated updates).
+    /// When `aggregated` is `false`, subscribes to the `trades` channel, where one update can
+    /// aggregate several trades. When `aggregated` is `true`, subscribes to the `trades-all`
+    /// channel, where each update carries one trade.
     ///
     /// # Errors
     ///
@@ -2293,7 +2313,7 @@ impl OKXWebSocketClient {
         let request = OKXWsRequest::<Value> {
             id: Some(request_id.clone()),
             op: super::enums::OKXWsOperation::BatchOrders,
-            exp_time: None,
+            exp_time: self.order_request_exp_time(),
             args,
         };
 
@@ -2368,7 +2388,7 @@ impl OKXWebSocketClient {
         let request = OKXWsRequest::<Value> {
             id: Some(request_id.clone()),
             op: super::enums::OKXWsOperation::BatchAmendOrders,
-            exp_time: None,
+            exp_time: self.order_request_exp_time(),
             args,
         };
 
@@ -2432,13 +2452,7 @@ impl OKXWebSocketClient {
             )));
         }
 
-        if let Some(tif) = time_in_force
-            && !OKX_SUPPORTED_TIME_IN_FORCE.contains(&tif)
-        {
-            return Err(OKXWsError::ClientError(format!(
-                "Unsupported time in force: {tif:?}",
-            )));
-        }
+        validate_order_time_in_force(time_in_force).map_err(OKXWsError::ClientError)?;
 
         let mut builder = WsPostOrderParamsBuilder::default();
 
@@ -2539,11 +2553,15 @@ impl OKXWebSocketClient {
         // OKX implements FOK/IOC as order types rather than separate time-in-force
         // Market + FOK is unsupported (FOK requires a limit price)
         // optimal_limit_ioc is only supported for SWAP/FUTURES, not SPOT or OPTION
-        if rpi && order_type != OrderType::Limit {
-            return Err(OKXWsError::ClientError(
-                "OKX RPI orders require a limit order".to_string(),
-            ));
-        }
+        validate_regular_order_params(
+            instrument_type,
+            order_type,
+            time_in_force,
+            post_only.unwrap_or(false),
+            rpi,
+            outcome.as_deref(),
+        )
+        .map_err(OKXWsError::ClientError)?;
 
         let (okx_ord_type, price) = if rpi {
             (OKXOrderType::Rpi, price)
@@ -2551,11 +2569,6 @@ impl OKXWebSocketClient {
             (OKXOrderType::PostOnly, price)
         } else if let Some(tif) = time_in_force {
             match (order_type, tif) {
-                (OrderType::Market, TimeInForce::Fok) => {
-                    return Err(OKXWsError::ClientError(
-                        "Market orders with FOK time-in-force are not supported by OKX. Use Limit order with FOK instead.".to_string()
-                    ));
-                }
                 (OrderType::Market, TimeInForce::Ioc) => {
                     // optimal_limit_ioc only works for SWAP/FUTURES
                     if matches!(
@@ -2567,14 +2580,7 @@ impl OKXWebSocketClient {
                         (OKXOrderType::OptimalLimitIoc, price)
                     }
                 }
-                (OrderType::Limit, TimeInForce::Fok) => {
-                    // OKX uses op_fok for options FOK orders
-                    if instrument_type == OKXInstrumentType::Option {
-                        (OKXOrderType::OpFok, price)
-                    } else {
-                        (OKXOrderType::Fok, price)
-                    }
-                }
+                (OrderType::Limit, TimeInForce::Fok) => (OKXOrderType::Fok, price),
                 (OrderType::Limit, TimeInForce::Ioc) => (OKXOrderType::Ioc, price),
                 _ => (OKXOrderType::from(order_type), price),
             }
@@ -2585,12 +2591,6 @@ impl OKXWebSocketClient {
         log::debug!(
             "Order type mapping: order_type={order_type:?}, time_in_force={time_in_force:?}, post_only={post_only:?} -> okx_ord_type={okx_ord_type:?}"
         );
-
-        if instrument_type == OKXInstrumentType::Events && outcome.is_none() {
-            return Err(OKXWsError::ClientError(
-                "OKX event contract orders require `outcome`".to_string(),
-            ));
-        }
 
         if let Some(outcome) = outcome {
             builder.outcome(outcome);
@@ -2638,7 +2638,7 @@ impl OKXWebSocketClient {
         let request = OKXWsRequest {
             id: Some(request_id.clone()),
             op: super::enums::OKXWsOperation::Order,
-            exp_time: None,
+            exp_time: self.order_request_exp_time(),
             args: vec![params],
         };
 
@@ -2793,7 +2793,7 @@ impl OKXWebSocketClient {
         let request = OKXWsRequest {
             id: Some(request_id.clone()),
             op: super::enums::OKXWsOperation::AmendOrder,
-            exp_time: None,
+            exp_time: self.order_request_exp_time(),
             args: vec![params],
         };
 
@@ -3633,7 +3633,7 @@ mod tests {
         },
         websocket::{
             handler::is_post_only_auto_cancel,
-            messages::{OKXOrderMsg, OKXWebSocketError, OKXWsFrame},
+            messages::{OKXOrderMsg, OKXWsFrame},
         },
     };
 
@@ -3672,6 +3672,15 @@ mod tests {
         let now = UnixNanos::new(1_700_000_000_999_999_999);
 
         assert_eq!(authentication_timestamp(now), "1700000000");
+    }
+
+    #[rstest]
+    #[case(None, None)]
+    #[case(Some(u64::MAX), Some(u64::MAX.to_string()))]
+    fn test_order_request_exp_time(#[case] ttl_ms: Option<u64>, #[case] expected: Option<String>) {
+        let client = OKXWebSocketClient::default().with_order_request_ttl_ms(ttl_ms);
+
+        assert_eq!(client.order_request_exp_time(), expected);
     }
 
     #[rstest]
@@ -4053,69 +4062,6 @@ mod tests {
             "Cannot connect while previous WebSocket handler task is still running"
         );
         assert!(!client.has_task());
-    }
-
-    #[rstest]
-    fn test_websocket_error_handling() {
-        let clock = get_atomic_clock_realtime();
-        let ts = clock.get_time_ns().as_u64();
-
-        let error = OKXWebSocketError {
-            code: "60012".to_string(),
-            message: "Invalid request".to_string(),
-            conn_id: None,
-            timestamp: ts,
-        };
-
-        assert_eq!(error.code, "60012");
-        assert_eq!(error.message, "Invalid request");
-        assert_eq!(error.timestamp, ts);
-
-        let nautilus_msg = OKXWsMessage::Error(error);
-        match nautilus_msg {
-            OKXWsMessage::Error(e) => {
-                assert_eq!(e.code, "60012");
-                assert_eq!(e.message, "Invalid request");
-            }
-            _ => panic!("Expected Error variant"),
-        }
-    }
-
-    #[rstest]
-    fn test_websocket_error_scenarios() {
-        let clock = get_atomic_clock_realtime();
-        let ts = clock.get_time_ns().as_u64();
-
-        let error_scenarios = vec![
-            ("60012", "Invalid request", None),
-            ("60009", "Invalid API key", Some("conn-123".to_string())),
-            ("60014", "Too many requests", None),
-            ("50001", "Order not found", None),
-        ];
-
-        for (code, message, conn_id) in error_scenarios {
-            let error = OKXWebSocketError {
-                code: code.to_string(),
-                message: message.to_string(),
-                conn_id: conn_id.clone(),
-                timestamp: ts,
-            };
-
-            assert_eq!(error.code, code);
-            assert_eq!(error.message, message);
-            assert_eq!(error.conn_id, conn_id);
-            assert_eq!(error.timestamp, ts);
-
-            let nautilus_msg = OKXWsMessage::Error(error);
-            match nautilus_msg {
-                OKXWsMessage::Error(e) => {
-                    assert_eq!(e.code, code);
-                    assert_eq!(e.message, message);
-                    assert_eq!(e.conn_id, conn_id);
-                }
-                _ => panic!("Expected Error variant"),
-            }
-        }
     }
 
     #[rstest]
@@ -4511,119 +4457,5 @@ mod tests {
         msg.ord_type = OKXOrderType::PostOnly;
 
         assert!(!is_post_only_auto_cancel(&msg));
-    }
-
-    #[tokio::test]
-    async fn test_batch_cancel_orders_with_multiple_orders() {
-        use nautilus_model::identifiers::{ClientOrderId, InstrumentId, VenueOrderId};
-
-        let client = OKXWebSocketClient::new(
-            Some("wss://test.okx.com".to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            TransportBackend::default(),
-            None,
-        )
-        .expect("Failed to create client");
-
-        let instrument_id = InstrumentId::from("BTC-USDT.OKX");
-        let client_order_id1 = ClientOrderId::new("order1");
-        let client_order_id2 = ClientOrderId::new("order2");
-        let venue_order_id1 = VenueOrderId::new("venue1");
-        let venue_order_id2 = VenueOrderId::new("venue2");
-
-        let orders = vec![
-            (instrument_id, Some(client_order_id1), Some(venue_order_id1)),
-            (instrument_id, Some(client_order_id2), Some(venue_order_id2)),
-        ];
-
-        let result = client.batch_cancel_orders(orders).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_batch_cancel_orders_with_only_client_order_id() {
-        use nautilus_model::identifiers::{ClientOrderId, InstrumentId};
-
-        let client = OKXWebSocketClient::new(
-            Some("wss://test.okx.com".to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            TransportBackend::default(),
-            None,
-        )
-        .expect("Failed to create client");
-
-        let instrument_id = InstrumentId::from("BTC-USDT.OKX");
-        let client_order_id = ClientOrderId::new("order1");
-
-        let orders = vec![(instrument_id, Some(client_order_id), None)];
-
-        let result = client.batch_cancel_orders(orders).await;
-
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_batch_cancel_orders_with_only_venue_order_id() {
-        use nautilus_model::identifiers::{InstrumentId, VenueOrderId};
-
-        let client = OKXWebSocketClient::new(
-            Some("wss://test.okx.com".to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            TransportBackend::default(),
-            None,
-        )
-        .expect("Failed to create client");
-
-        let instrument_id = InstrumentId::from("BTC-USDT.OKX");
-        let venue_order_id = VenueOrderId::new("venue1");
-
-        let orders = vec![(instrument_id, None, Some(venue_order_id))];
-
-        let result = client.batch_cancel_orders(orders).await;
-
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_batch_cancel_orders_with_both_ids() {
-        use nautilus_model::identifiers::{ClientOrderId, InstrumentId, VenueOrderId};
-
-        let client = OKXWebSocketClient::new(
-            Some("wss://test.okx.com".to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            TransportBackend::default(),
-            None,
-        )
-        .expect("Failed to create client");
-
-        let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
-        let client_order_id = ClientOrderId::new("order1");
-        let venue_order_id = VenueOrderId::new("venue1");
-
-        let orders = vec![(instrument_id, Some(client_order_id), Some(venue_order_id))];
-
-        let result = client.batch_cancel_orders(orders).await;
-
-        assert!(result.is_err());
     }
 }

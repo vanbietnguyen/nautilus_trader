@@ -373,7 +373,6 @@ coinapi nautilus_coinapi::python::coinapi
 coinbase nautilus_coinbase::python::coinbase
 common nautilus_common::python::common
 core nautilus_core::python::core
-cryptography nautilus_cryptography::python::cryptography
 data nautilus_data::python::data
 databento nautilus_databento::python::databento
 deribit nautilus_deribit::python::deribit
@@ -385,6 +384,7 @@ hyperliquid nautilus_hyperliquid::python::hyperliquid
 indicators nautilus_indicators::python::indicators
 infrastructure nautilus_infrastructure::python::infrastructure
 interactive_brokers nautilus_interactive_brokers::python::interactive_brokers
+kalshi nautilus_kalshi::python::kalshi
 kraken nautilus_kraken::python::kraken
 lighter nautilus_lighter::python::lighter
 live nautilus_live::python::live

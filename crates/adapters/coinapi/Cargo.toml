@@ -34,6 +34,7 @@ python = [
   "nautilus-network/python",
   "nautilus-system/python",
   "pyo3",
+  "dep:pyo3-async-runtimes",
   "pyo3-stub-gen",
 ]
 simulation = [
@@ -49,8 +50,6 @@ cargo-fuzz = true
 
 [package.metadata.cargo-machete]
 ignored = [
-  "axum", # Used by the shared book stress tests the harness includes by path
-  "nautilus-system", # Optional dep activated only via the python feature
   "rust_decimal_macros", # Used by the shared book stress tests the harness includes by path
 ]
 
@@ -87,9 +86,12 @@ tokio-util = { workspace = true }
 url = { workspace = true }
 ustr = { workspace = true }
 
-madsim = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
+pyo3-async-runtimes = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
+
+[target.'cfg(madsim)'.dependencies]
+madsim = { workspace = true, optional = true }
 
 [dev-dependencies]
 nautilus-live = { workspace = true, features = ["test-support"] }
@@ -104,6 +106,7 @@ futures-util = { workspace = true }
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { workspace = true }
 
 [[bench]]

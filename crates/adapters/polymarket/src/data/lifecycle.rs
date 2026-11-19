@@ -293,6 +293,7 @@ impl PolymarketDataClient {
                             &selection.condition_ids,
                             ResolveBatchErrorMode::Continue,
                             false,
+                            true,
                         )
                         .await;
                     }
@@ -1002,7 +1003,11 @@ mod tests {
         client
             .subscriptions
             .book_sync
-            .request_recovery(instrument_id, Instant::now());
+            .request_recovery_if_subscribed(
+                &client.subscriptions.active_delta_subs,
+                instrument_id,
+                Instant::now(),
+            );
         client
             .subscriptions
             .pending_auto_loads
@@ -1053,7 +1058,11 @@ mod tests {
         client
             .subscriptions
             .book_sync
-            .request_recovery(instrument_id, Instant::now());
+            .request_recovery_if_subscribed(
+                &client.subscriptions.active_delta_subs,
+                instrument_id,
+                Instant::now(),
+            );
         client
             .subscriptions
             .pending_auto_loads

@@ -149,7 +149,13 @@ class OKXExecutionClientConfig:
     @property
     def spot_trade_quote_ccy(self) -> str | None: ...
     @property
+    def use_spot_position_reports(self) -> bool: ...
+    @property
+    def spot_positions_quote_currency(self) -> str: ...
+    @property
     def max_reconciliation_history_pages(self) -> int | None: ...
+    @property
+    def order_request_ttl_ms(self) -> int | None: ...
     def __init__(
         self,
         account_id: model.AccountId,
@@ -177,6 +183,9 @@ class OKXExecutionClientConfig:
         instrument_families: typing.Sequence[str] | None = None,
         contract_types: typing.Sequence[OKXContractType] | None = None,
         use_spot_margin: bool = False,
+        order_request_ttl_ms: int | None = None,
+        use_spot_position_reports: bool = False,
+        spot_positions_quote_currency: str | None = None,
     ) -> None: ...
     @property
     def has_proxy_url(self) -> bool: ...

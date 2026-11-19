@@ -18,7 +18,6 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicI64, AtomicUsize, Ordering},
@@ -45,8 +44,10 @@ use nautilus_live::execution::failure::CommandFailure;
 use nautilus_model::{
     data::{Bar, BarType},
     enums::{
-        LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce, TriggerType,
+        AccountType, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
+        TriggerType,
     },
+    events::account::state::BALANCES_SNAPSHOT_COMPLETE_INFO_KEY,
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
@@ -69,8 +70,8 @@ use nautilus_okx::{
         client::{OKXHistoryCoverage, OKXHttpClient, OKXRawHttpClient, OKXResponse},
         error::OKXHttpError,
         models::{
-            OKXAmendOrderRequest, OKXAttachAlgoOrdRequest, OKXCancelOrderRequest,
-            OKXPlaceOrderRequest,
+            OKXAmendOrderRequest, OKXAttachAlgoOrdRequest, OKXCancelAlgoOrderRequest,
+            OKXCancelOrderRequest, OKXCancelSpreadOrderRequest, OKXPlaceOrderRequest,
         },
         query::{
             ActivateFeatureParams, GetAlgoOrdersParamsBuilder,
@@ -87,7 +88,10 @@ use nautilus_testkit::http::assert_http_redirect_rejected;
 use rstest::rstest;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 use ustr::Ustr;
 
 #[derive(Clone, Default)]
@@ -101,6 +105,7 @@ struct TestServerState {
     last_pending_orders_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
     last_order_history_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
     last_order_detail_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
+    order_history_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     mark_price_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     option_summary_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     price_limit_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
@@ -154,14 +159,8 @@ async fn wait_for_server(addr: SocketAddr, path: &str) {
     .await;
 }
 
-fn manifest_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
 fn load_test_data(filename: &str) -> Value {
-    let path = manifest_path().join("test_data").join(filename);
-    let content = std::fs::read_to_string(path).unwrap();
-    serde_json::from_str(&content).unwrap()
+    crate::common::load_test_json(filename)
 }
 
 fn okx_response(data: &[Value]) -> Value {
@@ -840,7 +839,13 @@ fn create_router(state: Arc<TestServerState>) -> Router {
                         }
 
                         *state.last_order_history_query.lock().await = Some(params);
-                        Json(load_test_data("http_get_orders_history.json")).into_response()
+                        let response = state
+                            .order_history_response
+                            .lock()
+                            .await
+                            .clone()
+                            .unwrap_or_else(|| load_test_data("http_get_orders_history.json"));
+                        Json(response).into_response()
                     }
                 },
             ),
@@ -873,7 +878,13 @@ fn create_router(state: Arc<TestServerState>) -> Router {
                         }
 
                         *state.last_order_detail_query.lock().await = Some(params);
-                        Json(load_test_data("http_get_orders_history.json")).into_response()
+                        let response = state
+                            .order_history_response
+                            .lock()
+                            .await
+                            .clone()
+                            .unwrap_or_else(|| load_test_data("http_get_orders_history.json"));
+                        Json(response).into_response()
                     }
                 },
             )
@@ -5225,6 +5236,39 @@ async fn test_http_request_algo_order_status_reports_uses_details_for_exact_look
 
 #[rstest]
 #[tokio::test]
+async fn test_http_request_account_state_marks_complete_balance_snapshot() {
+    let addr = start_test_server(Arc::new(TestServerState::default())).await;
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    let state = client
+        .request_account_state(AccountId::new("OKX-001"), AccountType::Cash)
+        .await
+        .unwrap();
+
+    assert_eq!(state.balances.len(), 1);
+    assert_eq!(
+        state
+            .info
+            .as_ref()
+            .and_then(|info| info.get_bool(BALANCES_SNAPSHOT_COMPLETE_INFO_KEY)),
+        Some(true),
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_http_request_order_status_reports_preserves_attached_tp_sl_child_ids() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
     let base_url = format!("http://{addr}");
@@ -5270,6 +5314,69 @@ async fn test_http_request_order_status_reports_preserves_attached_tp_sl_child_i
         .expect("expected linked child order ids");
     assert!(linked_order_ids.contains(&ClientOrderId::from("O-attached-sl")));
     assert!(linked_order_ids.contains(&ClientOrderId::from("O-attached-tp")));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_order_status_report_paths_map_post_only_cancel_to_rejected() {
+    let state = Arc::new(TestServerState::default());
+    let order = load_test_data("ws_orders_post_only_canceled_first.json")["data"][0].clone();
+    *state.order_history_response.lock().await = Some(okx_response(&[order]));
+    let addr = start_test_server(state.clone()).await;
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    for instrument in load_swap_instruments_any() {
+        client.cache_instrument(instrument);
+    }
+
+    let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
+    let client_order_id = ClientOrderId::from("OPOSTONLYCANCEL001");
+    let reports = client
+        .request_order_status_reports(
+            AccountId::new("OKX-001"),
+            Some(OKXInstrumentType::Swap),
+            Some(instrument_id),
+            None,
+            None,
+            false,
+            Some(50),
+        )
+        .await
+        .unwrap();
+    let detail_query_after_sweep = state.last_order_detail_query.lock().await.clone();
+    let mass_report = reports
+        .into_iter()
+        .find(|report| report.client_order_id == Some(client_order_id))
+        .expect("post-only order must appear in the mass-status sweep");
+    let single_report = client
+        .request_order_status_report(AccountId::new("OKX-001"), instrument_id, client_order_id)
+        .await
+        .unwrap()
+        .expect("post-only order must appear in the single-order query");
+
+    for report in [&mass_report, &single_report] {
+        assert_eq!(report.order_status, OrderStatus::Rejected);
+        assert_eq!(report.filled_qty.as_decimal(), Decimal::ZERO);
+        assert!(report.post_only);
+        assert_eq!(
+            report.cancel_reason.as_deref(),
+            Some("POST_ONLY would take liquidity"),
+        );
+    }
+
+    assert!(detail_query_after_sweep.is_none());
 }
 
 #[rstest]
@@ -5840,6 +5947,79 @@ async fn test_http_place_event_order_requires_outcome(#[case] post_only: bool) {
         other => panic!("Expected outcome validation error, was {other:?}"),
     }
     assert_eq!(*state.last_order_body.lock().await, None);
+}
+
+#[rstest]
+#[case::option("http_get_instruments_option.json", OKXTradeMode::Cross)]
+#[case::spot("http_get_instruments_spot.json", OKXTradeMode::Cash)]
+#[case::swap("http_get_instruments_swap.json", OKXTradeMode::Cross)]
+#[tokio::test]
+async fn test_http_place_limit_fok_order_uses_fok_on_wire(
+    #[case] fixture: &str,
+    #[case] td_mode: OKXTradeMode,
+) {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_test_server(state.clone()).await;
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+    let instruments = load_instruments_from(fixture);
+    let instrument_id = instruments[0].id();
+    client.cache_instruments(&instruments);
+
+    let response = client
+        .place_order_with_domain_types(
+            instrument_id,
+            td_mode,
+            ClientOrderId::from("Ofokwire002"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            Quantity::from("3"),
+            Some(TimeInForce::Fok),
+            Some(Price::from("0.0002")),
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let body = state.last_order_body.lock().await.clone().unwrap();
+    let mut expected = json!({
+        "instId": instrument_id.symbol.as_str(),
+        "tdMode": td_mode,
+        "clOrdId": "Ofokwire002",
+        "tag": OKX_NAUTILUS_BROKER_ID,
+        "side": "buy",
+        "ordType": "fok",
+        "sz": "3",
+        "px": "0.0002",
+    });
+
+    if td_mode == OKXTradeMode::Cross {
+        expected["posSide"] = json!("net");
+    }
+
+    assert_eq!(response.ord_id, Some(Ustr::from("12345")));
+    assert_eq!(body, expected);
 }
 
 #[rstest]
@@ -6961,38 +7141,112 @@ async fn test_amend_algo_order_preserves_ambiguous_first_attempt() {
 }
 
 #[rstest]
+#[case::algo("/api/v5/trade/cancel-algos")]
+#[case::advance_algo("/api/v5/trade/cancel-advance-algos")]
+#[case::spread("/api/v5/sprd/cancel-order")]
+#[case::spread_mass("/api/v5/sprd/mass-cancel")]
+#[tokio::test]
+async fn test_cancel_http_commands_send_once_on_transient_failure(
+    #[case] path: &'static str,
+    #[values(None, Some(429), Some(503))] status: Option<u16>,
+) {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&attempts);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let received = read_post_request(&mut stream).await;
+            let request_line = format!("POST {path} HTTP/1.1\r\n");
+            assert!(received.starts_with(request_line.as_bytes()));
+            counter.fetch_add(1, Ordering::SeqCst);
+
+            if let Some(status) = status {
+                let response = format!(
+                    "HTTP/1.1 {status} Transient failure\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        }
+    });
+
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        2,
+        2,
+        1,
+        1,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    let request = OKXCancelAlgoOrderRequest {
+        inst_id: "BTC-USDT-SWAP".to_string(),
+        inst_id_code: None,
+        algo_id: Some("7003".to_string()),
+        algo_cl_ord_id: None,
+    };
+
+    let error = match path {
+        "/api/v5/trade/cancel-algos" => client.cancel_algo_orders(vec![request]).await.unwrap_err(),
+        "/api/v5/trade/cancel-advance-algos" => client
+            .cancel_advance_algo_orders(vec![request])
+            .await
+            .unwrap_err(),
+        "/api/v5/sprd/cancel-order" => client
+            .cancel_spread_order(OKXCancelSpreadOrderRequest {
+                ord_id: Some("7004".to_string()),
+                cl_ord_id: None,
+            })
+            .await
+            .unwrap_err(),
+        "/api/v5/sprd/mass-cancel" => client
+            .cancel_all_spread_orders(InstrumentId::from("BTC-USDT_BTC-USDT-SWAP.OKX"))
+            .await
+            .unwrap_err(),
+        _ => unreachable!(),
+    };
+
+    server.abort();
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    match (&error, status) {
+        (OKXHttpError::HttpClientError(HttpClientError::TransportError(_)), None) => {}
+        (
+            OKXHttpError::RetryableStatus {
+                status: actual,
+                body,
+                retry_after,
+            },
+            Some(expected),
+        ) => {
+            assert_eq!(actual.as_u16(), expected);
+            assert_eq!(body, "");
+            assert_eq!(*retry_after, None);
+        }
+        _ => panic!("unexpected failure: {error:?}"),
+    }
+
+    assert_eq!(
+        classify_okx_http_failure(&error),
+        CommandFailure::Ambiguous(error.to_string())
+    );
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_place_order_truncated_response_is_ambiguous_transport_failure() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut received = Vec::new();
-        let mut buffer = [0; 4096];
-
-        loop {
-            let count = stream.read(&mut buffer).await.unwrap();
-            assert_ne!(count, 0, "request ended before its declared body");
-            received.extend_from_slice(&buffer[..count]);
-
-            let Some(header_end) = received.windows(4).position(|window| window == b"\r\n\r\n")
-            else {
-                continue;
-            };
-            let headers = std::str::from_utf8(&received[..header_end]).unwrap();
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap();
-
-            if received.len() >= header_end + 4 + content_length {
-                break;
-            }
-        }
+        let received = read_post_request(&mut stream).await;
 
         assert!(received.starts_with(b"POST /api/v5/trade/order HTTP/1.1\r\n"));
         stream
@@ -7051,6 +7305,37 @@ async fn test_place_order_truncated_response_is_ambiguous_transport_failure() {
         classify_okx_http_failure(&error),
         CommandFailure::Ambiguous(_)
     ));
+}
+
+async fn read_post_request(stream: &mut TcpStream) -> Vec<u8> {
+    let mut received = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        let count = stream.read(&mut buffer).await.unwrap();
+        assert_ne!(count, 0, "request ended before its declared body");
+        received.extend_from_slice(&buffer[..count]);
+
+        let Some(header_end) = received.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+
+        let headers = std::str::from_utf8(&received[..header_end]).unwrap();
+
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+
+        if received.len() >= header_end + 4 + content_length {
+            break;
+        }
+    }
+
+    received
 }
 
 #[rstest]
@@ -8379,10 +8664,18 @@ async fn assert_rpi_order_response(mut fixture: Value, reverse: bool) {
             .reverse();
     }
     let response = fixture["response"].clone();
-    let expected_request = fixture["request"].clone();
+    let mut expected_request = fixture["request"].clone();
     let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let captured = requests.clone();
     let op = response["op"].as_str().unwrap();
+    if op == "order" {
+        expected_request["tag"] = json!(OKX_NAUTILUS_BROKER_ID);
+    } else if op == "batch-orders" {
+        for request in expected_request.as_array_mut().unwrap() {
+            request["tag"] = json!(OKX_NAUTILUS_BROKER_ID);
+        }
+    }
+
     let path = match op {
         "batch-amend-orders" => "/api/v5/trade/amend-batch-orders".to_string(),
         _ => format!("/api/v5/trade/{op}"),
@@ -8822,90 +9115,13 @@ async fn test_http_place_algo_order_returns_error_on_nonzero_scode() {
     );
 }
 
-/// Verifies that `request_spot_margin_position_reports` resolves a BTC
-/// margin balance to the highest-priority spot pair, never to a derivative
-/// sharing the same base currency. With BTC-USD, BTC-USDT, and
-/// BTC-USDT-SWAP all cached, the USDT-quoted spot pair must win (quote
-/// priority USDT > USD) and the perpetual must never be selected.
-#[rstest]
-#[tokio::test]
-async fn test_http_request_spot_margin_position_reports_prefers_currency_pair() {
-    // Balance payload with a BTC short margin position (`spotInUseAmt` < 0,
-    // non-zero `liab`). Built from a raw string to stay under the `json!`
-    // macro recursion limit on the `OKXBalanceDetail` shape.
-    let balance_body: serde_json::Value = serde_json::from_str(
-        r#"{
-            "code": "0",
-            "msg": "",
-            "data": [{
-                "adjEq": "",
-                "borrowFroz": "",
-                "imr": "0",
-                "isoEq": "0",
-                "mgnRatio": "",
-                "mmr": "0",
-                "notionalUsd": "0",
-                "notionalUsdForBorrow": "0",
-                "notionalUsdForFutures": "0",
-                "notionalUsdForOption": "0",
-                "notionalUsdForSwap": "0",
-                "ordFroz": "0",
-                "totalEq": "0",
-                "uTime": "1744498994783",
-                "upl": "0",
-                "details": [{
-                    "accAvgPx": "",
-                    "availBal": "0",
-                    "availEq": "0",
-                    "borrowFroz": "",
-                    "cashBal": "0",
-                    "ccy": "BTC",
-                    "clSpotInUseAmt": "",
-                    "collateralEnabled": false,
-                    "crossLiab": "0.1",
-                    "disEq": "0",
-                    "eq": "-0.1",
-                    "eqUsd": "0",
-                    "fixedBal": "0",
-                    "frozenBal": "0",
-                    "imr": "0",
-                    "interest": "",
-                    "isoEq": "0",
-                    "isoLiab": "",
-                    "isoUpl": "0",
-                    "liab": "0.1",
-                    "maxLoan": "",
-                    "maxSpotInUseAmt": "",
-                    "mgnRatio": "",
-                    "mmr": "0",
-                    "notionalLever": "0",
-                    "openAvgPx": "",
-                    "ordFrozen": "0",
-                    "rewardBal": "0",
-                    "smtSyncEq": "0",
-                    "spotBal": "",
-                    "spotCopyTradingEq": "0",
-                    "spotInUseAmt": "-0.1",
-                    "spotIsoBal": "0",
-                    "spotUpl": "",
-                    "spotUplRatio": "",
-                    "stgyEq": "0",
-                    "totalPnl": "",
-                    "totalPnlRatio": "",
-                    "twap": "0",
-                    "uTime": "1744498994783",
-                    "upl": "0",
-                    "uplLiab": ""
-                }]
-            }]
-        }"#,
-    )
-    .expect("balance fixture must parse");
-
+/// Returns a client that reads `balance` and has spot, margin, and swap instruments cached, so
+/// BTC is the base of `BTC-USD`, `BTC-USDT`, and `BTC-USDT-SWAP`.
+async fn create_spot_position_report_client(balance: Value) -> OKXHttpClient {
     let router = Router::new().route(
         "/api/v5/account/balance",
         get(move |headers: HeaderMap| {
-            let body = balance_body.clone();
+            let body = balance.clone();
             async move {
                 if !has_auth_headers(&headers) {
                     return (
@@ -8927,23 +9143,17 @@ async fn test_http_request_spot_margin_position_reports_prefers_currency_pair() 
             .unwrap();
     });
 
-    // No /public/instruments route, so poll an always-404 path to confirm the
-    // server is accepting connections.
     wait_until_async(
-        || {
-            let addr_copy = addr;
-            async move { tokio::net::TcpStream::connect(addr_copy).await.is_ok() }
-        },
+        || async move { tokio::net::TcpStream::connect(addr).await.is_ok() },
         Duration::from_secs(5),
     )
     .await;
 
-    let base_url = format!("http://{addr}");
     let client = OKXHttpClient::with_credentials(
         Some("test_key".to_string()),
         Some("test_secret".to_string()),
         Some("test_passphrase".to_string()),
-        Some(base_url),
+        Some(format!("http://{addr}")),
         60,
         3,
         1000,
@@ -8953,48 +9163,275 @@ async fn test_http_request_spot_margin_position_reports_prefers_currency_pair() 
     )
     .unwrap();
 
-    // Seed three sources that all share BTC as the base currency:
-    //   - `http_get_instruments_spot.json` contributes BTC-USD (CurrencyPair)
-    //   - `http_get_instruments_margin.json` contributes BTC-USDT (also
-    //     parses to CurrencyPair via the Margin → spot path)
-    //   - `http_get_instruments_swap.json` contributes BTC-USDT-SWAP
-    //     (CryptoPerpetual)
-    // The filter must pick BTC-USDT (quote-priority USDT > USD), never the
-    // lexically-earlier BTC-USD and never the BTC-USDT-SWAP derivative.
-    for instrument in load_instruments_any() {
+    for instrument in load_instruments_any()
+        .into_iter()
+        .chain(load_instruments_from("http_get_instruments_margin.json"))
+        .chain(load_swap_instruments_any())
+    {
         client.cache_instrument(instrument);
     }
 
-    for instrument in load_instruments_from("http_get_instruments_margin.json") {
-        client.cache_instrument(instrument);
-    }
+    client
+}
 
-    for instrument in load_swap_instruments_any() {
-        client.cache_instrument(instrument);
+#[rstest]
+#[case::usdt("USDT", vec![("BTC-USDT.OKX", PositionSide::Long, "1.23456789"), ("ETH-USDT.OKX", PositionSide::Short, "2.500000")])]
+#[case::usd(
+    "USD",
+    vec![
+        ("BTC-USD.OKX", PositionSide::Long, "1.23456789"),
+        ("ETH-USD.OKX", PositionSide::Short, "2.500000"),
+        ("USDT-USD.OKX", PositionSide::Long, "5000.0000"),
+    ]
+)]
+#[tokio::test]
+async fn test_http_request_spot_position_reports_bulk(
+    #[case] quote_currency: &str,
+    #[case] expected: Vec<(&str, PositionSide, &str)>,
+) {
+    let client = create_spot_position_report_client(crate::common::balance_response(&[
+        ("BTC", "1.234567899", ""),
+        ("ETH", "-2.5", "2.5"),
+        ("SOL", "-0.0000009", "0.0000009"),
+        ("OKB", "0", "0"),
+        ("USDT", "5000", ""),
+    ]))
+    .await;
+    let account_id = AccountId::new("OKX-001");
+
+    let mut reports = client
+        .request_spot_position_reports(account_id, None, Ustr::from(quote_currency))
+        .await
+        .unwrap();
+    reports.sort_by_key(|report| report.instrument_id.to_string());
+
+    assert_eq!(reports.len(), expected.len());
+
+    for (report, (instrument_id, position_side, quantity)) in reports.iter().zip(expected) {
+        assert_eq!(report.account_id, account_id);
+        assert_eq!(report.instrument_id, InstrumentId::from(instrument_id));
+        assert_eq!(report.position_side, position_side);
+        assert_eq!(report.quantity, Quantity::from(quantity));
+        assert_eq!(
+            report.quantity.precision,
+            Quantity::from(quantity).precision
+        );
+        assert_eq!(report.avg_px_open, None);
+        assert_eq!(report.venue_position_id, None);
     }
+}
+
+#[rstest]
+#[case::long("BTC-USDT.OKX", Some((PositionSide::Long, "1.23456789")))]
+#[case::flat_zero_balance("OKB-USDT.OKX", Some((PositionSide::Flat, "0.000000")))]
+#[case::flat_dust("SOL-USDT.OKX", Some((PositionSide::Flat, "0.000000")))]
+#[case::flat_no_balance_row("ETH-USDT.OKX", Some((PositionSide::Flat, "0.000000")))]
+#[case::other_quote("BTC-USD.OKX", None)]
+#[case::derivative("BTC-USDT-SWAP.OKX", None)]
+#[case::uncached("DOGE-USDT.OKX", None)]
+#[tokio::test]
+async fn test_http_request_spot_position_reports_scoped(
+    #[case] instrument_id: &str,
+    #[case] expected: Option<(PositionSide, &str)>,
+) {
+    let client = create_spot_position_report_client(crate::common::balance_response(&[
+        ("BTC", "1.234567899", ""),
+        ("SOL", "0.0000009", ""),
+        ("OKB", "0", ""),
+    ]))
+    .await;
+    let instrument_id = InstrumentId::from(instrument_id);
 
     let reports = client
-        .request_spot_margin_position_reports(AccountId::new("OKX-001"))
+        .request_spot_position_reports(
+            AccountId::new("OKX-001"),
+            Some(instrument_id),
+            Ustr::from("USDT"),
+        )
         .await
         .unwrap();
 
-    assert_eq!(reports.len(), 1, "expected one BTC margin report");
+    let actual: Vec<_> = reports
+        .iter()
+        .map(|report| (report.instrument_id, report.position_side, report.quantity))
+        .collect();
+    let expected: Vec<_> = expected
+        .into_iter()
+        .map(|(position_side, quantity)| (instrument_id, position_side, Quantity::from(quantity)))
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[rstest]
+#[case::long(&[("BTC", "5", "2")], PositionSide::Long, "5.00000000")]
+#[case::short(&[("BTC", "-3", "3")], PositionSide::Short, "3.00000000")]
+#[case::flat(&[("BTC", "0", "0")], PositionSide::Flat, "0.00000000")]
+#[case::negative_cash(&[("BTC", "-1", "0")], PositionSide::Short, "1.00000000")]
+#[case::negative_cash_with_liab(&[("BTC", "-1", "1")], PositionSide::Short, "1.00000000")]
+#[case::long_round_down(&[("BTC", "1.234567899", "0")], PositionSide::Long, "1.23456789")]
+#[case::short_round_down(&[("BTC", "-1.234567899", "1.234567899")], PositionSide::Short, "1.23456789")]
+#[case::short_dust(&[("BTC", "-0.000000009", "0.000000009")], PositionSide::Flat, "0.00000000")]
+#[case::liability_not_subtracted(&[("BTC", "1.000000001", "0.000000009")], PositionSide::Long, "1.00000000")]
+#[case::aggregate_before_rounding(
+    &[("BTC", "1.000000009", "0"), ("BTC", "0.000000009", "0")],
+    PositionSide::Long,
+    "1.00000001"
+)]
+#[case::aggregate_signed_rows(
+    &[("BTC", "-2", "2"), ("BTC", "0.25", "0")],
+    PositionSide::Short,
+    "1.75000000"
+)]
+#[case::aggregate_exact_carry(
+    &[("BTC", "4.9999999999999999999999999999", "0"), ("BTC", "5.0000000000000000000000000001", "0")],
+    PositionSide::Long,
+    "10.00000000"
+)]
+#[case::aggregate_exact_cancellation(
+    &[("BTC", "4.9999999999999999999999999999", "0"), ("BTC", "-4", "0")],
+    PositionSide::Long,
+    "0.99999999"
+)]
+#[tokio::test]
+async fn test_http_request_spot_position_reports_net_balance(
+    #[case] details: &[(&str, &str, &str)],
+    #[case] position_side: PositionSide,
+    #[case] quantity: &str,
+) {
+    let client = create_spot_position_report_client(crate::common::balance_response(details)).await;
+    let account_id = AccountId::new("OKX-001");
+    let instrument_id = InstrumentId::from("BTC-USDT.OKX");
+
+    let reports = client
+        .request_spot_position_reports(account_id, Some(instrument_id), Ustr::from("USDT"))
+        .await
+        .unwrap();
+
+    assert_eq!(reports.len(), 1);
     let report = &reports[0];
+    assert_eq!(report.account_id, account_id);
+    assert_eq!(report.instrument_id, instrument_id);
+    assert_eq!(report.position_side, position_side);
+    assert_eq!(report.quantity, Quantity::from(quantity));
+    assert_eq!(report.quantity.precision, 8);
+    assert_eq!(report.avg_px_open, None);
+    assert_eq!(report.venue_position_id, None);
+    assert_eq!(report.ts_last, report.ts_init);
+}
+
+#[rstest]
+#[case::invalid_liab(&[("BTC", "1", "x")], "invalid liab 'x' for BTC")]
+#[case::invalid_cash_bal(&[("BTC", "x", "")], "invalid cashBal 'x' for BTC")]
+#[case::empty_cash_bal(&[("BTC", "", "")], "invalid cashBal '' for BTC")]
+#[case::inexact_liab(
+    &[("BTC", "1", "0.00000000000000000000000000001")],
+    "invalid liab '0.00000000000000000000000000001' for BTC"
+)]
+#[case::inexact_cash_bal(
+    &[("BTC", "0.99999999999999999999999999999", "")],
+    "invalid cashBal '0.99999999999999999999999999999' for BTC"
+)]
+#[case::later_row_unreadable(&[("ETH", "2", ""), ("BTC", "1", "x")], "invalid liab 'x' for BTC")]
+#[case::sum_overflow(
+    &[("BTC", "79228162514264337593543950335", "0"), ("BTC", "1", "0")],
+    "net balance overflowed for BTC"
+)]
+#[case::positive_precision_loss(
+    &[("BTC", "4.9999999999999999999999999999", "0"), ("BTC", "5", "0")],
+    "net balance lost precision for BTC"
+)]
+#[case::negative_precision_loss(
+    &[("BTC", "-4.9999999999999999999999999999", "0"), ("BTC", "-5", "0")],
+    "net balance lost precision for BTC"
+)]
+// Final cancellation exposes lost balances instead of a quantity-range failure
+#[case::large_first_precision_loss(
+    &[("BTC", "7922816251426433759354395033", "0"), ("BTC", "0.04", "0"), ("BTC", "-7922816251426433759354395033", "0")],
+    "net balance lost precision for BTC"
+)]
+#[case::small_first_precision_loss(
+    &[("BTC", "0.04", "0"), ("BTC", "7922816251426433759354395033", "0"), ("BTC", "-7922816251426433759354395033", "0")],
+    "net balance lost precision for BTC"
+)]
+#[case::quantity_unrepresentable(&[("BTC", "100000000000000", "0")], "Quantity")]
+#[tokio::test]
+async fn test_http_request_spot_position_reports_fails_closed(
+    #[case] details: &[(&str, &str, &str)],
+    #[case] expected: &str,
+) {
+    let client = create_spot_position_report_client(crate::common::balance_response(details)).await;
+
+    let error = client
+        .request_spot_position_reports(AccountId::new("OKX-001"), None, Ustr::from("USDT"))
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains(expected), "{error}");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_request_spot_position_reports_fails_without_account() {
+    let client = create_spot_position_report_client(okx_response(&[])).await;
+
+    let error = client
+        .request_spot_position_reports(AccountId::new("OKX-001"), None, Ustr::from("USDT"))
+        .await
+        .unwrap_err();
 
     assert_eq!(
-        report.instrument_id,
-        InstrumentId::from("BTC-USDT.OKX"),
-        "spot-margin report must prefer the USDT-quoted pair over USD and never a derivative",
+        error.to_string(),
+        "OKX balance response contained no account"
     );
-    assert_ne!(
-        report.instrument_id,
-        InstrumentId::from("BTC-USDT-SWAP.OKX"),
-        "derivative must never win the base-currency lookup",
-    );
-    assert_ne!(
-        report.instrument_id,
-        InstrumentId::from("BTC-USD.OKX"),
-        "USD must lose to USDT in the quote-priority tiebreaker",
+}
+
+#[rstest]
+#[case::derivative("BTC-USDT-SWAP.OKX")]
+#[case::other_quote("BTC-USD.OKX")]
+#[tokio::test]
+async fn test_http_request_spot_position_reports_skips_balance_without_covered_instrument(
+    #[case] instrument_id: &str,
+) {
+    // A balance read would fail here: the response contains no account
+    let client = create_spot_position_report_client(okx_response(&[])).await;
+
+    let reports = client
+        .request_spot_position_reports(
+            AccountId::new("OKX-001"),
+            Some(InstrumentId::from(instrument_id)),
+            Ustr::from("USDT"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reports, vec![]);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_request_spot_position_reports_ignores_unreported_currencies() {
+    let client = create_spot_position_report_client(crate::common::balance_response(&[
+        ("BTC", "1", ""),
+        ("USDT", "-250", "250"),
+        ("XYZ", "", "x"),
+    ]))
+    .await;
+
+    let reports = client
+        .request_spot_position_reports(AccountId::new("OKX-001"), None, Ustr::from("USDT"))
+        .await
+        .unwrap();
+
+    let actual: Vec<_> = reports
+        .iter()
+        .map(|report| (report.instrument_id, report.quantity))
+        .collect();
+    assert_eq!(
+        actual,
+        vec![(
+            InstrumentId::from("BTC-USDT.OKX"),
+            Quantity::from("1.00000000")
+        )]
     );
 }
 

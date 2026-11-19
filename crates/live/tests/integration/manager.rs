@@ -153,6 +153,7 @@ impl TestContext {
             UnixNanos::default(),
             Some(Currency::USDT()),
         );
+
         let account = AccountAny::Margin(MarginAccount::new(account_state, true));
         cache.borrow_mut().add_account(account).unwrap();
 
@@ -221,6 +222,16 @@ impl TestContext {
             .map(|o| o.clone())
     }
 
+    fn require_authoritative_fills(&self) {
+        let mut client = MockExecutionClient::new(Vec::new());
+        client.requires_authoritative_fills = true;
+        client.oms_type = OmsType::Netting;
+        let mut engine = self.exec_engine.borrow_mut();
+        engine.deregister_client(test_client_id()).unwrap();
+        engine.register_client(Box::new(client)).unwrap();
+        engine.register_oms_type(StrategyId::external(), OmsType::Netting);
+    }
+
     fn add_margin_account(&self, account_id: AccountId) {
         let account_state = AccountState::new(
             account_id,
@@ -237,6 +248,7 @@ impl TestContext {
             UnixNanos::default(),
             Some(Currency::USDT()),
         );
+
         let account = AccountAny::Margin(MarginAccount::new(account_state, true));
         self.cache.borrow_mut().add_account(account).unwrap();
     }
@@ -383,6 +395,7 @@ fn create_mass_status(
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_order_reports(order_reports);
     mass_status.add_fill_reports(fill_reports);
     mass_status
@@ -596,6 +609,7 @@ fn test_position_fill_report_preserves_netting_void_behavior(
         instrument.id(),
         StrategyId::test_default()
     ));
+
     let position =
         create_test_position(&instrument, position_id, OrderSide::Buy, "2.000", "3000.00");
     let mut fill = position.events[0].clone();
@@ -655,6 +669,7 @@ fn test_position_fill_report_preserves_netting_void_behavior(
         fill.ts_init,
         None,
     );
+
     let mut corrected_report = report.clone();
     corrected_report.last_qty = Quantity::from("1.000");
     corrected_report.commission = Money::from("0.25 USDT");
@@ -927,6 +942,7 @@ fn test_observe_fill_report_does_not_mark_fill_processed() {
         UnixNanos::from(2_000_000),
         None, // report_id
     );
+
     let report = ExecutionReport::Fill(Box::new(fill_report));
 
     ctx.manager.observe_execution_report(&report);
@@ -954,6 +970,7 @@ fn test_observe_position_report_records_activity() {
         None, // venue_position_id
         Some(dec!(3000.0)),
     );
+
     let report = ExecutionReport::Position(Box::new(position_report));
 
     let key = (instrument_id, test_account_id());
@@ -1176,6 +1193,7 @@ async fn test_reconcile_mass_status_warns_on_untrusted_cached_client_origin(
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_order_reports(vec![create_order_report(
         report_has_client_order_id.then_some(client_order_id),
         venue_order_id,
@@ -1243,6 +1261,7 @@ async fn test_reconcile_mass_status_warns_on_venue_only_fill_from_other_client()
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_fill_reports(vec![FillReport::new(
         test_account_id(),
         instrument_id,
@@ -1352,6 +1371,7 @@ async fn test_reconcile_mass_status_publishes_external_order_initialized() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         None,
         VenueOrderId::from("V-EXT-PUBLISH-MASS"),
@@ -1593,6 +1613,7 @@ async fn test_external_order_canceled_with_partial_fill() {
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -1638,6 +1659,7 @@ async fn test_external_terminal_order_with_incomplete_real_fills_infers_residual
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         None,
         venue_order_id,
@@ -1667,6 +1689,7 @@ async fn test_external_terminal_order_with_incomplete_real_fills_infers_residual
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -1759,6 +1782,7 @@ async fn test_cached_order_canceled_with_fills() {
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -1876,6 +1900,7 @@ async fn test_mass_reconciliation_applies_replacement_alias_fills_before_inferen
         UnixNanos::from(10_000_000),
         None,
     );
+
     let parent_report = create_order_report(
         Some(client_order_id),
         parent_id,
@@ -2101,6 +2126,7 @@ async fn test_external_order_filled_uses_real_fills() {
         UnixNanos::from(2_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill1, fill2]);
 
     let result = ctx
@@ -2345,6 +2371,7 @@ async fn test_external_order_filled_with_partial_fills_generates_inferred() {
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -2667,6 +2694,7 @@ async fn test_claim_external_orders_duplicate_fails_without_overwriting() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         None,
         VenueOrderId::from("V-EXT-DUPLICATE"),
@@ -2723,6 +2751,7 @@ async fn test_reconcile_mass_status_processes_fills_for_cached_order() {
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -2770,6 +2799,7 @@ async fn test_reconcile_mass_status_deduplicates_fills() {
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill.clone(), fill]);
 
     let result = ctx
@@ -3448,6 +3478,7 @@ async fn test_retained_fill_projects_missing_order_without_reapplying(
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(UnixNanos::from(2_000_000)), true);
     let mut order_report = create_order_report(
         include_client_order_id.then_some(client_order_id),
@@ -3491,6 +3522,7 @@ async fn test_retained_fill_projects_missing_order_without_reapplying(
         venue_position_id,
         Some(dec!(3000.00)),
     );
+
     mass_status.add_order_reports(vec![order_report]);
     if include_fill_report {
         mass_status.add_fill_reports(vec![fill_report]);
@@ -3587,6 +3619,7 @@ async fn test_inferred_delta_for_retained_order_applies_new_economics(
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         Some(client_order_id),
         venue_order_id,
@@ -3684,6 +3717,7 @@ async fn test_missing_venue_order_id_collision_is_scoped_by_instrument() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         None,
         venue_order_id,
@@ -3837,6 +3871,7 @@ async fn test_partially_known_fills_apply_only_new_economics(
         None,
         Some(dec!(3033.333333)),
     );
+
     mass_status.add_order_reports(vec![order_report]);
     mass_status.add_fill_reports(vec![known_fill_report, new_fill_report]);
     mass_status.add_position_reports(vec![position_report]);
@@ -3949,6 +3984,7 @@ async fn test_partial_window_known_fill_does_not_reapply_economics(
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let order_report = create_order_report_for_side(
         Some(closing_order_id),
         closing_venue_order_id,
@@ -3988,6 +4024,7 @@ async fn test_partial_window_known_fill_does_not_reapply_economics(
         None,
         Some(dec!(3000.00)),
     );
+
     mass_status.add_order_reports(vec![order_report]);
     mass_status.add_fill_reports(vec![fill_report]);
     mass_status.add_position_reports(vec![position_report]);
@@ -4036,6 +4073,7 @@ async fn test_split_lighter_reduce_only_lifecycle_preserves_explicit_flat() {
         close_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     let order_report = OrderStatusReport::new(
         test_account_id(),
@@ -4085,6 +4123,7 @@ async fn test_split_lighter_reduce_only_lifecycle_preserves_explicit_flat() {
         None,
         None,
     );
+
     mass_status.add_order_reports(vec![order_report]);
     mass_status.add_fill_reports(vec![fill_report]);
     mass_status.add_position_reports(vec![flat_report]);
@@ -4254,6 +4293,7 @@ async fn test_bounded_complete_lifecycle_applies_beside_split_close() {
         split_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     mass_status.add_order_reports(vec![opening_order, closing_order, split_order]);
     mass_status.add_fill_reports(vec![opening_fill, opening_fill_2, closing_fill, split_fill]);
@@ -4391,6 +4431,7 @@ async fn test_bounded_hedge_fill_applies_economics_once() {
         fill_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     mass_status.add_order_reports(vec![order_report]);
     mass_status.add_fill_reports(vec![fill_report]);
@@ -4612,6 +4653,7 @@ async fn test_bounded_reduce_only_history_reconciles_flat_or_remains_unresolved(
         closing_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     mass_status.add_order_reports(vec![closing_order]);
     mass_status.add_fill_reports(vec![closing_fill]);
@@ -4745,6 +4787,7 @@ async fn test_incomplete_bounded_reports_project_fills_order_only(#[case] has_fi
         fill_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), false);
     mass_status.add_order_reports(vec![order_report]);
     if has_fill_report {
@@ -4845,6 +4888,7 @@ async fn test_bounded_active_partial_order_preserves_order_and_reconciles_flat()
         fill_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     mass_status.add_order_reports(vec![order_report]);
     mass_status.add_position_reports(vec![flat_report]);
@@ -4954,6 +4998,7 @@ async fn test_bounded_nonflat_position_requires_coherent_historical_fill(
         fill_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     mass_status.add_order_reports(vec![order_report]);
     mass_status.add_fill_reports(vec![fill_report]);
@@ -5074,6 +5119,7 @@ async fn test_bounded_history_distinguishes_missing_and_explicit_flat_reports(
         fill_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     mass_status.add_order_reports(vec![order_report]);
     mass_status.add_fill_reports(vec![fill_report]);
@@ -5201,6 +5247,7 @@ async fn test_bounded_interleaved_multi_fill_orders_reconcile_explicit_flat() {
         opening_ts_2,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     mass_status.add_order_reports(vec![opening_order, closing_order]);
     mass_status.add_fill_reports(vec![opening_fill, opening_fill_2, closing_fill]);
@@ -5330,6 +5377,7 @@ async fn test_bounded_same_timestamp_orders_reconcile_explicit_flat() {
         fill_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     mass_status.add_order_reports(vec![opening_order, closing_order]);
     mass_status.add_fill_reports(vec![opening_fill, closing_fill]);
@@ -5523,6 +5571,7 @@ async fn test_order_spanning_two_lifecycles_keeps_pre_boundary_fill_order_only()
         None,
         Some(dec!(3200.00)),
     );
+
     mass_status.add_order_reports(vec![open_report, flip_report]);
     mass_status.add_fill_reports(vec![open_fill, close_fill, short_fill]);
     mass_status.add_position_reports(vec![position_report]);
@@ -5600,6 +5649,7 @@ async fn test_partially_filled_cached_order_recovers_remaining_fills_at_real_pri
         Some(test_account_id()),
     );
     order.apply(cached_fill).unwrap();
+
     {
         let mut cache = ctx.cache.borrow_mut();
         cache
@@ -5617,6 +5667,7 @@ async fn test_partially_filled_cached_order_recovers_remaining_fills_at_real_pri
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let order_report = create_order_report(
         Some(client_order_id),
         venue_order_id,
@@ -5643,6 +5694,7 @@ async fn test_partially_filled_cached_order_recovers_remaining_fills_at_real_pri
         UnixNanos::from(2_000_000),
         None,
     );
+
     mass_status.add_order_reports(vec![order_report]);
     mass_status.add_fill_reports(vec![remaining_fill]);
 
@@ -5773,6 +5825,7 @@ async fn test_closing_order_fills_recorded_once_across_restart_without_coverage(
         let (result, _) = reconcile_closing_scenario(&mut ctx, &mass_status);
         assert_eq!(count_filled_events(&result.events), 2);
         assert_closing_scenario_recorded_once(&ctx.cache.borrow(), closing_order_id);
+
         (
             closing_order_id,
             reported_order_id,
@@ -5850,7 +5903,6 @@ async fn test_unclaimed_external_closing_order_fills_leave_restored_position_ope
         assert_eq!(result.external_orders.len(), 1);
         assert_eq!(count_filled_events(&result.events), 2);
         assert_unclaimed_closing_scenario_state(&ctx.cache.borrow(), bounded);
-
         if bounded {
             assert!(position_events.is_empty(), "found {position_events:?}");
         } else {
@@ -5932,6 +5984,7 @@ fn test_bounded_closing_fills_close_known_hedging_position(#[case] indexed: bool
         UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2 + 1_000_000),
         None,
     );
+
     mass.set_report_window(Some(UnixNanos::from(CLOSING_SCENARIO_WINDOW_START)), true);
     mass.add_order_reports(vec![closing_scenario_closing_order_report(reported_id)]);
     let mut fills = closing_scenario_closing_fill_reports(reported_id);
@@ -6090,7 +6143,6 @@ async fn test_bounded_addition_before_close_warns_for_order_only_addition(
     };
 
     let add_report_order_id = cached_addition.then_some(add_order_id);
-
     if cached_addition {
         let mut add_order = OrderTestBuilder::new(OrderType::Limit)
             .client_order_id(add_order_id)
@@ -6271,6 +6323,7 @@ async fn test_withheld_fill_warning_follows_coverage_per_instrument() {
     install_manager_log_capture();
 
     let mut ctx = TestContext::with_cache(Cache::default(), ExecutionManagerConfig::default());
+
     {
         let mut engine = ctx.exec_engine.borrow_mut();
         engine.deregister_client(test_client_id()).unwrap();
@@ -6461,6 +6514,7 @@ async fn test_bounded_real_fill_after_restored_inference_stays_order_only() {
             UnixNanos::from(CLOSING_SCENARIO_FILL_TS_1),
             None,
         );
+
         mass.add_order_reports(vec![report]);
         let (result, _) = reconcile_closing_scenario(&mut ctx, &mass);
 
@@ -6481,6 +6535,7 @@ async fn test_bounded_real_fill_after_restored_inference_stays_order_only() {
                 .quantity,
             Quantity::from("0.600")
         );
+
         (
             closing_order_id,
             inferred_trade_id,
@@ -6497,6 +6552,7 @@ async fn test_bounded_real_fill_after_restored_inference_stays_order_only() {
         UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2),
         None,
     );
+
     mass.set_report_window(Some(UnixNanos::from(CLOSING_SCENARIO_WINDOW_START)), true);
     let fill = closing_scenario_closing_fill_reports(Some(closing_order_id)).remove(0);
     mass.add_fill_reports(vec![fill]);
@@ -6589,6 +6645,7 @@ fn test_bounded_closing_recovery_applies_explicit_fill_without_inferred_remainde
         UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2),
         None,
     );
+
     mass.set_report_window(Some(UnixNanos::from(CLOSING_SCENARIO_WINDOW_START)), true);
     let report = closing_scenario_closing_order_report(reported_order_id).with_avg_px(dec!(3112));
     let fill = closing_scenario_closing_fill_reports(reported_order_id).remove(0);
@@ -6671,6 +6728,7 @@ fn test_bounded_closing_fills_close_retained_short(#[case] closing: ClosingOrder
         UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2),
         None,
     );
+
     mass.set_report_window(Some(UnixNanos::from(CLOSING_SCENARIO_WINDOW_START)), true);
     mass.add_order_reports(vec![report]);
     mass.add_fill_reports(fills);
@@ -6703,6 +6761,7 @@ fn test_bounded_closing_recovery_does_not_apply_mismatched_instrument_fill(
         UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2),
         None,
     );
+
     mass.set_report_window(Some(UnixNanos::from(CLOSING_SCENARIO_WINDOW_START)), true);
     mass.add_order_reports(vec![closing_scenario_closing_order_report(
         reported_order_id,
@@ -6755,6 +6814,7 @@ async fn test_bounded_partial_close_then_remaining_fills_after_restore(
             UnixNanos::from(CLOSING_SCENARIO_FILL_TS_1),
             None,
         );
+
         mass.set_report_window(Some(UnixNanos::from(CLOSING_SCENARIO_WINDOW_START)), true);
         mass.add_order_reports(vec![report]);
         mass.add_fill_reports(vec![
@@ -6767,6 +6827,7 @@ async fn test_bounded_partial_close_then_remaining_fills_after_restore(
         assert_eq!(position.realized_pnl, Some(Money::from("39.15 USDT")));
         assert_eq!(position.commissions(), vec![Money::from("0.85 USDT")]);
         assert_eq!(position_events.len(), 1);
+
         (
             closing_order_id,
             reported_order_id,
@@ -6865,6 +6926,7 @@ fn test_bounded_closing_fills_respect_target_lifecycle_across_strategies() {
     cache_closing_scenario_open_long(&ctx, &test_instrument());
     let (order_id, reported_id) = prepare_closing_scenario_order(&mut ctx, ClosingOrder::Cached);
     let external_id = PositionId::new(format!("{}-EXTERNAL", test_instrument_id()));
+
     {
         let mut cache = ctx.cache.borrow_mut();
         let mut position = cache
@@ -7136,6 +7198,7 @@ fn closing_scenario_mass_status(
         UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2 + 1_000_000),
         Some(UUID4::new()),
     );
+
     let mut order_reports = vec![closing_scenario_closing_order_report(
         closing_client_order_id,
     )];
@@ -7315,6 +7378,7 @@ fn closing_scenario_context(
     covered: bool,
 ) -> TestContext {
     let ctx = TestContext::with_cache(cache, config);
+
     {
         let mut engine = ctx.exec_engine.borrow_mut();
         engine.deregister_client(test_client_id()).unwrap();
@@ -7394,6 +7458,7 @@ fn withheld_scenario_reports(
     let venue_order_id = VenueOrderId::new(format!("V-{tag}"));
     let mut order_report = closing_scenario_closing_order_report(client_order_id);
     order_report.venue_order_id = venue_order_id;
+
     let fill_reports = closing_scenario_closing_fill_reports(client_order_id)
         .into_iter()
         .enumerate()
@@ -7496,6 +7561,7 @@ async fn test_fill_before_retained_netting_lifecycle_projects_order_only() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let old_order_report = create_order_report(
         Some(old_order_id),
         old_venue_order_id,
@@ -7560,6 +7626,7 @@ async fn test_fill_before_retained_netting_lifecycle_projects_order_only() {
         None,
         Some(dec!(3200.00)),
     );
+
     mass_status.add_order_reports(vec![old_order_report, current_order_report]);
     mass_status.add_fill_reports(vec![old_fill_report, current_fill_report]);
     mass_status.add_position_reports(vec![position_report]);
@@ -7621,6 +7688,7 @@ async fn test_filled_report_with_reduced_quantity_closes_partially_filled_order(
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         Some(client_order_id),
         venue_order_id,
@@ -7953,6 +8021,7 @@ async fn test_reconcile_mass_status_sorts_events_chronologically() {
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill2, fill1]);
 
     let result = ctx
@@ -8487,7 +8556,6 @@ async fn test_submission_registry_interleaved_missing_checks_preserve_budget(
         assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
         let result = ctx.manager.check_inflight_orders();
         queries += result.queries.len();
-
         for event in &result.events {
             ctx.cache.borrow_mut().update_order(event).unwrap();
         }
@@ -8636,6 +8704,7 @@ async fn test_submission_retention_is_scoped_to_client(
     let mut ctx = TestContext::with_config(ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 1,
+        submission_recovery_policy: SubmissionRecoveryPolicy::ResolveLocally,
         ..Default::default()
     });
 
@@ -8727,6 +8796,7 @@ async fn test_inflight_timeout_uses_monotonic_gate_and_domain_event_timestamp() 
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 1,
+        submission_recovery_policy: SubmissionRecoveryPolicy::ResolveLocally,
         ..Default::default()
     };
 
@@ -8800,7 +8870,7 @@ fn test_config_default_values() {
     assert_eq!(config.inflight_max_retries, 5);
     assert_eq!(
         config.submission_recovery_policy,
-        SubmissionRecoveryPolicy::ResolveLocally,
+        SubmissionRecoveryPolicy::RetainUnresolved,
     );
 }
 
@@ -9061,6 +9131,7 @@ async fn test_inflight_increments_retry_count_before_max() {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 3,
+        submission_recovery_policy: SubmissionRecoveryPolicy::ResolveLocally,
         ..Default::default()
     };
 
@@ -9097,19 +9168,16 @@ async fn test_inflight_increments_retry_count_before_max() {
     assert!(result3.queries.is_empty());
 }
 
-#[rstest]
-#[case::resolve_locally(SubmissionRecoveryPolicy::ResolveLocally)]
-#[case::retain_unresolved(SubmissionRecoveryPolicy::RetainUnresolved)]
 #[cfg_attr(
     not(all(feature = "simulation", madsim)),
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-async fn test_inflight_pending_update_generates_canceled(#[case] policy: SubmissionRecoveryPolicy) {
+async fn test_inflight_pending_update_generates_canceled() {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 1,
-        submission_recovery_policy: policy,
+        submission_recovery_policy: SubmissionRecoveryPolicy::ResolveLocally,
         ..Default::default()
     };
 
@@ -9150,22 +9218,20 @@ async fn test_inflight_pending_update_generates_canceled(#[case] policy: Submiss
 
     if let OrderEventAny::Canceled(canceled) = &result.events[0] {
         assert_eq!(canceled.client_order_id, client_order_id);
+        assert_eq!(canceled.reason.as_deref(), Some("INFLIGHT_TIMEOUT"));
     }
 }
 
-#[rstest]
-#[case::resolve_locally(SubmissionRecoveryPolicy::ResolveLocally)]
-#[case::retain_unresolved(SubmissionRecoveryPolicy::RetainUnresolved)]
 #[cfg_attr(
     not(all(feature = "simulation", madsim)),
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-async fn test_inflight_pending_cancel_generates_canceled(#[case] policy: SubmissionRecoveryPolicy) {
+async fn test_inflight_pending_cancel_generates_canceled() {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 1,
-        submission_recovery_policy: policy,
+        submission_recovery_policy: SubmissionRecoveryPolicy::ResolveLocally,
         ..Default::default()
     };
 
@@ -9206,7 +9272,147 @@ async fn test_inflight_pending_cancel_generates_canceled(#[case] policy: Submiss
 
     if let OrderEventAny::Canceled(canceled) = &result.events[0] {
         assert_eq!(canceled.client_order_id, client_order_id);
+        assert_eq!(canceled.reason.as_deref(), Some("INFLIGHT_TIMEOUT"));
     }
+}
+
+#[rstest]
+#[case::pending_update(true, false)]
+#[case::pending_cancel(false, true)]
+#[case::pending_cancel_after_update(true, true)]
+#[cfg_attr(
+    not(all(feature = "simulation", madsim)),
+    tokio::test(start_paused = true)
+)]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+async fn test_inflight_pending_command_restores_status_under_retention(
+    #[case] pending_update: bool,
+    #[case] pending_cancel: bool,
+) {
+    let config = ExecutionManagerConfig {
+        inflight_threshold_ms: 100,
+        inflight_max_retries: 1,
+        submission_recovery_policy: SubmissionRecoveryPolicy::RetainUnresolved,
+        ..Default::default()
+    };
+
+    let mut ctx = TestContext::with_config(config);
+    let instrument_id = test_instrument_id();
+    let client_order_id = ClientOrderId::from("O-PENDING");
+    let venue_order_id = VenueOrderId::from("V-003");
+    ctx.add_instrument(test_instrument());
+
+    let mut order = if pending_update {
+        create_pending_update_order(
+            "O-PENDING",
+            instrument_id,
+            OrderSide::Buy,
+            "1.0",
+            "3000.00",
+            venue_order_id,
+        )
+    } else {
+        create_pending_cancel_order(
+            "O-PENDING",
+            instrument_id,
+            OrderSide::Buy,
+            "1.0",
+            "3000.00",
+            venue_order_id,
+        )
+    };
+
+    if pending_update && pending_cancel {
+        let pending = OrderEventAny::PendingCancel(
+            OrderPendingCancelSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(order.client_order_id())
+                .account_id(test_account_id())
+                .venue_order_id(venue_order_id)
+                .build(),
+        );
+        order.apply(pending).unwrap();
+    }
+
+    ctx.add_order(order);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
+    ctx.advance_both(dst::time::Duration::from_millis(200))
+        .await;
+
+    let result = ctx.manager.check_inflight_orders();
+    for event in &result.events {
+        ctx.manager.observe_order_event(event);
+        ctx.exec_engine.borrow_mut().process(event);
+    }
+
+    let mut expected = Vec::new();
+    if pending_cancel {
+        expected.push("CancelRejected");
+    }
+
+    if pending_update {
+        expected.push("ModifyRejected");
+    }
+
+    let rejections: Vec<_> = result
+        .events
+        .iter()
+        .map(|event| match event {
+            OrderEventAny::CancelRejected(event) => (
+                "CancelRejected",
+                event.client_order_id,
+                event.reason.as_str(),
+                event.reconciliation,
+                event.venue_order_id,
+                event.account_id,
+            ),
+            OrderEventAny::ModifyRejected(event) => (
+                "ModifyRejected",
+                event.client_order_id,
+                event.reason.as_str(),
+                event.reconciliation,
+                event.venue_order_id,
+                event.account_id,
+            ),
+            other => panic!("Expected a command rejection, was {other:?}"),
+        })
+        .collect();
+
+    let expected: Vec<_> = expected
+        .into_iter()
+        .map(|kind| {
+            (
+                kind,
+                client_order_id,
+                "INFLIGHT_TIMEOUT",
+                true,
+                Some(venue_order_id),
+                Some(test_account_id()),
+            )
+        })
+        .collect();
+
+    let order = ctx.get_order(&client_order_id).unwrap();
+    assert_eq!(rejections, expected);
+    assert!(
+        ctx.manager
+            .take_submission_recovery_exhaustions()
+            .is_empty()
+    );
+    assert_eq!(order.status(), OrderStatus::Accepted);
+    assert_eq!(order.ts_closed(), None);
+    assert!(!order.has_pending_update_command());
+    assert!(!order.has_pending_cancel_command());
+    assert!(
+        ctx.cache
+            .borrow()
+            .orders_open(None, None, None, None, None)
+            .into_iter()
+            .any(|order| order.client_order_id() == client_order_id)
+    );
+    assert!(ctx.manager.check_inflight_orders().events.is_empty());
 }
 
 #[cfg_attr(
@@ -9258,6 +9464,7 @@ async fn test_inflight_no_query_at_max_retries() {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 2,
+        submission_recovery_policy: SubmissionRecoveryPolicy::ResolveLocally,
         ..Default::default()
     };
 
@@ -9467,6 +9674,7 @@ async fn test_inflight_terminal_event_clears_tracking() {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 1,
+        submission_recovery_policy: SubmissionRecoveryPolicy::ResolveLocally,
         ..Default::default()
     };
 
@@ -9534,6 +9742,7 @@ fn test_observe_fill_report_without_client_order_id_uses_cache_fallback() {
         UnixNanos::from(2_000_000),
         None,
     );
+
     let report = ExecutionReport::Fill(Box::new(fill_report));
 
     // observe should resolve client_order_id via cache and record activity
@@ -10343,6 +10552,7 @@ async fn test_mass_status_skips_exact_duplicate_orders() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         Some(client_order_id),
         venue_order_id,
@@ -10442,6 +10652,7 @@ async fn test_mass_status_reconciles_when_status_differs() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         Some(client_order_id),
         venue_order_id,
@@ -10489,6 +10700,7 @@ async fn test_mass_status_reconciles_when_filled_qty_differs() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         Some(client_order_id),
         venue_order_id,
@@ -10547,6 +10759,7 @@ async fn test_mass_status_matches_order_by_venue_order_id() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         None,
         venue_order_id,
@@ -10606,6 +10819,7 @@ async fn test_mass_status_matches_order_by_venue_order_id_with_mismatched_client
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         Some(wrong_client_order_id),
         venue_order_id,
@@ -10670,6 +10884,7 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_accepted_orders()
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_order_reports(vec![report]);
 
     let _events = ctx
@@ -10710,6 +10925,7 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_external_orders()
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_order_reports(vec![report]);
 
     let result = ctx
@@ -10786,6 +11002,7 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_filled_orders() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_order_reports(vec![report]);
 
     let _events = ctx
@@ -10839,6 +11056,7 @@ async fn test_reconcile_mass_status_skips_orders_without_loaded_instruments() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_order_reports(vec![loaded_report, unloaded_report]);
 
     let _events = ctx
@@ -10885,6 +11103,7 @@ async fn test_reconcile_mass_status_creates_position_from_position_report() {
         None,
         Some(dec!(3000.50)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -10923,6 +11142,7 @@ async fn test_mass_status_netting_client_recovers_venue_position_id(
 
     let mut client = MockExecutionClient::new(Vec::new());
     client.oms_type = OmsType::Netting;
+
     {
         let mut engine = ctx.exec_engine.borrow_mut();
         engine.deregister_client(test_client_id()).unwrap();
@@ -10937,6 +11157,7 @@ async fn test_mass_status_netting_client_recovers_venue_position_id(
         UnixNanos::default(),
         None,
     );
+
     mass_status.add_position_reports(vec![PositionStatusReport::new(
         test_account_id(),
         instrument_id,
@@ -11129,6 +11350,7 @@ async fn test_mass_status_netting_ignores_duplicate_position_reports(
 
     let mut client = MockExecutionClient::new(Vec::new());
     client.oms_type = OmsType::Netting;
+
     {
         let mut engine = ctx.exec_engine.borrow_mut();
         engine.deregister_client(test_client_id()).unwrap();
@@ -11285,6 +11507,7 @@ async fn test_mass_status_entry_price_aggregates_each_side(
 
     let instrument = test_instrument();
     let instrument_id = instrument.id();
+
     let positions = [
         create_test_position(
             &instrument,
@@ -11638,6 +11861,7 @@ async fn test_mass_status_opening_only_average_applies_full_history(
 
     let mut client = MockExecutionClient::new(Vec::new());
     client.oms_type = OmsType::Netting;
+
     {
         let mut engine = ctx.exec_engine.borrow_mut();
         engine.deregister_client(test_client_id()).unwrap();
@@ -11893,6 +12117,7 @@ async fn test_mass_status_coarse_average_keeps_retained_position(
         None,
         Some(dec!(0.5599)),
     );
+
     report.avg_px_open_precision = avg_px_open_precision;
     ctx.add_instrument(instrument);
     ctx.add_margin_account(account_id);
@@ -11923,6 +12148,7 @@ async fn test_mass_status_coarse_average_keeps_retained_position(
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_position_reports(vec![report]);
     ctx.exec_engine
         .borrow_mut()
@@ -11986,6 +12212,7 @@ async fn test_mass_status_average_cost_with_commission_keeps_retained_position(
         None,
         Some(dec!(40.67)),
     );
+
     report.avg_px_open_precision = avg_px_open_precision;
     let mut mass_status = create_mass_status(vec![], vec![]);
     mass_status.add_position_reports(vec![report]);
@@ -12041,6 +12268,7 @@ async fn test_mass_status_coarse_average_prices_increase(
         None,
         Some(dec!(0.5599)),
     );
+
     report.avg_px_open_precision = avg_px_open_precision;
     ctx.add_instrument(instrument);
     ctx.cache
@@ -12112,6 +12340,7 @@ async fn test_mass_status_recovers_off_tick_position_average(
         hedging.then_some(PositionId::from("P-OFF-TICK")),
         Some(avg_px),
     );
+
     let mut mass_status = create_mass_status(vec![], vec![]);
     mass_status.add_position_reports(vec![report]);
 
@@ -12209,6 +12438,7 @@ async fn test_mass_status_recovers_off_tick_average_with_partial_fill_history(
         None,
         Some(avg_px),
     );
+
     let mut mass_status = create_mass_status(orders, fills);
     mass_status.add_position_reports(vec![report]);
 
@@ -12297,6 +12527,7 @@ async fn test_mass_status_reports_unresolved_position_prerequisite(
         UnixNanos::default(),
         None,
     );
+
     mass_status.add_position_reports(vec![report]);
     let result = ctx
         .manager
@@ -12346,6 +12577,7 @@ async fn test_mass_status_synchronized_position_does_not_require_entry_price(
         UnixNanos::default(),
         None,
     );
+
     mass_status.add_position_reports(vec![report.clone()]);
     let recovered = ctx
         .manager
@@ -12361,6 +12593,7 @@ async fn test_mass_status_synchronized_position_does_not_require_entry_price(
         UnixNanos::default(),
         None,
     );
+
     mass_status.add_position_reports(vec![report]);
     let synchronized = ctx
         .manager
@@ -12406,6 +12639,7 @@ async fn test_reconcile_mass_status_skips_flat_position_report() {
         None,
         None,
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -12446,6 +12680,7 @@ async fn test_reconcile_mass_status_skips_position_report_when_filtered() {
         None,
         Some(dec!(3000.50)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -12482,6 +12717,7 @@ async fn test_reconcile_mass_status_creates_short_position_from_report() {
         None,
         Some(dec!(2950.25)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -12542,6 +12778,7 @@ async fn test_reconcile_mass_status_skips_position_report_when_fills_exist() {
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     // Add a position report for the same instrument (would duplicate if not skipped)
@@ -12556,6 +12793,7 @@ async fn test_reconcile_mass_status_skips_position_report_when_fills_exist() {
         None,
         Some(dec!(3000.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -12803,6 +13041,7 @@ async fn test_reconcile_mass_status_routes_to_hedging_with_venue_position_id() {
         Some(PositionId::from("P-HEDGE-001")),
         Some(dec!(3000.50)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -12839,6 +13078,7 @@ async fn test_reconcile_mass_status_routes_to_netting_without_venue_position_id(
         None, // No venue_position_id
         Some(dec!(3000.50)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -12955,6 +13195,7 @@ async fn test_reconcile_mass_status_leaves_hedge_reversal_identity_unresolved() 
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(UnixNanos::from(1)), false);
 
     mass_status.add_fill_reports(vec![FillReport::new(
@@ -13227,6 +13468,7 @@ async fn test_reconcile_mass_status_skips_hedge_position_when_fills_lack_positio
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     // Add a hedge position report WITH venue_position_id
@@ -13241,6 +13483,7 @@ async fn test_reconcile_mass_status_skips_hedge_position_when_fills_lack_positio
         Some(PositionId::from("P-HEDGE-001")), // Has venue_position_id
         Some(dec!(3000.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -13297,6 +13540,7 @@ async fn test_reconcile_hedge_does_not_skip_unrelated_positions() {
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     // Add position reports for BOTH positions
@@ -13323,6 +13567,7 @@ async fn test_reconcile_hedge_does_not_skip_unrelated_positions() {
         Some(position_id_2), // Different position
         Some(dec!(3100.00)),
     );
+
     mass_status.add_position_reports(vec![position_report_1, position_report_2]);
 
     let result = ctx
@@ -13378,6 +13623,7 @@ async fn test_reconcile_hedge_position_matching_quantities() {
         Some(position_id),
         Some(dec!(3000.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -13430,6 +13676,7 @@ async fn test_reconcile_hedge_position_discrepancy_generates_order() {
         Some(position_id),
         Some(dec!(3000.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -13475,6 +13722,7 @@ async fn test_reconcile_missing_hedge_position_generates_order() {
         Some(PositionId::from("P-MISSING-001")),
         Some(dec!(3000.50)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -13526,6 +13774,7 @@ async fn test_reconcile_hedge_position_discrepancy_disabled() {
         Some(position_id),
         Some(dec!(3000.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -13566,6 +13815,7 @@ async fn test_reconcile_hedge_position_both_flat() {
         Some(PositionId::from("P-FLAT-001")),
         None,
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -13608,6 +13858,7 @@ async fn test_reconcile_hedge_short_position() {
         Some(PositionId::from("P-SHORT-001")),
         Some(dec!(3100.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -13790,6 +14041,7 @@ async fn test_adjust_fills_creates_synthetic_for_partial_window() {
         None, // Netting mode
         Some(dec!(3000.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     // Only have fills for 2.0 (partial window - missing opening fills)
@@ -13821,6 +14073,7 @@ async fn test_adjust_fills_creates_synthetic_for_partial_window() {
         UnixNanos::from(1_000_001),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -13881,6 +14134,7 @@ async fn test_missing_orders_disabled_skips_synthetic_fill_recovery(#[case] hedg
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let venue_position_id = hedging.then(|| PositionId::from("ETHUSDT-PERP.BINANCE-LONG"));
     mass_status.add_fill_reports(vec![FillReport::new(
         test_account_id(),
@@ -14160,6 +14414,7 @@ async fn test_position_reconciliation_order_has_reconciliation_tag() {
         None,
         Some(dec!(3000.50)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -14238,6 +14493,7 @@ async fn test_replayed_fill_does_not_reopen_reconciled_position(
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_position_reports(vec![PositionStatusReport::new(
         test_account_id(),
         instrument_id,
@@ -14272,6 +14528,7 @@ async fn test_replayed_fill_does_not_reopen_reconciled_position(
         UnixNanos::from(1_000_000),
         None,
     );
+
     ctx.exec_engine
         .borrow_mut()
         .reconcile_fill_report(&replayed);
@@ -14415,6 +14672,7 @@ async fn test_cross_zero_unbuildable_open_leg_has_no_side_effects() {
         None,
         Some(dec!(3100.00)),
     );
+
     report.signed_decimal_qty = -dec!(10000000000000000000);
     let client = MockPositionExecutionClient::new(vec![], vec![report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&client];
@@ -14505,6 +14763,7 @@ async fn test_cross_zero_unbuildable_open_leg_retries_without_poisoning_order_id
         None,
         Some(dec!(3100.00)),
     );
+
     unbuildable_report.signed_decimal_qty = -dec!(10000000000000000000);
     let unbuildable_client = MockPositionExecutionClient::new(vec![], vec![unbuildable_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&unbuildable_client];
@@ -14525,6 +14784,7 @@ async fn test_cross_zero_unbuildable_open_leg_retries_without_poisoning_order_id
         None,
         Some(dec!(3100.00)),
     );
+
     let valid_client = MockPositionExecutionClient::new(vec![], vec![valid_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&valid_client];
 
@@ -14608,6 +14868,7 @@ async fn test_netting_position_cross_zero_long_to_short() {
         None, // Netting mode
         Some(dec!(3100.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -14686,6 +14947,7 @@ async fn test_netting_position_cross_zero_short_to_long() {
         None, // Netting mode
         Some(dec!(2900.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -14764,6 +15026,7 @@ async fn test_netting_position_flat_report_closes_cached_position() {
         None, // Netting mode
         None, // No avg_px for flat
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -14860,6 +15123,7 @@ async fn test_expired_order_applies_fills_before_terminal_event() {
         UnixNanos::from(1_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -14945,6 +15209,7 @@ async fn test_partial_window_adjustment_skips_hedge_mode_instruments() {
         UnixNanos::from(1_000_001),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     // Add hedge mode position report (has venue_position_id)
@@ -14961,6 +15226,7 @@ async fn test_partial_window_adjustment_skips_hedge_mode_instruments() {
         Some(hedge_position_id), // Hedge mode - has venue_position_id
         Some(dec!(100.0)),       // avg_px_open
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -15274,6 +15540,7 @@ async fn test_mass_status_preserves_symbol_scoped_trade_ids() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_fill_reports(vec![fill1, fill2]);
 
     let result = ctx
@@ -15803,6 +16070,7 @@ async fn test_cross_zero_with_missing_cached_avg_px_returns_none() {
         None,
         Some(dec!(3100.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -15853,6 +16121,7 @@ async fn test_cross_zero_with_missing_venue_avg_px_closes_only() {
         None,
         None, // No avg_px - cannot open new position
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -15983,6 +16252,7 @@ async fn test_hedge_mode_with_filter_unclaimed_external_allows_synthetic() {
         Some(PositionId::new("HEDGE-001")),
         Some(dec!(3000.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -16081,6 +16351,7 @@ async fn test_duplicate_order_reports_reconciles_last_report() {
         UnixNanos::from(2_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let _result = ctx
@@ -16446,6 +16717,149 @@ async fn test_working_order_with_new_fills_updates_correctly() {
         order.filled_qty(),
         Quantity::from("7.0"),
         "Order should have updated filled qty"
+    );
+}
+
+#[rstest]
+#[case::orphan(false)]
+#[case::with_order_status(true)]
+#[tokio::test]
+async fn test_mass_status_recovers_later_fill_for_fill_report_order(
+    #[case] with_order_status: bool,
+) {
+    let mut ctx = TestContext::new();
+    let instrument_id = test_instrument_id();
+    ctx.add_instrument(test_instrument());
+    let venue_order_id = VenueOrderId::from("V-FILL-REPORT");
+    let client_order_id = ClientOrderId::from("V-FILL-REPORT");
+    let position_id = PositionId::from("P-FILL-REPORT");
+    let position = create_test_position(
+        &test_instrument(),
+        position_id,
+        OrderSide::Sell,
+        "3.0",
+        "3200.00",
+    );
+    ctx.add_position(&position);
+
+    let first = FillReport::new(
+        test_account_id(),
+        instrument_id,
+        venue_order_id,
+        TradeId::from("T-FILL-1"),
+        OrderSide::Buy,
+        Quantity::from("1.0"),
+        Price::from("3000.00"),
+        Money::from("0.10 USDT"),
+        LiquiditySide::Taker,
+        None,
+        Some(position_id),
+        UnixNanos::from(1_000),
+        UnixNanos::from(1_000),
+        None,
+    );
+
+    ctx.exec_engine.borrow_mut().reconcile_fill_report(&first);
+    assert_eq!(
+        ctx.get_order(&client_order_id).unwrap().status(),
+        OrderStatus::Filled
+    );
+    let mut second = first.clone();
+    second.report_id = UUID4::new();
+    second.trade_id = TradeId::from("T-FILL-2");
+    second.last_qty = Quantity::from("2.0");
+    second.last_px = Price::from("3100.00");
+    second.commission = Money::from("0.25 USDT");
+    second.ts_event = UnixNanos::from(2_000);
+
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::from(3_000),
+        None,
+    );
+
+    mass_status.add_fill_reports(vec![first.clone(), second.clone()]);
+
+    if with_order_status {
+        let status = OrderStatusReport::new(
+            test_account_id(),
+            instrument_id,
+            None,
+            venue_order_id,
+            OrderSide::Buy.into(),
+            OrderType::Market,
+            TimeInForce::Ioc,
+            OrderStatus::Filled,
+            Quantity::from("3.0"),
+            Quantity::from("3.0"),
+            UnixNanos::from(1_000),
+            UnixNanos::from(2_000),
+            UnixNanos::from(3_000),
+            None,
+        )
+        .with_avg_px(dec!(9200) / dec!(3));
+        mass_status.add_order_reports(vec![status]);
+    }
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    let order = ctx.get_order(&client_order_id).unwrap();
+    let position = ctx.cache.borrow().position_owned(&position_id).unwrap();
+
+    let fills: Vec<_> = result
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => {
+                Some((fill.trade_id, fill.last_qty, fill.last_px, fill.commission))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let mut expected_fills = vec![];
+    if !with_order_status {
+        expected_fills.push((
+            first.trade_id,
+            first.last_qty,
+            first.last_px,
+            Some(first.commission),
+        ));
+    }
+
+    expected_fills.push((
+        second.trade_id,
+        second.last_qty,
+        second.last_px,
+        Some(second.commission),
+    ));
+    assert_eq!(fills, expected_fills);
+    assert_eq!(order.quantity(), Quantity::from("3.0"));
+    assert_eq!(order.filled_qty(), Quantity::from("3.0"));
+    assert_eq!(order.status(), OrderStatus::Filled);
+    assert_eq!(order.trade_ids(), vec![&first.trade_id, &second.trade_id]);
+    assert_eq!(position.quantity, Quantity::from("0.0"));
+    assert_eq!(position.side, PositionSide::Flat);
+    assert_eq!(position.avg_px_open, dec!(3200));
+    assert_eq!(
+        position.commissions(),
+        vec![Money::from("2 USD"), Money::from("0.35 USDT")]
+    );
+
+    let replay = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    assert_eq!(replay.events, Vec::<OrderEventAny>::new());
+    assert_eq!(
+        serde_json::to_value(ctx.get_order(&client_order_id).unwrap()).unwrap(),
+        serde_json::to_value(order).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(ctx.cache.borrow().position_owned(&position_id).unwrap()).unwrap(),
+        serde_json::to_value(position).unwrap()
     );
 }
 
@@ -16836,6 +17250,7 @@ async fn test_filtered_client_order_ids_skips_orphan_fills() {
         UnixNanos::from(1_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -16904,6 +17319,7 @@ async fn test_filtered_client_order_ids_skips_orphan_fills_via_venue_order_id_lo
         UnixNanos::from(1_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -17036,6 +17452,7 @@ async fn test_reconciliation_instrument_ids_filters_position_reports() {
         None,
         Some(dec!(100.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let _result = ctx
@@ -17059,6 +17476,7 @@ struct MockExecutionClient {
     bulk_position_coverage: bool,
     uncovered_instrument_ids: IndexSet<InstrumentId>,
     retain_unresolved_submissions: bool,
+    requires_authoritative_fills: bool,
     client_id: ClientId,
     account_id: AccountId,
     venue: Venue,
@@ -17085,6 +17503,7 @@ impl MockExecutionClient {
             bulk_position_coverage: true,
             uncovered_instrument_ids: IndexSet::new(),
             retain_unresolved_submissions: false,
+            requires_authoritative_fills: false,
             order_venue_ids: IndexMap::new(),
             client_id: test_client_id(),
             account_id: test_account_id(),
@@ -17112,6 +17531,7 @@ impl MockExecutionClient {
             bulk_position_coverage: true,
             uncovered_instrument_ids: IndexSet::new(),
             retain_unresolved_submissions: false,
+            requires_authoritative_fills: false,
             order_venue_ids: IndexMap::new(),
             client_id,
             account_id: test_account_id(),
@@ -17139,6 +17559,7 @@ impl MockExecutionClient {
             bulk_position_coverage: true,
             uncovered_instrument_ids: IndexSet::new(),
             retain_unresolved_submissions: false,
+            requires_authoritative_fills: false,
             order_venue_ids: IndexMap::new(),
             client_id,
             account_id: test_account_id(),
@@ -17215,6 +17636,10 @@ impl MockExecutionClient {
 
 #[async_trait(?Send)]
 impl ExecutionClient for MockExecutionClient {
+    fn requires_authoritative_fills(&self) -> bool {
+        self.requires_authoritative_fills
+    }
+
     fn provides_bulk_position_coverage(&self, instrument_id: InstrumentId) -> bool {
         self.bulk_position_coverage && !self.uncovered_instrument_ids.contains(&instrument_id)
     }
@@ -17899,6 +18324,335 @@ async fn test_check_open_orders_proceeds_without_local_activity(#[case] has_clie
     }
 }
 
+#[tokio::test]
+async fn test_targeted_closing_fill_after_startup_snapshot_does_not_reopen_position() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        open_check_open_only: false,
+        open_check_threshold_ns: DurationNanos::ZERO,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    });
+
+    ctx.require_authoritative_fills();
+    let instrument = test_instrument();
+    ctx.add_instrument(instrument.clone());
+    let opening_id = ClientOrderId::from("O-RETAINED-OPENING");
+    let closing_id = ClientOrderId::from("O-MISSING-CLOSE");
+    let opening_venue = VenueOrderId::from("V-RETAINED-OPENING");
+    let closing_venue = VenueOrderId::from("V-MISSING-CLOSE");
+
+    for (client_id, venue_id, side) in [
+        (opening_id, opening_venue, OrderSide::Buy),
+        (closing_id, closing_venue, OrderSide::Sell),
+    ] {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .strategy_id(StrategyId::external())
+            .client_order_id(client_id)
+            .instrument_id(instrument.id())
+            .side(side)
+            .quantity(Quantity::from("4.0"))
+            .price(Price::from("3000.0"))
+            .build();
+        ctx.add_order(order.clone());
+        ctx.exec_engine
+            .borrow_mut()
+            .process(&TestOrderEventStubs::submitted(&order, test_account_id()));
+        ctx.exec_engine
+            .borrow_mut()
+            .process(&TestOrderEventStubs::accepted(
+                &order,
+                test_account_id(),
+                venue_id,
+            ));
+    }
+
+    let opening = create_fill_report(
+        opening_id,
+        opening_venue,
+        instrument.id(),
+        TradeId::from("T-RETAINED-OPENING"),
+        "4.0",
+    );
+    ctx.exec_engine.borrow_mut().reconcile_fill_report(&opening);
+    let report = create_order_report_for_side(
+        Some(closing_id),
+        closing_venue,
+        instrument.id(),
+        OrderSide::Sell,
+        OrderStatus::Filled,
+        Quantity::from("4.0"),
+        Quantity::from("4.0"),
+    )
+    .with_avg_px(dec!(3000.0));
+    let mut closing = create_fill_report(
+        closing_id,
+        closing_venue,
+        instrument.id(),
+        TradeId::from("T-MISSING-CLOSE"),
+        "4.0",
+    );
+    closing.order_side = OrderSide::Sell;
+    closing.ts_event = UnixNanos::from(1_100_000);
+    let mut startup = create_mass_status(vec![report.clone()], Vec::new());
+    startup.set_report_window(Some(UnixNanos::from(1_500_000)), true);
+    startup.add_position_reports(vec![PositionStatusReport::new(
+        test_account_id(),
+        instrument.id(),
+        PositionSide::Flat,
+        Quantity::from("0.0"),
+        UnixNanos::from(2_000_000),
+        UnixNanos::from(2_000_000),
+        None,
+        None,
+        None,
+    )]);
+    ctx.advance_time(3_000_000);
+    ctx.manager
+        .reconcile_execution_mass_status(&startup, &ctx.exec_engine);
+
+    let snapshot = {
+        let cache = ctx.cache.borrow();
+        assert_eq!(
+            cache
+                .positions_open(None, Some(&instrument.id()), None, None, None)
+                .len(),
+            0
+        );
+        let positions = cache.positions(None, Some(&instrument.id()), None, None, None);
+        assert_eq!(positions.len(), 1);
+        positions[0].clone()
+    };
+
+    let mut client = MockExecutionClient::new(vec![report.clone()])
+        .with_order_report(report)
+        .with_fill_reports(vec![closing.clone()]);
+    client.requires_authoritative_fills = true;
+    for _ in 0..2 {
+        for event in ctx.manager.check_open_orders(&[&client]).await {
+            ctx.exec_engine.borrow_mut().process(&event);
+            if matches!(event, OrderEventAny::Filled(_)) {
+                ctx.exec_engine.borrow_mut().process(&event);
+            }
+        }
+    }
+
+    let recovered = ctx.get_order(&closing_id).unwrap();
+    let cache = ctx.cache.borrow();
+    let positions = cache.positions(None, Some(&instrument.id()), None, None, None);
+    assert_eq!(recovered.status(), OrderStatus::Filled);
+    assert_eq!(recovered.filled_qty(), closing.last_qty);
+    assert_eq!(recovered.trade_ids(), vec![&closing.trade_id]);
+    assert_eq!(
+        recovered.commissions(),
+        &IndexMap::from([(closing.commission.currency, closing.commission)])
+    );
+    assert_eq!(
+        cache
+            .positions_open(None, Some(&instrument.id()), None, None, None)
+            .len(),
+        0
+    );
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].signed_decimal_qty(), Decimal::ZERO);
+    assert_eq!(positions[0].events, snapshot.events);
+    assert_eq!(positions[0].realized_pnl, snapshot.realized_pnl);
+    assert_eq!(positions[0].commissions(), snapshot.commissions());
+}
+
+#[rstest]
+#[case::uncached(false, "0.0", false)]
+#[case::cached(true, "0.0", false)]
+#[case::retained(true, "4.0", false)]
+#[case::strategy_cached(true, "0.0", true)]
+#[tokio::test]
+async fn test_targeted_fill_after_startup_snapshot_projects_order_only(
+    #[case] cached: bool,
+    #[case] retained_qty: Quantity,
+    #[case] strategy_owned: bool,
+) {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        open_check_open_only: false,
+        open_check_threshold_ns: DurationNanos::ZERO,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    });
+
+    let instrument = test_instrument();
+    ctx.add_instrument(instrument.clone());
+    let client_order_id = ClientOrderId::from("O-STARTUP-GAP");
+    let venue_order_id = VenueOrderId::from("V-STARTUP-GAP");
+    ctx.require_authoritative_fills();
+
+    if cached {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .strategy_id(if strategy_owned {
+                StrategyId::from("S-OWNED")
+            } else {
+                StrategyId::external()
+            })
+            .client_order_id(client_order_id)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("10.0"))
+            .price(Price::from("3000.0"))
+            .build();
+
+        ctx.add_order(order.clone());
+        ctx.exec_engine
+            .borrow_mut()
+            .process(&TestOrderEventStubs::submitted(&order, test_account_id()));
+        ctx.exec_engine
+            .borrow_mut()
+            .process(&TestOrderEventStubs::accepted(
+                &order,
+                test_account_id(),
+                venue_order_id,
+            ));
+
+        if retained_qty.is_positive() {
+            let retained = create_fill_report(
+                client_order_id,
+                venue_order_id,
+                instrument.id(),
+                TradeId::from("T-RETAINED"),
+                "4.0",
+            );
+            ctx.exec_engine
+                .borrow_mut()
+                .reconcile_fill_report(&retained);
+        }
+    }
+
+    let report = create_order_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument.id(),
+        OrderStatus::Filled,
+        Quantity::from("10.0"),
+        Quantity::from("10.0"),
+    )
+    .with_avg_px(dec!(3000.0));
+
+    let mut fill = create_fill_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        TradeId::from("T-STARTUP-GAP"),
+        if retained_qty.is_zero() {
+            "10.0"
+        } else {
+            "6.0"
+        },
+    );
+
+    fill.ts_event = UnixNanos::from(1_100_000);
+    let mut startup = create_mass_status(vec![report.clone()], Vec::new());
+    startup.set_report_window(Some(UnixNanos::from(1_500_000)), true);
+    startup.add_position_reports(vec![PositionStatusReport::new(
+        test_account_id(),
+        instrument.id(),
+        PositionSide::Long,
+        Quantity::from("10.0"),
+        UnixNanos::from(2_000_000),
+        UnixNanos::from(2_000_000),
+        None,
+        None,
+        Some(dec!(3000.0)),
+    )]);
+    ctx.advance_time(3_000_000);
+    ctx.manager
+        .reconcile_execution_mass_status(&startup, &ctx.exec_engine);
+    let original = ctx.get_order(&client_order_id).unwrap();
+    assert_eq!(
+        original.status(),
+        if retained_qty.is_zero() {
+            OrderStatus::Accepted
+        } else {
+            OrderStatus::PartiallyFilled
+        }
+    );
+    assert_eq!(original.filled_qty(), retained_qty);
+
+    let mut expected_trade_ids = if retained_qty.is_zero() {
+        Vec::new()
+    } else {
+        vec![TradeId::from("T-RETAINED")]
+    };
+
+    assert_eq!(
+        original
+            .trade_ids()
+            .into_iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        expected_trade_ids
+    );
+
+    let position = {
+        let cache = ctx.cache.borrow();
+        let positions = cache.positions_open(None, Some(&instrument.id()), None, None, None);
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].signed_decimal_qty(), dec!(10.0));
+        positions[0].clone()
+    };
+
+    assert_eq!(
+        position.events.last().unwrap().ts_event,
+        UnixNanos::from(3_000_000)
+    );
+
+    let mut client = MockExecutionClient::new(vec![report.clone()])
+        .with_order_report(report)
+        .with_fill_reports(vec![fill.clone()]);
+    client.requires_authoritative_fills = true;
+    for _ in 0..2 {
+        let events = ctx.manager.check_open_orders(&[&client]).await;
+        for event in &events {
+            ctx.exec_engine.borrow_mut().process(event);
+            if matches!(event, OrderEventAny::Filled(_)) {
+                ctx.exec_engine.borrow_mut().process(event);
+            }
+        }
+    }
+
+    expected_trade_ids.push(fill.trade_id);
+    let recovered = ctx.get_order(&client_order_id).unwrap();
+    let queries = client.fill_report_queries.borrow();
+    let cache = ctx.cache.borrow();
+    let positions = cache.positions_open(None, Some(&instrument.id()), None, None, None);
+    assert_eq!(queries.len(), 1);
+    assert_eq!(queries[0].venue_order_id, Some(venue_order_id));
+    assert_eq!(queries[0].start, None);
+    assert_eq!(queries[0].end, None);
+    assert_eq!(recovered.status(), OrderStatus::Filled);
+    assert_eq!(recovered.filled_qty(), Quantity::from("10.0"));
+    assert_eq!(
+        recovered
+            .trade_ids()
+            .into_iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        expected_trade_ids
+    );
+    assert_eq!(
+        recovered.commissions(),
+        &IndexMap::from([(
+            fill.commission.currency,
+            if retained_qty.is_zero() {
+                fill.commission
+            } else {
+                Money::from("1.00 USDT")
+            }
+        )])
+    );
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].id, position.id);
+    assert_eq!(positions[0].signed_decimal_qty(), dec!(10.0));
+    assert_eq!(positions[0].events, position.events);
+    assert_eq!(positions[0].realized_pnl, position.realized_pnl);
+    assert_eq!(positions[0].commissions(), position.commissions());
+}
+
 #[rstest]
 #[case::bulk("bulk", false, "2.0")]
 #[case::bulk_inflight("bulk", true, "2.0")]
@@ -18236,22 +18990,27 @@ async fn test_terminal_reconciliation_defers_unexplained_fill_gap(
 }
 
 #[rstest]
-#[case::bulk_canceled(false, OrderStatus::Canceled, "4.5", OrderStatus::Canceled, 2)]
-#[case::bulk_expired(false, OrderStatus::Expired, "4.5", OrderStatus::Expired, 2)]
-#[case::targeted_canceled(true, OrderStatus::Canceled, "4.5", OrderStatus::Canceled, 2)]
-#[case::targeted_expired(true, OrderStatus::Expired, "4.5", OrderStatus::Expired, 2)]
-#[case::bulk_canceled_full(false, OrderStatus::Canceled, "10.0", OrderStatus::Filled, 1)]
-#[case::bulk_expired_full(false, OrderStatus::Expired, "10.0", OrderStatus::Filled, 1)]
+#[case::bulk_canceled(false, false, OrderStatus::Canceled, "4.5", OrderStatus::Canceled, 2)]
+#[case::bulk_expired(false, false, OrderStatus::Expired, "4.5", OrderStatus::Expired, 2)]
+#[case::targeted_canceled(true, false, OrderStatus::Canceled, "4.5", OrderStatus::Canceled, 2)]
+#[case::targeted_expired(true, false, OrderStatus::Expired, "4.5", OrderStatus::Expired, 2)]
+#[case::targeted_filled(true, false, OrderStatus::Filled, "10.0", OrderStatus::Filled, 1)]
+#[case::bulk_canceled_full(false, false, OrderStatus::Canceled, "10.0", OrderStatus::Filled, 1)]
+#[case::bulk_expired_full(false, false, OrderStatus::Expired, "10.0", OrderStatus::Filled, 1)]
+#[case::open_only_canceled(true, true, OrderStatus::Canceled, "4.5", OrderStatus::Canceled, 2)]
+#[case::open_only_filled(true, true, OrderStatus::Filled, "10.0", OrderStatus::Filled, 1)]
 #[tokio::test]
 async fn test_check_open_orders_terminal_report_applies_fills(
     #[case] targeted: bool,
+    #[case] open_only: bool,
     #[case] report_status: OrderStatus,
     #[case] filled_qty: Quantity,
     #[case] expected_status: OrderStatus,
     #[case] event_count: usize,
 ) {
     let mut ctx = TestContext::with_config(ExecutionManagerConfig {
-        open_check_open_only: false,
+        open_check_open_only: open_only,
+        single_order_query_delay_ms: 0,
         open_check_missing_retries: 1,
         ..Default::default()
     });
@@ -18282,13 +19041,14 @@ async fn test_check_open_orders_terminal_report_applies_fills(
     reported_fill.last_px = Price::from("101.25");
     reported_fill.commission = commission;
 
-    let client = if targeted {
+    let mut client = if targeted {
         MockExecutionClient::new(Vec::new()).with_order_report(report.clone())
     } else {
         MockExecutionClient::new(vec![report.clone()])
     }
     .with_fill_reports(vec![reported_fill]);
 
+    client.requires_authoritative_fills = report_status == OrderStatus::Filled;
     client.fail_fill_reports.set(true);
 
     let failed = ctx.manager.check_open_orders(&[&client]).await;
@@ -18770,11 +19530,13 @@ async fn test_check_open_orders_mismatched_targeted_report_defers_resolution() {
 
 #[rstest]
 #[tokio::test]
-async fn test_check_open_orders_caps_targeted_queries_per_cycle() {
+async fn test_check_open_orders_caps_targeted_queries_per_cycle(
+    #[values(false, true)] open_only: bool,
+) {
     let config = ExecutionManagerConfig {
         open_check_threshold_ns: DurationNanos::ZERO,
         open_check_missing_retries: 1,
-        open_check_open_only: false,
+        open_check_open_only: open_only,
         max_single_order_queries_per_cycle: 1,
         single_order_query_delay_ms: 0,
         ..Default::default()
@@ -18804,7 +19566,7 @@ async fn test_check_open_orders_caps_targeted_queries_per_cycle() {
 
     let events = ctx.manager.check_open_orders(&clients).await;
 
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), usize::from(!open_only));
     assert_eq!(mock_a.order_report_query_count.get(), 1);
     assert_eq!(mock_b.order_report_query_count.get(), 0);
 }
@@ -18972,16 +19734,20 @@ async fn test_check_open_orders_partially_filled_missing_at_venue_generates_canc
     assert_eq!(order.filled_qty(), Quantity::from("4.0"));
 }
 
+#[rstest]
 #[cfg_attr(
     not(all(feature = "simulation", madsim)),
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-async fn test_check_open_orders_failed_client_does_not_advance_missing_retries() {
+async fn test_check_open_orders_failed_client_does_not_advance_missing_retries(
+    #[values(false, true)] open_only: bool,
+) {
     let config = ExecutionManagerConfig {
         open_check_threshold_ns: DurationNanos::ZERO,
         open_check_missing_retries: 2,
-        open_check_open_only: false,
+        open_check_open_only: open_only,
+        single_order_query_delay_ms: 0,
         ..Default::default()
     };
 
@@ -19023,11 +19789,19 @@ async fn test_check_open_orders_failed_client_does_not_advance_missing_retries()
     let clients: Vec<&dyn ExecutionClient> = vec![&healthy_client, &recovered_client];
     let second_events = ctx.manager.check_open_orders(&clients).await;
 
-    assert_eq!(second_events.len(), 1);
-    assert!(
-        matches!(&second_events[0], OrderEventAny::Rejected(rejected) if rejected.client_order_id == healthy_order_id),
-        "only the healthy venue order should exhaust its retry budget",
-    );
+    assert_eq!(healthy_client.order_report_query_count.get(), 1);
+    assert_eq!(recovered_client.order_report_query_count.get(), 0);
+
+    if open_only {
+        assert!(second_events.is_empty());
+    } else {
+        assert_eq!(second_events.len(), 1);
+        assert!(
+            matches!(&second_events[0], OrderEventAny::Rejected(rejected)
+            if rejected.client_order_id == healthy_order_id)
+        );
+    }
+
     assert_eq!(
         ctx.get_order(&failed_order_id).unwrap().status(),
         OrderStatus::Accepted,
@@ -19173,16 +19947,20 @@ async fn test_check_open_orders_failed_routing_client_fallback_coverage_does_not
     );
 }
 
+#[rstest]
 #[cfg_attr(
     not(all(feature = "simulation", madsim)),
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-async fn test_check_open_orders_positive_report_resets_missing_retry_ladder() {
+async fn test_check_open_orders_positive_report_resets_missing_retry_ladder(
+    #[values(false, true)] open_only: bool,
+) {
     let config = ExecutionManagerConfig {
         open_check_threshold_ns: DurationNanos::ZERO,
         open_check_missing_retries: 2,
-        open_check_open_only: false,
+        open_check_open_only: open_only,
+        single_order_query_delay_ms: 0,
         ..Default::default()
     };
 
@@ -19237,6 +20015,10 @@ async fn test_check_open_orders_positive_report_resets_missing_retry_ladder() {
         ctx.get_order(&client_order_id).unwrap().status(),
         OrderStatus::Accepted,
     );
+    assert_eq!(empty_again.order_report_query_count.get(), 0);
+    let fourth_events = ctx.manager.check_open_orders(&clients).await;
+    assert_eq!(empty_again.order_report_query_count.get(), 1);
+    assert_eq!(fourth_events.len(), usize::from(!open_only));
 }
 
 #[cfg_attr(
@@ -19308,16 +20090,20 @@ async fn test_check_open_orders_venue_id_only_report_resets_missing_retry_ladder
     );
 }
 
+#[rstest]
 #[cfg_attr(
     not(all(feature = "simulation", madsim)),
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-async fn test_check_open_orders_order_closed_during_query_leaves_no_retry_state() {
+async fn test_check_open_orders_order_closed_during_query_leaves_no_retry_state(
+    #[values(false, true)] open_only: bool,
+) {
     let config = ExecutionManagerConfig {
         open_check_threshold_ns: DurationNanos::ZERO,
         open_check_missing_retries: 2,
-        open_check_open_only: false,
+        open_check_open_only: open_only,
+        single_order_query_delay_ms: 0,
         ..Default::default()
     };
 
@@ -19344,6 +20130,7 @@ async fn test_check_open_orders_order_closed_during_query_leaves_no_retry_state(
     let events = ctx.manager.check_open_orders(&clients).await;
 
     assert!(events.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 0);
     assert_eq!(
         ctx.manager.recon_check_retry_count(&client_order_id),
         0,
@@ -19428,6 +20215,349 @@ async fn test_check_open_orders_deferred_pending_order_keeps_inflight_registrati
 
 #[rstest]
 #[tokio::test]
+async fn test_check_open_orders_open_only_negative_query_keeps_order_open(
+    #[values(false, true)] failed: bool,
+    #[values(false, true)] partially_filled: bool,
+) {
+    let _guard = MANAGER_LOG_TEST_LOCK.lock().await;
+    install_manager_log_capture();
+
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        open_check_threshold_ns: DurationNanos::ZERO,
+        open_check_missing_retries: 2,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    });
+
+    let instrument = test_instrument();
+    ctx.add_instrument(instrument.clone());
+    let client_order_id = ClientOrderId::from("O-OPEN-NEGATIVE");
+    let venue_order_id = VenueOrderId::from("V-OPEN-NEGATIVE");
+    insert_accepted_limit_order(&ctx, client_order_id, venue_order_id, test_client_id());
+    if partially_filled {
+        let order = ctx.get_order(&client_order_id).unwrap();
+        let fill = OrderFilledTestBuilder::new(&order, &instrument)
+            .last_qty(Quantity::from("4.0"))
+            .without_position_id()
+            .build();
+        ctx.cache.borrow_mut().update_order(&fill).unwrap();
+    }
+
+    let before = ctx.get_order(&client_order_id).unwrap();
+    let mut client = MockExecutionClient::new(Vec::new());
+    client.fail_order_report = failed;
+    for expected_queries in [0, 1, 1, 2] {
+        let events = ctx.manager.check_open_orders(&[&client]).await;
+        assert!(events.is_empty());
+        assert_eq!(client.order_report_query_count.get(), expected_queries);
+        assert_eq!(ctx.get_order(&client_order_id).unwrap(), before);
+    }
+
+    let warnings = MANAGER_LOG_CAPTURE.messages.lock();
+    let warnings: Vec<_> = warnings
+        .iter()
+        .filter(|message| message.contains(client_order_id.as_str()))
+        .collect();
+    assert_eq!(warnings.len(), 2, "found {warnings:?}");
+
+    let expected = if failed {
+        "Failed targeted order status query"
+    } else {
+        "Keeping O-OPEN-NEGATIVE open: targeted order status query found no report"
+    };
+
+    assert!(warnings.iter().all(|message| message.starts_with(expected)));
+    assert!(
+        ctx.manager
+            .take_submission_recovery_exhaustions()
+            .is_empty()
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_check_open_orders_bulk_failure_warning_rearms_after_recovery(
+    #[values(false, true)] open_only: bool,
+) {
+    let _guard = MANAGER_LOG_TEST_LOCK.lock().await;
+    install_manager_log_capture();
+
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        open_check_open_only: open_only,
+        open_check_threshold_ns: DurationNanos::ZERO,
+        open_check_missing_retries: 2,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    });
+
+    ctx.add_instrument(test_instrument());
+    let client_order_id = ClientOrderId::from("O-BULK-FAILURE-WARN");
+    insert_accepted_limit_order(
+        &ctx,
+        client_order_id,
+        VenueOrderId::from("V-BULK-FAILURE-WARN"),
+        test_client_id(),
+    );
+    let before = ctx.get_order(&client_order_id).unwrap();
+    let mut client = MockExecutionClient::failing(test_client_id(), test_venue());
+
+    let attempts = 3;
+    for _ in 0..attempts {
+        assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    }
+
+    let warnings = MANAGER_LOG_CAPTURE
+        .messages
+        .lock()
+        .iter()
+        .filter(|message| message.contains(client_order_id.as_str()))
+        .count();
+    assert_eq!(warnings, if open_only { 1 } else { attempts });
+
+    client.fail_order_reports = false;
+    assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    client.fail_order_reports = true;
+    assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+
+    let warnings = MANAGER_LOG_CAPTURE
+        .messages
+        .lock()
+        .iter()
+        .filter(|message| message.contains(client_order_id.as_str()))
+        .count();
+    assert_eq!(warnings, if open_only { 2 } else { attempts + 1 });
+    assert_eq!(ctx.get_order(&client_order_id).unwrap(), before);
+    assert_eq!(client.order_report_query_count.get(), 0);
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 1);
+}
+
+#[tokio::test]
+async fn test_check_open_orders_open_only_does_not_reopen_order_closed_during_targeted_query() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        open_check_threshold_ns: DurationNanos::ZERO,
+        open_check_missing_retries: 1,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    });
+
+    ctx.add_instrument(test_instrument());
+    let client_order_id = ClientOrderId::from("O-CLOSED-DURING-TARGET");
+    let venue_order_id = VenueOrderId::from("V-CLOSED-DURING-TARGET");
+    insert_accepted_limit_order(&ctx, client_order_id, venue_order_id, test_client_id());
+    let report = create_order_report(
+        Some(client_order_id),
+        venue_order_id,
+        test_instrument_id(),
+        OrderStatus::Accepted,
+        Quantity::from("10.0"),
+        Quantity::zero(1),
+    );
+    let mut expected = ctx.get_order(&client_order_id).unwrap();
+    let canceled =
+        TestOrderEventStubs::canceled(&expected, test_account_id(), Some(venue_order_id));
+    expected.apply(canceled.clone()).unwrap();
+    let cache = ctx.cache.clone();
+    let client = MockExecutionClient::new(Vec::new())
+        .with_order_report(report)
+        .with_on_order_report_query(Box::new(move || {
+            cache.borrow_mut().update_order(&canceled).unwrap();
+        }));
+
+    let events = ctx.manager.check_open_orders(&[&client]).await;
+
+    assert!(events.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 1);
+    assert_eq!(ctx.get_order(&client_order_id).unwrap(), expected);
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_check_open_orders_missing_lookback_skips_query(
+    #[values(false, true)] open_only: bool,
+) {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        open_check_threshold_ns: DurationNanos::ZERO,
+        open_check_missing_retries: 1,
+        open_check_open_only: open_only,
+        open_check_lookback_mins: Some(1),
+        ..Default::default()
+    });
+
+    ctx.add_instrument(test_instrument());
+    let client_order_id = ClientOrderId::from("O-LOOKBACK-MISSING");
+    insert_accepted_limit_order(
+        &ctx,
+        client_order_id,
+        VenueOrderId::from("V-LOOKBACK-MISSING"),
+        test_client_id(),
+    );
+    let before = ctx.get_order(&client_order_id).unwrap();
+    ctx.advance_time(DurationNanos::from_mins(2).as_u64());
+    let client = MockExecutionClient::new(Vec::new());
+
+    let events = ctx.manager.check_open_orders(&[&client]).await;
+
+    assert!(events.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 0);
+    assert_eq!(ctx.get_order(&client_order_id).unwrap(), before);
+}
+
+#[rstest]
+#[case::cancel(false)]
+#[case::modify(true)]
+#[cfg_attr(
+    not(all(feature = "simulation", madsim)),
+    tokio::test(start_paused = true)
+)]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+async fn test_check_open_orders_open_only_queries_after_inflight_timeout(#[case] modify: bool) {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        open_check_threshold_ns: DurationNanos::ZERO,
+        open_check_missing_retries: 2,
+        inflight_threshold_ms: 10,
+        inflight_max_retries: 2,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    });
+
+    ctx.add_instrument(test_instrument());
+    let client_order_id = ClientOrderId::from("O-OPEN-RESTORED");
+    let venue_order_id = VenueOrderId::from("V-OPEN-RESTORED");
+    insert_accepted_limit_order(&ctx, client_order_id, venue_order_id, test_client_id());
+    let order = ctx.get_order(&client_order_id).unwrap();
+
+    let pending = if modify {
+        OrderEventAny::PendingUpdate(
+            OrderPendingUpdateSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(client_order_id)
+                .venue_order_id(venue_order_id)
+                .account_id(test_account_id())
+                .build(),
+        )
+    } else {
+        OrderEventAny::PendingCancel(
+            OrderPendingCancelSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(client_order_id)
+                .venue_order_id(venue_order_id)
+                .account_id(test_account_id())
+                .build(),
+        )
+    };
+
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
+    let report = create_order_report(
+        Some(client_order_id),
+        venue_order_id,
+        test_instrument_id(),
+        OrderStatus::Canceled,
+        Quantity::from("10.0"),
+        Quantity::zero(1),
+    );
+    let client = MockExecutionClient::new(Vec::new()).with_order_report(report);
+
+    for _ in 0..2 {
+        assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    }
+
+    assert_eq!(client.order_report_query_count.get(), 0);
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 0);
+    ctx.cache.borrow_mut().update_order(&pending).unwrap();
+
+    ctx.advance_both(dst::time::Duration::from_millis(20)).await;
+    let inflight = ctx.manager.check_inflight_orders();
+    assert_eq!(inflight.queries.len(), 1);
+    assert!(inflight.events.is_empty());
+    assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 0);
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 1);
+
+    ctx.advance_both(dst::time::Duration::from_millis(20)).await;
+    let exhausted = ctx.manager.check_inflight_orders();
+    assert!(exhausted.queries.is_empty());
+    assert_eq!(exhausted.events.len(), 1);
+
+    match &exhausted.events[0] {
+        OrderEventAny::ModifyRejected(event) if modify => {
+            assert_eq!(event.reason, "INFLIGHT_TIMEOUT");
+            assert_eq!(event.client_order_id, client_order_id);
+        }
+        OrderEventAny::CancelRejected(event) if !modify => {
+            assert_eq!(event.reason, "INFLIGHT_TIMEOUT");
+            assert_eq!(event.client_order_id, client_order_id);
+        }
+        event => panic!("Expected command rejection, was {event:?}"),
+    }
+
+    ctx.exec_engine.borrow_mut().process(&exhausted.events[0]);
+    ctx.manager.observe_order_event(&exhausted.events[0]);
+    assert_eq!(
+        ctx.get_order(&client_order_id).unwrap().status(),
+        OrderStatus::Accepted
+    );
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 0);
+
+    assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 0);
+    let events = ctx.manager.check_open_orders(&[&client]).await;
+    assert_eq!(client.order_report_query_count.get(), 1);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(&events[0], OrderEventAny::Canceled(event)
+        if event.client_order_id == client_order_id && event.venue_order_id == Some(venue_order_id)));
+    ctx.exec_engine.borrow_mut().process(&events[0]);
+    assert_eq!(
+        ctx.get_order(&client_order_id).unwrap().status(),
+        OrderStatus::Canceled
+    );
+}
+
+#[cfg_attr(
+    not(all(feature = "simulation", madsim)),
+    tokio::test(start_paused = true)
+)]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+async fn test_check_open_orders_open_only_defers_recent_queries_and_activity() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        open_check_threshold_ns: DurationNanos::from_millis(100),
+        open_check_missing_retries: 1,
+        single_order_query_delay_ms: 200,
+        ..Default::default()
+    });
+
+    ctx.add_instrument(test_instrument());
+    let client_order_id = ClientOrderId::from("O-OPEN-RECENT");
+    insert_accepted_limit_order(
+        &ctx,
+        client_order_id,
+        VenueOrderId::from("V-OPEN-RECENT"),
+        test_client_id(),
+    );
+    ctx.manager.record_local_activity(client_order_id);
+    let client = MockExecutionClient::new(Vec::new());
+
+    assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 0);
+    ctx.advance_both(dst::time::Duration::from_millis(101))
+        .await;
+    assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 1);
+    ctx.advance_both(dst::time::Duration::from_millis(199))
+        .await;
+    assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 1);
+    ctx.advance_both(dst::time::Duration::from_millis(1)).await;
+    assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 2);
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_check_open_orders_open_only_missing_venue_order_does_not_reject() {
     let config = ExecutionManagerConfig {
         open_check_threshold_ns: DurationNanos::ZERO,
@@ -19456,6 +20586,7 @@ async fn test_check_open_orders_open_only_missing_venue_order_does_not_reject() 
     let events = ctx.manager.check_open_orders(&clients).await;
 
     assert!(events.is_empty());
+    assert_eq!(mock_client.order_report_query_count.get(), 0);
     let cached_order = ctx.get_order(&ClientOrderId::from("O-OPEN-ONLY")).unwrap();
     assert_eq!(cached_order.status(), OrderStatus::Submitted);
 }
@@ -19618,6 +20749,7 @@ async fn test_position_check_reconciles_venue_only_nonflat_report() {
         None,
         Some(dec!(3000.00)),
     );
+
     let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
@@ -19665,6 +20797,7 @@ async fn test_position_check_respects_disabled_order_generation(
         None,
         Some(dec!(3100.00)),
     );
+
     let client = MockPositionExecutionClient::new(Vec::new(), vec![report]);
 
     let events = ctx.manager.check_positions_consistency(&[&client]).await;
@@ -19707,6 +20840,7 @@ async fn test_position_check_updates_reported_hedge_position() {
         Some(position_id),
         Some(dec!(3100.00)),
     );
+
     ctx.add_instrument(instrument);
     ctx.add_position(&position);
     let client = MockPositionExecutionClient::new(vec![], vec![report]);
@@ -19772,6 +20906,7 @@ async fn test_position_check_cross_zero_preserves_both_hedge_position_ids() {
         Some(open_position_id),
         Some(dec!(3100.00)),
     );
+
     ctx.add_instrument(instrument);
     ctx.add_position(&position);
     let client = MockPositionExecutionClient::new(vec![], vec![report]);
@@ -19901,6 +21036,7 @@ async fn test_position_check_rereads_position_opened_during_request() {
         None,
         Some(dec!(3000.00)),
     );
+
     ctx.add_instrument(instrument);
 
     let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report])
@@ -19952,6 +21088,7 @@ async fn test_position_check_uses_current_avg_px_after_request() {
         None,
         Some(dec!(3200.00)),
     );
+
     ctx.add_instrument(instrument);
     ctx.add_position(&stale_position);
 
@@ -20479,6 +21616,7 @@ async fn test_position_check_uses_client_tolerance_for_observed_smoke_difference
         None,
         Some(dec!(3000.00)),
     );
+
     ctx.add_instrument(instrument);
     ctx.add_position(&position);
 
@@ -20527,6 +21665,7 @@ async fn test_position_check_uses_routing_client_tolerance() {
         None,
         Some(dec!(3000.00)),
     );
+
     ctx.add_instrument(instrument);
     ctx.add_margin_account(account_id);
     ctx.add_position(&position);
@@ -20591,6 +21730,7 @@ async fn test_mass_status_netting_uses_routing_client_tolerance(
         None,
         Some(dec!(3000.00)),
     );
+
     ctx.add_instrument(instrument);
     ctx.add_margin_account(account_id);
     ctx.add_position(&position);
@@ -20629,6 +21769,7 @@ async fn test_mass_status_netting_uses_routing_client_tolerance(
         None,
         Some(dec!(3000.00)),
     );
+
     mass_status.add_position_reports(vec![drift_report]);
 
     ctx.exec_engine
@@ -20701,6 +21842,7 @@ async fn test_routing_clients_on_same_venue_use_account_tolerances_independently
         None,
         Some(dec!(3000.00)),
     );
+
     ctx.add_instrument(instrument);
     ctx.add_margin_account(tolerant_account_id);
     ctx.add_margin_account(strict_account_id);
@@ -20770,6 +21912,7 @@ async fn test_position_check_reconciles_at_client_tolerance_boundary() {
         None,
         Some(dec!(3000.00)),
     );
+
     ctx.add_instrument(instrument);
     ctx.add_position(&position);
 
@@ -20989,6 +22132,7 @@ async fn test_position_check_aggregates_hedge_positions_before_comparing_report(
         None,
         Some(dec!(3050.00)),
     );
+
     let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
@@ -21105,6 +22249,7 @@ async fn test_position_check_skips_reports_outside_reconciliation_instruments() 
         None,
         Some(dec!(50000.0)),
     );
+
     let mock_client = MockPositionExecutionClient::new(vec![], vec![report.clone()]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
     let queried_clients = IndexSet::from([mock_client.client_id()]);
@@ -21334,6 +22479,7 @@ async fn test_position_check_flat_and_nonflat_reports_use_nonflat_report() {
         None,
         None,
     );
+
     ctx.add_instrument(instrument);
     ctx.add_position(&position);
 
@@ -21755,6 +22901,7 @@ async fn test_position_check_flat_venue_report_does_not_protect_stale_counter() 
         None,
         None,
     );
+
     let mock_client = MockPositionExecutionClient::new(vec![], vec![flat_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
@@ -21839,6 +22986,7 @@ async fn test_position_check_nonflat_venue_report_protects_counter() {
         None,
         Some(dec!(3000.00)),
     );
+
     let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report.clone()]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
@@ -22053,6 +23201,7 @@ async fn test_position_check_grace_survives_accelerated_trading_clock() {
         ts_event, // ts_init
         None,     // report_id
     );
+
     ctx.manager
         .observe_execution_report(&ExecutionReport::Fill(Box::new(fill_report)));
 
@@ -22074,6 +23223,7 @@ async fn test_position_check_grace_survives_accelerated_trading_clock() {
         None, // venue_position_id
         Some(dec!(3000.00)),
     );
+
     let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
@@ -22132,6 +23282,7 @@ async fn test_position_check_grace_expires_on_monotonic_clock() {
         ts_event,
         None,
     );
+
     ctx.manager
         .observe_execution_report(&ExecutionReport::Fill(Box::new(fill_report)));
 
@@ -22148,6 +23299,7 @@ async fn test_position_check_grace_expires_on_monotonic_clock() {
         None,
         Some(dec!(3000.00)),
     );
+
     let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
@@ -22213,6 +23365,7 @@ async fn test_check_positions_consistency_processes_only_discrepant_account() {
         None,
         Some(dec!(3000.00)),
     );
+
     let mock_client = MockPositionExecutionClient::new(vec![], vec![report_a]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
@@ -22365,6 +23518,7 @@ async fn test_reconcile_mass_status_publishes_raw_reports_for_capture() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let order_report = create_order_report(
         None,
         VenueOrderId::from("V-RAW-CAPTURE"),
@@ -22391,6 +23545,7 @@ async fn test_reconcile_mass_status_publishes_raw_reports_for_capture() {
         UnixNanos::from(2_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill_report.clone()]);
 
     let position_report = PositionStatusReport::new(
@@ -22404,6 +23559,7 @@ async fn test_reconcile_mass_status_publishes_raw_reports_for_capture() {
         None,
         Some(dec!(3000.0)),
     );
+
     mass_status.add_position_reports(vec![position_report.clone()]);
 
     let _ = ctx
@@ -22468,6 +23624,7 @@ async fn test_reconcile_mass_status_does_not_capture_synthetic_reports() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let order_report = create_order_report(
         None,
         venue_order_id,
@@ -22494,6 +23651,7 @@ async fn test_reconcile_mass_status_does_not_capture_synthetic_reports() {
         UnixNanos::from(2_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill_report.clone()]);
 
     let position_report = PositionStatusReport::new(
@@ -22507,6 +23665,7 @@ async fn test_reconcile_mass_status_does_not_capture_synthetic_reports() {
         None, // netting mode triggers adjust_mass_status_fills
         Some(dec!(3000.0)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let _ = ctx
@@ -22575,6 +23734,7 @@ async fn test_mass_status_zero_quantity_fill_does_not_consume_trade_id(#[case] b
         UnixNanos::from(1_000_000),
         None,
     );
+
     let mut zero = valid.clone();
     zero.last_qty = Quantity::zero(1);
     zero.commission = Money::from("123.45 USDT");
@@ -22759,6 +23919,7 @@ async fn test_fresh_cache_replacement_chain_preserves_native_fills(
             VenueOrderId::from("V-FRESH-CURRENT"),
         ],
     );
+
     {
         let mut engine = ctx.exec_engine.borrow_mut();
         engine.deregister_client(test_client_id()).unwrap();
@@ -22771,7 +23932,6 @@ async fn test_fresh_cache_replacement_chain_preserves_native_fills(
     let current_id = VenueOrderId::from("V-FRESH-CURRENT");
 
     let filled = if child_fill { "0.5" } else { "0.3" };
-
     let average = if child_fill {
         dec!(3500)
     } else {
@@ -22850,6 +24010,7 @@ async fn test_fresh_cache_replacement_chain_preserves_native_fills(
         UnixNanos::from(2000),
         None,
     );
+
     let mut fills = vec![middle_fill, root_fill.clone()];
     if child_fill {
         fills.push(FillReport::new(
@@ -22881,6 +24042,7 @@ async fn test_fresh_cache_replacement_chain_preserves_native_fills(
         UnixNanos::from(2000),
         None,
     );
+
     mass.add_order_reports(reports);
     mass.add_fill_reports(fills);
 
@@ -23111,6 +24273,7 @@ async fn test_fresh_cache_venue_id_history_requires_client_proof(#[case] venue_i
         UnixNanos::from(2000),
         None,
     );
+
     mass.add_order_reports(reports);
     let result = ctx
         .manager

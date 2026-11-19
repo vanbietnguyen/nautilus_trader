@@ -34,6 +34,7 @@ use nautilus_core::string::secret::REDACTED;
 use nautilus_core::{AtomicMap, string::secret::SecretString};
 use nautilus_live::{
     SocketControl,
+    book::snapshot::SnapshotGate,
     task::{TaskJoinOutcome, TaskSlot, finish_task},
 };
 use nautilus_model::{
@@ -51,6 +52,7 @@ use nautilus_network::{
         channel_message_handler,
     },
 };
+use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use crate::{
@@ -63,6 +65,7 @@ use crate::{
         enums::CoinbaseWsChannel,
     },
     websocket::{
+        error::CoinbaseWsError,
         handler::{FeedHandler, HandlerCommand, NautilusWsMessage},
         messages::{CoinbaseWsAction, CoinbaseWsSubscription},
     },
@@ -477,6 +480,98 @@ impl CoinbaseWebSocketClient {
             .map_err(|e| anyhow::anyhow!("Failed to send Unsubscribe command: {e}"))
     }
 
+    /// Subscribes to the `level2` channel for one product and waits for the write.
+    ///
+    /// `gate` opens once the subscribe frame is written; the book snapshot follows on the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload cannot be built, the feed handler is unavailable, the
+    /// write fails, or `cancel` ends the write first.
+    pub(crate) async fn subscribe_book(
+        &self,
+        product_id: Ustr,
+        cancel: CancellationToken,
+        gate: SnapshotGate,
+    ) -> Result<(), CoinbaseWsError> {
+        let subscribe = self.book_payload(CoinbaseWsAction::Subscribe, product_id)?;
+        let channel = CoinbaseWsChannel::Level2;
+        self.subscriptions
+            .mark_subscribe(&format!("{}|{product_id}", channel.as_ref()));
+
+        self.send_book_subscription(vec![subscribe], cancel, gate)
+            .await
+    }
+
+    /// Replaces the `level2` subscription for one product with an unsubscribe and subscribe pair.
+    ///
+    /// Coinbase sends a fresh snapshot only for a new subscription, so a duplicate subscribe
+    /// cannot recover a book. The retained subscription state is left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a payload cannot be built, the feed handler is unavailable, a write
+    /// fails, or `cancel` ends the writes first.
+    pub(crate) async fn resubscribe_book(
+        &self,
+        product_id: Ustr,
+        cancel: CancellationToken,
+        gate: SnapshotGate,
+    ) -> Result<(), CoinbaseWsError> {
+        let unsubscribe = self.book_payload(CoinbaseWsAction::Unsubscribe, product_id)?;
+        let subscribe = self.book_payload(CoinbaseWsAction::Subscribe, product_id)?;
+
+        self.send_book_subscription(vec![unsubscribe, subscribe], cancel, gate)
+            .await
+    }
+
+    fn book_payload(
+        &self,
+        action: CoinbaseWsAction,
+        product_id: Ustr,
+    ) -> Result<SecretString, CoinbaseWsError> {
+        let jwt = self.credential.as_ref().and_then(|c| c.build_ws_jwt().ok());
+
+        protect_subscription(CoinbaseWsSubscription {
+            msg_type: action,
+            product_ids: vec![product_id],
+            channel: CoinbaseWsChannel::Level2,
+            jwt,
+        })
+        .map(|subscription| subscription.payload)
+        .map_err(|e| CoinbaseWsError::MessageSerialization(e.to_string()))
+    }
+
+    async fn send_book_subscription(
+        &self,
+        payloads: Vec<SecretString>,
+        cancel: CancellationToken,
+        gate: SnapshotGate,
+    ) -> Result<(), CoinbaseWsError> {
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        let cmd_tx = self.cmd_tx.read().await;
+
+        if cancel.is_cancelled() {
+            return Err(CoinbaseWsError::ChannelSend(
+                "book subscription cancelled".to_string(),
+            ));
+        }
+
+        cmd_tx
+            .send(HandlerCommand::BookSubscription {
+                payloads,
+                cancel,
+                gate,
+                completion,
+            })
+            .map_err(|e| CoinbaseWsError::ChannelSend(e.to_string()))?;
+
+        drop(cmd_tx);
+        receiver
+            .await
+            .map_err(|e| CoinbaseWsError::ChannelSend(e.to_string()))?
+    }
+
     /// Returns the next parsed message from the feed handler.
     pub async fn next_message(&mut self) -> Option<NautilusWsMessage> {
         self.out_rx.as_mut()?.recv().await
@@ -731,6 +826,7 @@ fn resubscribe_all(
                             "JWT required for {channel} but build failed: {e}; topic {topic} not restored"
                         );
                         log::error!("{msg}");
+
                         if let Some(tx) = out_tx {
                             let _ = tx.send(NautilusWsMessage::Error(msg));
                         }
@@ -745,6 +841,7 @@ fn resubscribe_all(
                         "JWT required for {channel} but no credentials configured; topic {topic} not restored"
                     );
                     log::error!("{msg}");
+
                     if let Some(tx) = out_tx {
                         let _ = tx.send(NautilusWsMessage::Error(msg));
                     }
@@ -1190,6 +1287,7 @@ mod tests {
         let msg = out_rx
             .try_recv()
             .expect("Error event must be emitted when auth channel cannot resubscribe");
+
         match msg {
             NautilusWsMessage::Error(text) => {
                 assert!(
@@ -1226,6 +1324,7 @@ mod tests {
         let msg = out_rx
             .try_recv()
             .expect("Error event must be emitted when JWT build fails for an auth channel");
+
         match msg {
             NautilusWsMessage::Error(text) => {
                 assert!(text.contains("user"), "error must mention channel: {text}");

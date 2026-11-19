@@ -489,6 +489,7 @@ fn validate_client_bound_order_row(
         .expire_time()
         .filter(|value| !value.is_zero())
         .map(|value| value.as_seconds());
+
     if cached_order.time_in_force() == TimeInForce::Gtd {
         anyhow::ensure!(
             cached_expire_seconds == provider_expire_seconds,
@@ -714,10 +715,16 @@ pub(crate) fn build_target_order_report(
 ) -> anyhow::Result<OrderStatusReport> {
     let logical_fill_offset = match (scope.cached_order, scope.expected_quantity) {
         (Some(cached_order), None) => {
+            let instrument = resolve_target_instrument(
+                instruments,
+                order.asset_id,
+                Some(scope.instrument_id),
+                &format!("provider venue order {}", order.id),
+            )?;
             let (filled_before, leg_quantity) = venue_leg_filled_before_and_quantity(
                 cached_order,
                 scope.venue_order_id,
-                cached_order.quantity().precision,
+                instrument.size_precision(),
             )?;
             Some((cached_order.quantity(), filled_before, leg_quantity))
         }
@@ -806,15 +813,13 @@ pub(crate) fn order_status_scope_awaits_application(
     cached: Option<&OrderAny>,
     venue_order_id: &VenueOrderId,
 ) -> bool {
-    let mut ids = cached
-        .map(|order| {
-            order
-                .venue_order_ids()
-                .into_iter()
-                .copied()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let mut ids = cached.map_or_default(|order| {
+        order
+            .venue_order_ids()
+            .into_iter()
+            .copied()
+            .collect::<Vec<_>>()
+    });
 
     if !ids.contains(venue_order_id) {
         ids.push(*venue_order_id);
@@ -1911,7 +1916,7 @@ fn cached_order_trade_ids(
             order.account_id() == Some(report.account_id)
                 && order.instrument_id() == report.instrument_id
         })
-        .map(|order| {
+        .map_or_default(|order| {
             order
                 .events()
                 .iter()
@@ -1923,7 +1928,6 @@ fn cached_order_trade_ids(
                 })
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3014,6 +3018,104 @@ mod tests {
     fn open_order() -> PolymarketOpenOrder {
         serde_json::from_str(include_str!("../../test_data/http_open_order.json"))
             .expect("valid open-order fixture")
+    }
+
+    #[rstest]
+    #[case::partial("0.200000", "valid", None)]
+    #[case::minimum_fill("0.000001", "valid", None)]
+    #[case::unrepresentable_fill("0.0000001", "valid", Some("cannot be represented exactly"))]
+    #[case::missing_instrument("0.200000", "missing", Some("has no loaded Polymarket instrument"))]
+    #[case::wrong_instrument("0.200000", "mismatched", Some("not requested instrument"))]
+    fn test_target_report_preserves_fractional_fills_of_integer_orders(
+        #[case] filled_quantity: &str,
+        #[case] instrument_state: &str,
+        #[case] expected_error: Option<&str>,
+    ) {
+        use nautilus_model::orders::{builder::OrderTestBuilder, stubs::TestOrderEventStubs};
+
+        let instrument = test_instrument();
+        let instruments = if instrument_state == "missing" {
+            AtomicMap::default()
+        } else {
+            test_instruments()
+        };
+        let ctx = test_fill_context();
+        let venue_order_id = VenueOrderId::from("V-PARTIAL");
+        let filled_quantity = Quantity::from(filled_quantity);
+        let mut cached = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .price(Price::from("0.500"))
+            .quantity(Quantity::from("5"))
+            .build();
+        cached
+            .apply(TestOrderEventStubs::submitted(&cached, ctx.account_id))
+            .unwrap();
+        cached
+            .apply(TestOrderEventStubs::accepted(
+                &cached,
+                ctx.account_id,
+                venue_order_id,
+            ))
+            .unwrap();
+        let fill = TestOrderEventStubs::filled(
+            &cached,
+            &instrument,
+            None,
+            None,
+            Some(Price::from("0.500")),
+            Some(filled_quantity),
+            None,
+            None,
+            None,
+            Some(ctx.account_id),
+        );
+        cached.apply(fill).unwrap();
+        assert_eq!(cached.quantity().precision, 0);
+        let before = serde_json::to_value(&cached).unwrap();
+        let mut provider = open_order();
+        provider.id = venue_order_id.to_string();
+        provider.market = Ustr::from(TEST_CONDITION_ID);
+        provider.asset_id = Ustr::from(TEST_TOKEN_ID);
+        provider.outcome = crate::common::enums::PolymarketOutcome::yes();
+        provider.maker_address = TEST_USER_ADDRESS.to_string();
+        provider.owner = TEST_API_KEY.to_string();
+        provider.side = PolymarketOrderSide::Buy;
+        provider.status = crate::common::enums::PolymarketOrderStatus::Live;
+        provider.order_type = crate::common::enums::PolymarketOrderType::GTC;
+        provider.expiration = Some("0".to_string());
+        provider.original_size = dec!(5);
+        provider.price = dec!(0.5);
+        provider.size_matched = filled_quantity.as_decimal();
+
+        let result = build_target_order_report(
+            &provider,
+            &instruments,
+            &ctx,
+            TargetOrderReportScope::new(
+                if instrument_state == "mismatched" {
+                    InstrumentId::from("OTHER.POLYMARKET")
+                } else {
+                    instrument.id()
+                },
+                venue_order_id,
+                Some(cached.client_order_id()),
+                Some(&cached),
+                None,
+            ),
+            UnixNanos::from(123_000_000_000u64),
+        );
+
+        if let Some(expected_error) = expected_error {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(expected_error), "unexpected error: {error}");
+        } else {
+            let report = result.unwrap();
+            assert_eq!(report.order_status, OrderStatus::PartiallyFilled);
+            assert_eq!(report.quantity, Quantity::from("5"));
+            assert_eq!(report.filled_qty, filled_quantity);
+        }
+        assert_eq!(serde_json::to_value(&cached).unwrap(), before);
     }
 
     fn data_api_positions() -> Vec<DataApiPosition> {

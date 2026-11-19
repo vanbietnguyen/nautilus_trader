@@ -26,7 +26,8 @@
 //! [`RateLimiter`](crate::ratelimiter::RateLimiter) instances. Sharing a limiter across clients
 //! enforces one process-wide budget for scopes such as an IP address or account. The client accepts
 //! default and per-request headers, repeated query values, raw bodies, and client-level and
-//! per-request timeouts.
+//! per-request timeouts. Default header values are marked sensitive: `Debug` hides them, and
+//! HTTP/2 excludes them from the header compression table.
 //!
 //! # Proxy routing
 //!
@@ -63,6 +64,8 @@
 //!
 //! Buffered requests advertise gzip unless default or per-request headers set `Accept-Encoding`.
 //! Gzip responses are decoded before return; unsupported encodings and corrupt bodies are errors.
+//! A `Content-Encoding: gzip` response with zero wire bytes is returned without decoding, preserving
+//! its status and headers selected through `header_keys`.
 //! The request deadline includes gzip decoding. Responses whose method or status forbids content
 //! preserve their encoding metadata. Decoded responses omit `Content-Encoding` and `Content-Length`,
 //! even when selected through `header_keys`.

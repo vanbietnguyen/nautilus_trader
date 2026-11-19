@@ -182,6 +182,21 @@ pub trait DataActorNative {
     /// Returns the mutable actor core.
     fn core_mut(&mut self) -> &mut DataActorCore;
 
+    /// Dispatches framework startup and the user-facing start callback.
+    ///
+    /// Overrides call [`DataActor::on_start`] once after successful framework startup.
+    /// The default implementation only calls [`DataActor::on_start`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if framework startup or the user callback fails.
+    fn dispatch_start(&mut self) -> anyhow::Result<()>
+    where
+        Self: DataActor,
+    {
+        DataActor::on_start(self)
+    }
+
     /// Returns the mutable clock borrow for the actor.
     ///
     /// # Panics
@@ -830,10 +845,12 @@ pub trait DataActor {
     // panics-doc-ok
     /// Adds the `synthetic` instrument to the cache.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if a synthetic with the same ID already exists, or if the
-    /// backing cache fails to persist it.
+    /// Returns an error if a synthetic with the same ID already exists or the backing reports
+    /// a DeFi currency integrity error.
     ///
     /// # Panics
     ///
@@ -848,10 +865,12 @@ pub trait DataActor {
     // panics-doc-ok
     /// Updates the `synthetic` instrument in the cache, replacing the existing entry.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if no synthetic with the same ID already exists, or if the
-    /// backing cache fails to persist the replacement.
+    /// Returns an error if no synthetic with the same ID already exists or the backing reports
+    /// a DeFi currency integrity error.
     ///
     /// # Panics
     ///
@@ -2191,8 +2210,15 @@ pub trait DataActor {
 
     /// Subscribe to streaming [`OptionChainSlice`] snapshots for the option `series_id`.
     ///
+    /// Repeated subscriptions to the same series retain the first configuration.
+    /// Unsubscribe before changing the range, interval, client, or parameters.
+    ///
     /// The ATM price is always derived from the exchange-provided forward price
     /// embedded in each option greeks/ticker update.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the snapshot interval is zero.
     fn subscribe_option_chain(
         &mut self,
         series_id: OptionSeriesId,
@@ -2200,20 +2226,24 @@ pub trait DataActor {
         snapshot_interval_ms: Option<u64>,
         client_id: Option<ClientId>,
         params: Option<Params>,
-    ) where
+    ) -> anyhow::Result<()>
+    where
         Self: DataActorNative,
         Self: 'static + Debug + Sized,
     {
         let actor_id = self.core().actor_id().inner();
         let topic = get_option_chain_topic(series_id);
 
-        let handler = TypedHandler::from(move |slice: &OptionChainSlice| {
-            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
-                actor.handle_option_chain(slice);
-            } else {
-                log::error!("Actor {actor_id} not found for option chain handling");
-            }
-        });
+        let handler = TypedHandler::from_with_id(
+            format!("OptionChainActor({actor_id},{series_id})"),
+            move |slice: &OptionChainSlice| {
+                if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                    actor.handle_option_chain(slice);
+                } else {
+                    log::error!("Actor {actor_id} not found for option chain handling");
+                }
+            },
+        );
 
         DataActorCore::subscribe_option_chain(
             self.core_mut(),
@@ -2224,7 +2254,7 @@ pub trait DataActor {
             snapshot_interval_ms,
             client_id,
             params,
-        );
+        )
     }
 
     #[cfg(feature = "defi")]
@@ -3542,7 +3572,7 @@ where
     }
 
     fn on_start(&mut self) -> anyhow::Result<()> {
-        DataActor::on_start(self)
+        DataActorNative::dispatch_start(self)
     }
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
@@ -4092,25 +4122,33 @@ impl DataActorCore {
         subscription.command
     }
 
-    pub(crate) fn set_option_chain_subscription(
+    pub(crate) fn add_option_chain_subscription(
         &mut self,
         topic: MStr<Topic>,
         handler: TypedHandler<OptionChainSlice>,
-        command: DataCommand,
-    ) {
-        if let Some(subscription) = self.option_chain_handlers.get_mut(&topic) {
-            subscription.command = Some(command);
-            return;
+        command: SubscribeOptionChain,
+    ) -> bool {
+        if self.option_chain_handlers.contains_key(&topic) {
+            log::warn!(
+                "Actor {} attempted duplicate option chain subscription to '{topic}'",
+                self.actor_id,
+            );
+            return false;
         }
 
+        let owner_id = command.owner_id();
         self.option_chain_handlers.insert(
             topic,
             Subscription {
                 handler: handler.clone(),
-                command: Some(command),
+                command: Some(DataCommand::Subscribe(SubscribeCommand::OptionChain(
+                    command,
+                ))),
             },
         );
-        msgbus::subscribe_option_chain(topic.into(), handler, None);
+
+        msgbus::register_option_chain_owner(owner_id, handler);
+        true
     }
 
     pub(crate) fn remove_option_chain_subscription(
@@ -4118,7 +4156,13 @@ impl DataActorCore {
         topic: MStr<Topic>,
     ) -> Option<DataCommand> {
         let subscription = self.option_chain_handlers.remove(&topic)?;
-        msgbus::unsubscribe_option_chain(topic.into(), &subscription.handler);
+
+        if let Some(DataCommand::Subscribe(SubscribeCommand::OptionChain(command))) =
+            &subscription.command
+        {
+            msgbus::unregister_option_chain_owner(command.owner_id());
+        }
+
         subscription.command
     }
 
@@ -4401,11 +4445,13 @@ impl DataActorCore {
             &mut commands,
             |topic, handler| msgbus::unsubscribe_option_greeks(topic.into(), handler),
         );
-        Self::drain_subscriptions(
-            std::mem::take(&mut self.option_chain_handlers),
-            &mut commands,
-            |topic, handler| msgbus::unsubscribe_option_chain(topic.into(), handler),
-        );
+        let mut topics: Vec<_> = self.option_chain_handlers.keys().copied().collect();
+        topics.sort_unstable_by(|left, right| left.as_ref().cmp(right.as_ref()));
+        for topic in topics {
+            if let Some(command) = self.remove_option_chain_subscription(topic) {
+                commands.push(command);
+            }
+        }
 
         #[cfg(feature = "defi")]
         self.unsubscribe_all_defi(&mut commands);
@@ -4854,10 +4900,12 @@ impl DataActorCore {
 
     /// Adds the `synthetic` instrument to the cache.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if a synthetic with the same ID already exists, or if the
-    /// backing cache fails to persist it. Panics if the actor is not registered
+    /// Returns an error if a synthetic with the same ID already exists or the backing reports
+    /// a DeFi currency integrity error. Panics if the actor is not registered
     /// with a trader. // panics-doc-ok
     pub fn add_synthetic(&self, synthetic: SyntheticInstrument) -> anyhow::Result<()> {
         self.check_registered();
@@ -4871,11 +4919,13 @@ impl DataActorCore {
 
     /// Updates the `synthetic` instrument in the cache, replacing the existing entry.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if no synthetic with the same ID already exists, or if the
-    /// backing cache fails to persist the replacement. Panics if the actor is not
-    /// registered with a trader. // panics-doc-ok
+    /// Returns an error if no synthetic with the same ID already exists or the backing reports
+    /// a DeFi currency integrity error. Panics if the actor is not registered
+    /// with a trader. // panics-doc-ok
     pub fn update_synthetic(&self, synthetic: SyntheticInstrument) -> anyhow::Result<()> {
         self.check_registered();
 
@@ -5835,6 +5885,12 @@ impl DataActorCore {
     }
 
     /// Subscribes the actor to option chain snapshots.
+    ///
+    /// Repeated subscriptions to the same series retain the first configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the snapshot interval is zero.
     #[expect(
         clippy::too_many_arguments,
         reason = "subscription command mirrors the option chain request fields"
@@ -5848,20 +5904,10 @@ impl DataActorCore {
         snapshot_interval_ms: Option<u64>,
         client_id: Option<ClientId>,
         params: Option<Params>,
-    ) {
+    ) -> anyhow::Result<()> {
         self.check_registered();
 
-        let correlation_id = self
-            .option_chain_handlers
-            .get(&topic)
-            .and_then(|subscription| match subscription.command.as_ref() {
-                Some(DataCommand::Subscribe(SubscribeCommand::OptionChain(command))) => {
-                    Some(command.correlation_id.unwrap_or(command.command_id))
-                }
-                _ => None,
-            });
-
-        let mut subscribe = SubscribeOptionChain::new(
+        let subscribe = SubscribeOptionChain::new(
             series_id,
             strike_range,
             snapshot_interval_ms,
@@ -5870,12 +5916,15 @@ impl DataActorCore {
             client_id,
             Some(series_id.venue),
             params,
-        );
-        subscribe.correlation_id = correlation_id;
-        let command = DataCommand::Subscribe(SubscribeCommand::OptionChain(subscribe));
+        )?;
 
-        self.set_option_chain_subscription(topic, handler, command.clone());
-        self.send_data_cmd(command);
+        if self.add_option_chain_subscription(topic, handler, subscribe.clone()) {
+            self.send_data_cmd(DataCommand::Subscribe(SubscribeCommand::OptionChain(
+                subscribe,
+            )));
+        }
+
+        Ok(())
     }
 
     /// Unsubscribes the actor from data.

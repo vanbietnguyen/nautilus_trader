@@ -1605,9 +1605,7 @@ fn history_event(
     coverage: OKXHistoryCoverage,
 ) -> DataEvent {
     match coverage {
-        OKXHistoryCoverage::Complete => {
-            DataEvent::ResponseEnvelope(DataResponseEnvelope::new(response, true, None))
-        }
+        OKXHistoryCoverage::Complete => completed_response(response),
         OKXHistoryCoverage::Truncated => DataEvent::RequestFailed(DataRequestFailed {
             request_id,
             reason: "OKX page limit reached before the start of the window".to_string(),
@@ -1615,6 +1613,10 @@ fn history_event(
         }),
         OKXHistoryCoverage::Unverified => DataEvent::Response(response),
     }
+}
+
+fn completed_response(response: DataResponse) -> DataEvent {
+    DataEvent::ResponseEnvelope(DataResponseEnvelope::new(response, true, None))
 }
 
 /// The event that completes a request whose HTTP fetch failed.
@@ -2694,6 +2696,7 @@ impl DataClient for OKXDataClient {
         self.spawn_task(async move {
             let seq_before = update_lock.write_seq.load(Ordering::SeqCst);
             let mut all_instruments = Vec::new();
+            let mut failures = Vec::new();
 
             for inst_type in instrument_types {
                 let Some(families) = resolve_instrument_families(&instrument_families, inst_type)
@@ -2702,8 +2705,13 @@ impl DataClient for OKXDataClient {
                 };
 
                 if families.is_empty() {
-                    match http.request_instruments(inst_type, None).await {
-                        Ok((instruments, _inst_id_codes)) => {
+                    match http
+                        .request_instruments_with_parse_failures(inst_type, None)
+                        .await
+                    {
+                        Ok((instruments, _inst_id_codes, parse_failures)) => {
+                            failures.extend(parse_failures);
+
                             for instrument in instruments {
                                 if !contract_filter_with_config_types(
                                     contract_types.as_ref(),
@@ -2716,16 +2724,23 @@ impl DataClient for OKXDataClient {
                             }
                         }
                         Err(e) => {
-                            log::error!("Failed to fetch instruments for {inst_type:?}: {e:?}");
+                            failures.push(format!(
+                                "Failed to fetch instruments for {inst_type:?}: {e:#}"
+                            ));
                         }
                     }
                 } else {
                     for family in families {
                         match http
-                            .request_instruments(inst_type, Some(family.clone()))
+                            .request_instruments_with_parse_failures(
+                                inst_type,
+                                Some(family.clone()),
+                            )
                             .await
                         {
-                            Ok((instruments, _inst_id_codes)) => {
+                            Ok((instruments, _inst_id_codes, parse_failures)) => {
+                                failures.extend(parse_failures);
+
                                 for instrument in instruments {
                                     if !contract_filter_with_config_types(
                                         contract_types.as_ref(),
@@ -2738,9 +2753,9 @@ impl DataClient for OKXDataClient {
                                 }
                             }
                             Err(e) => {
-                                log::error!(
-                                    "Failed to fetch instruments for {inst_type:?} family {family}: {e:?}"
-                                );
+                                failures.push(format!(
+                                    "Failed to fetch instruments for {inst_type:?} family {family}: {e:#}"
+                                ));
                             }
                         }
                     }
@@ -2749,13 +2764,15 @@ impl DataClient for OKXDataClient {
 
             if load_spreads {
                 match http
-                    .request_spread_instruments(GetSpreadsParams {
+                    .request_spread_instruments_with_parse_failures(GetSpreadsParams {
                         state: Some("live".to_string()),
                         ..Default::default()
                     })
                     .await
                 {
-                    Ok(instruments) => {
+                    Ok((instruments, parse_failures)) => {
+                        failures.extend(parse_failures);
+
                         for instrument in instruments {
                             if !contract_filter_with_config_types(
                                 contract_types.as_ref(),
@@ -2768,7 +2785,7 @@ impl DataClient for OKXDataClient {
                         }
                     }
                     Err(e) => {
-                        log::error!("Failed to fetch OKX spread instruments: {e:?}");
+                        failures.push(format!("Failed to fetch OKX spread instruments: {e:#}"));
                     }
                 }
             }
@@ -2805,7 +2822,17 @@ impl DataClient for OKXDataClient {
                 params,
             ));
 
-            if let Err(e) = sender.send(DataEvent::Response(response)) {
+            let event = if failures.is_empty() {
+                completed_response(response)
+            } else {
+                DataEvent::RequestFailed(DataRequestFailed {
+                    request_id,
+                    reason: failures.join("; "),
+                    response: Some(response),
+                })
+            };
+
+            if let Err(e) = sender.send(event) {
                 log::error!("Failed to send instruments response: {e}");
             }
         });
@@ -2915,7 +2942,7 @@ impl DataClient for OKXDataClient {
                 params,
             )));
 
-            if let Err(e) = sender.send(DataEvent::Response(response)) {
+            if let Err(e) = sender.send(completed_response(response)) {
                 log::error!("Failed to send instrument response: {e}");
             }
         });
@@ -3927,99 +3954,59 @@ mod tests {
     }
 
     #[rstest]
-    fn parse_conventions_returns_both_when_params_missing() {
-        let result = parse_greeks_conventions_from_params(None);
-        assert_eq!(result, both());
-    }
-
-    #[rstest]
-    fn parse_conventions_returns_both_when_key_absent() {
-        let params = Params::new([("other_key".to_string(), json!("value"))].into());
-        let result = parse_greeks_conventions_from_params(Some(&params));
-        assert_eq!(result, both());
-    }
-
-    #[rstest]
-    #[case("BLACK_SCHOLES", OKXGreeksType::Bs)]
-    #[case("PRICE_ADJUSTED", OKXGreeksType::Pa)]
-    #[case("black_scholes", OKXGreeksType::Bs)]
-    #[case("price_adjusted", OKXGreeksType::Pa)]
-    fn parse_conventions_accepts_single_string(#[case] raw: &str, #[case] expected: OKXGreeksType) {
-        let params = Params::new([("greeks_convention".to_string(), json!(raw))].into());
-        let result = parse_greeks_conventions_from_params(Some(&params));
-        assert_eq!(result, only(expected));
-    }
-
-    #[rstest]
-    fn parse_conventions_accepts_list_of_strings() {
-        let params = Params::new(
-            [(
-                "greeks_convention".to_string(),
-                json!(["BLACK_SCHOLES", "PRICE_ADJUSTED"]),
-            )]
-            .into(),
-        );
-        let result = parse_greeks_conventions_from_params(Some(&params));
-        assert_eq!(result, both());
-    }
-
-    #[rstest]
-    fn parse_conventions_accepts_single_entry_list() {
-        let params =
-            Params::new([("greeks_convention".to_string(), json!(["PRICE_ADJUSTED"]))].into());
-        let result = parse_greeks_conventions_from_params(Some(&params));
-        assert_eq!(result, only(OKXGreeksType::Pa));
-    }
-
-    #[rstest]
-    fn parse_conventions_deduplicates_list_entries() {
-        let params = Params::new(
-            [(
-                "greeks_convention".to_string(),
-                json!(["BLACK_SCHOLES", "black_scholes"]),
-            )]
-            .into(),
-        );
-        let result = parse_greeks_conventions_from_params(Some(&params));
-        assert_eq!(result, only(OKXGreeksType::Bs));
-    }
-
-    #[rstest]
-    fn parse_conventions_skips_unknown_list_entries() {
-        let params = Params::new(
-            [(
-                "greeks_convention".to_string(),
-                json!(["BOGUS", "PRICE_ADJUSTED"]),
-            )]
-            .into(),
-        );
-        let result = parse_greeks_conventions_from_params(Some(&params));
-        assert_eq!(result, only(OKXGreeksType::Pa));
-    }
-
-    #[rstest]
-    fn parse_conventions_falls_back_to_both_on_all_unknown() {
-        let params = Params::new([("greeks_convention".to_string(), json!(["BOGUS"]))].into());
-        let result = parse_greeks_conventions_from_params(Some(&params));
-        assert_eq!(result, both());
-    }
-
-    #[rstest]
-    #[case(json!(1))]
-    #[case(json!(null))]
-    #[case(json!(true))]
-    #[case(json!({"nested": "object"}))]
-    fn parse_conventions_falls_back_on_non_string_value(#[case] value: serde_json::Value) {
-        let params = Params::new([("greeks_convention".to_string(), value)].into());
-        let result = parse_greeks_conventions_from_params(Some(&params));
-        assert_eq!(result, both());
-    }
-
-    #[rstest]
-    fn parse_conventions_falls_back_on_unknown_single_string() {
-        let params = Params::new([("greeks_convention".to_string(), json!("BOGUS"))].into());
-        let result = parse_greeks_conventions_from_params(Some(&params));
-        assert_eq!(result, both());
+    #[case(None, both())]
+    #[case(Some(("other_key", json!("value"))), both())]
+    #[case(
+        Some(("greeks_convention", json!("BLACK_SCHOLES"))),
+        only(OKXGreeksType::Bs)
+    )]
+    #[case(
+        Some(("greeks_convention", json!("PRICE_ADJUSTED"))),
+        only(OKXGreeksType::Pa)
+    )]
+    #[case(
+        Some(("greeks_convention", json!("black_scholes"))),
+        only(OKXGreeksType::Bs)
+    )]
+    #[case(
+        Some(("greeks_convention", json!("price_adjusted"))),
+        only(OKXGreeksType::Pa)
+    )]
+    #[case(
+        Some((
+            "greeks_convention",
+            json!(["BLACK_SCHOLES", "PRICE_ADJUSTED"])
+        )),
+        both()
+    )]
+    #[case(
+        Some(("greeks_convention", json!(["PRICE_ADJUSTED"]))),
+        only(OKXGreeksType::Pa)
+    )]
+    #[case(
+        Some((
+            "greeks_convention",
+            json!(["BLACK_SCHOLES", "black_scholes"])
+        )),
+        only(OKXGreeksType::Bs)
+    )]
+    #[case(
+        Some(("greeks_convention", json!(["BOGUS", "PRICE_ADJUSTED"]))),
+        only(OKXGreeksType::Pa)
+    )]
+    #[case(Some(("greeks_convention", json!(["BOGUS"]))), both())]
+    #[case(Some(("greeks_convention", json!(1))), both())]
+    #[case(Some(("greeks_convention", json!(null))), both())]
+    #[case(Some(("greeks_convention", json!(true))), both())]
+    #[case(Some(("greeks_convention", json!({"nested": "object"}))), both())]
+    #[case(Some(("greeks_convention", json!("BOGUS"))), both())]
+    fn parse_conventions(
+        #[case] entry: Option<(&str, Value)>,
+        #[case] expected: AHashSet<OKXGreeksType>,
+    ) {
+        let params = entry.map(|(key, value)| Params::new([(key.to_string(), value)].into()));
+        let result = parse_greeks_conventions_from_params(params.as_ref());
+        assert_eq!(result, expected);
     }
 
     fn rpi_book_message(filename: &str) -> OKXWsMessage {

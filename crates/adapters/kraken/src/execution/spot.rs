@@ -50,7 +50,6 @@ use nautilus_model::{
         AccountType, OmsType, OrderSide, OrderType, PositionSide, TimeInForce, TrailingOffsetType,
         TriggerType,
     },
-    events::OrderEventAny,
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
@@ -119,7 +118,6 @@ pub struct KrakenSpotExecutionClient {
     truncated_id_map: Arc<AtomicMap<String, ClientOrderId>>,
     ws_dispatch_state: Arc<WsDispatchState>,
     order_request_state: Arc<OrderRequestState>,
-    order_event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<OrderEventAny>>,
 }
 
 impl KrakenSpotExecutionClient {
@@ -204,7 +202,9 @@ impl KrakenSpotExecutionClient {
         // Connect() swaps in a live cmd_tx; capture the shared handle so the
         // dispatcher reads the current sender, not the dropped placeholder.
         let cmd_tx_handle = ws.handler_command_handle();
-        let (order_event_tx, order_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Placeholder: each connect installs the sender for that session's channel
+        let (order_event_tx, _) = tokio::sync::mpsc::unbounded_channel();
+
         let order_request_state = Arc::new(OrderRequestState::new(
             cmd_tx_handle,
             order_event_tx,
@@ -233,7 +233,6 @@ impl KrakenSpotExecutionClient {
             truncated_id_map: Arc::new(AtomicMap::new()),
             ws_dispatch_state,
             order_request_state,
-            order_event_rx: Some(order_event_rx),
         })
     }
 
@@ -605,6 +604,9 @@ impl KrakenSpotExecutionClient {
         let clock = self.clock;
         let cancellation_token = self.cancellation_token.clone();
 
+        let (order_event_tx, mut order_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.order_request_state.reset_event_sender(order_event_tx);
+
         let future = async move {
             tokio::pin!(stream);
 
@@ -643,35 +645,32 @@ impl KrakenSpotExecutionClient {
             .spawn(future)
             .context("failed to register Kraken Spot execution stream task")?;
 
-        let event_rx = self.order_event_rx.take();
+        let emitter = self.emitter.clone();
+        let cancellation_token = self.cancellation_token.clone();
 
-        if let Some(mut event_rx) = event_rx {
-            let emitter = self.emitter.clone();
-            let cancellation_token = self.cancellation_token.clone();
-
-            let future = async move {
-                loop {
-                    tokio::select! {
-                        () = cancellation_token.cancelled() => {
-                            log::debug!("Spot execution order-event forwarder cancelled");
-                            break;
-                        }
-                        event = event_rx.recv() => {
-                            match event {
-                                Some(event) => emitter.send_order_event(event),
-                                None => {
-                                    log::debug!("Spot execution order-event channel closed");
-                                    break;
-                                }
+        let future = async move {
+            loop {
+                tokio::select! {
+                    () = cancellation_token.cancelled() => {
+                        log::debug!("Spot execution order-event forwarder cancelled");
+                        break;
+                    }
+                    event = order_event_rx.recv() => {
+                        match event {
+                            Some(event) => emitter.send_order_event(event),
+                            None => {
+                                log::debug!("Spot execution order-event channel closed");
+                                break;
                             }
                         }
                     }
                 }
-            };
-            self.session_tasks
-                .spawn(future)
-                .context("failed to register Kraken Spot order event task")?;
-        }
+            }
+        };
+
+        self.session_tasks
+            .spawn(future)
+            .context("failed to register Kraken Spot order event task")?;
 
         Ok(())
     }
@@ -2076,31 +2075,40 @@ mod tests {
         cache::{Cache, InstrumentLookupError},
         clock::VirtualClock,
         factories::ExecutionClientFactory,
-        messages::execution::CancelOrder,
+        live::sender::EventSender,
+        messages::{ExecutionEvent, execution::CancelOrder},
     };
-    use nautilus_core::{Params, UUID4, UnixNanos};
-    use nautilus_model::identifiers::{
-        AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId,
+    use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
+    use nautilus_live::ExecutionEventEmitter;
+    use nautilus_model::{
+        identifiers::{
+            AccountId, ClientOrderId, InstrumentId, StrategyId, Symbol, TraderId, VenueOrderId,
+        },
+        instruments::{CurrencyPair, InstrumentAny},
+        types::{Currency, Price, Quantity},
     };
     use rstest::rstest;
     use serde_json::json;
 
     use super::{
-        AccountType, ClientId, CommandFailure, ExecutionClientCore,
-        KrakenSpotCancelOrderParamsBuilder, KrakenSpotExecutionClient, OmsType,
-        batch_cancel_item_for_spot, cancel_order_for_spot, resolve_leverage, resolve_use_ws_trade,
+        AccountType, ClientId, CommandFailure, ExecutionClientCore, KrakenSpotExecutionClient,
+        OmsType, batch_cancel_item_for_spot, cancel_order_for_spot, handle_cancel_failure,
+        resolve_leverage, resolve_use_ws_trade,
     };
     use crate::{
         common::{consts::KRAKEN_VENUE, enums::KrakenProductType},
         config::KrakenExecutionClientConfig,
         factories::KrakenExecutionClientFactory,
-        http::KrakenSpotHttpClient,
+        http::{KrakenHttpError, KrakenSpotHttpClient},
     };
 
     const TEST_INSTRUMENT_ID: &str = "BTC/USDT.KRAKEN";
 
+    /// The REST cancel fallback transmits exactly once with retries at their default, and its
+    /// failure surfaces as one ambiguous attempt: a retransmitted cancel may act on the venue
+    /// twice, and a rejection would misreport an order the venue may already have canceled.
     #[tokio::test]
-    async fn test_execution_config_max_retries_zero_disables_spot_cancel_retries() {
+    async fn test_spot_rest_cancel_sends_once_and_stays_ambiguous_with_retries_enabled() {
         let request_count = Arc::new(AtomicUsize::new(0));
         let handler_count = request_count.clone();
         let router = Router::new().route(
@@ -2132,19 +2140,161 @@ mod tests {
             api_key: "test-key".into(),
             api_secret: "c2VjcmV0".into(),
             base_url: Some(format!("http://{addr}")),
-            max_retries: 0,
             ..Default::default()
         };
         let client = KrakenSpotExecutionClient::new(core, config).unwrap();
-        let params = KrakenSpotCancelOrderParamsBuilder::default()
-            .txid("V-001".to_string())
-            .build()
-            .unwrap();
+        cache_test_spot_instrument(&client.http);
 
-        let result = client.http.inner.cancel_order(&params).await;
+        let result = cancel_order_for_spot(
+            &client.http,
+            AccountId::from("KRAKEN-001"),
+            InstrumentId::from(TEST_INSTRUMENT_ID),
+            Some(ClientOrderId::from("C-001")),
+            Some(VenueOrderId::from("V-001")),
+        )
+        .await;
 
-        assert!(result.is_err());
+        match result {
+            Err(CommandFailure::Ambiguous(reason)) => {
+                assert!(
+                    reason.contains("HTTP error 429"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            _ => panic!("Expected ambiguous cancel failure"),
+        }
+
         assert_eq!(request_count.load(Ordering::Relaxed), 1);
+    }
+
+    /// The execution config's retry budget reaches the spot HTTP client for authenticated
+    /// reads: with `max_retries: 1` an always-failing token request is sent exactly twice.
+    /// A broken wiring (client default of 3) would send four times; a send-once read would
+    /// send once. This restores the config wiring coverage the deleted `max_retries: 0`
+    /// test provided.
+    #[tokio::test]
+    async fn test_execution_config_max_retries_reaches_spot_http_reads() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let handler_count = request_count.clone();
+        let router = Router::new().route(
+            "/0/private/GetWebSocketsToken",
+            post(move || {
+                let handler_count = handler_count.clone();
+                async move {
+                    handler_count.fetch_add(1, Ordering::Relaxed);
+
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let cache = Rc::new(RefCell::new(Cache::default()));
+
+        let core = ExecutionClientCore::new(
+            TraderId::from("TRADER-001"),
+            ClientId::from("KRAKEN"),
+            *KRAKEN_VENUE,
+            OmsType::Netting,
+            AccountId::from("KRAKEN-001"),
+            AccountType::Cash,
+            None,
+            cache,
+        );
+
+        let config = KrakenExecutionClientConfig {
+            api_key: "test-key".into(),
+            api_secret: "c2VjcmV0".into(),
+            base_url: Some(format!("http://{addr}")),
+            max_retries: 1,
+            ..Default::default()
+        };
+
+        let client = KrakenSpotExecutionClient::new(core, config).unwrap();
+
+        let result = client.http.inner.get_websockets_token().await;
+
+        let error = result.expect_err("always-429 token request must fail");
+        assert!(
+            matches!(error, KrakenHttpError::NetworkError(ref message) if message.contains("HTTP error 429")),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(request_count.load(Ordering::Relaxed), 2);
+    }
+
+    /// An ambiguous cancel failure emits no rejection or denial: reconciliation, not an event,
+    /// resolves an order the venue may already have acted on.
+    #[rstest]
+    fn test_ambiguous_cancel_failure_emits_no_rejection() {
+        let clock = get_atomic_clock_realtime();
+
+        let mut emitter = ExecutionEventEmitter::new(
+            clock,
+            TraderId::from("TRADER-001"),
+            AccountId::from("KRAKEN-001"),
+            AccountType::Cash,
+            None,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let sender: EventSender<ExecutionEvent> = tx.into();
+        emitter.set_sender(sender);
+
+        handle_cancel_failure(
+            &emitter,
+            clock,
+            StrategyId::from("S-001"),
+            InstrumentId::from(TEST_INSTRUMENT_ID),
+            ClientOrderId::from("C-001"),
+            Some(VenueOrderId::from("V-001")),
+            CommandFailure::Ambiguous("HTTP error 429: rate limited".to_string()),
+            UUID4::new(),
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "ambiguous failure must emit no event"
+        );
+
+        // Control: a venue rejection does emit, so the absent event above is meaningful.
+        handle_cancel_failure(
+            &emitter,
+            clock,
+            StrategyId::from("S-001"),
+            InstrumentId::from(TEST_INSTRUMENT_ID),
+            ClientOrderId::from("C-001"),
+            Some(VenueOrderId::from("V-001")),
+            CommandFailure::VenueRejected("EOrder: Unknown order".to_string()),
+            UUID4::new(),
+        );
+
+        assert!(rx.try_recv().is_ok(), "venue rejection must emit an event");
+    }
+
+    fn cache_test_spot_instrument(http: &KrakenSpotHttpClient) -> InstrumentId {
+        let instrument_id = InstrumentId::from(TEST_INSTRUMENT_ID);
+
+        http.cache_instrument(InstrumentAny::CurrencyPair(
+            CurrencyPair::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(Symbol::new("XBTUSDT"))
+                .base_currency(Currency::BTC())
+                .quote_currency(Currency::USDT())
+                .price_precision(2)
+                .size_precision(8)
+                .price_increment(Price::from("0.01"))
+                .size_increment(Quantity::from("0.00000001"))
+                .ts_event(0.into())
+                .ts_init(0.into())
+                .build()
+                .unwrap(),
+        ));
+
+        instrument_id
     }
 
     fn params_with(key: &str, val: serde_json::Value) -> Params {

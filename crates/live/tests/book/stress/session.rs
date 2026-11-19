@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! A stress session: one data client behind a [`FaultProxy`], with every emitted batch checked.
+//! A stress session: one data client behind a [`FaultProxy`], with every requested book checked.
 
 use std::{net::SocketAddr, sync::Arc};
 
@@ -156,7 +156,7 @@ pub(crate) struct BookProgress {
     pub(crate) updates: usize,
 }
 
-/// One data client behind a [`FaultProxy`], with every emitted batch checked.
+/// One data client behind a [`FaultProxy`], with every requested book checked.
 pub(crate) struct Session<V: StressVenue> {
     args: StressArgs,
     venue: V,
@@ -248,7 +248,7 @@ impl<V: StressVenue> Session<V> {
         self.books.get(instrument_id).copied().unwrap_or_default()
     }
 
-    /// Returns the batches emitted in this session.
+    /// Returns the batches emitted for requested books in this session.
     #[must_use]
     pub(crate) fn batches(&self) -> usize {
         self.books.values().map(|book| book.batches).sum()
@@ -323,7 +323,6 @@ impl<V: StressVenue> Session<V> {
     /// Requires every open book to emit a new snapshot.
     pub(crate) fn expect_all(&mut self) {
         let open = self.open_books().collect::<Vec<_>>();
-
         for instrument_id in open {
             self.expect_snapshot(instrument_id);
         }
@@ -582,6 +581,9 @@ impl<V: StressVenue> Session<V> {
         };
 
         let instrument_id = deltas.instrument_id;
+        if !self.requested.contains(&instrument_id) {
+            return;
+        }
 
         if let Err(violation) = self.checker.apply(&deltas) {
             panic!(
@@ -592,7 +594,6 @@ impl<V: StressVenue> Session<V> {
 
         let book = self.books.entry(instrument_id).or_default();
         book.batches += 1;
-
         if deltas
             .deltas
             .first()
@@ -833,6 +834,35 @@ mod tests {
 
     fn args() -> StressArgs {
         StressArgs::parse(Vec::new(), Silent::SCENARIOS, 1, &[]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn unrequested_book_is_ignored_until_subscribed() {
+        let mut session = Session::<Silent>::connect(&args()).await;
+        let subscribed = InstrumentId::from("BTCUSDT.SILENT");
+        let unrequested = InstrumentId::from("ETHUSDT.SILENT");
+
+        session.subscribe(subscribed);
+        session.healthy(&[subscribed]).await;
+        session.apply(snapshot(unrequested, 1));
+        session.apply(update(unrequested, 2));
+        let ignored = session.book(&unrequested);
+        let unchecked = session.checker.book(unrequested).is_none();
+
+        session.subscribe(unrequested);
+        session.healthy(&[unrequested]).await;
+
+        let expected = BookProgress {
+            snapshots: 1,
+            batches: 4,
+            updates: 3,
+        };
+
+        assert_eq!(ignored, BookProgress::default());
+        assert!(unchecked);
+        assert_eq!(session.book(&subscribed), expected);
+        assert_eq!(session.book(&unrequested), expected);
+        assert_eq!(session.batches(), 8);
     }
 
     #[tokio::test]

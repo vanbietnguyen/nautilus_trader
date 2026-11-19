@@ -44,14 +44,13 @@ fn to_snake_case_ascii(bytes: &[u8]) -> String {
     let mut mode: u8 = BOUNDARY;
     let mut word_start = 0;
     let mut i = 0;
-
     while i < len {
         let b = bytes[i];
-
         if !b.is_ascii_alphanumeric() {
             if word_start < i {
                 push_lower_ascii(&mut result, &bytes[word_start..i], &mut first_word);
             }
+
             word_start = i + 1;
             mode = BOUNDARY;
             i += 1;
@@ -68,7 +67,6 @@ fn to_snake_case_ascii(bytes: &[u8]) -> String {
 
         if i + 1 < len && bytes[i + 1].is_ascii_alphanumeric() {
             let next = bytes[i + 1];
-
             if next_mode == LOWER && next.is_ascii_uppercase() {
                 push_lower_ascii(&mut result, &bytes[word_start..=i], &mut first_word);
                 word_start = i + 1;
@@ -77,6 +75,7 @@ fn to_snake_case_ascii(bytes: &[u8]) -> String {
                 if word_start < i {
                     push_lower_ascii(&mut result, &bytes[word_start..i], &mut first_word);
                 }
+
                 word_start = i;
                 mode = BOUNDARY;
             } else {
@@ -98,6 +97,7 @@ fn push_lower_ascii(result: &mut String, word: &[u8], first_word: &mut bool) {
     if !*first_word {
         result.push('_');
     }
+
     *first_word = false;
 
     for &b in word {
@@ -156,6 +156,7 @@ fn push_lower_unicode(result: &mut String, word: &str, first_word: &mut bool) {
     if !*first_word {
         result.push('_');
     }
+
     *first_word = false;
 
     for c in word.chars() {
@@ -224,7 +225,7 @@ fn title_case_unicode(s: &str) -> String {
 }
 
 fn push_titlecase(out: &mut String, ch: char) {
-    // Stable Rust does not expose `char::to_titlecase`. These Unicode 17 mappings from
+    // Stable Rust does not expose `char::to_titlecase`. These Unicode 18 mappings from
     // UnicodeData.txt and SpecialCasing.txt cannot be reproduced by keeping the first scalar of
     // the uppercase mapping and lowercasing the rest.
     match ch {
@@ -318,6 +319,10 @@ mod tests {
     #[case("SimpleHTTPServer", "simple_http_server")]
     #[case("version2Release", "version2_release")]
     #[case("ALLCAPS", "allcaps")]
+    #[case("__Bar__", "bar")]
+    #[case("éXMLParser", "é_xml_parser")]
+    #[case("é123DEf", "é123_d_ef")]
+    #[case("\u{4E2D}XMLParser", "\u{4E2D}xml_parser")]
     #[case("é--x", "é_x")]
     #[case("nautilus_model::data::bar::Bar", "nautilus_model_data_bar_bar")] // nautilus-import-ok
     fn test_to_snake_case(#[case] input: &str, #[case] expected: &str) {
@@ -365,6 +370,6 @@ mod tests {
 
     #[rstest]
     fn test_title_case_unicode_version() {
-        assert_eq!(char::UNICODE_VERSION, (17, 0, 0));
+        assert_eq!(char::UNICODE_VERSION, (18, 0, 0));
     }
 }

@@ -104,6 +104,28 @@ pub(crate) fn optional_price_value(
         .map_err(|e| EncodingError::ParseError(field, format!("row {row}: {e}")))
 }
 
+pub(crate) fn optional_parsed_value<T>(
+    values: Option<&StringArray>,
+    field: &'static str,
+    row: usize,
+) -> Result<Option<T>, EncodingError>
+where
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    let Some(column) = values else {
+        return Ok(None);
+    };
+
+    if column.is_null(row) {
+        return Ok(None);
+    }
+
+    T::from_str(column.value(row))
+        .map(Some)
+        .map_err(|e| EncodingError::ParseError(field, format!("row {row}: {e}")))
+}
+
 // Errors on empty/whitespace codes so corrupted rows surface as ParseError,
 // instead of silently registering as a fallback currency. Known codes resolve
 // from CURRENCY_MAP with original metadata; unknown non-empty codes fall back
@@ -715,6 +737,10 @@ mod tests {
                 crypto_option_spread_btc_deribit, crypto_perpetual_ethusdt, currency_pair_ethusdt,
                 equity_aapl, perpetual_contract_eurusd, tokenized_asset_aaplx,
             },
+            tick_scheme::{
+                FixedTickScheme, TickScheme, TieredTickScheme, get_tick_scheme,
+                register_tick_scheme,
+            },
         },
         types::{Currency, Money, Price, Quantity},
     };
@@ -1192,6 +1218,158 @@ mod tests {
         assert_eq!(decoded[0].event_id, None);
     }
 
+    #[rstest]
+    #[case::fixed("BINARY_CODEC_FIXED", TickScheme::Fixed(FixedTickScheme::new(Price::from("0.0020")).unwrap()))]
+    #[case::tiered("BINARY_CODEC_TIERED", TickScheme::Tiered(TieredTickScheme::from_ticks(vec![Price::from("0.000000001"), Price::from("0.123456789"), Price::from("0.999999999")], 9).unwrap()))]
+    #[case::betfair("BETFAIR", TickScheme::Betfair)]
+    #[case::crypto("CRYPTO_0_01", TickScheme::Crypto)]
+    fn test_binary_option_tick_scheme_definition_restores_missing_scheme(
+        #[case] name: &str,
+        #[case] scheme: TickScheme,
+    ) {
+        if get_tick_scheme(name).is_none() {
+            register_tick_scheme(name, scheme.clone()).unwrap();
+        }
+
+        let mut option = nautilus_model::instruments::stubs::binary_option();
+        option.tick_scheme = Some(Ustr::from(name));
+        let metadata = option.metadata();
+        let batch = BinaryOption::encode_batch(&metadata, &[option.clone()]).unwrap();
+        let restored_name = format!("{name}_RESTORED");
+        let mut columns = batch.columns().to_vec();
+        columns[batch.schema().index_of("tick_scheme").unwrap()] =
+            Arc::new(StringArray::from(vec![restored_name.as_str()]));
+        let batch = RecordBatch::try_new(batch.schema(), columns).unwrap();
+        assert_eq!(get_tick_scheme(&restored_name), None);
+
+        let decoded = binary_option::decode_binary_option_batch(&metadata, &batch).unwrap();
+        let repeated = binary_option::decode_binary_option_batch(&metadata, &batch).unwrap();
+        option.tick_scheme = Some(Ustr::from(restored_name.as_str()));
+
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap(),
+            serde_json::to_value([&option]).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&repeated).unwrap(),
+            serde_json::to_value([&option]).unwrap()
+        );
+        assert_eq!(get_tick_scheme(&restored_name), Some(scheme));
+    }
+
+    #[rstest]
+    #[case::missing_builtin(false, "BETFAIR")]
+    #[case::null_builtin(true, "BETFAIR")]
+    #[case::missing_custom(false, "BINARY_CODEC_LEGACY_REGISTERED_MISSING")]
+    #[case::null_custom(true, "BINARY_CODEC_LEGACY_REGISTERED_NULL")]
+    fn test_binary_option_tick_scheme_definition_legacy_default(
+        #[case] null: bool,
+        #[case] name: &str,
+    ) {
+        if get_tick_scheme(name).is_none() {
+            let scheme = FixedTickScheme::new(Price::from("0.0020")).unwrap();
+            register_tick_scheme(name, TickScheme::Fixed(scheme)).unwrap();
+        }
+
+        let mut option = nautilus_model::instruments::stubs::binary_option();
+        option.tick_scheme = Some(Ustr::from(name));
+        let metadata = option.metadata();
+        let batch = BinaryOption::encode_batch(&metadata, &[option.clone()]).unwrap();
+        let batch = if null {
+            batch_with_null_string_column(&batch, "tick_scheme_definition")
+        } else {
+            batch_without_column(&batch, "tick_scheme_definition")
+        };
+
+        let decoded = binary_option::decode_binary_option_batch(&metadata, &batch).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::to_value([option]).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case::missing(false)]
+    #[case::null(true)]
+    fn test_binary_option_legacy_unregistered_tick_scheme_rejected(#[case] null: bool) {
+        let option = nautilus_model::instruments::stubs::binary_option();
+        let metadata = option.metadata();
+        let batch = BinaryOption::encode_batch(&metadata, &[option]).unwrap();
+        let batch = if null {
+            batch_with_null_string_column(&batch, "tick_scheme_definition")
+        } else {
+            batch_without_column(&batch, "tick_scheme_definition")
+        };
+
+        let name = "BINARY_CODEC_LEGACY_UNREGISTERED";
+        let mut columns = batch.columns().to_vec();
+        columns[batch.schema().index_of("tick_scheme").unwrap()] =
+            Arc::new(StringArray::from(vec![name]));
+        let batch = RecordBatch::try_new(batch.schema(), columns).unwrap();
+        assert_eq!(get_tick_scheme(name), None);
+
+        let error = binary_option::decode_binary_option_batch(&metadata, &batch).unwrap_err();
+
+        assert!(
+            matches!(&error, EncodingError::ParseError("instrument", detail) if detail == "row 0: invalid BinaryOption: tick_scheme not found in tick schemes"),
+            "{error}"
+        );
+    }
+
+    #[rstest]
+    fn test_binary_option_encoding_unregistered_tick_scheme_rejected() {
+        let name = "BINARY_CODEC_ENCODING_UNREGISTERED";
+        let mut option = nautilus_model::instruments::stubs::binary_option();
+        option.tick_scheme = Some(Ustr::from(name));
+        let metadata = option.metadata();
+        assert_eq!(get_tick_scheme(name), None);
+
+        let error = BinaryOption::encode_batch(&metadata, &[option]).unwrap_err();
+
+        assert!(
+            matches!(&error, ArrowError::InvalidArgumentError(detail) if detail == "Unknown tick scheme BINARY_CODEC_ENCODING_UNREGISTERED"),
+            "{error}"
+        );
+    }
+
+    #[rstest]
+    #[case::malformed(Some("BINARY_CODEC_BAD_JSON"), "{", "EOF while parsing")]
+    #[case::no_name(None, r#"{"type":"crypto"}"#, "no tick scheme name")]
+    #[case::conflict(Some("BETFAIR"), r#"{"type":"crypto"}"#, "conflicting definition")]
+    #[case::invalid_ticks(
+        Some("BINARY_CODEC_BAD_TICKS"),
+        r#"{"type":"tiered","ticks":["0.02","0.01"],"precision":2}"#,
+        "not greater"
+    )]
+    #[case::inexact(
+        Some("BINARY_CODEC_INEXACT"),
+        r#"{"type":"tiered","ticks":["0.001"],"precision":2}"#,
+        "cannot be represented"
+    )]
+    fn test_binary_option_tick_scheme_definition_rejects_invalid_data(
+        #[case] name: Option<&str>,
+        #[case] json: &str,
+        #[case] message: &str,
+    ) {
+        let option = nautilus_model::instruments::stubs::binary_option();
+        let metadata = option.metadata();
+        let batch = BinaryOption::encode_batch(&metadata, &[option]).unwrap();
+        let mut columns = batch.columns().to_vec();
+        columns[batch.schema().index_of("tick_scheme").unwrap()] =
+            Arc::new(StringArray::from(vec![name]));
+        columns[batch.schema().index_of("tick_scheme_definition").unwrap()] =
+            Arc::new(StringArray::from(vec![json]));
+        let batch = RecordBatch::try_new(batch.schema(), columns).unwrap();
+
+        let error = binary_option::decode_binary_option_batch(&metadata, &batch).unwrap_err();
+
+        assert!(
+            matches!(&error, EncodingError::ParseError("tick_scheme_definition", detail) if detail.starts_with("row 0:") && detail.contains(message)),
+            "{error}"
+        );
+    }
+
     // The `betting` stub populates every bound, margin, and fee, so this covers the whole struct
     #[rstest]
     fn test_encode_decode_round_trip_betting_all_fields() {
@@ -1277,6 +1455,20 @@ mod tests {
         let new_schema = Schema::new_with_metadata(fields, schema.metadata().clone());
 
         RecordBatch::try_new(Arc::new(new_schema), columns).unwrap()
+    }
+
+    fn string_column_value<'a>(
+        record_batch: &'a RecordBatch,
+        column_name: &str,
+    ) -> Option<&'a str> {
+        let values = record_batch
+            .column_by_name(column_name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        (!values.is_null(0)).then(|| values.value(0))
     }
 
     fn batch_with_null_string_column(record_batch: &RecordBatch, column_name: &str) -> RecordBatch {
@@ -1735,6 +1927,95 @@ mod tests {
     fn test_roundtrip_index_instrument() {
         use nautilus_model::instruments::stubs::index_instrument_spx;
         roundtrip_case(&InstrumentAny::IndexInstrument(index_instrument_spx()));
+    }
+
+    #[rstest]
+    #[case::option_contract(InstrumentAny::OptionContract(
+        nautilus_model::instruments::stubs::option_contract_appl()
+    ))]
+    #[case::crypto_option(InstrumentAny::CryptoOption(crypto_option_btc_deribit(
+        3,
+        1,
+        Price::from("0.001"),
+        Quantity::from("0.1")
+    )))]
+    fn test_option_terms_round_trip(#[case] instrument: InstrumentAny) {
+        let (underlying_id, kind) = match &instrument {
+            InstrumentAny::OptionContract(_) => ("AAPL.NASDAQ", "CALL"),
+            InstrumentAny::CryptoOption(_) => ("BTCUSDT.BINANCE", "PUT"),
+            _ => unreachable!("option fixtures only"),
+        };
+
+        for (known, style, settlement) in [
+            (true, Some("AMERICAN"), Some("CASH")),
+            (true, Some("EUROPEAN"), Some("PHYSICAL")),
+            (false, Some("BERMUDAN"), Some("CASH")),
+            (true, Some("EUROPEAN"), None),
+            (true, None, Some("PHYSICAL")),
+            (false, None, None),
+        ] {
+            let mut encoded = serde_json::to_value(&instrument).unwrap();
+            let fields = encoded
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+                .next()
+                .unwrap();
+            fields["underlying_instrument_id"] =
+                serde_json::to_value(known.then_some(underlying_id)).unwrap();
+            fields["exercise_style"] = serde_json::to_value(style).unwrap();
+            fields["settlement_type"] = serde_json::to_value(settlement).unwrap();
+            let instrument: InstrumentAny = serde_json::from_value(encoded.clone()).unwrap();
+            let metadata = instrument.metadata();
+            let batch =
+                InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&instrument)).unwrap();
+            let restored = decode_instrument_any_batch(&metadata, &batch).unwrap();
+            assert_eq!(serde_json::to_value(&restored[0]).unwrap(), encoded);
+            assert_eq!(string_column_value(&batch, "option_kind"), Some(kind));
+            assert_eq!(string_column_value(&batch, "exercise_style"), style);
+
+            let legacy = batch_without_column(&batch, "underlying_instrument_id");
+            let legacy = batch_without_column(&legacy, "exercise_style");
+            let legacy = batch_without_column(&legacy, "settlement_type");
+            let decoded = decode_instrument_any_batch(&metadata, &legacy).unwrap();
+            let restored = serde_json::to_value(&decoded[0]).unwrap();
+            let fields = restored.as_object().unwrap().values().next().unwrap();
+            assert_eq!(fields["underlying_instrument_id"], serde_json::Value::Null);
+            assert_eq!(fields["exercise_style"], serde_json::Value::Null);
+            assert_eq!(fields["settlement_type"], serde_json::Value::Null);
+        }
+    }
+
+    #[rstest]
+    #[case::option_contract(InstrumentAny::OptionContract(
+        nautilus_model::instruments::stubs::option_contract_appl()
+    ))]
+    #[case::crypto_option(InstrumentAny::CryptoOption(crypto_option_btc_deribit(
+        3,
+        1,
+        Price::from("0.001"),
+        Quantity::from("0.1")
+    )))]
+    fn test_invalid_option_terms_return_field_error(
+        #[case] instrument: InstrumentAny,
+        #[values("underlying_instrument_id", "exercise_style", "settlement_type")]
+        field: &'static str,
+    ) {
+        let metadata = instrument.metadata();
+        let batch = InstrumentAny::encode_batch(&metadata, &[instrument]).unwrap();
+        let schema = batch.schema();
+        let index = schema.index_of(field).unwrap();
+        let mut columns = batch.columns().to_vec();
+        columns[index] = Arc::new(StringArray::from(vec!["INVALID"]));
+        let invalid = RecordBatch::try_new(schema, columns).unwrap();
+        let error = decode_instrument_any_batch(&metadata, &invalid).unwrap_err();
+
+        let EncodingError::ParseError(actual_field, detail) = error else {
+            panic!("expected field parse error, was {error:?}");
+        };
+
+        assert_eq!(actual_field, field);
+        assert!(detail.starts_with("row 0: "));
     }
 
     #[rstest]

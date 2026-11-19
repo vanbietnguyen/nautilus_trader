@@ -62,7 +62,7 @@ use nautilus_model::{
         AccountType, OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
         TrailingOffsetType,
     },
-    events::OrderDeniedReason,
+    events::{OrderDeniedReason, OrderPriceField},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, Venue,
         VenueOrderId,
@@ -73,6 +73,7 @@ use nautilus_model::{
     types::{AccountBalance, MarginBalance, Quantity},
 };
 use rust_decimal::Decimal;
+use ustr::Ustr;
 
 mod stream;
 
@@ -84,7 +85,8 @@ use crate::{
             OKX_RECONCILIATION_LOOKBACK_MAX_MINS, OKX_SUCCESS_CODE, OKX_VENUE,
             OKX_WS_HEARTBEAT_SECS, contract_filter_with_config_types, okx_algo_target_currency,
             okx_reduce_only_wire_value, resolve_instrument_families, validate_algo_trigger_type,
-            validate_okx_client_order_id,
+            validate_okx_client_order_id, validate_order_time_in_force,
+            validate_regular_order_params,
         },
         enums::{
             OKXAlgoOrderType, OKXInstrumentType, OKXMarginMode, OKXPositionMode, OKXPositionSide,
@@ -92,7 +94,7 @@ use crate::{
         },
         failure::{classify_okx_http_failure, classify_okx_venue_code, classify_okx_ws_failure},
         parse::{
-            is_order_status_report_more_advanced, nanos_to_datetime,
+            is_order_status_report_more_advanced, nanos_to_datetime, okx_instrument_type,
             okx_instrument_type_from_symbol, venue_position_id,
         },
         task::{spawn_task, terminate_tasks},
@@ -139,12 +141,21 @@ impl OKXExecutionClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the client fails to initialize.
+    /// Returns an error if the configuration is invalid, if `use_spot_position_reports` is set
+    /// without a NETTING OMS, or if the client fails to initialize.
     pub fn new(
         core: ExecutionClientCore,
         config: OKXExecutionClientConfig,
     ) -> anyhow::Result<Self> {
         config.validate()?;
+
+        // A wallet holding is one net quantity per pair, a HEDGING correction opens a new
+        // position instead of changing the cached one.
+        anyhow::ensure!(
+            !config.use_spot_position_reports || core.oms_type == OmsType::Netting,
+            "`use_spot_position_reports` requires a NETTING OMS, was {}; set `oms_type` to NETTING",
+            core.oms_type,
+        );
 
         let api_key = config
             .api_key
@@ -193,7 +204,8 @@ impl OKXExecutionClient {
             core.client_id,
             Some(*OKX_VENUE),
             "okx-private-user-streams",
-        ));
+        ))
+        .with_order_request_ttl_ms(config.order_request_ttl_ms);
 
         let ws_business = OKXWebSocketClient::with_credentials(
             Some(config.ws_business_url()),
@@ -321,6 +333,7 @@ impl OKXExecutionClient {
             account_id: self.core.account_id,
             http_client: self.http_client.clone(),
             instrument_types: self.config.instrument_types.clone(),
+            spot_positions_quote_currency: self.spot_positions_quote_currency(),
             recover_inst_id_codes: self.config.has_instrument_filters(),
             load_spreads: self.config.load_spreads,
             margin_mode: (self.position_mode == OKXPositionMode::LongShortMode).then_some(
@@ -334,6 +347,17 @@ impl OKXExecutionClient {
 
     fn instrument_types(&self) -> Vec<OKXInstrumentType> {
         OKXReportClient::instrument_types(&self.config.instrument_types)
+    }
+
+    fn spot_positions_quote_currency(&self) -> Option<Ustr> {
+        (self.config.use_spot_position_reports
+            && self.instrument_types().iter().any(|inst_type| {
+                matches!(
+                    inst_type,
+                    OKXInstrumentType::Spot | OKXInstrumentType::Margin
+                )
+            }))
+        .then(|| Ustr::from(self.config.spot_positions_quote_currency.as_str()))
     }
 
     async fn collect_order_status_reports(
@@ -1400,6 +1424,8 @@ impl OKXExecutionClient {
 
         self.ws_private.subscribe_account().await?;
 
+        self.subscribe_positions(&instrument_types).await?;
+
         // Liquidation warnings cover margin and derivative positions; SPOT has none
         if order_routing_types.iter().any(|t| {
             matches!(
@@ -1445,6 +1471,29 @@ impl OKXExecutionClient {
 
         // Wait for account to be registered in cache before completing connect
         self.await_account_registered(30.0).await?;
+
+        Ok(())
+    }
+
+    async fn subscribe_positions(
+        &self,
+        instrument_types: &[OKXInstrumentType],
+    ) -> anyhow::Result<()> {
+        for inst_type in [
+            OKXInstrumentType::Margin,
+            OKXInstrumentType::Swap,
+            OKXInstrumentType::Futures,
+            OKXInstrumentType::Option,
+        ] {
+            if instrument_types.contains(&inst_type)
+                || (inst_type == OKXInstrumentType::Margin
+                    && instrument_types.contains(&OKXInstrumentType::Spot)
+                    && self.config.uses_spot_margin())
+            {
+                log::debug!("Subscribing to positions channel for {inst_type:?}");
+                self.ws_private.subscribe_positions(inst_type).await?;
+            }
+        }
 
         Ok(())
     }
@@ -1699,6 +1748,10 @@ impl ExecutionClient for OKXExecutionClient {
         self.core.oms_type
     }
 
+    fn requires_authoritative_fills(&self) -> bool {
+        true
+    }
+
     fn provides_bulk_position_coverage(&self, instrument_id: InstrumentId) -> bool {
         if self.http_client.is_spread(instrument_id) {
             return false;
@@ -1781,6 +1834,7 @@ impl ExecutionClient for OKXExecutionClient {
             && self.session_tasks.is_empty()
             && !self.ws_private.has_task()
             && !self.ws_business.has_task()
+            && self.stream_state.is_healthy()
         {
             return Ok(());
         }
@@ -2289,11 +2343,11 @@ impl ExecutionClient for OKXExecutionClient {
 
             let trade_mode = self.trade_mode_for_order(cmd.instrument_id, cmd.params.as_ref());
 
-            if let Err(reason) = validate_order(
+            if let Err(reason) = self.validate_order(
                 &*order,
                 trade_mode,
                 OrderSubmission::Single,
-                self.http_client.is_spread(order.instrument_id()),
+                cmd.params.as_ref(),
             ) {
                 self.emitter.emit_order_denied(&order, &reason.to_string());
                 return Ok(());
@@ -2352,11 +2406,11 @@ impl ExecutionClient for OKXExecutionClient {
         let invalid: Vec<(ClientOrderId, OrderDeniedReason)> = orders
             .iter()
             .filter_map(|order| {
-                validate_order(
+                self.validate_order(
                     order,
                     trade_mode,
                     OrderSubmission::List,
-                    self.http_client.is_spread(order.instrument_id()),
+                    cmd.params.as_ref(),
                 )
                 .and_then(|()| {
                     self.validate_trade_mode(
@@ -2854,6 +2908,108 @@ impl OKXExecutionClient {
         })
     }
 
+    fn validate_order(
+        &self,
+        order: &impl Order,
+        trade_mode: OKXTradeMode,
+        submission: OrderSubmission,
+        params: Option<&Params>,
+    ) -> Result<(), OrderDeniedReason> {
+        if let Err(detail) = validate_okx_client_order_id(order.client_order_id().as_str()) {
+            return Err(OrderDeniedReason::InvalidClientOrderId { detail });
+        }
+
+        let is_spread = self.http_client.is_spread(order.instrument_id());
+        if is_spread && order.is_reduce_only() {
+            return Err(OrderDeniedReason::UnsupportedReduceOnly);
+        }
+
+        okx_algo_target_currency(
+            okx_instrument_type_from_symbol(order.instrument_id().symbol.as_str()),
+            trade_mode,
+            order.order_side(),
+            order.order_type(),
+            order.is_quote_quantity(),
+        )?;
+
+        validate_algo_trigger_type(
+            okx_instrument_type_from_symbol(order.instrument_id().symbol.as_str()),
+            trade_mode,
+            order.order_type(),
+            order.trigger_type(),
+        )
+        .map_err(|detail| OrderDeniedReason::ValidationFailed { detail })?;
+
+        if order.is_reduce_only()
+            && okx_reduce_only_wire_value(
+                okx_instrument_type_from_symbol(order.instrument_id().symbol.as_str()),
+                trade_mode,
+                order.order_side(),
+                None,
+                Some(true),
+            )
+            .is_err()
+        {
+            return Err(OrderDeniedReason::UnsupportedReduceOnly);
+        }
+
+        if matches!(submission, OrderSubmission::List) {
+            if OKX_CONDITIONAL_ORDER_TYPES.contains(&order.order_type()) {
+                return Err(OrderDeniedReason::UnsupportedOrderList {
+                    detail: format!(
+                        "conditional order {} is not supported",
+                        order.client_order_id()
+                    ),
+                });
+            }
+
+            if order.time_in_force() != TimeInForce::Gtc {
+                return Err(OrderDeniedReason::UnsupportedOrderList {
+                    detail: format!(
+                        "order {} has unsupported time in force {}",
+                        order.client_order_id(),
+                        order.time_in_force()
+                    ),
+                });
+            }
+        }
+
+        if !is_spread && !OKX_CONDITIONAL_ORDER_TYPES.contains(&order.order_type()) {
+            let instrument = self
+                .http_client
+                .get_instrument(&order.instrument_id().symbol.inner());
+
+            validate_limit_price(order, instrument.as_ref(), submission, params)?;
+
+            let instrument_type = instrument
+                .as_ref()
+                .map(okx_instrument_type)
+                .transpose()
+                .map_err(|e| OrderDeniedReason::ValidationFailed {
+                    detail: e.to_string(),
+                })?
+                .unwrap_or_else(|| {
+                    okx_instrument_type_from_symbol(order.instrument_id().symbol.as_str())
+                });
+
+            let outcome = get_param_as_string(params, "outcome");
+            validate_order_time_in_force(Some(order.time_in_force()))
+                .and_then(|()| {
+                    validate_regular_order_params(
+                        instrument_type,
+                        order.order_type(),
+                        Some(order.time_in_force()),
+                        order.is_post_only(),
+                        get_param_as_bool(params, "rpi").unwrap_or(false),
+                        outcome.as_deref(),
+                    )
+                })
+                .map_err(|detail| OrderDeniedReason::ValidationFailed { detail })?;
+        }
+
+        Ok(())
+    }
+
     fn validate_trade_mode(
         &self,
         instrument_id: InstrumentId,
@@ -3087,6 +3243,7 @@ struct OKXReportClient {
     account_id: AccountId,
     http_client: OKXHttpClient,
     instrument_types: Vec<OKXInstrumentType>,
+    spot_positions_quote_currency: Option<Ustr>,
     recover_inst_id_codes: bool,
     load_spreads: bool,
     margin_mode: Option<OKXMarginMode>,
@@ -3564,16 +3721,17 @@ impl OKXReportClient {
             }
         }
 
-        let mut margin_reports = self
-            .http_client
-            .request_spot_margin_position_reports(self.account_id)
-            .await?;
-
-        if let Some(instrument_id) = cmd.instrument_id {
-            margin_reports.retain(|report| report.instrument_id == instrument_id);
+        if let Some(quote_currency) = self.spot_positions_quote_currency {
+            reports.extend(
+                self.http_client
+                    .request_spot_position_reports(
+                        self.account_id,
+                        cmd.instrument_id,
+                        quote_currency,
+                    )
+                    .await?,
+            );
         }
-
-        reports.append(&mut margin_reports);
 
         let instrument_ids = reports.iter().map(|report| report.instrument_id).collect();
         self.prepare_inst_id_codes(instrument_ids).await?;
@@ -3765,6 +3923,42 @@ fn retain_external_regular_order_fallbacks(
     });
 }
 
+fn validate_limit_price(
+    order: &impl Order,
+    instrument: Option<&InstrumentAny>,
+    submission: OrderSubmission,
+    params: Option<&Params>,
+) -> Result<(), OrderDeniedReason> {
+    if order.order_type() != OrderType::Limit
+        || (matches!(submission, OrderSubmission::Single)
+            && (get_param_as_string(params, "px_usd").is_some()
+                || get_param_as_string(params, "px_vol").is_some()))
+    {
+        return Ok(());
+    }
+
+    let Some(price) = order.price() else {
+        return Ok(());
+    };
+
+    if !price.is_positive() {
+        return Err(OrderDeniedReason::PriceNotPositive {
+            field: OrderPriceField::Price,
+            price,
+        });
+    }
+
+    if let Some(instrument) = instrument {
+        instrument
+            .try_normalize_price(price)
+            .map_err(|e| OrderDeniedReason::ValidationFailed {
+                detail: e.to_string(),
+            })?;
+    }
+
+    Ok(())
+}
+
 fn validate_submit_position_id(
     instrument_id: InstrumentId,
     position_side: Option<PositionSide>,
@@ -3782,73 +3976,6 @@ fn validate_submit_position_id(
             position_id,
             detail: format!("expected OKX venue position ID {expected}"),
         });
-    }
-
-    Ok(())
-}
-
-fn validate_order(
-    order: &impl Order,
-    trade_mode: OKXTradeMode,
-    submission: OrderSubmission,
-    is_spread: bool,
-) -> Result<(), OrderDeniedReason> {
-    if let Err(detail) = validate_okx_client_order_id(order.client_order_id().as_str()) {
-        return Err(OrderDeniedReason::InvalidClientOrderId { detail });
-    }
-
-    if is_spread && order.is_reduce_only() {
-        return Err(OrderDeniedReason::UnsupportedReduceOnly);
-    }
-
-    okx_algo_target_currency(
-        okx_instrument_type_from_symbol(order.instrument_id().symbol.as_str()),
-        trade_mode,
-        order.order_side(),
-        order.order_type(),
-        order.is_quote_quantity(),
-    )?;
-
-    validate_algo_trigger_type(
-        okx_instrument_type_from_symbol(order.instrument_id().symbol.as_str()),
-        trade_mode,
-        order.order_type(),
-        order.trigger_type(),
-    )
-    .map_err(|detail| OrderDeniedReason::ValidationFailed { detail })?;
-
-    if order.is_reduce_only()
-        && okx_reduce_only_wire_value(
-            okx_instrument_type_from_symbol(order.instrument_id().symbol.as_str()),
-            trade_mode,
-            order.order_side(),
-            None,
-            Some(true),
-        )
-        .is_err()
-    {
-        return Err(OrderDeniedReason::UnsupportedReduceOnly);
-    }
-
-    if matches!(submission, OrderSubmission::List) {
-        if OKX_CONDITIONAL_ORDER_TYPES.contains(&order.order_type()) {
-            return Err(OrderDeniedReason::UnsupportedOrderList {
-                detail: format!(
-                    "conditional order {} is not supported",
-                    order.client_order_id()
-                ),
-            });
-        }
-
-        if order.time_in_force() != TimeInForce::Gtc {
-            return Err(OrderDeniedReason::UnsupportedOrderList {
-                detail: format!(
-                    "order {} has unsupported time in force {}",
-                    order.client_order_id(),
-                    order.time_in_force()
-                ),
-            });
-        }
     }
 
     Ok(())
@@ -4476,12 +4603,7 @@ mod tests {
             QueryOrderRoute::Regular
         );
         assert_eq!(
-            validate_order(
-                &order,
-                OKXTradeMode::Cross,
-                OrderSubmission::Single,
-                is_spread
-            ),
+            client.validate_order(&order, OKXTradeMode::Cross, OrderSubmission::Single, None),
             Ok(())
         );
     }
@@ -4497,7 +4619,12 @@ mod tests {
             .build();
 
         assert_eq!(
-            validate_order(&order, OKXTradeMode::Cross, OrderSubmission::Single, false),
+            build_test_exec_client().validate_order(
+                &order,
+                OKXTradeMode::Cross,
+                OrderSubmission::Single,
+                None
+            ),
             Ok(())
         );
     }
@@ -4513,7 +4640,12 @@ mod tests {
             .build();
 
         assert_eq!(
-            validate_order(&order, OKXTradeMode::Cross, OrderSubmission::List, false),
+            build_test_exec_client().validate_order(
+                &order,
+                OKXTradeMode::Cross,
+                OrderSubmission::List,
+                None
+            ),
             Err(OrderDeniedReason::UnsupportedOrderList {
                 detail: "conditional order OCONDITIONALLIST is not supported".to_string(),
             })
@@ -4532,7 +4664,12 @@ mod tests {
             .build();
 
         assert_eq!(
-            validate_order(&order, OKXTradeMode::Cross, OrderSubmission::List, false),
+            build_test_exec_client().validate_order(
+                &order,
+                OKXTradeMode::Cross,
+                OrderSubmission::List,
+                None
+            ),
             Err(OrderDeniedReason::UnsupportedOrderList {
                 detail: "order OIOCLIST has unsupported time in force IOC".to_string(),
             })
@@ -4557,7 +4694,12 @@ mod tests {
             .build();
 
         assert_eq!(
-            validate_order(&order, trade_mode, OrderSubmission::Single, false),
+            build_test_exec_client().validate_order(
+                &order,
+                trade_mode,
+                OrderSubmission::Single,
+                None
+            ),
             Err(OrderDeniedReason::UnsupportedReduceOnly)
         );
     }
@@ -6202,7 +6344,7 @@ mod tests {
                 );
                 cache
                     .borrow_mut()
-                    .add_order(order.clone(), None, Some(*OKX_CLIENT_ID), false)
+                    .add_order(order, None, Some(*OKX_CLIENT_ID), false)
                     .unwrap();
                 cache.borrow_mut().update_order(&accepted).unwrap();
             }
@@ -7347,10 +7489,19 @@ mod tests {
         );
         let event = rx.try_recv().unwrap();
 
-        let ExecutionEvent::Report(CommonExecutionReport::Fill(report)) = event else {
-            panic!("expected imported child fill report, was {event:?}");
+        let ExecutionEvent::Report(CommonExecutionReport::OrderWithFills(order, fills)) = event
+        else {
+            panic!("expected imported child order with fills, was {event:?}");
         };
 
+        assert_eq!(order.client_order_id, Some(cid));
+        assert_eq!(
+            order.venue_order_id,
+            VenueOrderId::from("2497956918703120501")
+        );
+        assert_eq!(order.order_status, OrderStatus::Filled);
+        assert_eq!(fills.len(), 1);
+        let report = &fills[0];
         assert_eq!(report.client_order_id, Some(cid));
         assert_eq!(
             report.venue_order_id,
@@ -7949,7 +8100,7 @@ mod tests {
             .client_order_id(ClientOrderId::from("OHEDGEWIRE"))
             .side(side)
             .quantity(Quantity::from("2"))
-            .price(Price::from("123.45"))
+            .price(Price::from("123.4"))
             .trigger_price(Price::from("120.00"))
             .reduce_only(reduce_only)
             .build();

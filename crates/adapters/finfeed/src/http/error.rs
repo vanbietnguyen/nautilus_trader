@@ -15,8 +15,6 @@
 
 //! Adapter-owned failure and retry classification.
 
-use std::time::Duration;
-
 use nautilus_model::identifiers::InstrumentId;
 use nautilus_network::{http::HttpClientError, retry::RetryError};
 use ustr::Ustr;
@@ -42,12 +40,16 @@ pub enum Error {
     /// Requested instrument is unavailable from the provider.
     #[error("FinFeed instrument {0} is unavailable")]
     Unavailable(InstrumentId),
+    /// Public Kalshi metadata retrieval, decoding, retry, or cancellation failed.
+    /// The underlying cause and response content are omitted.
+    #[error("Public Kalshi metadata request failed")]
+    KalshiMetadata,
     /// Unsuccessful HTTP response, retaining status and retry guidance.
     #[error("FinFeed HTTP status {status}")]
     Http {
         /// HTTP response status code.
         status: u16,
-        /// Integer `Retry-After` delay in seconds, when supplied.
+        /// `Retry-After` delay rounded up to whole seconds, when supplied.
         retry_after_secs: Option<u64>,
     },
     /// Transport failure with provider or credential-bearing text omitted.
@@ -88,22 +90,11 @@ impl Error {
         matches!(
             self,
             Self::Transport | Self::Timeout | Self::Retry(RetryError::OperationTimeout { .. })
-        ) || matches!(
-            self,
-            Self::Http {
-                status: 429 | 500 | 502 | 503 | 504,
-                ..
-            }
-        )
+        ) || matches!(self, Self::Http { status, .. } if Self::is_retryable_status(*status))
     }
 
-    pub(super) fn retry_delay(&self) -> Option<Duration> {
-        match self {
-            Self::Http {
-                retry_after_secs, ..
-            } => retry_after_secs.map(Duration::from_secs),
-            _ => None,
-        }
+    pub(super) const fn is_retryable_status(status: u16) -> bool {
+        matches!(status, 429 | 500 | 502 | 503 | 504)
     }
 }
 

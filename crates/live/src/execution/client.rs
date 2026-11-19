@@ -42,7 +42,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use indexmap::IndexMap;
+use indexmap::{IndexMap, map::Entry};
 use nautilus_common::{
     clients::{ExecutionClient, ExecutionReportTask},
     live::dst::task::JoinHandle,
@@ -286,7 +286,6 @@ impl LiveExecutionClient {
 
         let count = pending.len();
         let mut client = self.client.borrow_mut();
-
         while let Some(instrument) = pending.pop_front() {
             client.on_instrument(instrument);
         }
@@ -307,25 +306,24 @@ impl ReportCollector {
         clients: &[LiveExecutionClient],
         client_id: ClientId,
     ) -> anyhow::Result<&'a mut Self> {
-        if !collectors.contains_key(&client_id) {
-            let client = clients
-                .iter()
-                .find(|client| client.client_id() == client_id)
-                .ok_or_else(|| anyhow::anyhow!("execution client {client_id} is unavailable"))?;
-            let guard = client.reserve_report_task().await?;
-            let guard = Rc::new(guard);
-            collectors.insert(
-                client_id,
-                Self {
+        match collectors.entry(client_id) {
+            Entry::Occupied(entry) => Ok(entry.into_mut()),
+            Entry::Vacant(entry) => {
+                let client = clients
+                    .iter()
+                    .find(|client| client.client_id() == client_id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("execution client {client_id} is unavailable")
+                    })?;
+
+                let guard = client.reserve_report_task().await?;
+                let guard = Rc::new(guard);
+                Ok(entry.insert(Self {
                     client: client.clone(),
                     guard,
-                },
-            );
+                }))
+            }
         }
-
-        Ok(collectors
-            .get_mut(&client_id)
-            .expect("reserved report collector"))
     }
 
     #[expect(
@@ -341,7 +339,6 @@ impl ReportCollector {
         cmd: GenerateFillReports,
     ) -> anyhow::Result<CollectedReport<Vec<FillReport>>> {
         let task = self.client.client.borrow().generate_fill_reports_task(&cmd);
-
         let finish = if let Some(task) = task {
             self.client
                 .report_task
@@ -633,6 +630,10 @@ impl ExecutionClient for LiveExecutionClient {
             .borrow()
             .allows_reconciliation_overfill(order, report)
     }
+
+    fn requires_authoritative_fills(&self) -> bool {
+        self.client.borrow().requires_authoritative_fills()
+    }
 }
 
 #[cfg(test)]
@@ -714,24 +715,31 @@ mod tests {
         fn is_connected(&self) -> bool {
             true
         }
+
         fn client_id(&self) -> ClientId {
             ClientId::from("REPORT")
         }
+
         fn account_id(&self) -> AccountId {
             AccountId::from("REPORT-001")
         }
+
         fn venue(&self) -> Venue {
             Venue::from("REPORT")
         }
+
         fn oms_type(&self) -> OmsType {
             OmsType::Netting
         }
+
         fn get_account(&self) -> Option<AccountAny> {
             None
         }
+
         fn start(&mut self) -> anyhow::Result<()> {
             Ok(())
         }
+
         fn stop(&mut self) -> anyhow::Result<()> {
             Ok(())
         }
@@ -828,6 +836,7 @@ mod tests {
         ) -> anyhow::Result<Option<ExecutionMassStatus>> {
             std::future::pending().await
         }
+
         fn generate_account_state(
             &self,
             _balances: Vec<AccountBalance>,
@@ -934,6 +943,7 @@ mod tests {
             UnixNanos::default(),
             None,
         );
+
         assert_eq!(
             client.venue_order_ids(&mass_status),
             Some(IndexMap::from_iter([(
@@ -1303,7 +1313,6 @@ mod tests {
         let client = LiveExecutionClient::new(Box::new(ReportExecutionClient::default()));
         let finalized = Rc::new(Cell::new(0));
         let finalized_for_task = Rc::clone(&finalized);
-
         let (task, started, gate) = cpu_collection(move |value| {
             finalized_for_task.set(finalized_for_task.get() + 1);
             Ok(value)
@@ -1357,6 +1366,7 @@ mod tests {
             async { panic!("report decoding failed") },
             Ok,
         );
+
         let failure = client
             .collect_report(task)
             .await
@@ -1504,6 +1514,7 @@ mod tests {
         let client = Rc::new(LiveExecutionClient::new(Box::new(
             ReportExecutionClient::default(),
         )));
+
         let client_for_finish = Rc::clone(&client);
 
         let task = ExecutionReportTask {

@@ -28,9 +28,10 @@ use nautilus_model::{
         AvgPxReconciliation, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide,
         TimeInForce,
     },
-    identifiers::{AccountId, InstrumentId, VenueOrderId},
+    identifiers::{AccountId, InstrumentId, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orders::Order,
+    position::Position,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{Money, Quantity},
 };
@@ -411,15 +412,14 @@ pub fn check_position_reconciliation(
     false
 }
 
-/// Returns whether `report` predates an open position for its instrument and account that a
-/// synthetic reconciliation order opened and that does not hold the fill's trade.
+/// Returns whether a fill report predates a synthetic correction for its instrument and account.
 ///
-/// The venue position report behind such a position already includes the fill, so applying it
+/// The venue position report behind that correction already includes the fill, so applying it
 /// to the position would count the execution twice.
 #[must_use]
 pub fn fill_precedes_snapshot_reconciled_position(cache: &Cache, report: &FillReport) -> bool {
     cache
-        .positions_open(
+        .positions_refs(
             None,
             Some(&report.instrument_id),
             None,
@@ -428,16 +428,25 @@ pub fn fill_precedes_snapshot_reconciled_position(cache: &Cache, report: &FillRe
         )
         .into_iter()
         .any(|position| {
-            report.ts_event < position.ts_opened
-                && !position.trade_ids.contains(&report.trade_id)
-                && cache
-                    .order(&position.opening_order_id)
-                    .is_some_and(|order| {
-                        order.tags().is_some_and(|tags| {
-                            tags.iter()
-                                .any(|tag| tag.as_str() == RECONCILIATION_ORDER_TAG)
-                        })
+            fill_precedes_reconciled_position(cache, &position, report.trade_id, report.ts_event)
+        })
+}
+
+pub(crate) fn fill_precedes_reconciled_position(
+    cache: &Cache,
+    position: &Position,
+    trade_id: TradeId,
+    ts_event: UnixNanos,
+) -> bool {
+    !position.trade_ids.contains(&trade_id)
+        && position.events.iter().rev().any(|fill| {
+            ts_event < fill.ts_event
+                && cache.order(&fill.client_order_id).is_some_and(|order| {
+                    order.tags().is_some_and(|tags| {
+                        tags.iter()
+                            .any(|tag| tag.as_str() == RECONCILIATION_ORDER_TAG)
                     })
+                })
         })
 }
 
@@ -577,7 +586,7 @@ fn extract_instrument_reports(
 
     for (id, order) in mass_status.order_reports() {
         if order.instrument_id == instrument_id {
-            orders.insert(id, order.clone());
+            orders.insert(id, order);
         }
     }
 
@@ -631,7 +640,7 @@ fn extract_fills_for_instrument(
     // Seed order_map
     for (id, order) in mass_status.order_reports() {
         if order.instrument_id == instrument_id {
-            order_map.insert(id, order.clone());
+            order_map.insert(id, order);
         }
     }
 
@@ -661,7 +670,7 @@ fn extract_fills_for_instrument(
                 fill_map
                     .entry(venue_order_id)
                     .or_insert_with(Vec::new)
-                    .push(fill.clone());
+                    .push(fill);
             }
         }
     }

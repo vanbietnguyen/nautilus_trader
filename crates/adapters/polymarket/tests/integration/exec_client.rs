@@ -12409,7 +12409,7 @@ async fn test_modify_order_guard_rejects_without_venue_requests(
 #[case::immediate_buy_below_signed_shares(
     Some(json!("5")),
     ("0.001", TimeInForce::Fok, "5.0000", "0.226", None, "0.227"),
-    "Polymarket replacement amount 4.97798 shares is below the market minimum order size 5"
+    "Polymarket replacement amount 4.97797 shares is below the market minimum order size 5"
 )]
 #[case::immediate_buy_zero_budget(
     Some(json!("5")),
@@ -15813,7 +15813,7 @@ async fn test_submit_immediate_limit_buy_quantizes_fractional_cent_maker_amount(
     );
     assert_eq!(
         signed_order.get("takerAmount").and_then(Value::as_str),
-        Some("4994800"),
+        Some("4994790"),
     );
     assert_eq!(
         body.get("orderType").and_then(Value::as_str),
@@ -17150,7 +17150,7 @@ async fn test_submit_order_list_quantizes_immediate_buys_before_post() {
         );
         assert_eq!(
             signed_order.get("takerAmount").and_then(Value::as_str),
-            Some("4994800"),
+            Some("4994790"),
         );
     }
 }
@@ -23426,6 +23426,79 @@ async fn test_query_order_does_not_emit_report_for_target_fill_contradiction(
     )
     .await;
     assert_no_execution_event(&mut rx).await;
+}
+
+#[rstest]
+#[case::single(false)]
+#[case::batch(true)]
+#[tokio::test]
+async fn test_auto_redeem_refreshes_account_balance(#[case] batch: bool) {
+    let state = TestServerState::default();
+    state.balance_response.lock().await["balance"] = Value::String("100000000".into());
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    let account_id = AccountId::from("POLYMARKET-001");
+    add_test_account_to_cache(&cache, account_id);
+    client.start().unwrap();
+    client.connect().await.unwrap();
+    let initial = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let ExecutionEvent::Account(initial) = initial else {
+        panic!("Expected initial account state");
+    };
+
+    assert_eq!(
+        initial.balances,
+        vec![AccountBalance::new(
+            Money::from("100 pUSD"),
+            Money::from("0 pUSD"),
+            Money::from("100 pUSD"),
+        )],
+    );
+
+    state.balance_response.lock().await["balance"] = Value::String("107250000".into());
+    let redemption = load_json("ws_user_auto_redeem.json");
+
+    let message = if batch {
+        Value::Array(vec![redemption])
+    } else {
+        redemption
+    };
+
+    state.send_user(message).await;
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("Auto-redeem should refresh the account without another trade or query")
+        .unwrap();
+
+    let ExecutionEvent::Account(event) = event else {
+        panic!("Expected account state after auto-redeem");
+    };
+
+    assert_eq!(event.account_id, account_id);
+    assert_eq!(
+        event.balances,
+        vec![AccountBalance::new(
+            Money::from("107.25 pUSD"),
+            Money::from("0 pUSD"),
+            Money::from("107.25 pUSD"),
+        )],
+    );
+    assert!(event.margins.is_empty());
+    assert!(event.is_reported);
+    assert_eq!(
+        state.startup_request_paths.lock().await.as_slice(),
+        [
+            "/version",
+            "/ws",
+            "/balance-allowance",
+            "/balance-allowance"
+        ],
+    );
+    client.disconnect().await.unwrap();
 }
 
 #[rstest]

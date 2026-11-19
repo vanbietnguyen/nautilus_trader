@@ -26,6 +26,7 @@ pub mod settlement;
 pub mod stubs;
 
 use std::{
+    borrow::Cow,
     cell::{Cell, RefCell, RefMut},
     collections::{HashMap, HashSet},
     fmt::{Debug, Display},
@@ -54,8 +55,7 @@ use nautilus_common::{
     },
     msgbus::{
         self, MStr, MessagingSwitchboard, Pattern, TypedHandler, TypedIntoHandler, get_message_bus,
-        switchboard::{self},
-        typed_handler::ShareableMessageHandler,
+        switchboard, typed_handler::ShareableMessageHandler,
     },
     runner::{
         TradingCommandMessage, capture_trading_cmd, trading_cmd_is_dispatching,
@@ -84,7 +84,7 @@ use nautilus_model::{
     },
     instruments::{Instrument, InstrumentAny},
     orderbook::own::{OwnBookOrder, OwnOrderBook, should_handle_own_book_order},
-    orders::{Order, OrderAny, OrderError},
+    orders::{FILL_REPORT_ORDER_TAG, Order, OrderAny, OrderError},
     position::{Position, PositionReplayEvent},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{Money, Quantity},
@@ -92,14 +92,16 @@ use nautilus_model::{
 use position::CorrectedPosition;
 pub use position::{PositionStateSnapshot, SnapshotAnchorer};
 use rust_decimal::Decimal;
+use ustr::Ustr;
 
 use crate::{
     client::ExecutionClientAdapter,
     reconciliation::{
-        check_position_reconciliation, fill_precedes_snapshot_reconciled_position,
-        generate_external_order_status_events, generate_reconciliation_order_events,
-        generate_reconciliation_order_pre_fill_events,
-        generate_reconciliation_order_snapshot_events, reconcile_fill_report as reconcile_fill,
+        check_position_reconciliation, fill_precedes_reconciled_position,
+        fill_precedes_snapshot_reconciled_position, generate_external_order_status_events,
+        generate_reconciliation_order_events, generate_reconciliation_order_pre_fill_events,
+        generate_reconciliation_order_snapshot_events, preserve_order_amendment,
+        reconcile_fill_report as reconcile_fill,
     },
 };
 
@@ -713,8 +715,14 @@ impl ExecutionEngine {
 
     /// Connects all registered execution clients concurrently.
     ///
-    /// Connection failures are logged but do not prevent the node from running.
-    pub async fn connect(&mut self) {
+    /// Successful clients remain connected if another client fails.
+    /// Logs identify failed clients without provider error text, which can contain credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any client fails to connect, listing failed client IDs without provider
+    /// error text.
+    pub async fn connect(&mut self) -> anyhow::Result<()> {
         let futures: Vec<_> = self
             .get_clients_mut()
             .into_iter()
@@ -725,11 +733,22 @@ impl ExecutionEngine {
             .collect();
 
         let results = join_all(futures).await;
+        let mut failed_clients = Vec::new();
 
         for (client_id, result) in results {
             if result.is_err() {
                 log::error!("Failed to connect execution client {client_id}: connection failed");
+                failed_clients.push(client_id.to_string());
             }
+        }
+
+        if failed_clients.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Failed to connect execution clients: {}",
+                failed_clients.join(", ")
+            )
         }
     }
 
@@ -978,6 +997,9 @@ impl ExecutionEngine {
     #[expect(clippy::await_holding_refcell_ref)]
     /// Loads persistent state into cache and rebuilds indices.
     ///
+    /// When `manage_own_order_books` is enabled, clears and rebuilds own order books from
+    /// eligible non-closed restored orders.
+    ///
     /// # Errors
     ///
     /// Returns an error if any cache operation fails.
@@ -997,8 +1019,8 @@ impl ExecutionEngine {
             let mut cache = self.cache.borrow_mut();
             cache.build_index();
             let _ = cache.check_integrity();
-
             if self.config.manage_own_order_books {
+                cache.clear_own_order_books();
                 cache
                     .orders(None, None, None, None, None)
                     .into_iter()
@@ -1066,11 +1088,14 @@ impl ExecutionEngine {
     ///
     /// Handles order status transitions by generating appropriate events when the venue
     /// reports a different status than our local state. Supports all order states including
-    /// fills with inferred fill generation when instruments are available.
+    /// fills with inferred fill generation when instruments are available. Clients requiring
+    /// authoritative fills accept submitted orders but defer fill-dependent status transitions when
+    /// the report has missing executions.
     ///
     /// When the order is not found in cache, creates an external order from the report.
-    /// This handles exchange-generated orders (liquidation, ADL, settlement) that were
-    /// not submitted locally.
+    /// Orders requiring authoritative fills are created and accepted while their fills and dependent
+    /// status transitions remain pending. This handles exchange-generated orders (liquidation, ADL,
+    /// settlement) that were not submitted locally.
     pub fn reconcile_order_status_report(&mut self, report: &OrderStatusReport) {
         self.handle_order_status_report(report, false);
     }
@@ -1097,10 +1122,121 @@ impl ExecutionEngine {
         drop(cache);
 
         if let Some(order) = order {
-            self.apply_order_report_events(&order, report, instrument.as_ref(), is_snapshot);
+            self.reconcile_cached_order_status(&order, report, instrument.as_ref(), is_snapshot);
+        } else if instrument.is_some() && self.order_report_has_missing_fills(report, None) {
+            let _ = self.accept_external_order_from_status(report);
         } else {
             self.create_external_order(report, instrument.as_ref());
         }
+    }
+
+    fn reconcile_cached_order_status(
+        &mut self,
+        order: &OrderAny,
+        report: &OrderStatusReport,
+        instrument: Option<&InstrumentAny>,
+        is_snapshot: bool,
+    ) {
+        let requires_authoritative_fills = self.requires_authoritative_fills(report, Some(order));
+        let current_report = preserve_order_amendment(order, report, requires_authoritative_fills);
+        let report = current_report.as_ref();
+
+        if self.order_report_has_missing_fills(report, Some(order)) {
+            if order.status() == OrderStatus::Submitted {
+                let ts_now = self.clock.borrow().timestamp_ns();
+                for event in generate_reconciliation_order_pre_fill_events(order, report, ts_now) {
+                    self.handle_event(&event);
+                }
+            }
+
+            log::debug!(
+                "Deferring order status for {}: awaiting authoritative fills",
+                report.venue_order_id,
+            );
+            return;
+        }
+
+        let ts_now = self.clock.borrow().timestamp_ns();
+        let events = if is_snapshot {
+            generate_reconciliation_order_snapshot_events(order, report, instrument, ts_now)
+        } else {
+            generate_reconciliation_order_events(order, report, instrument, ts_now)
+        };
+
+        for event in &events {
+            self.handle_event(event);
+        }
+    }
+
+    fn order_report_has_missing_fills(
+        &self,
+        report: &OrderStatusReport,
+        order: Option<&OrderAny>,
+    ) -> bool {
+        let filled_qty = order.map_or(
+            Quantity::zero(report.filled_qty.precision),
+            Order::filled_qty,
+        );
+
+        if report.filled_qty <= filled_qty {
+            return false;
+        }
+
+        self.requires_authoritative_fills(report, order)
+    }
+
+    fn requires_authoritative_fills(
+        &self,
+        report: &OrderStatusReport,
+        order: Option<&OrderAny>,
+    ) -> bool {
+        let client = order
+            .and_then(|order| {
+                self.cache
+                    .borrow()
+                    .client_id(&order.client_order_id())
+                    .copied()
+            })
+            .and_then(|id| self.clients.get(&id));
+
+        client.map_or_else(
+            || {
+                self.clients.values().any(|client| {
+                    client.account_id == report.account_id
+                        && client.handles_order_venue(report.instrument_id.venue)
+                        && client.requires_authoritative_fills()
+                })
+            },
+            |client| client.requires_authoritative_fills(),
+        )
+    }
+
+    fn accept_external_order_from_status(
+        &mut self,
+        report: &OrderStatusReport,
+    ) -> Option<OrderAny> {
+        let order = self.materialize_external_order_from_status(report)?;
+        let ts_now = self.clock.borrow().timestamp_ns();
+
+        let accepted = OrderAccepted::new(
+            order.trader_id(),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            report.venue_order_id,
+            report.account_id,
+            UUID4::new(),
+            report.ts_accepted,
+            ts_now,
+            true,
+        );
+        self.handle_event(&OrderEventAny::Accepted(accepted));
+        Some(
+            self.cache
+                .borrow()
+                .order_owned(&order.client_order_id())
+                .unwrap_or(order),
+        )
     }
 
     fn create_external_order(
@@ -1287,6 +1423,8 @@ impl ExecutionEngine {
         let trader_id = get_message_bus().borrow().trader_id;
         let ts_now = self.clock.borrow().timestamp_ns();
 
+        let tags = Some(vec![Ustr::from(FILL_REPORT_ORDER_TAG)]);
+
         let initialized = OrderInitialized::new(
             trader_id,
             strategy_id,
@@ -1321,7 +1459,7 @@ impl ExecutionEngine {
             None, // exec_algorithm_id
             None, // exec_algorithm_params
             None, // exec_spawn_id
-            None, // tags
+            tags, // tags
         );
 
         self.materialize_external_order(
@@ -1429,21 +1567,14 @@ impl ExecutionEngine {
     /// if the fill is not a duplicate and won't cause an overfill. When `allow_overfills` is
     /// disabled and the execution client allows a reconciliation overfill, the engine raises
     /// the order quantity to the filled quantity plus this fill before applying it. An already
-    /// filled order is not raised again. When the order is not in cache, an external order is
+    /// filled order is not raised by this policy. When the order is not in cache, an external order is
     /// bootstrapped from the fill so that venue-initiated closures (e.g. Hyperliquid
     /// liquidations) that arrive without a companion order status report still update the
-    /// local position.
+    /// local position. The bootstrapped order's quantity can grow with each distinct fill,
+    /// even after it is filled.
     ///
-    /// # Replayed Fills
-    ///
-    /// A fill updates its order but no position when an open position for its instrument and
-    /// account:
-    /// - Was opened by a synthetic reconciliation order.
-    /// - Has a `ts_opened` later than the fill's `ts_event`.
-    /// - Does not hold the fill's trade.
-    ///
-    /// The venue position report behind that position already includes the fill, so this stops
-    /// a venue that replays executions after a restart from doubling the position.
+    /// Replayed fills update their orders only when a cached synthetic correction already covers
+    /// them. Standalone reports check all strategies for the instrument and account.
     pub fn reconcile_fill_report(&mut self, report: &FillReport) {
         msgbus::publish_any(
             MessagingSwitchboard::reconciliation_raw_fill_report_topic(),
@@ -1531,7 +1662,8 @@ impl ExecutionEngine {
         report: &FillReport,
         ts_now: UnixNanos,
     ) -> Option<OrderAny> {
-        if self.config.allow_overfills
+        if order.is_fill_report_order()
+            || self.config.allow_overfills
             || order.status() == OrderStatus::Filled
             || order.trade_ids().iter().any(|id| **id == report.trade_id)
         {
@@ -1587,7 +1719,9 @@ impl ExecutionEngine {
     ///
     /// Real fills supplied by the adapter are applied first so their `trade_id` and
     /// `commission` are preserved; any residual quantity not covered by the fills is
-    /// then synthesized as an inferred fill from the status report's `avg_px`.
+    /// then synthesized as an inferred fill from the status report's `avg_px`, unless the client
+    /// requires authoritative fills. In that case, residual quantity and dependent status transitions
+    /// remain pending.
     /// Adapters use this to emit ADL / liquidation / settlement events without
     /// losing real fill metadata.
     ///
@@ -1636,10 +1770,19 @@ impl ExecutionEngine {
             if fills.is_empty()
                 && let Some(order) = order
             {
-                self.apply_order_report_events(&order, report, None, is_snapshot);
+                self.reconcile_cached_order_status(&order, report, None, is_snapshot);
             }
             return;
         };
+
+        let requires_authoritative_fills =
+            self.requires_authoritative_fills(report, order.as_ref());
+        let current_report = match order.as_ref() {
+            Some(order) => preserve_order_amendment(order, report, requires_authoritative_fills),
+            None => Cow::Borrowed(report),
+        };
+
+        let report = current_report.as_ref();
 
         // Bootstrap the external order with only OrderAccepted; defer fill events to
         // the per-fill loop so real fill metadata is preserved.
@@ -1657,28 +1800,11 @@ impl ExecutionEngine {
                     .unwrap_or(order)
             }
             None => {
-                let Some(order) = self.materialize_external_order_from_status(report) else {
+                let Some(order) = self.accept_external_order_from_status(report) else {
                     return;
                 };
-                let ts_now = self.clock.borrow().timestamp_ns();
-                let accepted = OrderAccepted::new(
-                    order.trader_id(),
-                    order.strategy_id(),
-                    order.instrument_id(),
-                    order.client_order_id(),
-                    report.venue_order_id,
-                    report.account_id,
-                    UUID4::new(),
-                    report.ts_accepted,
-                    ts_now,
-                    true, // reconciliation
-                );
-                self.handle_event(&OrderEventAny::Accepted(accepted));
-                self.cache
-                    .borrow()
-                    .order(&order.client_order_id())
-                    .map(|o| o.clone())
-                    .unwrap_or(order)
+
+                order
             }
         };
 
@@ -1708,26 +1834,7 @@ impl ExecutionEngine {
             }
         }
 
-        self.apply_order_report_events(&order, report, Some(&instrument), is_snapshot);
-    }
-
-    fn apply_order_report_events(
-        &mut self,
-        order: &OrderAny,
-        report: &OrderStatusReport,
-        instrument: Option<&InstrumentAny>,
-        is_snapshot: bool,
-    ) {
-        let ts_now = self.clock.borrow().timestamp_ns();
-        let events = if is_snapshot {
-            generate_reconciliation_order_snapshot_events(order, report, instrument, ts_now)
-        } else {
-            generate_reconciliation_order_events(order, report, instrument, ts_now)
-        };
-
-        for event in &events {
-            self.handle_event(event);
-        }
+        self.reconcile_cached_order_status(&order, report, Some(&instrument), is_snapshot);
     }
 
     /// Reconciles a position status report received at runtime.
@@ -1966,6 +2073,18 @@ impl ExecutionEngine {
     }
 
     /// Processes an order event, updating internal state and routing as needed.
+    ///
+    /// # Replayed Fills
+    ///
+    /// A reconciliation fill updates its order but no position when a cached position for its
+    /// instrument and account:
+    /// - Has a synthetic reconciliation fill later than the execution's `ts_event`.
+    /// - Does not hold the fill's trade.
+    ///
+    /// The venue position report behind that correction already includes the fill, so this stops
+    /// a venue that replays executions after a restart from doubling the position.
+    /// NETTING fills check all strategies; HEDGING fills check the routed position.
+    /// Ordinary private fills and price restatements still apply to positions.
     pub fn process(&mut self, event: &OrderEventAny) {
         self.handle_event(event);
     }
@@ -3030,7 +3149,62 @@ impl ExecutionEngine {
     }
 
     fn handle_event(&mut self, event: &OrderEventAny) {
-        self.handle_event_with_position_application(event, true);
+        let covered = match event {
+            OrderEventAny::Filled(fill) if fill.reconciliation => {
+                self.fill_precedes_reconciliation_snapshot(fill)
+            }
+            _ => false,
+        };
+
+        self.handle_event_with_position_application(event, !covered);
+    }
+
+    fn fill_precedes_reconciliation_snapshot(&self, fill: &OrderFilled) -> bool {
+        let oms_type = self.determine_oms_type(fill);
+        let cache = self.cache.borrow();
+
+        if cache
+            .order(&fill.client_order_id)
+            .is_some_and(|order| is_fill_price_restatement(&order, fill))
+        {
+            return false;
+        }
+
+        let is_covered = |position: &Position| {
+            position.account_id == fill.account_id
+                && position.instrument_id == fill.instrument_id
+                && fill_precedes_reconciled_position(&cache, position, fill.trade_id, fill.ts_event)
+        };
+
+        if oms_type != OmsType::Hedging {
+            let positions = cache.positions_refs(
+                None,
+                Some(&fill.instrument_id),
+                None,
+                Some(&fill.account_id),
+                None,
+            );
+            return positions.into_iter().any(|position| is_covered(&position));
+        }
+
+        let Ok(indexed) = self.cached_fill_position_id(fill, oms_type) else {
+            return false;
+        };
+
+        let Some(order) = cache.order(&fill.client_order_id) else {
+            return false;
+        };
+
+        let Some(position_id) = indexed
+            .or(fill.position_id)
+            .or_else(|| self.cached_hedging_position_id(fill, &order))
+        else {
+            return false;
+        };
+
+        cache
+            .position_ref(&position_id)
+            .is_some_and(|position| is_covered(&position))
     }
 
     fn handle_event_with_position_application(
@@ -3775,45 +3949,8 @@ impl ExecutionEngine {
             &cached_order
         };
 
-        // Check execution spawn orders
-        if let Some(spawn_id) = order.exec_spawn_id() {
-            let spawn_orders = cache.orders_for_exec_spawn(&spawn_id);
-            for spawned_order in spawn_orders {
-                if let Some(pos_id) = spawned_order.position_id() {
-                    if self.config.debug {
-                        log::debug!("Found spawned {} for {}", pos_id, fill.client_order_id());
-                    }
-                    return pos_id;
-                }
-            }
-        }
-
-        if order.is_reduce_only() {
-            let mut candidates = cache
-                .positions_open(
-                    None,
-                    Some(&fill.instrument_id),
-                    Some(&fill.strategy_id),
-                    Some(&fill.account_id),
-                    None,
-                )
-                .into_iter()
-                .filter(|position| position.is_opposite_side(fill.order_side));
-            let candidate = candidates.next();
-
-            if let Some(position) = candidate
-                && candidates.next().is_none()
-                && order.would_reduce_only(position.side, position.quantity)
-            {
-                if self.config.debug {
-                    log::debug!(
-                        "Assigned reduce-only fill {} to position {}",
-                        fill.client_order_id(),
-                        position.id
-                    );
-                }
-                return position.id;
-            }
+        if let Some(position_id) = self.cached_hedging_position_id(fill, order) {
+            return position_id;
         }
 
         // Generate new position ID
@@ -3825,6 +3962,45 @@ impl ExecutionEngine {
         position_id
     }
 
+    fn cached_hedging_position_id(
+        &self,
+        fill: &OrderFilled,
+        order: &OrderAny,
+    ) -> Option<PositionId> {
+        let cache = self.cache.borrow();
+
+        if let Some(position_id) = order.exec_spawn_id().and_then(|spawn_id| {
+            cache
+                .orders_for_exec_spawn(&spawn_id)
+                .into_iter()
+                .find_map(|order| order.position_id())
+        }) {
+            return Some(position_id);
+        }
+
+        if !order.is_reduce_only() {
+            return None;
+        }
+
+        let mut candidates = cache
+            .positions_open(
+                None,
+                Some(&fill.instrument_id),
+                Some(&fill.strategy_id),
+                Some(&fill.account_id),
+                None,
+            )
+            .into_iter()
+            .filter(|position| position.is_opposite_side(fill.order_side));
+        let position = candidates.next()?;
+        if candidates.next().is_some() || !order.would_reduce_only(position.side, position.quantity)
+        {
+            return None;
+        }
+
+        Some(position.id)
+    }
+
     fn determine_netting_position_id(
         &self,
         fill: &OrderFilled,
@@ -3832,6 +4008,7 @@ impl ExecutionEngine {
     ) -> PositionId {
         let position_id = PositionId::new(format!("{}-{}", fill.instrument_id, fill.strategy_id));
         let cache = self.cache.borrow();
+
         if order.is_none_or(|order| !order.is_reduce_only())
             || cache
                 .position_ref(&position_id)
@@ -4098,6 +4275,10 @@ impl ExecutionEngine {
     }
 
     fn check_overfill(&self, order: &OrderAny, fill: &OrderFilled) -> anyhow::Result<()> {
+        if order.is_fill_report_order() {
+            return Ok(());
+        }
+
         let potential_overfill = order.calculate_overfill(fill.last_qty);
 
         if potential_overfill.is_positive() {
@@ -5586,31 +5767,26 @@ mod tests {
         let mut position = Position::new(&instrument, opening.clone());
         position.apply(&closing);
 
-        let fill_voided = OrderFillVoided::new(
-            opening.trader_id,
-            opening.strategy_id,
-            opening.instrument_id,
-            opening.client_order_id,
-            opening.venue_order_id,
-            opening.account_id,
-            "C-TRANSFER".into(),
-            opening.trade_id,
-            Quantity::from(1),
-            None,
-            opening.order_side,
-            opening.order_type,
-            opening.last_px,
-            opening.currency,
-            opening.liquidity_side,
-            opening.position_id,
-            None,
-            None,
-            UUID4::new(),
-            UnixNanos::from(4),
-            UnixNanos::from(4),
-            false,
-            false,
-        );
+        let fill_voided = OrderFillVoidedSpec::builder()
+            .trader_id(opening.trader_id)
+            .strategy_id(opening.strategy_id)
+            .instrument_id(opening.instrument_id)
+            .client_order_id(opening.client_order_id)
+            .venue_order_id(opening.venue_order_id)
+            .account_id(opening.account_id)
+            .correction_id("C-TRANSFER".into())
+            .trade_id(opening.trade_id)
+            .voided_qty(Quantity::from(1))
+            .order_side(opening.order_side)
+            .order_type(opening.order_type)
+            .last_px(opening.last_px)
+            .currency(opening.currency)
+            .liquidity_side(opening.liquidity_side)
+            .maybe_position_id(opening.position_id)
+            .event_id(UUID4::new())
+            .ts_event(UnixNanos::from(4))
+            .ts_init(UnixNanos::from(4))
+            .build();
         position.fill_voids.push(PositionFillVoid {
             event: fill_voided,
             voided_qty: Quantity::from(1),

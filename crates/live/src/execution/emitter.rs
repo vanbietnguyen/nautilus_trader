@@ -39,6 +39,7 @@ use nautilus_common::{
 };
 use nautilus_core::{Params, UUID4, UnixNanos, time::AtomicTime};
 use nautilus_model::{
+    data::CustomData,
     enums::{AccountType, LiquiditySide},
     events::{
         AccountState, OrderAcceptedBatch, OrderCancelDenied, OrderCancelRejected,
@@ -420,6 +421,7 @@ impl ExecutionEventEmitter {
             false,
             due_post_only,
         );
+
         self.send_order_event(OrderEventAny::Rejected(event));
     }
 
@@ -450,6 +452,7 @@ impl ExecutionEventEmitter {
             venue_order_id,
             Some(self.factory.account_id()),
         );
+
         event.causation_id = causation_id;
         self.send_order_event(OrderEventAny::ModifyDenied(event));
     }
@@ -482,6 +485,7 @@ impl ExecutionEventEmitter {
             venue_order_id,
             Some(self.factory.account_id()),
         );
+
         event.causation_id = causation_id;
         self.send_order_event(OrderEventAny::ModifyRejected(event));
     }
@@ -513,6 +517,7 @@ impl ExecutionEventEmitter {
             venue_order_id,
             Some(self.factory.account_id()),
         );
+
         event.causation_id = causation_id;
         self.send_order_event(OrderEventAny::CancelDenied(event));
     }
@@ -545,6 +550,7 @@ impl ExecutionEventEmitter {
             venue_order_id,
             Some(self.factory.account_id()),
         );
+
         event.causation_id = causation_id;
         self.send_order_event(OrderEventAny::CancelRejected(event));
     }
@@ -598,6 +604,13 @@ impl ExecutionEventEmitter {
     /// Emits an account state event.
     pub fn send_account_state(&self, state: AccountState) {
         if let Err(e) = self.try_send_account_state(state) {
+            log::warn!("{e}");
+        }
+    }
+
+    /// Emits custom data for publication on the message bus.
+    pub fn send_custom_data(&self, data: CustomData) {
+        if let Err(e) = self.try_send(ExecutionEvent::Data(data), "custom data") {
             log::warn!("{e}");
         }
     }

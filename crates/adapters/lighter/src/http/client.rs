@@ -70,10 +70,11 @@ use crate::{
         },
         query::{
             LighterAccountActiveOrdersQuery, LighterAccountInactiveOrdersQuery,
-            LighterAccountLookup, LighterAccountQuery, LighterCandlesQuery, LighterFundingsQuery,
-            LighterMakerOnlyApiKeysQuery, LighterNextNonceQuery, LighterOrderBookDetailsQuery,
-            LighterOrderBookOrdersQuery, LighterOrderBooksQuery, LighterRecentTradesQuery,
-            LighterTradesQuery, LighterTxLookup, LighterTxQuery,
+            LighterAccountLookup, LighterAccountOrdersQuery, LighterAccountQuery,
+            LighterCandlesQuery, LighterFundingsQuery, LighterMakerOnlyApiKeysQuery,
+            LighterNextNonceQuery, LighterOrderBookDetailsQuery, LighterOrderBookOrdersQuery,
+            LighterOrderBooksQuery, LighterRecentTradesQuery, LighterTradesQuery, LighterTxLookup,
+            LighterTxQuery, validate_client_order_indexes,
         },
     },
 };
@@ -82,6 +83,7 @@ const API_V1: &str = "/api/v1";
 const ENDPOINT_ACCOUNT: &str = "/api/v1/account";
 const ENDPOINT_ACCOUNT_ACTIVE_ORDERS: &str = "/api/v1/accountActiveOrders";
 const ENDPOINT_ACCOUNT_INACTIVE_ORDERS: &str = "/api/v1/accountInactiveOrders";
+const ENDPOINT_ACCOUNT_ORDERS: &str = "/api/v1/accountOrders";
 const ENDPOINT_CANDLES: &str = "/api/v1/candles";
 const ENDPOINT_FUNDINGS: &str = "/api/v1/fundings";
 const ENDPOINT_MAKER_ONLY_API_KEYS: &str = "/api/v1/getMakerOnlyApiKeys";
@@ -317,7 +319,9 @@ impl LighterRawHttpClient {
     ///
     /// Returns an error if the request fails or the response is invalid.
     pub async fn get_trades(&self, query: &LighterTradesQuery) -> LighterHttpResult<LighterTrades> {
-        self.send_get_request(ENDPOINT_TRADES, Some(query)).await
+        let headers = authorization_headers(query.authorization.as_ref(), query.auth.as_ref());
+        self.send_get_request_with_headers(ENDPOINT_TRADES, Some(query), headers)
+            .await
     }
 
     /// Calls `GET /api/v1/candles`.
@@ -365,7 +369,8 @@ impl LighterRawHttpClient {
         &self,
         query: &LighterAccountActiveOrdersQuery,
     ) -> LighterHttpResult<LighterOrders> {
-        self.send_get_request(ENDPOINT_ACCOUNT_ACTIVE_ORDERS, Some(query))
+        let headers = authorization_headers(query.authorization.as_ref(), query.auth.as_ref());
+        self.send_get_request_with_headers(ENDPOINT_ACCOUNT_ACTIVE_ORDERS, Some(query), headers)
             .await
     }
 
@@ -378,7 +383,24 @@ impl LighterRawHttpClient {
         &self,
         query: &LighterAccountInactiveOrdersQuery,
     ) -> LighterHttpResult<LighterOrders> {
-        self.send_get_request(ENDPOINT_ACCOUNT_INACTIVE_ORDERS, Some(query))
+        let headers = authorization_headers(query.authorization.as_ref(), query.auth.as_ref());
+        self.send_get_request_with_headers(ENDPOINT_ACCOUNT_INACTIVE_ORDERS, Some(query), headers)
+            .await
+    }
+
+    /// Calls `GET /api/v1/accountOrders`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn get_account_orders(
+        &self,
+        query: &LighterAccountOrdersQuery,
+    ) -> LighterHttpResult<LighterOrders> {
+        validate_client_order_indexes(&query.client_order_indexes)
+            .map_err(LighterHttpError::Parse)?;
+        let headers = authorization_headers(query.authorization.as_ref(), query.auth.as_ref());
+        self.send_get_request_with_headers(ENDPOINT_ACCOUNT_ORDERS, Some(query), headers)
             .await
     }
 
@@ -416,16 +438,8 @@ impl LighterRawHttpClient {
         let params = LighterMakerOnlyApiKeysParams {
             account_index: query.account_index,
         };
-        let headers = query
-            .authorization
-            .as_ref()
-            .or(query.auth.as_ref())
-            .map(|auth| {
-                HashMap::from([(
-                    HEADER_AUTHORIZATION.to_string(),
-                    auth.expose_secret().to_owned(),
-                )])
-            });
+
+        let headers = authorization_headers(query.authorization.as_ref(), query.auth.as_ref());
         self.send_get_request_with_headers(ENDPOINT_MAKER_ONLY_API_KEYS, Some(&params), headers)
             .await
     }
@@ -721,6 +735,18 @@ struct LighterMakerOnlyApiKeysParams {
     account_index: i64,
 }
 
+fn authorization_headers(
+    authorization: Option<&SecretString>,
+    auth: Option<&SecretString>,
+) -> Option<HashMap<String, String>> {
+    authorization.or(auth).map(|token| {
+        HashMap::from([(
+            HEADER_AUTHORIZATION.to_string(),
+            token.expose_secret().to_owned(),
+        )])
+    })
+}
+
 fn multipart_headers() -> HashMap<String, String> {
     HashMap::from([
         ("Accept".to_string(), "application/json".to_string()),
@@ -967,6 +993,18 @@ impl LighterHttpClient {
         query: &LighterAccountInactiveOrdersQuery,
     ) -> LighterHttpResult<LighterOrders> {
         self.inner.get_account_inactive_orders(query).await
+    }
+
+    /// Calls `GET /api/v1/accountOrders`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn get_account_orders(
+        &self,
+        query: &LighterAccountOrdersQuery,
+    ) -> LighterHttpResult<LighterOrders> {
+        self.inner.get_account_orders(query).await
     }
 
     /// Calls `GET /api/v1/nextNonce` for `(account_index, api_key_index)`.
@@ -1222,6 +1260,7 @@ impl LighterHttpClient {
 
         let limit_satisfied =
             !start_was_unspecified && requested_limit.is_some_and(|limit| bars.len() >= limit);
+
         if pages >= MAX_BAR_REQUEST_PAGES && cursor_ms < end_ms && !limit_satisfied {
             return Err(LighterHttpError::HistoryIncomplete {
                 data_type: "bar",
@@ -1374,6 +1413,7 @@ impl LighterHttpClient {
 
         let limit_satisfied = !start_was_unspecified
             && requested_limit.is_some_and(|limit| funding_rates.len() >= limit);
+
         if pages >= MAX_FUNDING_REQUEST_PAGES && cursor_ms < end_ms && !limit_satisfied {
             return Err(LighterHttpError::HistoryIncomplete {
                 data_type: "funding rate",
@@ -1394,7 +1434,7 @@ impl LighterHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or nonempty metadata contains no valid instruments.
+    /// Returns an error if the request fails or supported markets contain no valid instruments.
     pub async fn request_instruments(&self) -> LighterHttpResult<Vec<InstrumentAny>> {
         self.request_instruments_for_query(&LighterOrderBookDetailsQuery::default())
             .await
@@ -1404,7 +1444,7 @@ impl LighterHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or nonempty metadata contains no valid instruments.
+    /// Returns an error if the request fails or supported markets contain no valid instruments.
     pub async fn request_instruments_with_status(
         &self,
     ) -> LighterHttpResult<Vec<(InstrumentAny, LighterMarketStatus)>> {

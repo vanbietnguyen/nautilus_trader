@@ -35,8 +35,6 @@ use nautilus_core::{
     string::secret::{REDACTED, SecretString},
     time::get_atomic_clock_realtime,
 };
-#[cfg(test)]
-use nautilus_live::book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS;
 use nautilus_live::book::{
     BookSequenceOutcome,
     recovery::{BookRecoveryOutcome, BookRecoveryState},
@@ -305,25 +303,6 @@ enum CompletionKind {
 }
 
 impl FeedHandler {
-    #[cfg(test)]
-    pub(super) fn new(
-        signal: Arc<AtomicBool>,
-        cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
-        raw_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Message)>,
-        out_tx: tokio::sync::mpsc::UnboundedSender<NautilusWsMessage>,
-        subscriptions: SubscriptionState,
-    ) -> Self {
-        Self::new_with_settlement_currency(
-            signal,
-            cmd_rx,
-            raw_rx,
-            out_tx,
-            subscriptions,
-            Currency::get_or_create_crypto("USDC"),
-            Duration::from_secs(DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS),
-        )
-    }
-
     pub(super) fn new_with_settlement_currency(
         signal: Arc<AtomicBool>,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
@@ -702,7 +681,7 @@ impl FeedHandler {
                                     continue;
                                 }
                                 let messages = self
-                                    .handle_frame(frame, ts_init)
+                                    .route_frame(frame, &text, ts_init)
                                     .into_iter()
                                     .map(|msg| msg.with_connection_epoch(connection_epoch))
                                     .collect();
@@ -968,6 +947,7 @@ impl FeedHandler {
             .subscription_attempts
             .remove(&topic)
             .expect("matching subscription attempt disappeared");
+
         for response_tx in std::mem::take(&mut attempt.response_txs) {
             let _ = response_tx.send(Ok(()));
         }
@@ -1361,6 +1341,36 @@ impl FeedHandler {
         );
     }
 
+    fn route_frame(
+        &mut self,
+        frame: LighterWsFrame,
+        text: &str,
+        ts_init: UnixNanos,
+    ) -> Vec<NautilusWsMessage> {
+        if self.forwards_raw(&frame) {
+            return raw_message(text);
+        }
+
+        self.handle_frame(frame, ts_init)
+    }
+
+    // Account frames are typed only with an execution context; height has no typed consumer
+    fn forwards_raw(&self, frame: &LighterWsFrame) -> bool {
+        match frame {
+            LighterWsFrame::Height { .. } => true,
+            LighterWsFrame::AccountOrders { .. }
+            | LighterWsFrame::AccountAllOrders { .. }
+            | LighterWsFrame::AccountTx { .. }
+            | LighterWsFrame::AccountAllTradesSnapshot { .. }
+            | LighterWsFrame::AccountAllTrades { .. }
+            | LighterWsFrame::AccountAllPositionsSnapshot { .. }
+            | LighterWsFrame::AccountAllPositions { .. }
+            | LighterWsFrame::AccountAllAssets { .. }
+            | LighterWsFrame::UserStats { .. } => self.exec_account.is_none(),
+            _ => false,
+        }
+    }
+
     fn handle_frame(
         &mut self,
         frame: LighterWsFrame,
@@ -1405,9 +1415,6 @@ impl FeedHandler {
             LighterWsFrame::AccountTx { channel, txs } => self.handle_account_tx(channel, txs),
             LighterWsFrame::AccountOrders { ref orders, .. }
             | LighterWsFrame::AccountAllOrders { ref orders, .. } => {
-                if self.exec_account.is_none() {
-                    return raw_message(&frame);
-                }
                 let mut msgs = self.handle_account_orders(orders, ts_init);
                 msgs.push(NautilusWsMessage::AccountStreamFirstFrame(
                     AccountStream::Orders,
@@ -1418,13 +1425,8 @@ impl FeedHandler {
             // rather than `update/`. When typed execution routing is active
             // we drop the snapshot to avoid re-emitting prior executions as
             // fresh fill reports on every reconnect (HTTP reconciliation
-            // owns historical state recovery). When no execution context is
-            // set we still forward as `Raw` to preserve the prior contract
-            // for unauthenticated subscribers.
+            // owns historical state recovery).
             LighterWsFrame::AccountAllTradesSnapshot { .. } => {
-                if self.exec_account.is_none() {
-                    return raw_message(&frame);
-                }
                 log::debug!(
                     "Skipping Lighter account_all_trades snapshot frame; \
                      reconcile historical fills via HTTP",
@@ -1434,9 +1436,6 @@ impl FeedHandler {
                 )]
             }
             LighterWsFrame::AccountAllTrades { ref trades, .. } => {
-                if self.exec_account.is_none() {
-                    return raw_message(&frame);
-                }
                 let mut msgs = self.handle_account_trades(trades.values().flatten(), ts_init);
                 msgs.push(NautilusWsMessage::AccountStreamFirstFrame(
                     AccountStream::Trades,
@@ -1444,9 +1443,6 @@ impl FeedHandler {
                 msgs
             }
             LighterWsFrame::AccountAllPositionsSnapshot { ref positions, .. } => {
-                if self.exec_account.is_none() {
-                    return raw_message(&frame);
-                }
                 let mut msgs =
                     self.handle_account_positions(positions, ts_init, PositionFrameType::Snapshot);
                 msgs.push(NautilusWsMessage::AccountStreamFirstFrame(
@@ -1455,9 +1451,6 @@ impl FeedHandler {
                 msgs
             }
             LighterWsFrame::AccountAllPositions { ref positions, .. } => {
-                if self.exec_account.is_none() {
-                    return raw_message(&frame);
-                }
                 self.handle_account_positions(positions, ts_init, PositionFrameType::Update)
             }
             LighterWsFrame::AccountAllAssets {
@@ -1465,9 +1458,6 @@ impl FeedHandler {
                 timestamp,
                 ..
             } => {
-                if self.exec_account.is_none() {
-                    return raw_message(&frame);
-                }
                 let mut msgs = self.handle_account_assets(assets, timestamp, ts_init);
                 msgs.push(NautilusWsMessage::AccountStreamFirstFrame(
                     AccountStream::Assets,
@@ -1479,9 +1469,6 @@ impl FeedHandler {
                 timestamp,
                 ..
             } => {
-                if self.exec_account.is_none() {
-                    return raw_message(&frame);
-                }
                 let mut msgs = self.handle_user_stats(stats, timestamp, ts_init);
                 msgs.push(NautilusWsMessage::AccountStreamFirstFrame(
                     AccountStream::UserStats,
@@ -1508,14 +1495,13 @@ impl FeedHandler {
                 ref candles,
                 ..
             } => self.handle_candles(channel, candles, ts_init),
-            LighterWsFrame::Shutdown { .. } => Vec::new(),
-            LighterWsFrame::Height { .. } => raw_message(&frame),
+            LighterWsFrame::Shutdown { .. } | LighterWsFrame::Height { .. } => Vec::new(),
         }
     }
 
     fn handle_account_tx(&self, channel: Ustr, txs: Vec<LighterWsTx>) -> Vec<NautilusWsMessage> {
         let Some((_, account_index)) = self.exec_account else {
-            return raw_message(&LighterWsFrame::AccountTx { channel, txs });
+            return Vec::new();
         };
 
         if channel.as_str() != format!("account_tx:{account_index}") {
@@ -2113,8 +2099,7 @@ impl FeedHandler {
             return Vec::new();
         };
 
-        // The position frame carries no top-level event timestamp, so stamp
-        // ts_event with the wall-clock time the handler observed the frame.
+        // Account transaction times stay on raw frames; reports use arrival time
         let ts_event = ts_init;
 
         let mut reports = Vec::new();
@@ -2242,9 +2227,14 @@ enum PositionFrameType {
     Update,
 }
 
-fn raw_message(frame: &LighterWsFrame) -> Vec<NautilusWsMessage> {
-    let value = serde_json::to_value(frame).unwrap_or(serde_json::Value::Null);
-    vec![NautilusWsMessage::Raw(value)]
+fn raw_message(text: &str) -> Vec<NautilusWsMessage> {
+    match serde_json::from_str(text) {
+        Ok(value) => vec![NautilusWsMessage::Raw(value)],
+        Err(e) => {
+            log::error!("Failed to forward raw Lighter WS frame: {e}");
+            Vec::new()
+        }
+    }
 }
 
 // Codes outside the transaction range (e.g. 30003 "Already Subscribed")
@@ -2401,6 +2391,7 @@ mod tests {
 
     use futures_util::FutureExt;
     use log::{Level, LevelFilter, Log, Metadata, Record};
+    use nautilus_live::book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS;
     use nautilus_model::{
         enums::{AccountType, BookAction, RecordFlag},
         identifiers::{InstrumentId, Symbol, Venue},
@@ -2417,6 +2408,26 @@ mod tests {
         common::enums::{LighterCandleResolution, LighterTxStatus, LighterTxType},
         websocket::messages::{LighterMarketSelection, LighterWsCandle, LighterWsChannel},
     };
+
+    impl FeedHandler {
+        fn new(
+            signal: Arc<AtomicBool>,
+            cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
+            raw_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Message)>,
+            out_tx: tokio::sync::mpsc::UnboundedSender<NautilusWsMessage>,
+            subscriptions: SubscriptionState,
+        ) -> Self {
+            Self::new_with_settlement_currency(
+                signal,
+                cmd_rx,
+                raw_rx,
+                out_tx,
+                subscriptions,
+                Currency::get_or_create_crypto("USDC"),
+                Duration::from_secs(DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS),
+            )
+        }
+    }
 
     const SECRET_MARKER: &str = "426426426";
 
@@ -3333,10 +3344,9 @@ mod tests {
             handler.exec_account = None;
         }
 
-        let frame: LighterWsFrame =
-            serde_json::from_str(include_str!("../../test_data/ws_account_tx_update.json"))
-                .unwrap();
-        let messages = handler.handle_frame(frame.clone(), UnixNanos::from(11));
+        let text = include_str!("../../test_data/ws_account_tx_update.json");
+        let frame: LighterWsFrame = serde_json::from_str(text).unwrap();
+        let messages = handler.route_frame(frame, text, UnixNanos::from(11));
         assert_eq!(messages.len(), 1);
         let message = messages
             .into_iter()
@@ -3367,7 +3377,10 @@ mod tests {
                 panic!("expected raw transaction update");
             };
 
-            assert_eq!(value, serde_json::to_value(frame).unwrap());
+            assert_eq!(
+                value,
+                serde_json::from_str::<serde_json::Value>(text).unwrap()
+            );
         }
     }
 
@@ -3434,6 +3447,80 @@ mod tests {
                 }
             }
             other => panic!("expected execution reports, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::positions(include_str!("../../test_data/ws_account_all_positions_transaction_time.json"), true)]
+    #[case::assets(include_str!("../../test_data/ws_account_all_assets_transaction_time.json"), false)]
+    fn account_transaction_time_preserves_raw_frames_and_receive_order(
+        #[case] fixture: &str,
+        #[case] positions: bool,
+    ) {
+        let mut handler = make_handler_with_account();
+        let mut raw_handler = make_handler_with_account();
+        raw_handler.exec_account = None;
+        let stats: LighterWsFrame = serde_json::from_str(WS_USER_STATS_UPDATE).unwrap();
+        handler.handle_frame(stats, UnixNanos::from(10));
+
+        for (index, (transaction_time, amount)) in [
+            (200, "1.5000"),
+            (200, "2.5000"),
+            (100, "3.5000"),
+            (100, "3.5000"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut value: serde_json::Value = serde_json::from_str(fixture).unwrap();
+            value["transaction_time"] = json!(transaction_time);
+            if positions {
+                value["positions"]["0"]["position"] = json!(amount);
+            } else {
+                value["assets"]["3"]["balance"] = json!(amount);
+            }
+
+            let frame: LighterWsFrame = serde_json::from_value(value.clone()).unwrap();
+            let ts_init = UnixNanos::from(11 + index as u64);
+            let raw = raw_handler.route_frame(frame.clone(), &value.to_string(), ts_init);
+            let messages = strip_account_marker(handler.handle_frame(frame, ts_init));
+
+            assert_eq!(raw.len(), 1);
+
+            let NautilusWsMessage::Raw(raw_value) = &raw[0] else {
+                panic!("expected raw account frame");
+            };
+
+            assert_eq!(raw_value, &value);
+            assert_eq!(messages.len(), 1);
+
+            match &messages[0] {
+                NautilusWsMessage::PositionUpdate {
+                    reports,
+                    closed_market_ids,
+                    skipped_market_ids,
+                } => {
+                    assert!(positions);
+                    assert_eq!(reports.len(), 1);
+                    assert_eq!(reports[0].quantity, Quantity::from(amount));
+                    assert_eq!(reports[0].ts_last, ts_init);
+                    assert_eq!(reports[0].ts_init, ts_init);
+                    assert!(closed_market_ids.is_empty());
+                    assert!(skipped_market_ids.is_empty());
+                }
+                NautilusWsMessage::AccountState(state) => {
+                    assert!(!positions);
+                    assert_eq!(state.balances.len(), 1);
+                    assert_eq!(
+                        state.balances[0].total.as_decimal(),
+                        Decimal::from_str_exact(amount).unwrap() + Decimal::from(40),
+                    );
+                    assert_eq!(state.ts_event, UnixNanos::from(1_781_161_199_648_000_000));
+                    assert_eq!(state.ts_init, ts_init);
+                    assert_eq!(state.info, None);
+                }
+                other => panic!("expected account state or position update, was {other:?}"),
+            }
         }
     }
 
@@ -3920,12 +4007,7 @@ mod tests {
 
     #[rstest]
     fn handle_frame_routes_account_assets_and_user_stats_to_unified_state() {
-        // Fixture is the captured production no-position payload (10 USDC
-        // on spot, 40 USDC pledged as perp collateral, no resting orders).
-        // Lighter runs unified margin: both legs are deployable equity, so
-        // total = balance + margin_balance, locked = locked_balance only,
-        // and MarginBalance.initial = 0 because user_stats.collateral ==
-        // available_balance (no margin in use).
+        // The snapshot holds 50 USDC in total and reports 40 USDC available
         let mut handler = make_handler_with_account();
         let assets_frame: super::LighterWsFrame =
             serde_json::from_str(WS_ACCOUNT_ALL_ASSETS_UPDATE).unwrap();
@@ -3944,11 +4026,9 @@ mod tests {
                 assert_eq!(state.base_currency, None);
                 assert_eq!(state.balances.len(), 1);
                 assert_eq!(state.balances[0].currency, usdc);
-                // balance 10 + margin_balance 40 = 50 total; locked = 0
-                // (no resting spot orders); free = 50 (all deployable).
                 assert_eq!(state.balances[0].total, Money::from("50.000000 USDC"));
-                assert_eq!(state.balances[0].locked, Money::from("0 USDC"));
-                assert_eq!(state.balances[0].free, Money::from("50.000000 USDC"));
+                assert_eq!(state.balances[0].locked, Money::from("10 USDC"));
+                assert_eq!(state.balances[0].free, Money::from("40.000000 USDC"));
                 assert_eq!(state.margins.len(), 1);
                 assert_eq!(state.margins[0].currency, usdc);
                 assert_eq!(state.margins[0].initial, Money::from("0 USDC"));
@@ -3969,9 +4049,8 @@ mod tests {
         // The 5 mUSDC haircut on margin_balance is the entry fee. The
         // 0.827055 USDC gap between collateral and available_balance is
         // the initial margin pledged to the open position. AccountBalance
-        // is unchanged in shape; perp-margin-in-use lives on
-        // MarginBalance, not in `locked`. Maintenance is zero because
-        // Lighter doesn't publish a maintenance value on user_stats.
+        // also includes funds outside the venue's reported availability.
+        // Maintenance is zero because user_stats does not publish it.
         let mut handler = make_handler_with_account();
         let assets_frame: super::LighterWsFrame =
             serde_json::from_str(WS_ACCOUNT_ALL_ASSETS_WITH_POSITION).unwrap();
@@ -3992,8 +4071,8 @@ mod tests {
                 // the trailing digit to 8 decimals, matching the
                 // production log).
                 assert_eq!(state.balances[0].total, Money::from("49.99536956 USDC"));
-                assert_eq!(state.balances[0].locked, Money::from("0 USDC"));
-                assert_eq!(state.balances[0].free, Money::from("49.99536956 USDC"));
+                assert_eq!(state.balances[0].locked, Money::from("10.82705556 USDC"));
+                assert_eq!(state.balances[0].free, Money::from("39.16831400 USDC"));
                 assert_eq!(state.margins.len(), 1);
                 // initial = collateral 39.995369 - available 39.168314 = 0.827055
                 assert_eq!(state.margins[0].initial, Money::from("0.82705500 USDC"));
@@ -4042,6 +4121,7 @@ mod tests {
                 .iter()
                 .find(|m| matches!(m, NautilusWsMessage::AccountStreamFirstFrame(_)))
                 .unwrap_or_else(|| panic!("missing marker for {expected:?}"));
+
             match marker {
                 NautilusWsMessage::AccountStreamFirstFrame(stream) => {
                     assert_eq!(*stream, expected);
@@ -4061,27 +4141,120 @@ mod tests {
     }
 
     #[rstest]
-    fn handle_frame_account_orders_without_context_falls_back_to_raw() {
-        let signal = Arc::new(AtomicBool::new(false));
-        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
-        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
-        let mut handler =
-            FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
-        handler.instruments.insert(0, stub_eth_perp_instrument());
-        // exec_account intentionally left unset; the handler must preserve
-        // the prior `Raw` forwarding contract for unauthenticated subscribers.
+    #[case::account_orders_update(WS_ACCOUNT_ORDERS_UPDATE, "update/account_orders")]
+    #[case::account_orders_snapshot(WS_ACCOUNT_ORDERS_UPDATE, "subscribed/account_orders")]
+    #[case::account_all_trades_update(WS_ACCOUNT_ALL_TRADES_UPDATE, "update/account_all_trades")]
+    #[case::account_all_trades_snapshot(
+        snapshot_trade_frame_json(),
+        "subscribed/account_all_trades"
+    )]
+    #[case::account_all_positions_update(
+        WS_ACCOUNT_ALL_POSITIONS_UPDATE,
+        "update/account_all_positions"
+    )]
+    #[case::account_all_positions_snapshot(
+        WS_ACCOUNT_ALL_POSITIONS_UPDATE,
+        "subscribed/account_all_positions"
+    )]
+    #[case::account_all_assets_update(WS_ACCOUNT_ALL_ASSETS_UPDATE, "update/account_all_assets")]
+    #[case::account_all_assets_snapshot(
+        WS_ACCOUNT_ALL_ASSETS_UPDATE,
+        "subscribed/account_all_assets"
+    )]
+    #[case::user_stats_update(WS_USER_STATS_UPDATE, "update/user_stats")]
+    #[case::user_stats_snapshot(WS_USER_STATS_UPDATE, "subscribed/user_stats")]
+    #[case::account_tx_update(
+        include_str!("../../test_data/ws_account_tx_update.json"),
+        "update/account_tx"
+    )]
+    #[case::height_update(include_str!("../../test_data/ws_height_update.json"), "update/height")]
+    #[case::height_snapshot(
+        include_str!("../../test_data/ws_height_update.json"),
+        "subscribed/height"
+    )]
+    fn route_frame_without_context_forwards_original_frame(
+        #[case] fixture: &str,
+        #[case] frame_type: &str,
+    ) {
+        let mut handler = make_handler_with_account();
+        handler.exec_account = None;
+        let mut original: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        original["type"] = json!(frame_type);
+        original["unmodeled_sentinel"] = json!({"kept": [1, "two"]});
+        let text = original.to_string();
+        let frame: LighterWsFrame = serde_json::from_str(&text).unwrap();
 
-        let frame: super::LighterWsFrame = serde_json::from_str(WS_ACCOUNT_ORDERS_UPDATE).unwrap();
-        let messages = handler.handle_frame(frame, UnixNanos::from(11));
+        let messages = handler.route_frame(frame, &text, UnixNanos::from(11));
 
         assert_eq!(messages.len(), 1);
-        match &messages[0] {
-            NautilusWsMessage::Raw(value) => {
-                assert_eq!(value["type"], "update/account_orders");
-            }
-            other => panic!("expected raw fallback, was {other:?}"),
-        }
+
+        let NautilusWsMessage::Raw(value) = &messages[0] else {
+            panic!("expected raw frame, was {:?}", messages[0]);
+        };
+
+        assert_eq!(value, &original);
+    }
+
+    #[rstest]
+    #[case::account_orders_snapshot(WS_ACCOUNT_ORDERS_UPDATE, "subscribed/account_orders", 0)]
+    #[case::account_all_trades_update(WS_ACCOUNT_ALL_TRADES_UPDATE, "update/account_all_trades", 1)]
+    #[case::account_all_trades_snapshot(
+        snapshot_trade_frame_json(),
+        "subscribed/account_all_trades",
+        0
+    )]
+    #[case::account_all_assets_snapshot(
+        WS_ACCOUNT_ALL_ASSETS_UPDATE,
+        "subscribed/account_all_assets",
+        0
+    )]
+    #[case::user_stats_snapshot(WS_USER_STATS_UPDATE, "subscribed/user_stats", 0)]
+    fn route_frame_with_context_keeps_typed_routing(
+        #[case] fixture: &str,
+        #[case] frame_type: &str,
+        #[case] expected_fills: usize,
+    ) {
+        let mut handler = make_handler_with_account();
+        let mut typed_handler = make_handler_with_account();
+        let mut original: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        original["type"] = json!(frame_type);
+        original["unmodeled_sentinel"] = json!("ignored");
+        let text = original.to_string();
+        let frame: LighterWsFrame = serde_json::from_str(&text).unwrap();
+
+        let routed = handler.route_frame(frame.clone(), &text, UnixNanos::from(11));
+        let typed = typed_handler.handle_frame(frame, UnixNanos::from(11));
+
+        let fills = routed
+            .iter()
+            .filter_map(|msg| match msg {
+                NautilusWsMessage::ExecutionReports(reports) => Some(reports),
+                _ => None,
+            })
+            .flatten()
+            .filter(|report| matches!(report, super::ExecutionReport::Fill(_)))
+            .count();
+
+        assert_eq!(
+            routed
+                .iter()
+                .map(std::mem::discriminant)
+                .collect::<Vec<_>>(),
+            typed.iter().map(std::mem::discriminant).collect::<Vec<_>>(),
+        );
+        assert_eq!(fills, expected_fills);
+        assert_eq!(
+            routed
+                .iter()
+                .filter(|msg| matches!(msg, NautilusWsMessage::AccountStreamFirstFrame(_)))
+                .count(),
+            1,
+        );
+        assert!(
+            !routed
+                .iter()
+                .any(|msg| matches!(msg, NautilusWsMessage::Raw(_)))
+        );
     }
 
     #[rstest]
@@ -4249,31 +4422,6 @@ mod tests {
         let messages = strip_account_marker(handler.handle_frame(frame, UnixNanos::from(11)));
 
         assert!(messages.is_empty());
-    }
-
-    #[rstest]
-    fn handle_frame_account_all_trades_snapshot_falls_back_to_raw_without_context() {
-        let signal = Arc::new(AtomicBool::new(false));
-        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
-        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
-        let mut handler =
-            FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
-        handler.instruments.insert(0, stub_eth_perp_instrument());
-        // No exec_account: preserve prior Raw forwarding so unauthenticated
-        // subscribers still see the snapshot frame.
-
-        let frame: super::LighterWsFrame =
-            serde_json::from_str(snapshot_trade_frame_json()).unwrap();
-        let messages = handler.handle_frame(frame, UnixNanos::from(11));
-
-        assert_eq!(messages.len(), 1);
-        match &messages[0] {
-            NautilusWsMessage::Raw(value) => {
-                assert_eq!(value["type"], "subscribed/account_all_trades");
-            }
-            other => panic!("expected raw fallback, was {other:?}"),
-        }
     }
 
     #[rstest]

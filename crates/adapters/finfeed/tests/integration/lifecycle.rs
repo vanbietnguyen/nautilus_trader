@@ -38,7 +38,7 @@ use tokio::io::AsyncWriteExt;
 
 use super::{
     data::response,
-    dst::{bind_peer, read_request},
+    dst::{HttpPeer, bind_peer, read_request},
     polling::connected_selection,
 };
 
@@ -69,28 +69,56 @@ async fn terminal_refresh_cancels_all_feeds_and_retains_history_across_reconnect
     #[case] restart: bool,
 ) {
     let blocked = 2 + usize::from(inflight == "bars");
-    let (peer, http, mut observed, release) = terminal_peer(metadata(status), inflight).await;
+    let (peer, http, mut observed, release) = terminal_peer(metadata(status), inflight, 4).await;
     let (mut client, mut receiver) = connected_selection(http, vec![MARKET_ID.into()], 100).await;
-    subscribe(&mut client, inflight).unwrap();
-    if inflight == "activity" && !restart {
-        subscribe(&mut client, "trade").unwrap();
-    } else if inflight == "book" && !restart {
-        subscribe(&mut client, "depth").unwrap();
+
+    if !restart && matches!(inflight, "activity" | "book") {
+        let target = if inflight == "activity" {
+            format!("/v1/activity/POLYMARKET/{MARKET_ID}/latest?limit=100")
+        } else {
+            format!("/v1/orderbook/POLYMARKET/{MARKET_ID}/current")
+        };
+
+        let request = peer
+            .cancel_request(
+                &mut client,
+                &target,
+                |client| subscribe(client, inflight).unwrap(),
+                |client| {
+                    subscribe(
+                        client,
+                        if inflight == "activity" {
+                            "trade"
+                        } else {
+                            "depth"
+                        },
+                    )
+                    .unwrap();
+                },
+            )
+            .await;
+
+        assert_eq!(
+            request.lines().next().unwrap(),
+            format!("GET {target} HTTP/1.1")
+        );
+    } else {
+        subscribe(&mut client, inflight).unwrap();
     }
 
-    for index in 0..=blocked {
-        assert_eq!(observed.recv().await.unwrap(), index);
-    }
+    let poll_path = match inflight {
+        "activity" => "/latest?limit=100",
+        "book" => "/current",
+        "periods" => "/ohlcv/periods",
+        "bars" => "/latest?period_id=1SEC&limit=101",
+        _ => unreachable!(),
+    };
+
+    wait_for_poll(&mut observed, poll_path).await;
 
     if restart {
         subscribe(&mut client, "depth").unwrap();
-        assert_eq!(
-            time::timeout(Duration::from_secs(3), observed.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-            blocked + 1,
-        );
+        wait_for_poll(&mut observed, poll_path).await;
     }
 
     for feed in ["activity", "trade", "book", "depth", "bars"] {
@@ -144,14 +172,6 @@ async fn terminal_refresh_cancels_all_feeds_and_retains_history_across_reconnect
         .unwrap()
         .unwrap();
     client.disconnect().await.unwrap();
-
-    let poll_path = match inflight {
-        "activity" => "/latest?limit=100",
-        "book" => "/current",
-        "periods" => "/ohlcv/periods",
-        "bars" => "/latest?period_id=1SEC&limit=101",
-        _ => unreachable!(),
-    };
 
     let polls = requests.iter().filter(|r| r.contains(poll_path)).count();
 
@@ -235,25 +255,13 @@ async fn nonterminal_refresh_replaces_inflight_context_and_keeps_subscription(
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
 #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
 async fn reconnect_observes_terminal_before_restoring_retained_feeds(#[case] status: &str) {
-    let (peer, http, mut observed, release) = refresh_peer(
-        vec![
-            EXCHANGES.into(),
-            MARKET.into(),
-            ACTIVITY.into(),
-            EXCHANGES.into(),
-            metadata(status),
-        ],
-        2,
-    )
-    .await;
+    let (peer, http, mut observed, release) = terminal_peer(metadata(status), "activity", 2).await;
     let (mut client, mut receiver) = connected_selection(http, vec![MARKET_ID.into()], 100).await;
     for feed in ["activity", "trade", "book", "depth", "bars"] {
         subscribe(&mut client, feed).unwrap();
     }
 
-    for index in 0..3 {
-        assert_eq!(observed.recv().await.unwrap(), index);
-    }
+    wait_for_poll(&mut observed, "/latest?limit=100").await;
 
     client.disconnect().await.unwrap();
     client.connect().await.unwrap();
@@ -265,7 +273,23 @@ async fn reconnect_observes_terminal_before_restoring_retained_feeds(#[case] sta
     assert_eq!(instrument.id(), id());
     assert_eq!(instrument.info().unwrap().get_str("status"), Some(status));
     release.send(()).unwrap();
-    assert_eq!(peer.await.unwrap().len(), 5);
+    let requests = time::timeout(Duration::from_secs(5), peer)
+        .await
+        .unwrap()
+        .unwrap();
+    let targets = requests
+        .iter()
+        .map(|request| request.split_whitespace().nth(1).unwrap())
+        .collect::<Vec<_>>();
+    assert!((5..=6).contains(&targets.len()));
+    assert_eq!(targets[0], "/v1/exchanges");
+    assert_eq!(targets[1], format!("/v1/markets/POLYMARKET/{MARKET_ID}"));
+    assert_eq!(&targets[targets.len() - 2..], &targets[..2]);
+    assert!(
+        targets[2..targets.len() - 2].iter().all(
+            |target| *target == format!("/v1/activity/POLYMARKET/{MARKET_ID}/latest?limit=100")
+        )
+    );
     client.disconnect().await.unwrap();
     assert!(receiver.try_recv().is_err());
 }
@@ -564,13 +588,27 @@ fn id() -> InstrumentId {
     to_instrument_id("POLYMARKET", MARKET_ID).unwrap()
 }
 
+async fn wait_for_poll(observed: &mut tokio::sync::mpsc::UnboundedReceiver<String>, path: &str) {
+    time::timeout(Duration::from_secs(5), async {
+        loop {
+            let request = observed.recv().await.expect("lifecycle peer closed");
+            if request.contains(path) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("lifecycle poll did not start");
+}
+
 async fn terminal_peer(
     terminal: String,
     inflight: &str,
+    definitions_expected: usize,
 ) -> (
-    task::JoinHandle<Vec<String>>,
+    HttpPeer,
     FinFeedHttpConfig,
-    tokio::sync::mpsc::UnboundedReceiver<usize>,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
     tokio::sync::oneshot::Sender<()>,
 ) {
     let (listener, address) = bind_peer().await;
@@ -586,14 +624,13 @@ async fn terminal_peer(
     let (release, mut released) = tokio::sync::oneshot::channel();
     let inflight = inflight.to_owned();
 
-    let peer = task::spawn(async move {
+    let peer = HttpPeer::spawn(move |mut cancellations| async move {
         let mut requests = Vec::new();
         let mut pending = Vec::new();
         let mut release_received = false;
         let mut definitions = 0;
-
-        while definitions < 4 {
-            let (mut stream, _) = tokio::select! {
+        while definitions < definitions_expected || !release_received {
+            let (mut stream, request) = tokio::select! {
                 biased;
                 result = &mut released, if !release_received => {
                     result.unwrap();
@@ -604,11 +641,9 @@ async fn terminal_peer(
                     }
                     continue;
                 },
-                accepted = listener.accept() => accepted.unwrap(),
+                accepted = cancellations.accept(&listener) => accepted,
             };
-            let request = read_request(&mut stream).await;
             let target = request.split_whitespace().nth(1).unwrap();
-
             let (body, poll) = if target == "/v1/exchanges" {
                 (EXCHANGES, false)
             } else if target == format!("/v1/markets/POLYMARKET/{MARKET_ID}") {
@@ -639,7 +674,7 @@ async fn terminal_peer(
                 panic!("unexpected lifecycle request: {target}");
             };
 
-            observed.send(requests.len()).unwrap();
+            observed.send(request.clone()).unwrap();
             requests.push(request);
 
             if poll && !release_received {

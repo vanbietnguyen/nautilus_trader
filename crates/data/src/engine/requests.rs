@@ -226,9 +226,7 @@ impl ContinuousFutureRequest {
     }
 
     pub(super) fn child_params(&self, parent_params: Option<&Params>, parent_id: UUID4) -> Params {
-        let mut child_params = parent_params
-            .map(|params| IndexMap::clone(params))
-            .unwrap_or_default();
+        let mut child_params = parent_params.map_or_default(|params| IndexMap::clone(params));
         child_params.shift_remove(CONTINUOUS_FUTURE_TRANSITIONS);
         child_params.shift_remove(CONTINUOUS_FUTURE_ADJUSTMENT_MODE);
         child_params.shift_remove(LAST_POST_INSTRUMENT_ID);
@@ -825,6 +823,7 @@ fn parse_optional_chain_bound(
 
     let instrument_id = InstrumentId::from_str(raw)
         .with_context(|| format!("Invalid continuous future {key} for {target_instrument_id}"))?;
+
     if instrument_id.venue != target_instrument_id.venue {
         anyhow::bail!(
             "Continuous future {key} venue mismatch for {target_instrument_id}: target venue {}, {key} venue {}",
@@ -873,6 +872,7 @@ fn parse_transitions(
             parse_transition_instrument_id(row.get("pre_instrument_id"), target_bar_type)?;
         let post_instrument_id =
             parse_transition_instrument_id(row.get("post_instrument_id"), target_bar_type)?;
+
         if pre_instrument_id.venue != target_venue || post_instrument_id.venue != target_venue {
             anyhow::bail!(
                 "Continuous future segment venue mismatch for {target_bar_type}: target venue {target_venue}, segment venues pre={}, post={}",

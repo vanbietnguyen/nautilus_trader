@@ -70,6 +70,7 @@ def test_config_defaults(values: dict) -> None:
     Expose every default without resolving credentials.
     """
     config = FinFeedDataClientConfig(**values)
+
     expected = {
         "base_url_http": "https://api.prediction-markets.finfeedapi.com/v1/",
         "http_timeout_secs": 300,
@@ -90,7 +91,9 @@ def test_config_defaults(values: dict) -> None:
         "instruments": [],
         "has_api_key": False,
         "has_proxy_url": False,
+        "kalshi_metadata_url": None,
     }
+
     assert {name: getattr(config, name) for name in expected} == expected
 
 
@@ -115,13 +118,16 @@ def test_config_distinct_values_and_secret_redaction() -> None:
         "poll_interval_ms": 137,
         "poll_limit": 23,
         "connect_timeout_secs": 43,
+        "kalshi_metadata_url": "http://localhost:8125/trade-api/v2",
     }
+
     config = FinFeedDataClientConfig(
         api_key="projection-secret",
         proxy_url="http://user:proxy-secret@localhost:8124",
         instruments=[_selection()],
         **expected,
     )
+
     assert {name: getattr(config, name) for name in expected} == expected
     assert config.has_api_key is True
     assert config.has_proxy_url is True
@@ -159,6 +165,7 @@ def test_polling_capacity_reaches_client_construction(limit: int) -> None:
         instruments=[_selection()],
         poll_limit=limit,
     )
+
     assert config.poll_limit == limit
     node = _build_node(config)
     assert node.trader_id == TraderId("TESTER-001")
@@ -190,6 +197,7 @@ def test_polling_capacity_reaches_client_construction(limit: int) -> None:
         ({"retry_backoff_factor": 0.0}, "invalid retry backoff"),
         ({"base_url_http": "http://example.com/"}, "base URL must be HTTPS"),
         ({"proxy_url": "bad proxy"}, "invalid proxy URL"),
+        ({"kalshi_metadata_url": "bad endpoint"}, "invalid public Kalshi metadata"),
     ],
 )
 def test_invalid_values_fail_at_client_construction(values: dict, message: str) -> None:

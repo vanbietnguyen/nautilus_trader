@@ -32,7 +32,7 @@ use nautilus_model::{
     types::{Currency, Price, Quantity},
 };
 use rust_decimal::Decimal;
-use sqlx::{FromRow, Row, postgres::PgRow, types::Json};
+use sqlx::{FromRow, Row, error::BoxDynError, postgres::PgRow, types::Json};
 use ustr::Ustr;
 
 use crate::sql::models::{decode_money, enums::AssetClassPg, read_u8, read_u64};
@@ -96,7 +96,7 @@ pub struct TokenizedAssetRow(pub TokenizedAsset);
 
 impl<'r> FromRow<'r, PgRow> for InstrumentAnyRow {
     fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
-        let kind = row.get::<String, _>("kind");
+        let kind = row.try_get::<String, _>("kind")?;
         if kind == "BETTING" {
             Ok(Self(InstrumentAny::Betting(
                 BettingInstrumentRow::from_row(row).unwrap().0,
@@ -115,7 +115,7 @@ impl<'r> FromRow<'r, PgRow> for InstrumentAnyRow {
             )))
         } else if kind == "CRYPTO_OPTION" {
             Ok(Self(InstrumentAny::CryptoOption(
-                CryptoOptionRow::from_row(row).unwrap().0,
+                CryptoOptionRow::from_row(row)?.0,
             )))
         } else if kind == "CRYPTO_OPTION_SPREAD" {
             Ok(Self(InstrumentAny::CryptoOptionSpread(
@@ -143,7 +143,7 @@ impl<'r> FromRow<'r, PgRow> for InstrumentAnyRow {
             )))
         } else if kind == "OPTION_CONTRACT" {
             Ok(Self(InstrumentAny::OptionContract(
-                OptionContractRow::from_row(row).unwrap().0,
+                OptionContractRow::from_row(row)?.0,
             )))
         } else if kind == "COMMODITY" {
             Ok(Self(InstrumentAny::Commodity(
@@ -157,7 +157,7 @@ impl<'r> FromRow<'r, PgRow> for InstrumentAnyRow {
             Ok(Self(InstrumentAny::Cfd(CfdRow::from_row(row).unwrap().0)))
         } else if kind == "OPTION_SPREAD" {
             Ok(Self(InstrumentAny::OptionSpread(
-                OptionSpreadRow::from_row(row).unwrap().0,
+                OptionSpreadRow::from_row(row)?.0,
             )))
         } else if kind == "PERPETUAL_CONTRACT" {
             Ok(Self(InstrumentAny::PerpetualContract(
@@ -598,6 +598,10 @@ impl<'r> FromRow<'r, PgRow> for CryptoOptionRow {
 
         let info: Option<Json<Params>> = row.try_get("info")?;
 
+        let underlying_instrument_id = read_optional_parsed(row, "underlying_instrument_id")?;
+        let exercise_style = read_optional_parsed(row, "exercise_style")?;
+        let settlement_type = read_optional_parsed(row, "settlement_type")?;
+
         let inst = CryptoOption::builder()
             .instrument_id(id)
             .raw_symbol(raw_symbol)
@@ -606,6 +610,9 @@ impl<'r> FromRow<'r, PgRow> for CryptoOptionRow {
             .settlement_currency(settlement_currency)
             .is_inverse(is_inverse)
             .option_kind(option_kind)
+            .maybe_underlying_instrument_id(underlying_instrument_id)
+            .maybe_exercise_style(exercise_style)
+            .maybe_settlement_type(settlement_type)
             .strike_price(strike_price)
             .activation_ns(activation_ns)
             .expiration_ns(expiration_ns)
@@ -1049,6 +1056,10 @@ impl<'r> FromRow<'r, PgRow> for OptionContractRow {
 
         let info: Option<Json<Params>> = row.try_get("info")?;
 
+        let underlying_instrument_id = read_optional_parsed(row, "underlying_instrument_id")?;
+        let exercise_style = read_optional_parsed(row, "exercise_style")?;
+        let settlement_type = read_optional_parsed(row, "settlement_type")?;
+
         let inst = OptionContract::builder()
             .instrument_id(id)
             .raw_symbol(raw_symbol)
@@ -1056,6 +1067,9 @@ impl<'r> FromRow<'r, PgRow> for OptionContractRow {
             .maybe_exchange(exchange)
             .underlying(underlying)
             .option_kind(option_kind)
+            .maybe_underlying_instrument_id(underlying_instrument_id)
+            .maybe_exercise_style(exercise_style)
+            .maybe_settlement_type(settlement_type)
             .strike_price(strike_price)
             .currency(currency)
             .activation_ns(activation_ns)
@@ -1404,8 +1418,96 @@ impl<'r> FromRow<'r, PgRow> for PerpetualContractRow {
 }
 
 impl<'r> FromRow<'r, PgRow> for OptionSpreadRow {
-    fn from_row(_row: &'r PgRow) -> Result<Self, sqlx::Error> {
-        todo!("Implement FromRow for OptionSpread")
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        let result = (|| {
+            let id = read_parsed(row, "id")?;
+            let raw_symbol: String = row.try_get("raw_symbol")?;
+
+            let raw_symbol =
+                Symbol::new_checked(raw_symbol).map_err(|e| sqlx::Error::ColumnDecode {
+                    index: "raw_symbol".to_string(),
+                    source: e.to_string().into(),
+                })?;
+
+            let asset_class = row.try_get::<AssetClassPg, _>("asset_class")?.0;
+            let exchange = row
+                .try_get::<Option<String>, _>("exchange")?
+                .as_deref()
+                .map(Ustr::from);
+            let underlying = row
+                .try_get::<String, _>("underlying")
+                .map(|value| Ustr::from(&value))?;
+            let strategy_type = row
+                .try_get::<String, _>("strategy_type")
+                .map(|value| Ustr::from(&value))?;
+            let activation_ns = read_parsed(row, "activation_ns")?;
+            let expiration_ns = read_parsed(row, "expiration_ns")?;
+            let currency = read_parsed(row, "quote_currency")?;
+            let price_precision = read_u8(row, "price_precision")?;
+            let price_increment = read_parsed(row, "price_increment")?;
+            let size_precision = read_u8(row, "size_precision")?;
+            let size_increment: Quantity = read_parsed(row, "size_increment")?;
+            let multiplier = read_parsed(row, "multiplier")?;
+            let lot_size = read_parsed(row, "lot_size")?;
+            let max_quantity = read_optional_parsed(row, "max_quantity")?;
+            let min_quantity = read_optional_parsed(row, "min_quantity")?;
+            let max_price = read_optional_parsed(row, "max_price")?;
+            let min_price = read_optional_parsed(row, "min_price")?;
+            let margin_init = read_parsed(row, "margin_init")?;
+            let margin_maint = read_parsed(row, "margin_maint")?;
+            let tick_scheme = row
+                .try_get::<Option<String>, _>("tick_scheme")?
+                .as_deref()
+                .map(Ustr::from);
+            let info: Option<Json<Params>> = row.try_get("info")?;
+            let ts_event = read_parsed(row, "ts_event")?;
+            let ts_init = read_parsed(row, "ts_init")?;
+
+            let mut inst = OptionSpread::builder()
+                .instrument_id(id)
+                .raw_symbol(raw_symbol)
+                .asset_class(asset_class)
+                .maybe_exchange(exchange)
+                .underlying(underlying)
+                .strategy_type(strategy_type)
+                .activation_ns(activation_ns)
+                .expiration_ns(expiration_ns)
+                .currency(currency)
+                .price_precision(price_precision)
+                .price_increment(price_increment)
+                .multiplier(multiplier)
+                .lot_size(lot_size)
+                .maybe_max_quantity(max_quantity)
+                .maybe_min_quantity(min_quantity)
+                .maybe_max_price(max_price)
+                .maybe_min_price(min_price)
+                .margin_init(margin_init)
+                .margin_maint(margin_maint)
+                .maybe_tick_scheme(tick_scheme)
+                .maybe_info(info.map(|info| info.0))
+                .ts_event(ts_event)
+                .ts_init(ts_init)
+                .build()
+                .map_err(|e| sqlx::Error::Decode(e.to_string().into()))?;
+
+            // Preserve SQL NULL instead of the constructor's minimum quantity default
+            inst.min_quantity = min_quantity;
+            if size_precision != inst.size_precision
+                || size_increment != inst.size_increment
+                || size_increment.precision != inst.size_increment.precision
+            {
+                return Err(sqlx::Error::Decode(
+                    "Invalid size_precision or size_increment for OptionSpread".into(),
+                ));
+            }
+
+            Ok(Self(inst))
+        })();
+
+        result.map_err(|e: sqlx::Error| {
+            let id = row.try_get::<String, _>("id").ok();
+            sqlx::Error::Decode(format!("Invalid OptionSpread row {id:?}: {e}").into())
+        })
     }
 }
 
@@ -1721,4 +1823,31 @@ fn read_optional_quantity(row: &PgRow, column: &str) -> Option<Quantity> {
     row.try_get::<Option<String>, _>(column)
         .ok()
         .and_then(|res| res.map(|res| Quantity::from(res.as_str())))
+}
+
+fn read_parsed<T>(row: &PgRow, column: &str) -> Result<T, sqlx::Error>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    let value: String = row.try_get(column)?;
+    value.parse::<T>().map_err(|e| sqlx::Error::ColumnDecode {
+        index: column.to_string(),
+        source: e.to_string().into(),
+    })
+}
+
+fn read_optional_parsed<T>(row: &PgRow, column: &str) -> Result<Option<T>, sqlx::Error>
+where
+    T: FromStr,
+    T::Err: Into<BoxDynError>,
+{
+    row.try_get::<Option<String>, _>(column)?
+        .map(|value| {
+            value.parse::<T>().map_err(|e| sqlx::Error::ColumnDecode {
+                index: column.to_string(),
+                source: e.into(),
+            })
+        })
+        .transpose()
 }

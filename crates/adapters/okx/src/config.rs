@@ -227,6 +227,10 @@ impl OKXDataClientConfig {
 }
 
 /// Configuration for the OKX execution client.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent venue options exposed as flat config fields"
+)]
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
@@ -306,6 +310,20 @@ pub struct OKXExecutionClientConfig {
     /// after the USD-to-USDC spot migration. The value must appear in that
     /// instrument's `tradeQuoteCcyList`.
     pub spot_trade_quote_ccy: Option<String>,
+    /// Whether to report net spot wallet balances as positions.
+    ///
+    /// Each cached spot pair quoted in `spot_positions_quote_currency` reports the signed `cashBal`
+    /// of its base currency as `LONG` or `SHORT`. The client declares no bulk position coverage for
+    /// those pairs, so a pair without a report keeps its cached position. The client requires a
+    /// NETTING OMS, which a spot-only client must set through `oms_type`.
+    #[builder(default)]
+    pub use_spot_position_reports: bool,
+    /// Quote currency of the spot pairs that report wallet-derived positions.
+    ///
+    /// Only relevant when `use_spot_position_reports` is `true`. A balance is reported on the
+    /// pair quoted in this currency and on no other pair.
+    #[builder(default = "USDT".to_string())]
+    pub spot_positions_quote_currency: String,
     /// Optional WebSocket authentication timeout (seconds), defaulting to
     /// `AUTHENTICATION_TIMEOUT_SECS` when unset.
     pub auth_timeout_secs: Option<u64>,
@@ -318,6 +336,14 @@ pub struct OKXExecutionClientConfig {
     /// live algo orders, and positions are unaffected. Skipped or truncated
     /// history marks reports incomplete and reduces recovery coverage.
     pub max_reconciliation_history_pages: Option<u32>,
+    /// Optional TTL (milliseconds) for WebSocket place and amend requests, sent to OKX as
+    /// `expTime`.
+    ///
+    /// Each request carries `expTime = now + ttl`, computed from the local clock when the
+    /// request is built, so time spent waiting for rate limits or a reconnect counts against
+    /// it. OKX does not process a request once its server time is past `expTime`. Allow for
+    /// clock skew between the local host and OKX. `None` omits `expTime`. Must be positive.
+    pub order_request_ttl_ms: Option<u64>,
 }
 
 #[cfg(feature = "python")]
@@ -342,7 +368,10 @@ nautilus_core::impl_pyo3_config_getters!(OKXExecutionClientConfig {
     auth_timeout_secs: Option<u64>,
     transport_backend: TransportBackend,
     spot_trade_quote_ccy: Option<String>,
+    use_spot_position_reports: bool,
+    spot_positions_quote_currency: String,
     max_reconciliation_history_pages: Option<u32>,
+    order_request_ttl_ms: Option<u64>,
 });
 
 impl Default for OKXExecutionClientConfig {
@@ -363,7 +392,8 @@ impl OKXExecutionClientConfig {
     /// # Errors
     ///
     /// Returns an error if selections are duplicated, blank, or conflicting, required settings
-    /// are missing, retry delays are invalid, or MMP cancellation is enabled.
+    /// are missing, retry delays or the order request TTL are invalid, MMP cancellation
+    /// is enabled, or spot position reports use a quote currency that is not an uppercase code.
     pub fn validate(&self) -> ConfigResult<()> {
         validate_instrument_selections(
             &self.instrument_types,
@@ -372,11 +402,34 @@ impl OKXExecutionClientConfig {
         )?;
         validate_retry_delays(self.retry_delay_initial_ms, self.retry_delay_max_ms)?;
 
+        if let Some(ttl_ms) = self.order_request_ttl_ms {
+            check_range("order_request_ttl_ms", ttl_ms > 0, "must be positive")?;
+            check_range(
+                "order_request_ttl_ms",
+                ttl_ms <= MAX_ORDER_REQUEST_TTL_MS,
+                format!("must be at most {MAX_ORDER_REQUEST_TTL_MS}"),
+            )?;
+        }
+
         if self.use_mm_mass_cancel {
             return Err(ConfigError::unsupported_value(
                 "use_mm_mass_cancel",
                 "MMP-only family cancellation does not cancel ordinary orders",
             ));
+        }
+
+        if self.use_spot_position_reports {
+            let quote_currency = &self.spot_positions_quote_currency;
+            if quote_currency.is_empty()
+                || !quote_currency
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            {
+                return Err(ConfigError::invalid_value(
+                    "spot_positions_quote_currency",
+                    "must be an uppercase currency code such as USDT",
+                ));
+            }
         }
 
         Ok(())
@@ -480,6 +533,9 @@ fn validate_instrument_selections(
 
     Ok(())
 }
+
+/// Upper bound for `order_request_ttl_ms`.
+const MAX_ORDER_REQUEST_TTL_MS: u64 = 9_999_999_999_999;
 
 pub(crate) fn validate_retry_delays(initial_ms: u64, max_ms: u64) -> ConfigResult<()> {
     check_range("retry_delay_initial_ms", initial_ms > 0, "must be positive")?;

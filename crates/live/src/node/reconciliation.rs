@@ -313,7 +313,6 @@ impl LiveNode {
             reports,
         } = result;
         let mut venue_reports = IndexMap::new();
-
         for report in &position_result.reports {
             venue_reports
                 .entry((report.instrument_id, report.account_id))
@@ -338,10 +337,7 @@ impl LiveNode {
             }
 
             let mut expected_revision = self.exec_manager.position_activity_revision(&key);
-            let key_venue_reports = venue_reports
-                .get(&key)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
+            let key_venue_reports = venue_reports.get(&key).map_or_default(Vec::as_slice);
             let mut applied_fill = false;
             let mut blocked = false;
 
@@ -505,8 +501,7 @@ impl LiveNode {
         drop(open_order_report_task.take());
         let (planned_client_order_ids, carried_results) = targeted_order_report_task
             .take()
-            .map(|task| task.into_results(false))
-            .unwrap_or_default();
+            .map_or_default(|task| task.into_results(false));
         drop(position_report_task.take());
 
         for client in &self.exec_clients {
@@ -1266,14 +1261,17 @@ mod tests {
         #[case] failed: usize,
     ) {
         let mut node = LiveNode::build("PositionFinishError".to_string(), None).unwrap();
+
         let states = [
             PositionCollectionState::default(),
             PositionCollectionState::default(),
         ];
+
         let ids = [
             ClientId::from("POSITION-DEADLINE"),
             ClientId::from("POSITION-DEADLINE-2"),
         ];
+
         states[failed].finish_error.set(true);
         for (state, client_id) in states.iter().zip(ids) {
             node.exec_clients.push(LiveExecutionClient::new(Box::new(
@@ -1408,6 +1406,7 @@ mod tests {
             let started = self.state.started.clone();
             let gate_at = self.gate_at;
             let release = self.release.clone();
+
             async move {
                 let count = started.fetch_add(1, Ordering::SeqCst) + 1;
                 if count == gate_at {

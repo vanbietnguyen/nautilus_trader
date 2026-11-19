@@ -47,8 +47,6 @@ pub(crate) const CRYPTO_SNAPSHOT_FIXTURE: &str =
     include_str!("../../../test_data/polybolt_crypto_price_snapshot.json");
 pub(crate) const TWAP_UPDATE_FIXTURE: &str =
     include_str!("../../../test_data/polybolt_crypto_twap_update.json");
-pub(crate) const EQUITY_UPDATE_FIXTURE: &str =
-    include_str!("../../../test_data/polybolt_equity_price_update.json");
 pub(crate) const EQUITY_SNAPSHOT_FIXTURE: &str =
     include_str!("../../../test_data/polybolt_equity_price_snapshot.json");
 pub(crate) const AUTHED_FIXTURE: &str = include_str!("../../../test_data/polybolt_authed.json");
@@ -181,13 +179,15 @@ async fn handle_polybolt_socket(mut socket: WebSocket, state: TestServerState) {
                 let replies = if payload["op"] == "auth" {
                     state.auth_counts.lock()[connection] += 1;
                     auth_replies(&state, &payload)
-                } else {
+                } else if matches!(payload["op"].as_str(), Some("subscribe" | "unsubscribe")) {
                     state
                         .subscription_times
                         .lock()
                         .await
                         .push(std::time::Instant::now());
                     subscription_replies(&state, &payload, &mut sequences)
+                } else {
+                    Vec::new()
                 };
 
                 for reply in replies {

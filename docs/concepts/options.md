@@ -28,6 +28,101 @@ Greeks-relevant metadata varies by instrument type:
 - `BinaryOption`: has `expiration_ns` and `outcome`/`description`, but no
   `strike_price`, `option_kind`, or `underlying`.
 
+Vanilla `OptionContract` and `CryptoOption` also carry three optional contract fields:
+
+- `underlying_instrument_id`: the actual underlying instrument. It is independent of
+  `OptionSeriesId.underlying_instrument_id`, which supplies the reference price.
+- `exercise_style`: when the holder can exercise the option.
+- `settlement_type`: what the option delivers on exercise.
+
+See [Exercise style and settlement type](#exercise-style-and-settlement-type) for the values.
+
+Adapters set these fields as follows:
+
+- **Interactive Brokers**: fills the underlying ID when the provider has already resolved that contract
+  to an instrument; unresolved IDs remain `None`. The exercise style and settlement type remain `None`.
+- **Deribit**: sets the exercise style to `EUROPEAN` and leaves the underlying ID and settlement type
+  `None`. Its option definitions supply no exact underlying instrument ID, and its
+  [inverse](https://support.deribit.com/hc/en-us/articles/31424939096093-Inverse-Options) and
+  [linear](https://support.deribit.com/hc/en-us/articles/31424932728093-Linear-USDC-Options) options settle
+  through futures in two steps, which a single settlement type does not represent.
+- **Derive**, **OKX**, and **Bybit**: set the exercise style to `EUROPEAN` and the settlement type to `CASH`.
+- **Tardis**: sets both fields from the
+  [source exchange](../integrations/tardis.md#option-exercise-style-and-settlement-type).
+- **Databento**: sets the exercise style and settlement type from each
+  [option definition](../integrations/databento.md#option-exercise-style-and-settlement-type).
+
+Deribit, Derive, OKX, Bybit, and Tardis instrument definitions carry neither field, so these adapters apply
+each venue's contract specification. Tardis applies the Deribit, OKX, and Bybit rules and leaves both fields
+`None` for other source exchanges.
+
+Rust builders and Python constructors accept these fields. JSON, dictionaries, Arrow, and PostgreSQL
+preserve them; missing fields in older JSON and Arrow records load as `None`. Equality and hashing use
+only the instrument ID. The matching engine and Greeks calculator do not read these fields.
+
+### Exercise style and settlement type
+
+Exercise style and settlement type are independent of each other and of `option_kind`. For example, US
+equity options are American-style and physically settled, and S&P 500 index (SPX) options are
+European-style and cash-settled.
+
+**Exercise style** (`exercise_style`):
+
+| Value      | Exercise                                  |
+| ---------- | ----------------------------------------- |
+| `AMERICAN` | At any time up to expiration.             |
+| `EUROPEAN` | Only at expiration.                       |
+| `BERMUDAN` | Only on specified dates up to expiration. |
+| `None`     | Unknown.                                  |
+
+**Settlement type** (`settlement_type`):
+
+| Value      | Settlement                                            |
+| ---------- | ----------------------------------------------------- |
+| `CASH`     | Pays the intrinsic value in the settlement currency.  |
+| `PHYSICAL` | Delivers a position in the underlying.                |
+| `None`     | Unknown, or no single type represents the settlement. |
+
+## Simulated spread execution
+
+Build spread IDs with `new_generic_spread_id` from signed leg ratios; venue-native IDs without encoded
+legs cannot execute. Cache each leg instrument and its latest quote before submitting an order.
+
+Strategy callbacks receive leg fills before the parent fill. Leg fills use derived order IDs without
+cached orders, create leg positions, and book commissions. The parent fill reports the total commission
+without creating a position; the portfolio does not book it again.
+
+If leg preparation fails, the simulator skips that execution. Resting limit orders, including priced
+market-to-limit remainders, keep working; orders that cannot rest are canceled.
+
+Cost currency means quote currency for linear legs, base currency for inverse legs, and settlement
+currency for quanto legs.
+
+**Requirements**:
+
+- **Liquidity**: Keep `liquidity_consumption=false` (the default). With `true`, new spread orders are
+  rejected and restored spread orders are canceled before matching or reserving liquidity.
+- **FOK**: One fill candidate must cover the entire order. Orders requiring multiple candidates are
+  canceled before any leg or parent fill, even when candidates share a price.
+- **Numeric limits**: Quantity scaling uses checked `u128` arithmetic; price allocation uses checked
+  `i128` and `Decimal` arithmetic. Executions are skipped if the required calculations exceed these ranges,
+  even when the final values would fit after cancellation. Leg quantities must also be exactly representable
+  as `Decimal` in position accounting.
+- **Balances**: Calculated accounts without a base currency need balance entries for positive fees
+  outside a leg's cost currency. Margin accounts also need an entry for each leg's cost currency.
+- **Conversion rates**: Calculated accounts with a base currency need rates for each leg's cost and fee currencies.
+
+:::warning Cash-account limitations
+Spread legs bypass equity and binary-option short-sale inventory checks and can open short positions.
+Avoid cash spreads containing these legs.
+
+Insufficient cash stops a backtest with an error, possibly after fill callbacks. Discard results from
+errored runs.
+
+Sandbox execution continues after cash-accounting errors and can leave balances and positions
+inconsistent. Stop the session after such an error.
+:::
+
 ## Option identifiers
 
 ### Series references
@@ -138,9 +233,10 @@ self.unsubscribe_option_greeks(instrument_id, client_id=client_id)
 ### Option chain subscriptions
 
 An option chain subscription aggregates quotes and Greeks across all strikes in an option series into
-`OptionChainSlice` snapshots. The `DataEngine` creates one Rust `OptionChainManager` per series and owns its
-lifecycle. It creates the manager, routes incoming data, runs snapshot timers, and drains wire subscription
-changes.
+`OptionChainSlice` snapshots. The `DataEngine` creates an `OptionChainManager` for each actor's subscription.
+Actors subscribing to the same series keep independent strike ranges and snapshot intervals.
+The engine routes incoming data, runs snapshot timers, and manages quote, Greeks, and instrument status
+subscriptions to data clients.
 
 ```python
 from nautilus_trader.model import OptionSeriesId
@@ -168,6 +264,22 @@ def on_option_chain(self, chain) -> None:
             self.log.info(f"Call {strike}: delta={call.greeks.delta:.4f}")
 ```
 
+- **Repeated subscribe**: Calls from the same actor for the same series retain the first configuration.
+  Unsubscribe before changing the range, interval, client, or `params`.
+- **Shared feeds**: Quote, Greeks, and instrument status feeds share ownership with other chains and direct
+  subscriptions. The first physical subscription determines `params` until the last owner releases it.
+- **Routing**: Wire subscription commands retain the selected client and `params`. Incoming data uses
+  instrument-based topics and is not isolated by client.
+- **Retirement**: Streamed `Close` and `NotAvailableForTrading` statuses, including backtest events, retire
+  contracts. Statuses from historical requests do not change chain membership. Retirements persist across
+  client replacement and disconnect; engine reset or disposal clears them. A streamed `Trading` status
+  restores eligibility for later definitions or subscriptions.
+- **Actor cleanup**: Actor unsubscribe, reset, fault, and disposal release only that actor's chain.
+- **Engine cleanup**: Client removal releases that client's chains and pending reference-price requests before
+  removing the adapter. Engine reset, disposal, and explicit disconnect remove all chain managers, handlers,
+  timers, pending requests, and wire subscription ownership. After engine-side cleanup, unsubscribe, then
+  subscribe again to resume the actor's chain.
+
 ### Strike range filtering
 
 `StrikeRange` controls which strikes are active in a chain subscription:
@@ -178,6 +290,10 @@ def on_option_chain(self, chain) -> None:
 | `AtmRelative` | N strikes above and N below the current ATM strike. | `StrikeRange.atm_relative(5, 5)` |
 | `AtmPercent`  | All strikes within a percentage band around ATM.    | `StrikeRange.atm_percent(0.10)`  |
 | `Delta`       | Strikes whose call or put delta is near a target.   | `StrikeRange.delta(0.25, 0.05)`  |
+
+`StrikeRange::atm_percent` requires a finite, non-negative `pct`. `StrikeRange::delta` requires finite
+`target` and `tolerance` values in [0, 1]. These Rust constructors return `Result`; the corresponding
+Python factories raise `ValueError` for invalid values.
 
 For dynamic strike ranges, subscriptions are **deferred until the ATM price is determined**. ATM is derived
 from the venue reference price in `OptionGreeks.underlying_price`. It can also be seeded from a reference
@@ -207,7 +323,7 @@ The `snapshot_interval_ms` parameter controls publishing behavior:
   active instrument publishes a slice immediately. Suitable for latency-sensitive
   strategies that react to individual updates.
 
-The engine rejects `snapshot_interval_ms=0`. Use `None` for raw mode.
+`subscribe_option_chain` raises `ValueError` for `snapshot_interval_ms=0`. Use `None` for raw mode.
 
 ## Backtesting option chains
 
@@ -308,10 +424,16 @@ example in `crates/backtest/examples/`.
 
 ## Option chain architecture
 
-The option chain system is event-driven and built around per-series isolation. The
-`DataEngine` creates one Rust `OptionChainManager` per subscribed option series. The
-manager wraps `OptionChainAggregator` and `AtmTracker`, registers message bus handlers,
-publishes snapshots, and queues wire subscription changes for the engine to drain.
+The option chain system is event-driven. Its managers wrap `OptionChainAggregator` and `AtmTracker`, register
+message bus handlers, publish snapshots, and queue wire subscription changes for the `DataEngine` to drain.
+
+- **Rust owner identity**: A `SubscribeOptionChain` command's owner ID is its `correlation_id` when set,
+  otherwise its `command_id`.
+- **Rust delivery**: Register `register_option_chain_owner(command.owner_id(), handler)` to receive that
+  owner's slices. Call `unregister_option_chain_owner` when the owner retires.
+- **Rust release**: Set `UnsubscribeOptionChain.correlation_id` to the owner ID. Without it, an unsubscribe
+  releases the chain only when exactly one owner exists. Low-level external commands can move an existing
+  owner to another external client.
 
 ```mermaid
 flowchart TD
@@ -319,7 +441,7 @@ flowchart TD
         DE[DataEngine]
     end
 
-    subgraph "OptionChainManager (per series)"
+    subgraph "OptionChainManager (per subscription)"
         MGR[OptionChainManager]
         AGG[OptionChainAggregator]
         ATM[AtmTracker]
@@ -343,21 +465,21 @@ flowchart TD
 
 #### DataEngine
 
-Holds one `OptionChainManager` per active `OptionSeriesId`:
+Tracks subscription owners within each `OptionSeriesId`:
 
 - **Subscription**: on `SubscribeOptionChain`, it resolves instruments from the cache and requests a series
   reference price for dynamic strike ranges. It creates the manager, subscribes active instruments to the data
   client, and sets up the snapshot timer.
 - **Timer tick**: the manager checks for rebalances, publishes a snapshot, and queues any wire subscription
   changes for the engine to drain.
-- **Teardown**: on `UnsubscribeOptionChain` or when all instruments expire, it tears down the manager, cancels
-  the timer, and unsubscribes wire-level feeds.
+- **Teardown**: owner unsubscribe, series expiry, or expiry of the last contract removes the manager,
+  handlers, timer, and wire subscription ownership. Client and engine cleanup use the same ownership-release
+  rules.
 
 #### OptionChainManager
 
-A per-series Rust manager around `OptionChainAggregator` and `AtmTracker`. The `DataEngine` feeds it market
-data through `handle_quote()` and `handle_greeks()`. The manager bootstraps the active instrument set
-internally on the first ATM price.
+The `DataEngine` feeds the manager market data through `handle_quote()` and `handle_greeks()`. The manager
+bootstraps the active instrument set internally on the first ATM price.
 
 - **Snapshot mode**: timer callbacks call `publish_slice()`.
 - **Raw mode**: each active quote or Greeks update calls `publish_slice()` immediately.
@@ -383,8 +505,8 @@ determined until the ATM price is known. Two bootstrap paths are available:
 
 **Instant bootstrap (reference price available)**:
 
-1. `DataEngine` receives `SubscribeOptionChain`, resolves all instruments for the
-   series from the cache, and requests a reference price from the data client.
+1. `DataEngine` receives `SubscribeOptionChain`, resolves eligible instruments for the series from the cache,
+   excluding retirements, and requests a reference price from the data client.
 2. When the reference price response arrives, the engine creates the manager with
    the ATM price pre-seeded. The manager computes the active strike set during
    construction.
@@ -437,12 +559,19 @@ single option contract:
 
 Properties:
 
-| Property     | Type             | Description                         |
-| ------------ | ---------------- | ----------------------------------- |
-| `series_id`  | `OptionSeriesId` | The option series identifier.       |
-| `atm_strike` | `Price` or None  | Current ATM strike (if determined). |
-| `ts_event`   | `int`            | UNIX timestamp (nanoseconds).       |
-| `ts_init`    | `int`            | UNIX timestamp (nanoseconds).       |
+| Property     | Type             | Description                                                          |
+| ------------ | ---------------- | -------------------------------------------------------------------- |
+| `series_id`  | `OptionSeriesId` | The option series identifier.                                        |
+| `atm_strike` | `Price` or None  | Current ATM strike (if determined).                                  |
+| `ts_event`   | `int`            | Highest `ts_event` of accepted quotes and Greeks (UNIX nanoseconds). |
+| `ts_init`    | `int`            | Publication time as a UNIX timestamp (nanoseconds).                  |
+
+For engine-published slices, `ts_event` never decreases within a subscription. Greeks count while
+they wait for the first quote or when the chain uses them to set the ATM price. After a rebalance,
+`ts_event` can be later than every quote and Greek in the slice.
+Without new market data, a timer tick leaves `ts_event` unchanged.
+
+The engine uses its clock for `ts_init` in raw mode, timer mode, and replay.
 
 Call and put data are accessed through methods, not as direct properties.
 Each `OptionStrikeData` returned by these methods contains a `quote` (`QuoteTick`)

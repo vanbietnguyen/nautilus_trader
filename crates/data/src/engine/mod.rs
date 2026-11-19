@@ -72,7 +72,7 @@ use bar::{
 };
 use book::{
     BookDeltasKey, BookSnapshotInfos, BookSnapshotKey, BookSnapshotSource, BookSnapshotter,
-    BookSubscription, BookSubscriptionOwner, BookUpdater,
+    BookSubscription, BookSubscriptionOwner, BookUpdater, RequestBookEvents,
 };
 pub(crate) use commands::{DeferredCommand, DeferredCommandQueue};
 use config::DataEngineConfig;
@@ -97,10 +97,9 @@ use nautilus_common::{
         RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth, SubscribeCommand,
         SubscribeOptionChain, SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades,
         TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth,
-        UnsubscribeBookSnapshots, UnsubscribeCommand, UnsubscribeInstrumentStatus,
-        UnsubscribeOptionChain, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
-        ensure_routable_bar_types, ensure_routable_instrument_ids, is_parent_subscription,
-        quote_routing,
+        UnsubscribeBookSnapshots, UnsubscribeCommand, UnsubscribeOptionChain,
+        UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades, ensure_routable_bar_types,
+        ensure_routable_instrument_ids, is_parent_subscription, quote_routing,
     },
     msgbus::{
         self, BusPayloadType, ShareableMessageHandler, TypedHandler, TypedIntoHandler,
@@ -149,8 +148,8 @@ use requests::{
     response_params, sets_cut_warmup, sets_quotes,
 };
 use responses::{
-    keep_open_end, log_if_empty_response, parent_request_window, quote_and_trade_runs,
-    rebind_response_correlation, rebuild_pipeline_response, same_instrument,
+    append_failure, keep_open_end, log_if_empty_response, parent_request_window,
+    quote_and_trade_runs, rebind_response_correlation, rebuild_pipeline_response, same_instrument,
 };
 use serde_json::Value;
 use spread_quote::SpreadQuoteState;
@@ -207,8 +206,10 @@ pub struct DataEngine {
     bar_aggregators: IndexMap<BarAggregatorKey, Rc<RefCell<Box<dyn BarAggregator>>>>,
     bar_aggregator_handlers: AHashMap<BarAggregatorKey, Vec<BarAggregatorSubscription>>,
     bar_aggregator_warmups: AHashMap<BarAggregatorKey, BarAggregatorWarmup>,
+    bar_aggregators_pending_stop: AHashSet<BarAggregatorKey>,
     subscriptions_bar_aggregation: AHashMap<BarType, BarAggregationSubscription>,
     request_bar_aggregations: AHashMap<UUID4, RequestBarAggregation>,
+    request_book_events: AHashMap<(UUID4, InstrumentId), RequestBookEvents>,
     inflight_requests: AHashMap<UUID4, RequestCommand>,
     request_pipeline_parent_request: AHashMap<UUID4, RequestCommand>,
     request_pipeline_n_components: AHashMap<UUID4, usize>,
@@ -223,8 +224,10 @@ pub struct DataEngine {
     continuous_future_subscriptions: AHashMap<BarType, ContinuousFutureSubscriptionState>,
     continuous_future_roller: Option<Rc<ContinuousFutureRoller>>,
     spread_quote_states: AHashMap<InstrumentId, SpreadQuoteState>,
-    option_chain_managers: AHashMap<OptionSeriesId, Rc<RefCell<OptionChainManager>>>,
+    option_chain_managers:
+        AHashMap<OptionSeriesId, IndexMap<UUID4, Rc<RefCell<OptionChainManager>>>>,
     option_chain_instrument_index: AHashMap<InstrumentId, OptionSeriesId>,
+    option_chain_instruments_expired: AHashSet<InstrumentId>,
     deferred_cmd_queue: DeferredCommandQueue,
     /// `RANGE_INCLUSIVE` bars completed while their completing update is being delivered,
     /// published once that delivery returns.
@@ -254,8 +257,8 @@ pub struct DataEngine {
     late_envelopes: u64,
     join_deadline_timer: Option<Rc<JoinDeadlineTimer>>,
     option_chain_bootstrapper: Option<Rc<OptionChainBootstrapper>>,
-    pending_option_chain_requests: AHashMap<UUID4, PendingOptionChainRequest>,
-    option_chain_greeks_bootstraps: AHashMap<OptionSeriesId, OptionChainGreeksBootstrap>,
+    pending_option_chain_requests: IndexMap<UUID4, PendingOptionChainRequest>,
+    option_chain_greeks_bootstraps: AHashMap<(OptionSeriesId, UUID4), OptionChainGreeksBootstrap>,
     synthetic_quote_feeds: AHashMap<InstrumentId, Vec<SyntheticInstrument>>,
     synthetic_trade_feeds: AHashMap<InstrumentId, Vec<SyntheticInstrument>>,
     subscribed_synthetic_quotes: AHashMap<InstrumentId, usize>,
@@ -318,8 +321,10 @@ impl DataEngine {
             bar_aggregators: IndexMap::new(),
             bar_aggregator_handlers: AHashMap::new(),
             bar_aggregator_warmups: AHashMap::new(),
+            bar_aggregators_pending_stop: AHashSet::new(),
             subscriptions_bar_aggregation: AHashMap::new(),
             request_bar_aggregations: AHashMap::new(),
+            request_book_events: AHashMap::new(),
             inflight_requests: AHashMap::new(),
             request_pipeline_parent_request: AHashMap::new(),
             request_pipeline_n_components: AHashMap::new(),
@@ -336,6 +341,7 @@ impl DataEngine {
             spread_quote_states: AHashMap::new(),
             option_chain_managers: AHashMap::new(),
             option_chain_instrument_index: AHashMap::new(),
+            option_chain_instruments_expired: AHashSet::new(),
             deferred_cmd_queue: Rc::new(RefCell::new(VecDeque::new())),
             deferred_bars: Rc::new(RefCell::new(VecDeque::new())),
             interleaved_requests: AHashMap::new(),
@@ -348,7 +354,7 @@ impl DataEngine {
             late_envelopes: 0,
             join_deadline_timer: None,
             option_chain_bootstrapper: None,
-            pending_option_chain_requests: AHashMap::new(),
+            pending_option_chain_requests: IndexMap::new(),
             option_chain_greeks_bootstraps: AHashMap::new(),
             synthetic_quote_feeds: AHashMap::new(),
             synthetic_trade_feeds: AHashMap::new(),
@@ -585,6 +591,7 @@ impl DataEngine {
 
     /// Resets all registered data clients and clears engine state.
     pub fn reset(&mut self) {
+        self.unsubscribe_all_option_chains();
         self.is_stopped = false;
 
         for client in self.get_clients_mut() {
@@ -595,34 +602,8 @@ impl DataEngine {
             }
         }
 
-        let keys: Vec<BarAggregatorKey> = self.bar_aggregators.keys().copied().collect();
-        for (bar_type, request_id) in keys {
-            if let Err(e) = self.stop_bar_aggregator(bar_type, request_id) {
-                log::error!("Error stopping bar aggregator during reset for {bar_type}: {e}");
-            }
-        }
-        self.subscriptions_bar_aggregation.clear();
-
-        self.request_bar_aggregations.clear();
-        self.interleaved_requests.clear();
-        self.request_replays.clear();
-        self.kept_replays.clear();
-        self.pending_releases.clear();
-        self.inflight_requests.clear();
-        self.request_deadlines.clear();
-        self.suppressed_legs.clear();
-        self.request_pipeline_parent_request.clear();
-        self.request_pipeline_n_components.clear();
-        self.request_pipeline_parent_request_id.clear();
-        self.request_pipeline_responses.clear();
-        #[cfg(feature = "streaming")]
-        self.client_feed_missing.clear();
-        self.time_range_pipeline_requests.clear();
-        self.time_range_pipeline_parent_request_id.clear();
-        self.parent_join_request_id.clear();
-        self.pending_join_requests.clear();
-        self.continuous_future_requests.clear();
-        self.continuous_future_parent_request_id.clear();
+        self.clear_bar_aggregators();
+        self.clear_request_state();
 
         for state in self.continuous_future_subscriptions.values_mut() {
             if let Some(name) = state.timer_name.take() {
@@ -636,43 +617,9 @@ impl DataEngine {
             self.stop_spread_quote_aggregation(spread_id);
         }
 
-        // Tear down option chain managers to unregister their msgbus handlers
-        let managers: Vec<_> = self.option_chain_managers.drain().collect();
-        for (_, manager) in managers {
-            manager.borrow_mut().teardown(&self.clock);
-        }
+        self.clear_option_chain_managers();
 
-        self.option_chain_instrument_index.clear();
-        self.cancel_pending_option_chain_requests(None);
-        self.clear_option_chain_greeks_bootstraps();
-
-        // Unsubscribe BookUpdaters before dropping; otherwise the typed router
-        // keeps dispatching to abandoned updaters. `book_updaters` is keyed by
-        // per-underlying id, so the literal per-underlying topic is the same
-        // string the subscribe path used.
-        let book_updaters: Vec<(InstrumentId, Rc<BookUpdater>)> =
-            self.book_updaters.drain().collect();
-        for (instrument_id, updater) in book_updaters {
-            let deltas_topic = switchboard::get_book_deltas_topic(instrument_id);
-            let depth_topic = switchboard::get_book_depth_topic(instrument_id);
-            let deltas_handler: TypedHandler<OrderBookDeltas> =
-                TypedHandler::new(Rc::clone(&updater));
-            let depth_handler: TypedHandler<OrderBookDepth> = TypedHandler::new(updater);
-            msgbus::unsubscribe_book_deltas(deltas_topic.into(), &deltas_handler);
-            msgbus::unsubscribe_book_depth(depth_topic.into(), &depth_handler);
-        }
-
-        self.book_subscriptions.clear();
-        self.book_subscription_owners.clear();
-
-        self.book_deltas_counts.clear();
-        self.book_depth_counts.clear();
-        self.book_intervals.clear();
-        self.book_snapshot_counts.clear();
-        self.book_snapshot_sources.clear();
-        self.book_snapshotters.clear();
-        self.buffered_deltas_map.clear();
-        self.deltas_frame.clear();
+        self.clear_book_state();
 
         self.synthetic_quote_feeds.clear();
         self.synthetic_trade_feeds.clear();
@@ -694,15 +641,42 @@ impl DataEngine {
         self.late_envelopes = 0;
     }
 
+    fn clear_request_state(&mut self) {
+        self.request_bar_aggregations.clear();
+        self.interleaved_requests.clear();
+        self.request_replays.clear();
+        self.kept_replays.clear();
+        self.pending_releases.clear();
+        self.bar_aggregators_pending_stop.clear();
+        self.request_book_events.clear();
+        self.inflight_requests.clear();
+        self.request_deadlines.clear();
+        self.suppressed_legs.clear();
+        self.request_pipeline_parent_request.clear();
+        self.request_pipeline_n_components.clear();
+        self.request_pipeline_parent_request_id.clear();
+        self.request_pipeline_responses.clear();
+        #[cfg(feature = "streaming")]
+        self.client_feed_missing.clear();
+        self.time_range_pipeline_requests.clear();
+        self.time_range_pipeline_parent_request_id.clear();
+        self.parent_join_request_id.clear();
+        self.pending_join_requests.clear();
+        self.continuous_future_requests.clear();
+        self.continuous_future_parent_request_id.clear();
+    }
+
     /// Disposes the engine, stopping all clients and canceling any timers.
     pub fn dispose(&mut self) {
+        self.unsubscribe_all_option_chains();
+
         for client in self.get_clients_mut() {
             if client.dispose().is_err() {
                 log::error!("Failed to dispose data client {}", client.client_id());
             }
         }
 
-        self.clear_option_chain_greeks_bootstraps();
+        self.clear_option_chain_managers();
 
         // Continuous-future source handlers live outside bar_aggregator_handlers,
         // so release them before dropping the aggregators
@@ -731,6 +705,7 @@ impl DataEngine {
                 log::error!("Error stopping bar aggregator during dispose for {bar_type}: {e}");
             }
         }
+        self.clear_request_state();
 
         self.subscriptions_external.clear();
 
@@ -739,9 +714,14 @@ impl DataEngine {
 
     /// Connects all registered data clients concurrently.
     ///
-    /// Connection failures are logged but do not prevent the node from running.
-    /// Logs identify the client but omit provider error text, which can contain credentials.
-    pub async fn connect(&mut self) {
+    /// Successful clients remain connected if another client fails.
+    /// Logs identify failed clients without provider error text, which can contain credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any client fails to connect, listing failed client IDs without provider
+    /// error text.
+    pub async fn connect(&mut self) -> anyhow::Result<()> {
         let futures: Vec<_> = self
             .get_clients_mut()
             .into_iter()
@@ -752,20 +732,33 @@ impl DataEngine {
             .collect();
 
         let results = join_all(futures).await;
+        let mut failed_clients = Vec::new();
 
         for (client_id, result) in results {
             if result.is_err() {
                 log::error!("Failed to connect data client {client_id}: connection failed");
+                failed_clients.push(client_id.to_string());
             }
+        }
+
+        if failed_clients.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Failed to connect data clients: {}",
+                failed_clients.join(", ")
+            )
         }
     }
 
-    /// Disconnects all registered data clients concurrently.
+    /// Releases all option chains, then disconnects registered data clients concurrently.
     ///
     /// # Errors
     ///
     /// Returns an error if any client fails to disconnect.
     pub async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.unsubscribe_all_option_chains();
+
         let futures: Vec<_> = self
             .get_clients_mut()
             .into_iter()
@@ -844,7 +837,13 @@ impl DataEngine {
         subscribed.extend(
             self.bar_aggregators
                 .keys()
-                .filter(|(_, request_id)| request_id.is_none())
+                // A builder a replay drives with no subscription is a kept request's, not one
+                .filter(|key| {
+                    key.1.is_none()
+                        && !self.bar_aggregators_pending_stop.contains(*key)
+                        && (self.bar_aggregator_handlers.contains_key(*key)
+                            || !self.is_replay_driven(key))
+                })
                 .map(|(bar_type, _)| *bar_type),
         );
         subscribed
@@ -1198,12 +1197,6 @@ impl DataEngine {
                     return Ok(None);
                 }
             }
-            SubscribeCommand::OptionChain(cmd) if cmd.snapshot_interval_ms == Some(0) => {
-                anyhow::bail!(
-                    "Cannot subscribe option chain {} with a zero `snapshot_interval_ms`; use `None` for raw mode",
-                    cmd.series_id,
-                );
-            }
             SubscribeCommand::OptionChain(cmd) => {
                 self.subscribe_option_chain(cmd);
                 return Ok(None);
@@ -1451,8 +1444,8 @@ impl DataEngine {
     ) -> anyhow::Result<()> {
         let (dispatch, result) = match cmd {
             SubscribeCommand::OptionChain(command) => {
-                self.retain_external_option_chain(client_id, command, cmd);
-                (Some(cmd.clone()), Ok(()))
+                let acquired = self.retain_external_option_chain(client_id, command, cmd);
+                (acquired.then(|| cmd.clone()), Ok(()))
             }
             _ => self.prepare_external_subscribe(client_id, cmd),
         };
@@ -1574,6 +1567,11 @@ impl DataEngine {
     }
 
     fn unsubscribe_external(&mut self, client_id: ClientId, cmd: &UnsubscribeCommand) {
+        if let UnsubscribeCommand::OptionChain(command) = cmd {
+            self.unsubscribe_external_option_chain(client_id, command);
+            return;
+        }
+
         let mut releases = IndexMap::new();
 
         for member in split_unsubscribe(cmd) {
@@ -2228,7 +2226,7 @@ impl DataEngine {
             return;
         };
 
-        self.route_response_payload(resp, &envelope);
+        self.route_response_payload(resp, envelope);
     }
 
     fn finish_empty_response(&mut self, envelope: &DataResponseEnvelope) {
@@ -2272,16 +2270,16 @@ impl DataEngine {
 
         match failure {
             Some(reason) if envelope.failure_reason().is_none() => {
-                msgbus::send_response_envelope(&envelope.clone().with_failure(reason));
+                self.deliver_response_envelope(&envelope.clone().with_failure(reason));
             }
-            _ => msgbus::send_response_envelope(envelope),
+            _ => self.deliver_response_envelope(envelope),
         }
 
         // What its kept builders' subscriptions are given comes after its terminal
         self.finish_release(request_id, release);
     }
 
-    fn route_response_payload(&mut self, resp: DataResponse, envelope: &DataResponseEnvelope) {
+    fn route_response_payload(&mut self, resp: DataResponse, mut envelope: DataResponseEnvelope) {
         let resp = rebind_response_correlation(resp, *envelope.correlation_id());
         if log::log_enabled!(log::Level::Debug) {
             let correlation_id = resp.correlation_id();
@@ -2319,7 +2317,7 @@ impl DataEngine {
                 .filter(|state| state.interleave)
                 .cloned()
         {
-            self.respond_interleaved_trades(trades, &state, envelope);
+            self.respond_interleaved_trades(trades, &state, &envelope);
             return;
         }
 
@@ -2329,19 +2327,34 @@ impl DataEngine {
             .then(|| self.kept_bare_answer_failure(*resp.correlation_id()))
             .flatten()
             .filter(|_| envelope.failure_reason().is_none());
-        let failed = bare_failure.map(|reason| envelope.clone().with_failure(reason));
-        let envelope = failed.as_ref().unwrap_or(envelope);
+        if let Some(reason) = bare_failure {
+            envelope = envelope.with_failure(reason);
+        }
 
         let release = self.process_request_bar_aggregation_response(
             &resp,
             envelope.completed(),
             envelope.failure_reason(),
         );
-
-        msgbus::send_response_envelope(envelope);
+        if self.handle_book_deltas_envelope(&mut envelope) {
+            self.deliver_response_envelope(&envelope);
+        }
 
         // What its kept builders' subscriptions are given comes after its terminal
         self.finish_release(*resp.correlation_id(), release);
+    }
+
+    // Completes the request's book events before its final envelope reaches the requester
+    fn deliver_response_envelope(&mut self, envelope: &DataResponseEnvelope) {
+        if envelope.completed()
+            && let Some(reason) = self.complete_request_book_events(envelope.correlation_id())
+        {
+            let failed = append_failure(envelope.clone(), reason);
+            msgbus::send_response_envelope(&failed);
+            return;
+        }
+
+        msgbus::send_response_envelope(envelope);
     }
 
     fn handle_response_payload(&mut self, resp: &DataResponse) -> bool {
@@ -2378,11 +2391,6 @@ impl DataEngine {
                 }
             }
             DataResponse::Book(r) => self.handle_book_response(&r.data),
-            DataResponse::BookDeltas(r) => {
-                if !log_if_empty_response(&r.data, &r.instrument_id, &correlation_id) {
-                    self.handle_book_deltas_response(r);
-                }
-            }
             DataResponse::BookDepth(r) => {
                 if !log_if_empty_response(&r.data, &r.instrument_id, &correlation_id) {
                     self.handle_book_depth_response(r);
@@ -2394,7 +2402,8 @@ impl DataEngine {
                 self.handle_option_chain_reference_price_response(&correlation_id, r);
                 return false;
             }
-            DataResponse::Data(_) => {}
+            // Book deltas are handled with their envelope, which holds an open event back
+            DataResponse::BookDeltas(_) | DataResponse::Data(_) => {}
         }
 
         true
@@ -2429,7 +2438,7 @@ impl DataEngine {
 
     fn handle_request_pipeline_response(
         &mut self,
-        envelope: DataResponseEnvelope,
+        mut envelope: DataResponseEnvelope,
     ) -> Option<DataResponseEnvelope> {
         let leg_id = *envelope.correlation_id();
 
@@ -2438,9 +2447,15 @@ impl DataEngine {
         };
 
         #[cfg(feature = "streaming")]
-        let envelope = self.keep_client_feed_rows(envelope);
+        {
+            envelope = self.keep_client_feed_rows(envelope);
+        }
 
         let completed = envelope.completed();
+        if completed && let Some(reason) = self.complete_request_book_events(&leg_id) {
+            envelope = append_failure(envelope, reason);
+        }
+
         let slots = self.request_pipeline_responses.get_mut(&parent_id)?;
         slots[index].get_or_insert_with(Vec::new).push(envelope);
 
@@ -2508,8 +2523,12 @@ impl DataEngine {
         };
 
         let (parent_start, parent_end) = parent_request_window(parent);
-        if self.emit_partitioned_book_responses(parent_id, parent, &legs) {
-            return DataResponseEnvelope::terminal(parent_id, failure_reason);
+
+        if let Some(replay_failures) =
+            self.emit_partitioned_book_responses(parent_id, parent, &legs)
+        {
+            let terminal = DataResponseEnvelope::terminal(parent_id, failure_reason);
+            return replay_failures.into_iter().fold(terminal, append_failure);
         }
 
         let rebuilt = rebuild_pipeline_response(parent_id, parent, legs);
@@ -2521,8 +2540,13 @@ impl DataEngine {
             return DataResponseEnvelope::terminal(parent_id, Some(reason));
         };
 
-        if let DataResponse::BookDeltas(r) = &mut rebuilt {
-            self.book_deltas_snapshot_replay(r);
+        // A book without its snapshot is unusable, so the request fails with no payload
+        if let DataResponse::BookDeltas(r) = &mut rebuilt
+            && !self.is_later_time_range_join_window(&parent_id)
+            && let Err(e) = self.book_deltas_snapshot_replay(r)
+        {
+            let terminal = DataResponseEnvelope::terminal(parent_id, failure_reason);
+            return append_failure(terminal, e.to_string());
         }
 
         if parent.is_some_and(sets_cut_warmup) {
@@ -2628,14 +2652,16 @@ impl DataEngine {
         Ok(last)
     }
 
+    // Returns the snapshot replay failures of the legs it withheld, or `None` when the legs
+    // share one instrument and so rebuild into a single response
     fn emit_partitioned_book_responses(
         &mut self,
         parent_id: UUID4,
         parent: Option<&RequestCommand>,
         legs: &[DataResponse],
-    ) -> bool {
+    ) -> Option<Vec<String>> {
         if !matches!(parent, Some(RequestCommand::BookDeltas(_))) {
-            return false;
+            return None;
         }
 
         let mut ids = legs.iter().filter_map(|r| match r {
@@ -2643,23 +2669,39 @@ impl DataEngine {
             _ => None,
         });
 
-        let Some(first) = ids.next() else {
-            return false;
-        };
-
+        let first = ids.next()?;
         if !ids.any(|id| !same_instrument(id, first)) {
-            return false;
+            return None;
         }
 
         let (start, end) = parent_request_window(parent);
-
+        let mut replay_failures = Vec::new();
+        let mut withheld: Vec<InstrumentId> = Vec::new();
+        let mut partitions = Vec::with_capacity(legs.len());
         for response in legs {
             let child_id = *response.correlation_id();
             let mut response = rebind_response_correlation(response.clone(), parent_id);
             if let DataResponse::BookDeltas(r) = &mut response {
                 r.start = start.or(r.start);
                 r.end = end.or(r.end);
-                self.book_deltas_snapshot_replay(r);
+                if let Err(e) = self.book_deltas_snapshot_replay(r) {
+                    replay_failures.push(e.to_string());
+                    withheld.push(r.instrument_id);
+                    continue;
+                }
+            }
+
+            partitions.push((child_id, response));
+        }
+
+        for (child_id, mut response) in partitions {
+            // A book without its snapshot is unusable, so none of its instrument's deltas go out
+            if let DataResponse::BookDeltas(r) = &response
+                && withheld
+                    .iter()
+                    .any(|id| same_instrument(*id, r.instrument_id))
+            {
+                continue;
             }
 
             response.trim_to_bounds();
@@ -2670,7 +2712,7 @@ impl DataEngine {
             ));
         }
 
-        true
+        Some(replay_failures)
     }
 
     fn handle_request_join(&mut self, req: RequestJoin) -> anyhow::Result<()> {

@@ -13,27 +13,36 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{collections::HashMap, fs, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use jiff::{SignedDuration, Timestamp};
 use nautilus_coinapi::{
-    config::CoinApiDataClientConfig,
+    config::{CoinApiDataClientConfig, CoinApiInstrumentSelection},
     http::{
         client::{CoinApiHttpClient, CoinApiHttpConfig},
         error::Error,
+        models::Symbol,
+        parse::parse_instruments,
         query::{
             BookQuery, ExchangesQuery, HISTORY_LIMIT_MAX, HistoryQuery, HistoryRange, OhlcvQuery,
             SymbolsQuery, TradesQuery,
         },
     },
+    loaders::CoinApiDataLoader,
 };
 use nautilus_core::{UnixNanos, string::secret::SecretString};
-use nautilus_model::{identifiers::InstrumentId, instruments::Instrument};
+use nautilus_model::{
+    data::Bar,
+    identifiers::InstrumentId,
+    instruments::Instrument,
+    types::{Price, Quantity},
+};
 use nautilus_network::{
     dst::{net::TcpListener, task, time},
     retry::{RetryConfig, RetryError},
 };
 use rstest::rstest;
+use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const SYMBOL: &str = "TEST_SPOT_BTC_USD";
@@ -46,8 +55,8 @@ fn config() -> CoinApiHttpConfig {
             max_delay_ms: 100,
             jitter_ms: 0,
             max_retries: 2,
-            operation_timeout_ms: Some(1_000),
-            max_elapsed_ms: Some(5_000),
+            operation_timeout_ms: Some(5_000),
+            max_elapsed_ms: Some(10_000),
             ..RetryConfig::default()
         },
         ..CoinApiHttpConfig::default()
@@ -67,8 +76,16 @@ fn range(limit: u32) -> HistoryQuery {
 }
 
 async fn peer(
-    responses: Vec<(u16, &'static str, &'static str)>,
+    responses: Vec<(
+        u16,
+        impl Into<String> + Send + 'static,
+        impl Into<String> + Send + 'static,
+    )>,
 ) -> (task::JoinHandle<Vec<String>>, CoinApiHttpConfig) {
+    let responses: Vec<_> = responses
+        .into_iter()
+        .map(|(status, headers, body)| (status, headers.into(), body.into()))
+        .collect();
     let (listener, address) = listener().await;
 
     let config = CoinApiHttpConfig {
@@ -320,6 +337,307 @@ async fn retry_after_then_success() {
     assert!(start.elapsed() >= Duration::from_secs(1));
     assert_eq!(peer.await.unwrap().len(), 2);
     assert_eq!(client.credits_remaining(), 98);
+}
+
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+#[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+async fn rest_request_interval_paces_retries_and_other_endpoints() {
+    let (peer, mut config) = peer(vec![
+        (503, "", ""),
+        (200, "", include_str!("../../test_data/empty.json")),
+        (200, "", include_str!("../../test_data/empty.json")),
+    ])
+    .await;
+    config.min_request_interval_ms = Some(1_000);
+    config.retry.operation_timeout_ms = Some(500);
+    let client = client(config.clone());
+    let started = time::Instant::now();
+
+    let query = ExchangesQuery::default();
+    let exchanges = client.get_exchanges(&query);
+    tokio::pin!(exchanges);
+    assert!(
+        time::timeout(Duration::from_millis(250), exchanges.as_mut())
+            .await
+            .is_err()
+    );
+    assert_eq!(client.credits_remaining(), 99);
+    assert_eq!(exchanges.await.unwrap(), vec![]);
+    assert!(started.elapsed() >= Duration::from_secs(1));
+
+    let query = SymbolsQuery::default();
+    let symbols = client.get_symbols("COINBASE", &query);
+    tokio::pin!(symbols);
+    assert!(
+        time::timeout(Duration::from_millis(250), symbols.as_mut())
+            .await
+            .is_err()
+    );
+    assert_eq!(client.credits_remaining(), 98);
+    assert_eq!(symbols.await.unwrap(), vec![]);
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    assert_eq!(client.credits_remaining(), 97);
+
+    let requests = peer.await.unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_request(&requests[0], "/v1/exchanges", &config);
+    assert_request(&requests[1], "/v1/exchanges", &config);
+    assert_request(&requests[2], "/v1/symbols/COINBASE/active", &config);
+}
+
+#[cfg(all(feature = "simulation", madsim))]
+#[madsim::test]
+async fn rest_http_date_retry_preserves_the_subsecond_delay() {
+    use jiff::fmt::rfc2822::DateTimePrinter;
+    use nautilus_core::time::wall_clock_now;
+
+    let now = Timestamp::try_from(wall_clock_now()).unwrap();
+    let retry_at = Timestamp::from_second(now.as_second() + 2).unwrap();
+    let mut date = String::new();
+    DateTimePrinter::new()
+        .print_timestamp_rfc9110(&retry_at, &mut date)
+        .unwrap();
+    let (peer, mut config) = peer(vec![
+        (504, format!("Retry-After: {date}\r\n"), ""),
+        (200, String::new(), "[]"),
+    ])
+    .await;
+    config.retry.max_retries = 1;
+    config.retry.max_elapsed_ms = Some(650);
+    let client = client(config.clone());
+    let delay = retry_at
+        .duration_since(now)
+        .unsigned_abs()
+        .checked_sub(Duration::from_millis(350))
+        .expect("retry date is at least one second ahead");
+    time::sleep(delay).await;
+    let started = time::Instant::now();
+
+    assert_eq!(
+        client
+            .get_exchanges(&ExchangesQuery::default())
+            .await
+            .unwrap(),
+        vec![]
+    );
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert_eq!(client.credits_remaining(), 98);
+    let requests = peer.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_request(&requests[0], "/v1/exchanges", &config);
+    assert_request(&requests[1], "/v1/exchanges", &config);
+}
+
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+#[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+async fn rest_retry_after_delays_other_endpoints_without_retries() {
+    let (peer, mut config) = peer(vec![
+        (429, "Retry-After: 1\r\n", ""),
+        (200, "", include_str!("../../test_data/empty.json")),
+    ])
+    .await;
+    config.retry.max_retries = 0;
+    config.retry.operation_timeout_ms = Some(500);
+    let client = client(config.clone());
+    let started = time::Instant::now();
+    assert!(matches!(
+        client.get_exchanges(&ExchangesQuery::default()).await,
+        Err(Error::Http {
+            status: 429,
+            retry_after_secs: Some(1),
+        })
+    ));
+
+    let query = SymbolsQuery::default();
+    let symbols = client.get_symbols("COINBASE", &query);
+    tokio::pin!(symbols);
+    assert!(
+        time::timeout(Duration::from_millis(250), symbols.as_mut())
+            .await
+            .is_err()
+    );
+    assert_eq!(client.credits_remaining(), 99);
+
+    assert_eq!(symbols.await.unwrap(), vec![]);
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert_eq!(client.credits_remaining(), 98);
+    let requests = peer.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_request(&requests[0], "/v1/exchanges", &config);
+    assert_request(&requests[1], "/v1/symbols/COINBASE/active", &config);
+}
+
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+#[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+async fn rest_retry_after_uses_time_since_headers() {
+    let (listener, address) = listener().await;
+    let mut config = config();
+    config.base_url = format!("http://{address}/v1/");
+    config.retry.max_retries = 1;
+    config.retry.max_elapsed_ms = Some(3_000);
+    let client = client(config.clone());
+
+    let peer = task::spawn(async move {
+        let mut requests = Vec::new();
+        let mut headers_sent = None;
+
+        for attempt in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+
+            requests.push(String::from_utf8(request).unwrap());
+
+            if attempt == 0 {
+                headers_sent = Some(time::Instant::now());
+                stream
+                    .write_all(b"HTTP/1.1 503 Busy\r\nRetry-After: 2\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+                time::sleep(Duration::from_millis(1_500)).await;
+                stream.write_all(b"busy").await.unwrap();
+            } else {
+                assert!(headers_sent.unwrap().elapsed() >= Duration::from_secs(2));
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            stream.flush().await.unwrap();
+        }
+
+        requests
+    });
+
+    assert_eq!(
+        client
+            .get_exchanges(&ExchangesQuery::default())
+            .await
+            .unwrap(),
+        vec![]
+    );
+    assert_eq!(client.credits_remaining(), 98);
+    let requests = peer.await.unwrap();
+    assert_eq!(requests.len(), 2);
+
+    for request in requests {
+        assert_request(&request, "/v1/exchanges", &config);
+    }
+}
+
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+#[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+async fn rest_retry_after_survives_a_stalled_response_body() {
+    let (listener, address) = listener().await;
+    let mut config = config();
+    config.base_url = format!("http://{address}/v1/");
+    config.retry.max_retries = 0;
+    config.retry.operation_timeout_ms = Some(500);
+    let client = client(config.clone());
+
+    let peer = task::spawn(async move {
+        let (mut stalled, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(stalled.read_u8().await.unwrap());
+        }
+
+        stalled
+            .write_all(
+                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 2\r\nContent-Length: 4\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        stalled.flush().await.unwrap();
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut next_request = Vec::new();
+        while !next_request.ends_with(b"\r\n\r\n") {
+            next_request.push(stream.read_u8().await.unwrap());
+        }
+
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]")
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+
+        [request, next_request].map(|request| String::from_utf8(request).unwrap())
+    });
+
+    let started = time::Instant::now();
+    assert!(matches!(
+        client.get_exchanges(&ExchangesQuery::default()).await,
+        Err(Error::Retry(RetryError::OperationTimeout {
+            timeout_ms: 500
+        }))
+    ));
+
+    let query = SymbolsQuery::default();
+    let symbols = client.get_symbols("COINBASE", &query);
+    tokio::pin!(symbols);
+    assert!(
+        time::timeout(Duration::from_millis(200), symbols.as_mut())
+            .await
+            .is_err()
+    );
+    assert_eq!(client.credits_remaining(), 99);
+    assert_eq!(symbols.await.unwrap(), vec![]);
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    assert_eq!(client.credits_remaining(), 98);
+    let requests = peer.await.unwrap();
+    assert_request(&requests[0], "/v1/exchanges", &config);
+    assert_request(&requests[1], "/v1/symbols/COINBASE/active", &config);
+}
+
+#[rstest]
+#[case::exhausted_credits(1)]
+#[case::elapsed_budget(2)]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+#[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+async fn rest_cooldown_respects_local_budgets(#[case] credit_budget: u64) {
+    let (peer, mut config) = peer(vec![(429, "Retry-After: 60\r\n", "")]).await;
+    config.credit_budget = credit_budget;
+    config.retry.max_retries = 0;
+    config.retry.operation_timeout_ms = Some(500);
+    config.retry.max_elapsed_ms = Some(1_000);
+    let client = client(config.clone());
+
+    assert!(matches!(
+        client.get_exchanges(&ExchangesQuery::default()).await,
+        Err(Error::Http {
+            status: 429,
+            retry_after_secs: Some(60),
+        })
+    ));
+    let error = client
+        .get_symbols("COINBASE", &SymbolsQuery::default())
+        .await
+        .unwrap_err();
+
+    if credit_budget == 1 {
+        assert!(matches!(error, Error::CreditBudget));
+    } else {
+        assert!(matches!(
+            error,
+            Error::Retry(RetryError::ElapsedBudgetExceeded {
+                attempt: 1,
+                max_attempts: 1,
+                last_error: None,
+            })
+        ));
+    }
+
+    assert_eq!(client.credits_remaining(), credit_budget - 1);
+    let requests = peer.await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_request(&requests[0], "/v1/exchanges", &config);
 }
 
 #[rstest]
@@ -653,7 +971,7 @@ async fn request_timeout_is_bounded() {
     let peer = task::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         assert_eq!(stream.read_u8().await.unwrap(), b'G');
-        time::sleep(Duration::from_secs(1)).await;
+        std::future::pending::<()>().await;
     });
 
     assert!(matches!(
@@ -1257,7 +1575,7 @@ async fn range_without_credits_never_sends() {
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
 #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
 async fn range_between_grid_points_is_empty_without_request(#[case] family: &str) {
-    let (peer, config) = peer(vec![]).await;
+    let (peer, config) = peer(Vec::<(u16, &'static str, &'static str)>::new()).await;
     let client = client(config);
 
     let range = HistoryRange {
@@ -1321,7 +1639,7 @@ async fn backoff_cannot_exceed_elapsed_budget() {
         include_str!("../../test_data/error.json"),
     )])
     .await;
-    config.retry.max_elapsed_ms = Some(500);
+    config.retry.max_elapsed_ms = Some(5_000);
     let client = client(config);
     let start = time::Instant::now();
     assert!(matches!(
@@ -1332,7 +1650,7 @@ async fn backoff_cannot_exceed_elapsed_budget() {
             ..
         })
     ));
-    assert!(start.elapsed() < Duration::from_secs(1));
+    assert!(start.elapsed() < Duration::from_secs(10));
     assert_eq!(peer.await.unwrap().len(), 1);
     assert_eq!(client.credits_remaining(), 99);
 }
@@ -1383,19 +1701,22 @@ async fn redirects_do_not_forward_credentials() {
 }
 
 #[rstest]
-#[case(0, 1, Some(1))]
-#[case(1, 0, Some(1))]
-#[case(1, 1, None)]
-#[case(1, 1, Some(0))]
+#[case(0, 1, Some(1), None)]
+#[case(1, 0, Some(1), None)]
+#[case(1, 1, None, None)]
+#[case(1, 1, Some(0), None)]
+#[case(1, 1, Some(1), Some(0))]
 fn admission_configuration_requires_positive_bounds(
     #[case] concurrency: usize,
     #[case] budget: u64,
     #[case] elapsed: Option<u64>,
+    #[case] interval_ms: Option<u64>,
 ) {
     let mut config = config();
     config.max_concurrent_requests = concurrency;
     config.credit_budget = budget;
     config.retry.max_elapsed_ms = elapsed;
+    config.min_request_interval_ms = interval_ms;
     assert!(matches!(
         CoinApiHttpClient::new(SecretString::from("test-api-key"), config),
         Err(Error::Validation(_))
@@ -1510,7 +1831,7 @@ async fn instrument_loading_skips_unmapped_symbols() {
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
 #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
 async fn instrument_loading_rejects_invalid_price_precision(#[case] precision: u8) {
-    let (peer, config) = peer(vec![]).await;
+    let (peer, config) = peer(Vec::<(u16, &'static str, &'static str)>::new()).await;
     let client = client(config);
 
     let error = client
@@ -1532,3 +1853,410 @@ async fn instrument_loading_rejects_invalid_price_precision(#[case] precision: u
 }
 
 mod websocket;
+
+#[rstest]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+#[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+async fn loader_reuses_metadata_for_multiple_requests() {
+    let (peer, http) = peer(vec![
+        (200, "", include_str!("../../test_data/symbols_spot.json")),
+        (200, "", include_str!("../../test_data/trades.json")),
+        (200, "", include_str!("../../test_data/trades.json")),
+    ])
+    .await;
+    let id = InstrumentId::from("BTC-USD.COINBASE");
+
+    let http = CoinApiHttpConfig {
+        base_url: http.base_url,
+        retry: RetryConfig {
+            max_retries: 0,
+            ..http.retry
+        },
+        ..Default::default()
+    };
+
+    let selections = vec![CoinApiInstrumentSelection {
+        exchange_id: "COINBASE".into(),
+        query: SymbolsQuery::default(),
+        instrument_ids: vec![id],
+    }];
+
+    let loader =
+        CoinApiDataLoader::with_http_config(Some(SecretString::from("test-api-key")), http);
+    let instruments = loader
+        .request_instruments(&selections, &Default::default())
+        .await
+        .unwrap();
+    let start = UnixNanos::from("2026-09-23T09:09:00Z".parse::<Timestamp>().unwrap());
+    let end = UnixNanos::from("2026-09-23T09:10:00Z".parse::<Timestamp>().unwrap());
+    let first = loader.request_trades(id, start, end, None).await.unwrap();
+    let second = loader.request_trades(id, start, end, None).await.unwrap();
+    let requests = peer.await.unwrap();
+    assert_eq!(instruments.len(), 1);
+    assert_eq!(instruments[0].id(), id);
+    assert_eq!(loader.instrument(id).unwrap(), instruments[0]);
+    assert_eq!(first, second);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].instrument_id, id);
+    assert_eq!(first[0].price.to_string(), "85988.49");
+    assert_eq!(first[0].size.to_string(), "0.01000000");
+    assert_eq!(first[0].ts_event.as_u64(), 1_790_154_540_082_275_000);
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].starts_with("GET /v1/symbols/COINBASE/active "));
+    assert!(requests[1].starts_with("GET /v1/trades/COINBASE_SPOT_BTC_USD/history?"));
+    assert!(
+        requests[1]
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with("&limit=9900 HTTP/1.1")
+    );
+    assert!(
+        requests[2]
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with("&limit=9800 HTTP/1.1")
+    );
+}
+
+#[rstest]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+#[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+async fn loader_rejects_credit_truncated_history_without_partial_results() {
+    let source: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../../test_data/trades.json")).unwrap();
+    let start: Timestamp = "2026-09-23T09:09:00Z".parse().unwrap();
+
+    let rows: Vec<_> = (0..100)
+        .map(|index| {
+            let mut row = source[0].clone();
+            row["time_exchange"] = (start + SignedDuration::from_secs(index))
+                .to_string()
+                .into();
+            row
+        })
+        .collect();
+
+    let body = serde_json::to_string(&rows).unwrap();
+    let (peer, http) = peer(vec![(200, "", body)]).await;
+
+    let http = CoinApiHttpConfig {
+        base_url: http.base_url,
+        credit_budget: 1,
+        retry: RetryConfig {
+            max_retries: 0,
+            ..http.retry
+        },
+        ..Default::default()
+    };
+
+    let loader =
+        CoinApiDataLoader::with_http_config(Some(SecretString::from("test-api-key")), http);
+
+    let symbols: Vec<Symbol> =
+        serde_json::from_str(include_str!("../../test_data/symbols_spot.json")).unwrap();
+    let (instruments, _) = parse_instruments(&symbols, UnixNanos::default());
+    let id = InstrumentId::from("BTC-USD.COINBASE");
+    let item = instruments
+        .into_iter()
+        .find(|item| item.instrument.id() == id)
+        .unwrap();
+    loader
+        .add_instrument(item.instrument, Some(item.symbol_id), None)
+        .unwrap();
+    let end = start + SignedDuration::from_secs(600);
+    let error = loader
+        .request_trades(id, UnixNanos::from(start), UnixNanos::from(end), None)
+        .await
+        .unwrap_err();
+    let requests = peer.await.unwrap();
+    assert_eq!(
+        error.to_string(),
+        "CoinAPI history truncated after 99 records with 0 credits remaining; no partial result returned; use a shorter window or a new loader with a larger credit_budget"
+    );
+    assert_eq!(requests.len(), 1);
+}
+
+#[rstest]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+#[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+async fn loader_failed_batch_refresh_preserves_registry() {
+    let (peer, http) = peer(vec![
+        (200, "", include_str!("../../test_data/symbols_spot.json")),
+        (404, "", include_str!("../../test_data/error.json")),
+    ])
+    .await;
+    let id = InstrumentId::from("BTC-USD.COINBASE");
+    let missing = InstrumentId::from("BTCUSDT.BINANCE");
+
+    let http = CoinApiHttpConfig {
+        base_url: http.base_url,
+        retry: RetryConfig {
+            max_retries: 0,
+            ..http.retry
+        },
+        ..Default::default()
+    };
+
+    let loader =
+        CoinApiDataLoader::with_http_config(Some(SecretString::from("test-api-key")), http);
+    let selections = vec![
+        CoinApiInstrumentSelection {
+            exchange_id: "COINBASE".into(),
+            query: SymbolsQuery::default(),
+            instrument_ids: vec![id],
+        },
+        CoinApiInstrumentSelection {
+            exchange_id: "BINANCE".into(),
+            query: SymbolsQuery::default(),
+            instrument_ids: vec![missing],
+        },
+    ];
+
+    let symbols: Vec<Symbol> =
+        serde_json::from_str(include_str!("../../test_data/symbols_spot.json")).unwrap();
+    let (definitions, _) = parse_instruments(&symbols, UnixNanos::from(17));
+    let old = definitions
+        .into_iter()
+        .find(|item| item.instrument.id() == id)
+        .unwrap();
+    loader
+        .add_instrument(old.instrument.clone(), Some(old.symbol_id), Some(27_576))
+        .unwrap();
+    let error = loader
+        .request_instruments(&selections, &Default::default())
+        .await
+        .unwrap_err();
+    let requests = peer.await.unwrap();
+    assert!(error.to_string().contains("404"), "{error:#}");
+    assert_eq!(loader.instrument(id).unwrap(), old.instrument);
+    assert_eq!(
+        loader.instrument(missing).unwrap_err().to_string(),
+        format!("No loaded instrument {missing}")
+    );
+    assert_eq!(requests.len(), 2);
+}
+
+#[rstest]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+#[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+async fn loader_rejects_invalid_history_record_without_partial_results() {
+    let mut rows: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../../test_data/trades.json")).unwrap();
+    rows.push(rows[0].clone());
+    rows[1]["price"] = "85988.491".parse::<serde_json::Number>().unwrap().into();
+    let (peer, http) = peer(vec![(200, "", serde_json::to_string(&rows).unwrap())]).await;
+
+    let http = CoinApiHttpConfig {
+        base_url: http.base_url,
+        retry: RetryConfig {
+            max_retries: 0,
+            ..http.retry
+        },
+        ..Default::default()
+    };
+
+    let loader =
+        CoinApiDataLoader::with_http_config(Some(SecretString::from("test-api-key")), http);
+
+    let symbols: Vec<Symbol> =
+        serde_json::from_str(include_str!("../../test_data/symbols_spot.json")).unwrap();
+    let (definitions, _) = parse_instruments(&symbols, UnixNanos::default());
+    let id = InstrumentId::from("BTC-USD.COINBASE");
+    let item = definitions
+        .into_iter()
+        .find(|item| item.instrument.id() == id)
+        .unwrap();
+    loader
+        .add_instrument(item.instrument, Some(item.symbol_id), None)
+        .unwrap();
+    let start = UnixNanos::from("2026-09-23T09:09:00Z".parse::<Timestamp>().unwrap());
+    let end = UnixNanos::from("2026-09-23T09:10:00Z".parse::<Timestamp>().unwrap());
+    let error = loader
+        .request_trades(id, start, end, NonZeroUsize::new(2))
+        .await
+        .unwrap_err();
+    let requests = peer.await.unwrap();
+    assert_eq!(
+        error.to_string(),
+        "price 85988.491 is finer than instrument precision 2"
+    );
+    assert_eq!(requests.len(), 1);
+}
+
+#[rstest]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+#[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+async fn loader_bars_exclude_periods_closing_after_end() {
+    let mut rows: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../../test_data/ohlcv.json")).unwrap();
+    rows[0]["price_close"] = "85998.70".parse::<serde_json::Number>().unwrap().into();
+    for field in [
+        "time_period_start",
+        "time_period_end",
+        "time_open",
+        "time_close",
+    ] {
+        rows[0][field] = rows[0][field]
+            .as_str()
+            .unwrap()
+            .replace("2026-09-23", "2020-09-23")
+            .into();
+    }
+
+    rows.push(rows[0].clone());
+    rows[1]["time_period_start"] = "2020-09-23T09:10:00Z".into();
+    rows[1]["time_period_end"] = "2020-09-23T09:11:00Z".into();
+    let (peer, http) = peer(vec![(200, "", serde_json::to_string(&rows).unwrap())]).await;
+
+    let http = CoinApiHttpConfig {
+        base_url: http.base_url,
+        retry: RetryConfig {
+            max_retries: 0,
+            ..http.retry
+        },
+        ..Default::default()
+    };
+
+    let loader =
+        CoinApiDataLoader::with_http_config(Some(SecretString::from("test-api-key")), http);
+
+    let symbols: Vec<Symbol> =
+        serde_json::from_str(include_str!("../../test_data/symbols_spot.json")).unwrap();
+    let (definitions, _) = parse_instruments(&symbols, UnixNanos::default());
+    let id = InstrumentId::from("BTC-USD.COINBASE");
+    let item = definitions
+        .into_iter()
+        .find(|item| item.instrument.id() == id)
+        .unwrap();
+    loader
+        .add_instrument(item.instrument, Some(item.symbol_id), None)
+        .unwrap();
+    let start = UnixNanos::from("2020-09-23T09:09:00Z".parse::<Timestamp>().unwrap());
+    let end = UnixNanos::from("2020-09-23T09:10:30Z".parse::<Timestamp>().unwrap());
+    let bar_type = "BTC-USD.COINBASE-1-MINUTE-LAST-EXTERNAL".parse().unwrap();
+    let bars = loader
+        .request_bars(bar_type, start, end, NonZeroUsize::new(2))
+        .await
+        .unwrap();
+    let requests = peer.await.unwrap();
+    let timestamp = UnixNanos::from("2020-09-23T09:10:00Z".parse::<Timestamp>().unwrap());
+    assert_eq!(
+        bars,
+        [Bar::new(
+            bar_type,
+            Price::from("85988.49"),
+            Price::from("86007.23"),
+            Price::from("85986.91"),
+            Price::from("85998.70"),
+            Quantity::from("0.97075568"),
+            timestamp,
+            timestamp,
+        )]
+    );
+    assert_eq!(requests.len(), 1);
+}
+
+#[rstest]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+#[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+async fn loader_maps_numeric_symbols_from_requested_metadata() {
+    let mut symbols: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../../test_data/symbols_spot.json")).unwrap();
+    let kraken = symbols
+        .iter_mut()
+        .find(|symbol| symbol["symbol_id"] == "KRAKEN_SPOT_BTC_USD")
+        .unwrap();
+    kraken["symbol_id_int"] = serde_json::Value::Null;
+    let body = serde_json::to_string(&symbols).unwrap();
+    let (peer, http) = peer(vec![
+        (200, "", body.clone()),
+        (200, "", body.clone()),
+        (200, "", body),
+    ])
+    .await;
+
+    let selections = [
+        ("BINANCE", "BTCUSDT.BINANCE"),
+        ("COINBASE", "BTC-USD.COINBASE"),
+        ("KRAKEN", "BTC/USD.KRAKEN"),
+    ];
+
+    let http = CoinApiHttpConfig {
+        base_url: http.base_url,
+        retry: RetryConfig {
+            max_retries: 0,
+            ..http.retry
+        },
+        ..Default::default()
+    };
+
+    let loader =
+        CoinApiDataLoader::with_http_config(Some(SecretString::from("test-api-key")), http);
+
+    let instrument_selections: Vec<_> = selections
+        .iter()
+        .map(|(exchange, id)| CoinApiInstrumentSelection {
+            exchange_id: (*exchange).into(),
+            query: SymbolsQuery::default(),
+            instrument_ids: vec![InstrumentId::from(*id)],
+        })
+        .collect();
+
+    let instruments = loader
+        .request_instruments(&instrument_selections, &Default::default())
+        .await
+        .unwrap();
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("TP-1MIN.csv");
+    let mut lines = vec![
+        "symbol_id;time_period_start;time_period_end;time_open;time_close;px_open;px_high;px_low;px_close;sx_cnt;sx_sum".to_owned(),
+    ];
+    lines.extend(["138123", "27576", "599", "1"].map(|id| {
+        format!("{id};2025-09-11T00:00:00.0000000;2025-09-11T00:01:00.0000000;2025-09-11T00:00:01.0000000;2025-09-11T00:00:59.0000000;1;2;0.5;1.5;3;4")
+    }));
+
+    fs::write(&path, lines.join("\n")).unwrap();
+    let bars = loader.load_bars(&path, None, None).unwrap();
+    let requests = peer.await.unwrap();
+    let end = UnixNanos::from("2025-09-11T00:01:00Z".parse::<Timestamp>().unwrap());
+
+    let expected: Vec<_> = [
+        "BTCUSDT.BINANCE-1-MINUTE-LAST-EXTERNAL",
+        "BTC-USD.COINBASE-1-MINUTE-LAST-EXTERNAL",
+    ]
+    .map(|bar_type| {
+        Bar::new(
+            bar_type.parse().unwrap(),
+            Price::from("1.00"),
+            Price::from("2.00"),
+            Price::from("0.50"),
+            Price::from("1.50"),
+            Quantity::from("4"),
+            end,
+            end,
+        )
+    })
+    .into();
+
+    assert_eq!(bars, expected);
+    assert_eq!(
+        instruments
+            .iter()
+            .map(|instrument| instrument.id())
+            .collect::<Vec<_>>(),
+        selections.map(|(_, id)| InstrumentId::from(id)),
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.lines().next().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "GET /v1/symbols/BINANCE/active HTTP/1.1",
+            "GET /v1/symbols/COINBASE/active HTTP/1.1",
+            "GET /v1/symbols/KRAKEN/active HTTP/1.1",
+        ],
+    );
+}

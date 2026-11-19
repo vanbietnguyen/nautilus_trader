@@ -92,8 +92,8 @@ use crate::{
             MessagingSwitchboard, get_bars_topic, get_book_deltas_topic, get_book_depth_topic,
             get_book_snapshots_topic, get_custom_topic, get_funding_rate_topic,
             get_index_price_topic, get_instrument_close_topic, get_instrument_status_topic,
-            get_instrument_topic, get_mark_price_topic, get_option_chain_topic,
-            get_option_greeks_topic, get_quotes_topic, get_trades_topic,
+            get_instrument_topic, get_mark_price_topic, get_option_greeks_topic, get_quotes_topic,
+            get_trades_topic,
         },
     },
     nautilus_actor,
@@ -1873,15 +1873,18 @@ fn test_subscription_facade_sends_exact_command_matrix(
         actor.subscribe_funding_rates(instrument_id, Some(client_id), Some(params.clone()));
         actor.subscribe_instrument_status(instrument_id, Some(client_id), Some(params.clone()));
         actor.subscribe_instrument_close(instrument_id, Some(client_id), Some(params.clone()));
-        actor.subscribe_option_greeks(instrument_id, Some(client_id), Some(params.clone()));
+        actor.subscribe_option_greeks(instrument_id, Some(client_id), Some(params));
     }
-    actor.subscribe_option_chain(
-        series_id,
-        strike_range.clone(),
-        snapshot_interval_ms,
-        Some(client_id),
-        Some(params.clone()),
-    );
+
+    actor
+        .subscribe_option_chain(
+            series_id,
+            strike_range.clone(),
+            snapshot_interval_ms,
+            Some(client_id),
+            Some(params.clone()),
+        )
+        .unwrap();
 
     actor.unsubscribe_data(
         data_type.clone(),
@@ -2057,6 +2060,7 @@ fn test_subscription_facade_sends_exact_command_matrix(
             SubscribeCommand::BookDeltas(_)
                 | SubscribeCommand::BookDepth(_)
                 | SubscribeCommand::BookSnapshots(_)
+                | SubscribeCommand::OptionChain(_)
         )
         .then(|| subscribe.command_id());
         assert_eq!(unsubscribe.correlation_id(), expected);
@@ -2719,16 +2723,19 @@ fn test_release_subscriptions_emits_retained_unsubscribe_commands(
         Some(book_params.clone()),
     );
     actor.subscribe_bars(bar_type, Some(bar_client_id), Some(bar_params.clone()));
-    actor.subscribe_option_chain(
-        series_id,
-        StrikeRange::AtmRelative {
-            strikes_above: 13,
-            strikes_below: 17,
-        },
-        Some(1_009),
-        Some(chain_client_id),
-        Some(chain_params),
-    );
+    actor
+        .subscribe_option_chain(
+            series_id,
+            StrikeRange::AtmRelative {
+                strikes_above: 13,
+                strikes_below: 17,
+            },
+            Some(1_009),
+            Some(chain_client_id),
+            Some(chain_params),
+        )
+        .unwrap();
+
     actor.subscribe_instrument(
         instrument_id,
         Some(remaining_client_id),
@@ -3184,7 +3191,7 @@ fn test_reset_releases_subscription_before_restart(
 }
 
 #[rstest]
-fn test_option_chain_resubscription_sends_edit_and_retains_latest_identity(
+fn test_option_chain_duplicate_subscription_keeps_first_identity(
     clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
@@ -3214,48 +3221,38 @@ fn test_option_chain_resubscription_sends_edit_and_retains_latest_identity(
         strikes_below: 11,
     };
 
-    actor.subscribe_option_chain(
-        series_id,
-        first_range.clone(),
-        Some(1_000),
-        Some(first_client_id),
-        None,
-    );
-    actor.subscribe_option_chain(
-        series_id,
-        second_range.clone(),
-        Some(2_000),
-        Some(second_client_id),
-        None,
-    );
+    actor
+        .subscribe_option_chain(
+            series_id,
+            first_range.clone(),
+            Some(1_000),
+            Some(first_client_id),
+            None,
+        )
+        .unwrap();
+    actor
+        .subscribe_option_chain(
+            series_id,
+            second_range,
+            Some(2_000),
+            Some(second_client_id),
+            None,
+        )
+        .unwrap();
 
-    assert_eq!(
-        get_message_bus()
-            .borrow()
-            .router_option_chain
-            .subscription_count(),
-        1,
-    );
+    assert_eq!(get_message_bus().borrow().option_chain_owners.len(), 1,);
 
     let commands = saver.get_messages();
-    let [
-        DataCommand::Subscribe(SubscribeCommand::OptionChain(first)),
-        DataCommand::Subscribe(SubscribeCommand::OptionChain(second)),
-    ] = commands.as_slice()
-    else {
-        panic!("expected two option chain subscribe commands, was {commands:?}");
+
+    let [DataCommand::Subscribe(SubscribeCommand::OptionChain(first))] = commands.as_slice() else {
+        panic!("expected one option chain subscribe command, was {commands:?}");
     };
     assert_eq!(first.series_id, series_id);
     assert_eq!(first.strike_range, first_range);
     assert_eq!(first.snapshot_interval_ms, Some(1_000));
     assert_eq!(first.client_id, Some(first_client_id));
     assert_eq!(first.correlation_id, None);
-    assert_eq!(second.series_id, series_id);
-    assert_eq!(second.strike_range, second_range);
-    assert_eq!(second.snapshot_interval_ms, Some(2_000));
-    assert_eq!(second.client_id, Some(second_client_id));
-    assert_ne!(second.command_id, first.command_id);
-    assert_eq!(second.correlation_id, Some(first.command_id));
+    let owner_id = first.command_id;
 
     saver.clear();
     actor.unsubscribe_option_chain(series_id, Some(fallback_client_id));
@@ -3266,14 +3263,9 @@ fn test_option_chain_resubscription_sends_edit_and_retains_latest_identity(
         panic!("expected one option chain unsubscribe command, was {commands:?}");
     };
     assert_eq!(command.series_id, series_id);
-    assert_eq!(command.client_id, Some(second_client_id));
-    assert_eq!(
-        get_message_bus()
-            .borrow()
-            .router_option_chain
-            .subscription_count(),
-        0,
-    );
+    assert_eq!(command.client_id, Some(first_client_id));
+    assert_eq!(command.correlation_id, Some(owner_id));
+    assert_eq!(get_message_bus().borrow().option_chain_owners.len(), 0,);
 }
 
 #[rstest]
@@ -5087,6 +5079,11 @@ fn test_subscribe_and_receive_option_chain(
     let actor_id = register_data_actor(clock, cache, trader_id);
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
+    let (handler, saver) = get_typed_into_message_saving_handler::<DataCommand>(None);
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        handler,
+    );
 
     let series_id = OptionSeriesId::new_derived(
         Venue::from("OPRA"),
@@ -5098,7 +5095,10 @@ fn test_subscribe_and_receive_option_chain(
         strikes_above: 5,
         strikes_below: 5,
     };
-    actor.subscribe_option_chain(series_id, strike_range, None, None, None);
+
+    actor
+        .subscribe_option_chain(series_id, strike_range, None, None, None)
+        .unwrap();
 
     let slice = OptionChainSlice {
         series_id,
@@ -5109,8 +5109,15 @@ fn test_subscribe_and_receive_option_chain(
         ts_init: UnixNanos::default(),
     };
 
-    let topic = get_option_chain_topic(series_id);
-    msgbus::publish_option_chain(topic, &slice);
+    let commands = saver.get_messages();
+
+    let [DataCommand::Subscribe(SubscribeCommand::OptionChain(command))] = commands.as_slice()
+    else {
+        panic!("expected one option chain subscribe");
+    };
+
+    let owner_id = command.owner_id();
+    msgbus::publish_option_chain_owner(owner_id, &slice);
 
     assert_eq!(actor.received_chain_slices.len(), 1);
     assert_eq!(actor.received_chain_slices[0].series_id, series_id);
@@ -5417,6 +5424,11 @@ fn test_unsubscribe_option_chain(
     let actor_id = register_data_actor(clock, cache, trader_id);
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
+    let (handler, saver) = get_typed_into_message_saving_handler::<DataCommand>(None);
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        handler,
+    );
 
     let series_id = OptionSeriesId::new_derived(
         Venue::from("OPRA"),
@@ -5428,7 +5440,10 @@ fn test_unsubscribe_option_chain(
         strikes_above: 5,
         strikes_below: 5,
     };
-    actor.subscribe_option_chain(series_id, strike_range, None, None, None);
+
+    actor
+        .subscribe_option_chain(series_id, strike_range, None, None, None)
+        .unwrap();
 
     let slice = OptionChainSlice {
         series_id,
@@ -5439,14 +5454,21 @@ fn test_unsubscribe_option_chain(
         ts_init: UnixNanos::default(),
     };
 
-    let topic = get_option_chain_topic(series_id);
-    msgbus::publish_option_chain(topic, &slice);
+    let commands = saver.get_messages();
+
+    let [DataCommand::Subscribe(SubscribeCommand::OptionChain(command))] = commands.as_slice()
+    else {
+        panic!("expected one option chain subscribe");
+    };
+
+    let owner_id = command.owner_id();
+    msgbus::publish_option_chain_owner(owner_id, &slice);
 
     assert_eq!(actor.received_chain_slices.len(), 1);
 
     actor.unsubscribe_option_chain(series_id, None);
 
-    msgbus::publish_option_chain(topic, &slice);
+    msgbus::publish_option_chain_owner(owner_id, &slice);
 
     assert_eq!(actor.received_chain_slices.len(), 1);
 }
@@ -5645,7 +5667,7 @@ fn test_defi_subscription_facade_sends_exact_command_matrix(
             Some(params.clone()),
         );
         actor.subscribe_pool_fee_collects(instrument_id, Some(client_id), Some(params.clone()));
-        actor.subscribe_pool_flash_events(instrument_id, Some(client_id), Some(params.clone()));
+        actor.subscribe_pool_flash_events(instrument_id, Some(client_id), Some(params));
     }
     actor.unsubscribe_blocks(chain, Some(client_id), Some(params.clone()));
     actor.unsubscribe_pool(instrument_id, Some(client_id), Some(params.clone()));
@@ -6684,7 +6706,9 @@ fn test_release_subscriptions_removes_every_handler_family_and_is_idempotent(
     actor.subscribe_index_prices(instrument_id, None, None);
     actor.subscribe_funding_rates(instrument_id, None, None);
     actor.subscribe_option_greeks(instrument_id, None, None);
-    actor.subscribe_option_chain(series_id, strike_range, Some(250), None, None);
+    actor
+        .subscribe_option_chain(series_id, strike_range, Some(250), None, None)
+        .unwrap();
 
     #[cfg(feature = "defi")]
     {
@@ -6713,7 +6737,7 @@ fn test_release_subscriptions_removes_every_handler_family_and_is_idempotent(
             bus.router_index_prices.subscription_count(),
             bus.router_funding_rates.subscription_count(),
             bus.router_option_greeks.subscription_count(),
-            bus.router_option_chain.subscription_count(),
+            bus.option_chain_owners.len(),
         ]
     };
     #[cfg(feature = "defi")]
@@ -8873,4 +8897,76 @@ fn test_failed_retirement_request_cleanup(
     drop(actor);
     crate::component::deregister_component(&actor_id);
     crate::actor::registry::deregister_actor(&actor_id);
+}
+
+#[rstest]
+fn test_option_chain_zero_interval_has_no_side_effects(
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    #[values(false, true)] subscribed: bool,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let (handler, saver) = get_typed_into_message_saving_handler::<DataCommand>(None);
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        handler,
+    );
+    let series_id = OptionSeriesId::new_derived(
+        Venue::from("DERIBIT"),
+        Ustr::from("BTC"),
+        Ustr::from("USD"),
+        UnixNanos::from(37),
+    );
+    let client_id = ClientId::from("RETAINED-CHAIN-CLIENT");
+    let params = Params::new([("owner".to_string(), serde_json::json!(37))].into());
+
+    if subscribed {
+        actor
+            .subscribe_option_chain(
+                series_id,
+                StrikeRange::AtmRelative {
+                    strikes_above: 2,
+                    strikes_below: 3,
+                },
+                Some(750),
+                Some(client_id),
+                Some(params.clone()),
+            )
+            .unwrap();
+
+        saver.clear();
+    }
+
+    let error = actor
+        .subscribe_option_chain(series_id, StrikeRange::Fixed(vec![]), Some(0), None, None)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid u64 for 'snapshot_interval_ms' not positive, was 0"
+    );
+    assert_eq!(
+        get_message_bus().borrow().option_chain_owners.len(),
+        usize::from(subscribed)
+    );
+    assert!(saver.get_messages().is_empty());
+
+    if subscribed {
+        actor.unsubscribe_option_chain(series_id, Some(ClientId::from("FALLBACK-CLIENT")));
+
+        let commands = saver.get_messages();
+
+        let [DataCommand::Unsubscribe(UnsubscribeCommand::OptionChain(command))] =
+            commands.as_slice()
+        else {
+            panic!("expected the retained chain unsubscribe, was {commands:?}");
+        };
+
+        assert_eq!(command.series_id, series_id);
+        assert_eq!(command.client_id, Some(client_id));
+        assert_eq!(command.venue, Some(series_id.venue));
+        assert_eq!(command.params, Some(params));
+        assert_eq!(get_message_bus().borrow().option_chain_owners.len(), 0);
+    }
 }

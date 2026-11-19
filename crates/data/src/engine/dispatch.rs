@@ -35,7 +35,7 @@ impl DataEngine {
         }
     }
 
-    pub(crate) fn cache_instrument(&self, instrument: &InstrumentAny) -> bool {
+    pub(crate) fn cache_instrument(&mut self, instrument: &InstrumentAny) -> bool {
         log::debug!("Handling instrument: {}", instrument.id());
 
         if let Err(e) = self
@@ -53,6 +53,11 @@ impl DataEngine {
             {
                 return false;
             }
+        }
+
+        if instrument.option_kind().is_none() {
+            self.option_chain_instruments_expired
+                .remove(&instrument.id());
         }
 
         true
@@ -217,16 +222,14 @@ impl DataEngine {
 
         let topic = switchboard::get_instrument_status_topic(status.instrument_id);
         msgbus::publish_any(topic, &status);
-
-        if self
-            .option_chain_instrument_index
-            .contains_key(&status.instrument_id)
-            && matches!(
-                status.action,
-                MarketStatusAction::Close | MarketStatusAction::NotAvailableForTrading
-            )
-        {
+        if matches!(
+            status.action,
+            MarketStatusAction::Close | MarketStatusAction::NotAvailableForTrading
+        ) {
             self.expire_option_chain_instrument(status.instrument_id);
+        } else if status.action == MarketStatusAction::Trading {
+            self.option_chain_instruments_expired
+                .remove(&status.instrument_id);
         }
     }
 
@@ -237,6 +240,7 @@ impl DataEngine {
 
     pub(super) fn handle_custom_data(&self, custom: &CustomData) {
         log::debug!("Processing custom data: {}", custom.data.type_name());
+        self.cache.borrow_mut().add_custom_data(custom.clone());
         let topic = switchboard::get_custom_topic(&custom.data_type);
         msgbus::publish_any(topic, custom);
     }
@@ -397,6 +401,11 @@ impl DataEngine {
 
     pub(super) fn handle_custom_data_pipeline(&self, custom: &CustomData) {
         log::debug!("Pipeline custom data: {}", custom.data.type_name());
+
+        if self.pipeline_cache_writes_allowed() {
+            self.cache.borrow_mut().add_custom_data(custom.clone());
+        }
+
         let topic = switchboard::get_pipeline_custom_topic(&custom.data_type);
         msgbus::publish_any(topic, custom);
     }

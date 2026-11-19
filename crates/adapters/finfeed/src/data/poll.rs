@@ -473,6 +473,7 @@ enum Batch {
 struct Schedule {
     revision: u64,
     suspended: bool,
+    saturated: bool,
     due: time::Instant,
 }
 
@@ -481,7 +482,19 @@ impl Default for Schedule {
         Self {
             revision: 0,
             suspended: false,
+            saturated: false,
             due: time::Instant::now(),
+        }
+    }
+}
+
+impl Schedule {
+    fn saturation_level(&mut self, saturated: bool) -> log::Level {
+        let was_saturated = std::mem::replace(&mut self.saturated, saturated);
+        if saturated && !was_saturated {
+            log::Level::Warn
+        } else {
+            log::Level::Debug
         }
     }
 }
@@ -498,6 +511,22 @@ struct ActivityScope {
     schedule: Schedule,
     quote_ids: Option<Identities<QuoteTick>>,
     trade_ids: Option<Identities<TradeId>>,
+}
+
+impl ActivityScope {
+    fn log_saturation(&mut self, id: InstrumentId, batch: &ActivityBatch, limit: u32) {
+        let quotes = batch.quotes.as_ref().map_or(0, Vec::len);
+        let trades = batch.trades.as_ref().map_or(0, Vec::len);
+        let quotes_saturated = self.quote_ids.is_some() && quotes == limit as usize;
+        let trades_saturated = self.trade_ids.is_some() && trades == limit as usize;
+        let level = self
+            .schedule
+            .saturation_level(quotes_saturated || trades_saturated);
+        log::log!(
+            level,
+            "FinFeed activity received for {id}, quotes={quotes}, trades={trades}, per-list limit={limit}, quotes_saturated={quotes_saturated}, trades_saturated={trades_saturated}"
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -588,15 +617,7 @@ impl Scope {
                     return Ok(());
                 };
 
-                let quotes = batch.quotes.as_ref().map_or(0, Vec::len);
-                let trades = batch.trades.as_ref().map_or(0, Vec::len);
-                let quotes_saturated = activity.quote_ids.is_some() && quotes == limit as usize;
-                let trades_saturated = activity.trade_ids.is_some() && trades == limit as usize;
-                log::debug!(
-                    "FinFeed activity received for {}, quotes={quotes}, trades={trades}, per-list limit={limit}, quotes_saturated={quotes_saturated}, trades_saturated={trades_saturated}",
-                    instrument.id
-                );
-
+                activity.log_saturation(instrument.id, &batch, limit);
                 publish(activity, instrument, batch, sender)
             }
             Batch::Book(source) => {
@@ -612,10 +633,12 @@ impl Scope {
                 };
 
                 let limit = limit + 1;
-                log::debug!(
-                    "FinFeed OHLCV received for {bar_type}, records={}, limit={limit}, saturated={}",
-                    records.len(),
-                    records.len() == limit as usize
+                let saturated = records.len() == limit as usize;
+                let level = bars.schedule.saturation_level(saturated);
+                log::log!(
+                    level,
+                    "FinFeed OHLCV received for {bar_type}, records={}, limit={limit}, saturated={saturated}",
+                    records.len()
                 );
 
                 if let Err(e) = bars.publish(records, cutoff, bar_type, &period, instrument, sender)
@@ -760,7 +783,10 @@ fn publish(
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    log::warn!("Invalid FinFeed poll quote omitted: {e}");
+                    log::warn!(
+                        "Invalid FinFeed poll quote omitted for {}: {e}",
+                        instrument.id
+                    );
                 }
             }
         }
@@ -1012,10 +1038,12 @@ mod tests {
     use crate::http::{client::FinFeedHttpConfig, models::Market, parse::parse_instrument};
 
     #[rstest]
-    #[case::book_unsubscribed(Feed::Book, true)]
-    #[case::book_subscribed(Feed::Book, false)]
-    #[case::activity_unsubscribed(Feed::Activity, true)]
-    #[case::activity_subscribed(Feed::Activity, false)]
+    #[case::book_unsubscribed(Feed::Book, true, false)]
+    #[case::book_subscribed(Feed::Book, false, false)]
+    #[case::book_churn(Feed::Book, false, true)]
+    #[case::activity_unsubscribed(Feed::Activity, true, false)]
+    #[case::activity_subscribed(Feed::Activity, false, false)]
+    #[case::activity_churn(Feed::Activity, false, true)]
     #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     #[cfg_attr(
         not(all(feature = "simulation", madsim)),
@@ -1024,6 +1052,7 @@ mod tests {
     async fn unsubscribe_cancels_admission_wait_before_any_poll_is_sent(
         #[case] feed: Feed,
         #[case] unsubscribe: bool,
+        #[case] churn: bool,
     ) {
         let mut client = super::super::tests::subscription_client();
 
@@ -1091,11 +1120,47 @@ mod tests {
 
         assert_eq!(http.attempts_remaining(), 2);
 
-        if unsubscribe {
-            let client_id = Some(client.client_id());
-            let command_id = UUID4::new();
-            let ts_init = UnixNanos::from(0);
+        let client_id = Some(client.client_id());
+        let command_id = UUID4::new();
+        let ts_init = UnixNanos::from(0);
 
+        if churn {
+            match feed {
+                Feed::Book => client.subscribe_activity(id, true).unwrap(),
+                Feed::Activity => client
+                    .subscribe_book(id, BookType::L2_MBP, true, None)
+                    .unwrap(),
+                Feed::Bars(_) => unreachable!(),
+            }
+
+            poll_fn(|cx| {
+                assert!(pending.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+
+            match feed {
+                Feed::Book => client
+                    .unsubscribe_quotes(&UnsubscribeQuotes::new(
+                        id, client_id, None, command_id, ts_init, None, None,
+                    ))
+                    .unwrap(),
+                Feed::Activity => client
+                    .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
+                        id, client_id, None, command_id, ts_init, None, None,
+                    ))
+                    .unwrap(),
+                Feed::Bars(_) => unreachable!(),
+            }
+
+            poll_fn(|cx| {
+                assert!(pending.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+        }
+
+        if unsubscribe {
             match feed {
                 Feed::Book => client
                     .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(

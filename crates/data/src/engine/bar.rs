@@ -110,8 +110,10 @@ pub(super) struct RequestReplay {
     /// builders (see [`DataEngine::release_kept_bars`]). A refused request never changes it.
     claim: UUID4,
     /// The kept builders its claiming request released while that request was in flight (see
-    /// [`DataEngine::release_kept_bars`]): the request keeps them to its end, then they are
-    /// removed, not kept, unless a subscription held back on one takes it over then.
+    /// [`DataEngine::release_kept_bars`]): the request keeps them to its end. One of them is
+    /// marked to be stopped then (`bar_aggregators_pending_stop`) once it has no subscription,
+    /// whichever of its release and its last unsubscribe comes second; a subscription held back
+    /// on it at the end takes it over instead. Cleared at the request's end.
     released: Vec<BarAggregatorKey>,
 }
 
@@ -699,8 +701,10 @@ impl DataEngine {
     /// Releases the claim of the request `cmd.request_id` on the builder of `cmd.bar_type` kept by
     /// request (see [`ReleaseKeptBars`]), acting only when that request claims the builder's
     /// replay (see [`RequestReplay::claim`]): an idle builder is stopped and removed, and its
-    /// replay with it when it is the last; one that request still runs is marked, and removed at
-    /// its end (see [`RequestReplay::released`]), its answer untouched. Only the released bar
+    /// replay with it when it is the last; one that request still runs is marked (see
+    /// [`RequestReplay::released`]), and, once no subscription is held back on it, marked to be
+    /// stopped at the request's end (see `bar_aggregators_pending_stop`), its answer untouched; a
+    /// subscription held back on it takes it over then instead. Only the released bar
     /// type's builder goes: the others of the replay are left as they are. A release naming any
     /// other request, or a builder no replay holds any more (a subscription took it over), is
     /// ignored.
@@ -732,6 +736,10 @@ impl DataEngine {
         {
             if !replay.released.contains(&key) {
                 replay.released.push(key);
+            }
+            // With no subscription held back on it, nobody uses it after the request
+            if !self.bar_aggregator_handlers.contains_key(&key) {
+                self.bar_aggregators_pending_stop.insert(key);
             }
             return;
         }
@@ -851,13 +859,12 @@ impl DataEngine {
         let (bar_types, aggregator_request_id) = self
             .request_bar_aggregations
             .get(&request_id)
-            .map(|state| {
+            .map_or_default(|state| {
                 (
                     state.bar_types.clone(),
                     state.aggregator_request_id(request_id),
                 )
-            })
-            .unwrap_or_default();
+            });
 
         for bar_type in bar_types {
             self.connect_time_bar_source(bar_type, aggregator_request_id);
@@ -1138,9 +1145,10 @@ impl DataEngine {
     /// Keeps the builders of a kept request that succeeded on its replay, idle: no output
     /// handler, nothing drives them, their armed deadlines stay armed, until a later request
     /// continues the replay from its coverage, a subscription takes them over or the request
-    /// claiming the replay releases them (see [`Self::release_kept_bars`]). Those the request
-    /// released while it ran (see [`RequestReplay::released`]) are removed now, after its answer,
-    /// and the replay goes with its last builder.
+    /// claiming the replay releases them (see [`Self::release_kept_bars`]). Those marked to be
+    /// stopped after the request (released while it ran, with no subscription: see
+    /// [`RequestReplay::released`]) are removed now, after its answer, and the replay goes with
+    /// its last builder.
     ///
     /// The builders whose subscriptions were held back while the answer was in flight leave the
     /// replay now, together, on a clock of their own (see [`Self::hand_over_clock`]), and are
@@ -1182,8 +1190,11 @@ impl DataEngine {
             })
         };
 
-        for key in std::mem::take(&mut replay.released) {
-            if !replay.builders.contains(&key) {
+        let remaining: Vec<BarAggregatorKey> = replay.builders.clone();
+        for key in remaining {
+            let stop_after_request = self.bar_aggregators_pending_stop.contains(&key)
+                && !self.has_pending_shared_bar_aggregation(key.0);
+            if !stop_after_request {
                 continue;
             }
 
@@ -1195,6 +1206,7 @@ impl DataEngine {
             }
             replay.builders.retain(|kept| *kept != key);
         }
+        replay.released.clear();
 
         for key in &replay.builders {
             if let Some(aggregator) = self.bar_aggregators.get(key) {
@@ -1720,8 +1732,7 @@ impl DataEngine {
         let bars = self
             .interleaved_requests
             .get(&request_id)
-            .map(|interleaved| Rc::clone(&interleaved.bars))
-            .unwrap_or_default();
+            .map_or_default(|interleaved| Rc::clone(&interleaved.bars));
         let mut pending = Vec::new();
 
         for trade in resp.data.iter() {
@@ -2020,10 +2031,7 @@ impl DataEngine {
 
         // A kept builder a request is still running stays the request's: a subscription held
         // back on it is released now, and only that subscription
-        let in_flight = self
-            .request_replays
-            .values()
-            .any(|replay| replay.builders.contains(&key));
+        let in_flight = self.has_pending_shared_bar_aggregation(bar_type);
         let held_back = in_flight && self.bar_aggregator_handlers.contains_key(&key);
         if in_flight && !held_back {
             return;
@@ -2055,16 +2063,24 @@ impl DataEngine {
             },
         );
 
-        if held_back {
-            self.release_bar_aggregator_handlers(&key);
-            self.subscriptions_bar_aggregation
-                .remove(&bar_type.standard());
-            self.unsubscribe_bar_aggregator(&command);
-        } else if self
-            .bar_aggregators
-            .contains_key(&bar_aggregator_key(bar_type, None))
-        {
-            match self.stop_bar_aggregator(bar_type, None) {
+        if self.bar_aggregators.contains_key(&key) {
+            let result = if self.has_pending_shared_bar_aggregation(bar_type) {
+                // Release live data without canceling an accepted historical aggregation
+                self.unsubscribe_bar_aggregator_handlers(&key);
+                // Stopped when the request ends only if its request already released it
+                if self
+                    .request_replays
+                    .values()
+                    .any(|replay| replay.released.contains(&key))
+                {
+                    self.bar_aggregators_pending_stop.insert(key);
+                }
+                Ok(())
+            } else {
+                self.stop_bar_aggregator(bar_type, None)
+            };
+
+            match result {
                 Ok(()) => {
                     self.subscriptions_bar_aggregation
                         .remove(&bar_type.standard());
@@ -2074,6 +2090,10 @@ impl DataEngine {
             }
         }
 
+        self.release_composite_bar_source(&command);
+    }
+
+    fn release_composite_bar_source(&mut self, command: &UnsubscribeBars) {
         // After stopping a composite, release its source through `unsubscribe_bars`, which frees
         // the client feed recorded in the source's retained command.
         if command
@@ -2101,6 +2121,16 @@ impl DataEngine {
                 ));
             }
         }
+    }
+
+    fn has_pending_shared_bar_aggregation(&self, bar_type: BarType) -> bool {
+        self.request_bar_aggregations.values().any(|state| {
+            state.update_subscriptions
+                && state
+                    .bar_types
+                    .iter()
+                    .any(|requested| requested.standard() == bar_type.standard())
+        })
     }
 
     fn create_bar_aggregator(
@@ -2337,7 +2367,7 @@ impl DataEngine {
         // A composite would share the builder by its standard bar type, so its source bars
         // would build on the kept request's records: refused before anything is set up
         anyhow::ensure!(
-            !bar_type.is_composite() || !self.is_kept_request_building(bar_type),
+            !bar_type.is_composite() || !self.has_pending_shared_bar_aggregation(bar_type),
             "Cannot subscribe {bar_type}: a kept request is building {} from another source; \
              subscribe after it ends",
             bar_type.standard(),
@@ -2374,6 +2404,7 @@ impl DataEngine {
         }
 
         self.start_bar_aggregator(bar_type, None, skip_first_non_full_bar, time_zone)?;
+        self.bar_aggregators_pending_stop.remove(&key);
         let source = self.subscribe_bar_aggregator(cmd);
         self.subscriptions_bar_aggregation.insert(
             bar_type.standard(),
@@ -2394,8 +2425,6 @@ impl DataEngine {
         time_zone: Option<TimeZone>,
     ) -> anyhow::Result<()> {
         let key = bar_aggregator_key(bar_type, request_id);
-        let bar_type_std = bar_type.standard();
-
         self.create_bar_aggregator_for_key(
             bar_type,
             request_id,
@@ -2407,95 +2436,19 @@ impl DataEngine {
             .get(&key)
             .map(Rc::clone)
             .ok_or_else(|| anyhow::anyhow!("Cannot start bar aggregation for {bar_type}"))?;
+        // A deferred aggregator is still building its kept request's answer on the request's
+        // replay, so live data is held back and fed to it once the request ends
         let defer_subscription_activation = request_id.is_none()
             && aggregator.borrow().is_running()
             && !self.bar_aggregator_handlers.contains_key(&key);
 
         if !self.bar_aggregator_handlers.contains_key(&key) {
-            // Subscribe to underlying data topics
-            let mut subscriptions = Vec::new();
-
-            // A deferred aggregator is still building its kept request's answer on the request's
-            // replay, so live data is held back and fed to it once the request ends
-            let defer = defer_subscription_activation;
-            let warmup;
-
-            if bar_type.is_composite() {
-                let topic = switchboard::get_bars_topic(bar_type.composite());
-                let buffer = defer.then(WarmupBuffer::new);
-                let handler = TypedHandler::new(
-                    BarBarHandler::new(&aggregator, bar_type_std).with_warmup(buffer.clone()),
-                );
-                warmup = buffer.map(BarAggregatorWarmup::Bar);
-                msgbus::subscribe_bars(topic.into(), handler.clone(), None);
-                subscriptions.push(BarAggregatorSubscription::Bar { topic, handler });
-            } else if bar_type.spec().price_type == PriceType::Last {
-                let topic = switchboard::get_trades_topic(bar_type.instrument_id());
-                // Chosen once here: only a joined warm-up's builder takes trades through a slot
-                let handler = if defer && self.is_joined_warmup(&key) {
-                    let buffer = WarmupBuffer::new();
-                    let joined = JoinedSlot::default();
-                    warmup = Some(BarAggregatorWarmup::JoinedTrade(
-                        buffer.clone(),
-                        joined.clone(),
-                    ));
-                    TypedHandler::new(JoinedTradeHandler::new(
-                        &aggregator,
-                        bar_type_std,
-                        buffer,
-                        joined,
-                    ))
-                } else {
-                    let buffer = defer.then(WarmupBuffer::new);
-                    let handler = TypedHandler::new(
-                        BarTradeHandler::new(&aggregator, bar_type_std).with_warmup(buffer.clone()),
-                    );
-                    warmup = buffer.map(BarAggregatorWarmup::Trade);
-                    handler
-                };
-                msgbus::subscribe_trades(
-                    topic.into(),
-                    handler.clone(),
-                    Some(BAR_AGGREGATOR_PRIORITY),
-                );
-                subscriptions.push(BarAggregatorSubscription::Trade { topic, handler });
-            } else {
-                // Warn if imbalance/runs aggregation is wired to quotes (needs aggressor_side from trades)
-                if matches!(
-                    bar_type.spec().aggregation,
-                    BarAggregation::TickImbalance
-                        | BarAggregation::VolumeImbalance
-                        | BarAggregation::ValueImbalance
-                        | BarAggregation::TickRuns
-                        | BarAggregation::VolumeRuns
-                        | BarAggregation::ValueRuns
-                ) {
-                    log::warn!(
-                        "Bar type {bar_type} uses imbalance/runs aggregation which requires trade \
-                         data with `aggressor_side`, but `price_type` is not LAST so it will receive \
-                         quote data: bars will not emit correctly",
-                    );
-                }
-
-                let topic = switchboard::get_quotes_topic(bar_type.instrument_id());
-                let buffer = defer.then(WarmupBuffer::new);
-                let handler = TypedHandler::new(
-                    BarQuoteHandler::new(&aggregator, bar_type_std).with_warmup(buffer.clone()),
-                );
-                warmup = buffer.map(BarAggregatorWarmup::Quote);
-                msgbus::subscribe_quotes(
-                    topic.into(),
-                    handler.clone(),
-                    Some(BAR_AGGREGATOR_PRIORITY),
-                );
-                subscriptions.push(BarAggregatorSubscription::Quote { topic, handler });
-            }
-
-            self.bar_aggregator_handlers.insert(key, subscriptions);
-
-            if let Some(warmup) = warmup {
-                self.bar_aggregator_warmups.insert(key, warmup);
-            }
+            self.subscribe_bar_aggregator_handlers(
+                key,
+                bar_type,
+                &aggregator,
+                defer_subscription_activation,
+            );
         }
 
         if defer_subscription_activation {
@@ -2533,17 +2486,92 @@ impl DataEngine {
         })
     }
 
-    /// Returns whether a kept request (`update_subscriptions`) that has not ended is building
-    /// the builder of `bar_type`'s standard bar type.
-    fn is_kept_request_building(&self, bar_type: BarType) -> bool {
-        let key = bar_aggregator_key(bar_type, None);
-        self.request_bar_aggregations.values().any(|state| {
-            state.update_subscriptions
-                && state
-                    .bar_types
-                    .iter()
-                    .any(|kept| bar_aggregator_key(*kept, None) == key)
-        })
+    fn subscribe_bar_aggregator_handlers(
+        &mut self,
+        key: BarAggregatorKey,
+        bar_type: BarType,
+        aggregator: &Rc<RefCell<Box<dyn BarAggregator>>>,
+        defer: bool,
+    ) {
+        // Subscribe to underlying data topics
+        let mut subscriptions = Vec::new();
+
+        let bar_type_std = bar_type.standard();
+        let warmup;
+
+        if bar_type.is_composite() {
+            let topic = switchboard::get_bars_topic(bar_type.composite());
+            let buffer = defer.then(WarmupBuffer::new);
+
+            let handler = TypedHandler::new(
+                BarBarHandler::new(aggregator, bar_type_std).with_warmup(buffer.clone()),
+            );
+
+            warmup = buffer.map(BarAggregatorWarmup::Bar);
+            msgbus::subscribe_bars(topic.into(), handler.clone(), None);
+            subscriptions.push(BarAggregatorSubscription::Bar { topic, handler });
+        } else if bar_type.spec().price_type == PriceType::Last {
+            let topic = switchboard::get_trades_topic(bar_type.instrument_id());
+            // Chosen once here: only a joined warm-up's builder takes trades through a slot
+            let handler = if defer && self.is_joined_warmup(&key) {
+                let buffer = WarmupBuffer::new();
+                let joined = JoinedSlot::default();
+                warmup = Some(BarAggregatorWarmup::JoinedTrade(
+                    buffer.clone(),
+                    joined.clone(),
+                ));
+                TypedHandler::new(JoinedTradeHandler::new(
+                    aggregator,
+                    bar_type_std,
+                    buffer,
+                    joined,
+                ))
+            } else {
+                let buffer = defer.then(WarmupBuffer::new);
+
+                let handler = TypedHandler::new(
+                    BarTradeHandler::new(aggregator, bar_type_std).with_warmup(buffer.clone()),
+                );
+
+                warmup = buffer.map(BarAggregatorWarmup::Trade);
+                handler
+            };
+            msgbus::subscribe_trades(topic.into(), handler.clone(), Some(BAR_AGGREGATOR_PRIORITY));
+            subscriptions.push(BarAggregatorSubscription::Trade { topic, handler });
+        } else {
+            // Warn if imbalance/runs aggregation is wired to quotes (needs aggressor_side from trades)
+            if matches!(
+                bar_type.spec().aggregation,
+                BarAggregation::TickImbalance
+                    | BarAggregation::VolumeImbalance
+                    | BarAggregation::ValueImbalance
+                    | BarAggregation::TickRuns
+                    | BarAggregation::VolumeRuns
+                    | BarAggregation::ValueRuns
+            ) {
+                log::warn!(
+                    "Bar type {bar_type} uses imbalance/runs aggregation which requires trade \
+                     data with `aggressor_side`, but `price_type` is not LAST so it will receive \
+                     quote data: bars will not emit correctly",
+                );
+            }
+
+            let topic = switchboard::get_quotes_topic(bar_type.instrument_id());
+            let buffer = defer.then(WarmupBuffer::new);
+
+            let handler = TypedHandler::new(
+                BarQuoteHandler::new(aggregator, bar_type_std).with_warmup(buffer.clone()),
+            );
+
+            warmup = buffer.map(BarAggregatorWarmup::Quote);
+            msgbus::subscribe_quotes(topic.into(), handler.clone(), Some(BAR_AGGREGATOR_PRIORITY));
+            subscriptions.push(BarAggregatorSubscription::Quote { topic, handler });
+        }
+
+        self.bar_aggregator_handlers.insert(key, subscriptions);
+        if let Some(warmup) = warmup {
+            self.bar_aggregator_warmups.insert(key, warmup);
+        }
     }
 
     fn subscribe_bar_aggregator(&mut self, cmd: &SubscribeBars) -> Option<SubscribeCommand> {
@@ -2762,6 +2790,17 @@ impl DataEngine {
         }
     }
 
+    pub(super) fn clear_bar_aggregators(&mut self) {
+        let keys: Vec<BarAggregatorKey> = self.bar_aggregators.keys().copied().collect();
+        for (bar_type, request_id) in keys {
+            if let Err(e) = self.stop_bar_aggregator(bar_type, request_id) {
+                log::error!("Error stopping bar aggregator during reset for {bar_type}: {e}");
+            }
+        }
+
+        self.subscriptions_bar_aggregation.clear();
+    }
+
     pub(super) fn stop_bar_aggregator(
         &mut self,
         bar_type: BarType,
@@ -2774,14 +2813,15 @@ impl DataEngine {
         })?;
 
         aggregator.borrow_mut().stop();
-        self.release_bar_aggregator_handlers(&key);
+        self.bar_aggregators_pending_stop.remove(&key);
+        self.unsubscribe_bar_aggregator_handlers(&key);
 
         Ok(())
     }
 
     /// Unsubscribes the message handlers of the builder under `key` and drops the live data held
     /// back for it, so nothing holds more for it (see [`BarAggregatorWarmup::discard`]).
-    fn release_bar_aggregator_handlers(&mut self, key: &BarAggregatorKey) {
+    fn unsubscribe_bar_aggregator_handlers(&mut self, key: &BarAggregatorKey) {
         if let Some(warmup) = self.bar_aggregator_warmups.remove(key) {
             warmup.discard();
         }

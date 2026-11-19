@@ -458,6 +458,8 @@ impl SubscribeCommand {
                     cmd.client_id,
                     cmd.venue,
                 );
+
+                unsubscribe.correlation_id = Some(cmd.owner_id());
                 unsubscribe.params = cmd.params;
                 UnsubscribeCommand::OptionChain(unsubscribe)
             }
@@ -927,7 +929,7 @@ impl UnsubscribeCommand {
             Self::InstrumentStatus(cmd) => cmd.correlation_id,
             Self::InstrumentClose(cmd) => cmd.correlation_id,
             Self::OptionGreeks(cmd) => cmd.correlation_id,
-            Self::OptionChain(_) => None,
+            Self::OptionChain(cmd) => cmd.correlation_id,
         }
     }
 }

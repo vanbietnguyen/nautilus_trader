@@ -17,11 +17,12 @@
 
 use std::{
     future::Future,
+    str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::{StreamExt, pin_mut};
@@ -37,6 +38,7 @@ use nautilus_common::{
 };
 use nautilus_core::{
     DurationNanos, Params, UUID4, UnixNanos,
+    datetime::{NANOSECONDS_IN_MILLISECOND, unix_nanos_to_iso8601},
     env::get_or_env_var,
     string::secret::SecretString,
     time::{AtomicTime, get_atomic_clock_realtime},
@@ -48,6 +50,7 @@ use nautilus_live::{
 };
 use nautilus_model::{
     accounts::AccountAny,
+    data::CustomData,
     enums::{OmsType, OrderStatus, OrderType},
     events::{OrderCanceled, OrderDeniedReason, OrderEventAny},
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue},
@@ -63,27 +66,34 @@ use crate::{
         consts::BYBIT_VENUE,
         credential::credential_env_vars,
         enums::{
-            BybitAccountType, BybitEnvironment, BybitOrderSide, BybitOrderSmpType, BybitOrderType,
-            BybitPositionIdx, BybitPositionMode, BybitProductType, BybitTpSlMode,
-            resolve_trigger_type,
+            BybitAccountType, BybitEnvironment, BybitMarginAction, BybitOrderSide,
+            BybitOrderSmpType, BybitOrderType, BybitPositionIdx, BybitPositionMode,
+            BybitProductType, BybitTpSlMode, resolve_trigger_type,
         },
         parse::{
             BybitTpSlParams, bybit_rejection_due_post_only, extract_raw_symbol, get_price_str,
             make_hedge_venue_position_id, map_time_in_force, nanos_to_millis,
-            parse_bybit_tp_sl_params, resolve_position_idx as resolve_bybit_position_idx,
-            spot_leverage, spot_market_unit, trigger_direction,
+            parse_bybit_tp_sl_params, parse_margin_action,
+            resolve_position_idx as resolve_bybit_position_idx, spot_leverage, spot_market_unit,
+            trigger_direction,
         },
         rate_limit::batch_send_limit,
         symbol::BybitSymbol,
     },
     config::BybitExecutionClientConfig,
+    data_types::{
+        BybitMarginBorrowResult, BybitMarginRepayResult, BybitMarginStatusResult,
+        register_bybit_custom_data,
+    },
     http::{
         client::BybitHttpClient,
         error::{
             BybitCancelOrderError, BybitHttpError, BybitModifyOrderError, BybitSubmitOrderError,
             is_bybit_ambiguous_order_error_code,
         },
+        reconciliation::{ReportRead, instrument_in_scope},
     },
+    repay::repay_blackout_delay,
     websocket::{
         client::BybitWebSocketClient,
         dispatch::{
@@ -154,8 +164,8 @@ impl BybitExecutionClient {
 
         let mut ws_private = BybitWebSocketClient::new_private(
             config.environment,
-            Some(api_key.clone()),
-            Some(api_secret.clone()),
+            Some(api_key),
+            Some(api_secret),
             Some(config.ws_private_url()),
             config.heartbeat_interval_secs,
             config.transport_backend,
@@ -173,8 +183,7 @@ impl BybitExecutionClient {
 
         let mut ws_trade = BybitWebSocketClient::new_trade(
             config.environment,
-            Some(api_key),
-            Some(api_secret),
+            http_client.clone(),
             Some(config.ws_trade_url()),
             config.heartbeat_interval_secs,
             config.transport_backend,
@@ -233,7 +242,7 @@ impl BybitExecutionClient {
         product_types: Vec<BybitProductType>,
         instruments: Arc<AHashMap<Ustr, InstrumentAny>>,
         state: Arc<WsDispatchState>,
-    ) {
+    ) -> anyhow::Result<()> {
         for product_type in product_types {
             match http_client
                 .request_fee_rates(product_type, None, None)
@@ -249,11 +258,24 @@ impl BybitExecutionClient {
                         cache_execution_fee_rates(&state, &instruments, product_type, fee_rates);
                     log::debug!("Cached {cached} {product_type:?} execution fee rates");
                 }
-                Err(e) => log::warn!(
-                    "Failed to refresh {product_type:?} execution fee rates, retaining previous rates when available: {e}"
-                ),
+                Err(e) => {
+                    let has_previous_rates = state.fee_rates.iter().any(|entry| {
+                        BybitProductType::from_suffix(entry.key().symbol.as_str())
+                            == Some(product_type)
+                    });
+
+                    anyhow::ensure!(
+                        has_previous_rates,
+                        "failed to request {product_type:?} execution fee rates: {e}"
+                    );
+                    log::warn!(
+                        "Failed to refresh {product_type:?} execution fee rates, retaining previous rates: {e}"
+                    );
+                }
             }
         }
+
+        Ok(())
     }
 
     async fn initialize_instruments(
@@ -295,15 +317,15 @@ impl BybitExecutionClient {
             self.core.set_instruments_initialized();
         }
 
+        // Fast fills need these rates, so load them before the private stream connects
         if self.config.use_ws_execution_fast {
-            let http_client = self.http_client.clone();
-            let instruments = Arc::clone(&self.instruments_cache);
-            let state = Arc::clone(&self.dispatch_state);
-            self.spawn_task("refresh Bybit execution fee rates", async move {
-                Self::refresh_execution_fee_rates(http_client, product_types, instruments, state)
-                    .await;
-                Ok(())
-            });
+            Self::refresh_execution_fee_rates(
+                self.http_client.clone(),
+                product_types,
+                Arc::clone(&self.instruments_cache),
+                Arc::clone(&self.dispatch_state),
+            )
+            .await?;
         }
 
         Ok(())
@@ -383,6 +405,234 @@ impl BybitExecutionClient {
             emitter.send_account_state(account_state);
             Ok(())
         });
+    }
+
+    fn borrow_spot_margin(&self, coin: Option<String>, amount: Option<String>, amount_given: bool) {
+        let Some(coin) = coin else {
+            log::error!("Borrow action requires 'coin' param");
+            return;
+        };
+
+        let quantity = match Self::margin_quantity(&coin, amount.as_deref(), amount_given) {
+            Ok(quantity) => quantity,
+            Err(message) => {
+                log::error!("{message}");
+                let ts_now = self.clock.get_time_ns();
+
+                let result = BybitMarginBorrowResult::new(
+                    coin,
+                    amount.unwrap_or_default(),
+                    false,
+                    message.to_string(),
+                    ts_now,
+                    ts_now,
+                );
+                self.emitter
+                    .send_custom_data(CustomData::from_arc(Arc::new(result)));
+                return;
+            }
+        };
+
+        let amount_str = quantity.to_string();
+
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+        self.spawn_task("borrow_spot", async move {
+            let ts_now = clock.get_time_ns();
+
+            let (success, message) = match http_client.borrow_spot(&coin, quantity).await {
+                Ok(_) => {
+                    log::info!("Borrowed {quantity} {coin}");
+                    (true, String::new())
+                }
+                Err(e) => {
+                    let message = format!("{e}");
+                    log::error!("Borrow failed: {message}");
+                    (false, message)
+                }
+            };
+
+            let result =
+                BybitMarginBorrowResult::new(coin, amount_str, success, message, ts_now, ts_now);
+            emitter.send_custom_data(CustomData::from_arc(Arc::new(result)));
+            Ok(())
+        });
+    }
+
+    fn repay_spot_margin(&self, coin: Option<String>, amount: Option<String>, amount_given: bool) {
+        let Some(coin) = coin else {
+            log::error!("Repay action requires 'coin' param");
+            return;
+        };
+
+        // A missing amount repays the whole outstanding borrow; a present amount that is
+        // not a string or number must fail instead of becoming a repay-all.
+        let quantity = match amount.as_deref() {
+            Some(amount_str) => match Self::margin_quantity(&coin, Some(amount_str), true) {
+                Ok(quantity) => Some(quantity),
+                Err(message) => {
+                    log::error!("{message}");
+                    let ts_now = self.clock.get_time_ns();
+
+                    let result = BybitMarginRepayResult::new(
+                        coin,
+                        amount,
+                        false,
+                        "FAIL".to_string(),
+                        message.to_string(),
+                        ts_now,
+                        ts_now,
+                    );
+                    self.emitter
+                        .send_custom_data(CustomData::from_arc(Arc::new(result)));
+                    return;
+                }
+            },
+            None if amount_given => {
+                let message = format!("invalid 'amount' for {coin}, was not a string or number");
+                log::error!("{message}");
+                let ts_now = self.clock.get_time_ns();
+
+                let result = BybitMarginRepayResult::new(
+                    coin,
+                    None,
+                    false,
+                    "FAIL".to_string(),
+                    message,
+                    ts_now,
+                    ts_now,
+                );
+                self.emitter
+                    .send_custom_data(CustomData::from_arc(Arc::new(result)));
+                return;
+            }
+            None => None,
+        };
+
+        let amount_str = quantity.map(|quantity| quantity.to_string());
+
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+        self.spawn_task("repay_spot", async move {
+            // Manual repayment uses no-convert repayment, so a balance shortfall fails
+            // instead of spending other assets, and only the repay endpoints are blocked
+            // by the hourly interest-calculation window. The check runs in the task
+            // directly before the request; throttling after the check can still
+            // carry a request into the window, which the docs disclose as a venue error.
+            let now_ns = clock.get_time_ns();
+
+            if let Some(result) =
+                Self::repay_blackout_rejection(&coin, amount_str.as_deref(), now_ns)
+            {
+                log::warn!("Deferring manual repay: {}", result.message);
+                emitter.send_custom_data(CustomData::from_arc(Arc::new(result)));
+                return Ok(());
+            }
+
+            let ts_now = clock.get_time_ns();
+
+            let (success, result_status, message) =
+                match http_client.repay_spot_borrow(&coin, quantity).await {
+                    Ok(response) => {
+                        let status = response.result.result_status;
+                        log::info!(
+                            "Repaid {} {coin} (result status {status})",
+                            amount_str.as_deref().unwrap_or("all"),
+                        );
+                        (true, status.to_string(), String::new())
+                    }
+                    Err(e) => {
+                        let message = format!("{e}");
+                        log::error!("Repay failed: {message}");
+                        (false, "FAIL".to_string(), message)
+                    }
+                };
+
+            let result = BybitMarginRepayResult::new(
+                coin,
+                amount_str,
+                success,
+                result_status,
+                message,
+                ts_now,
+                ts_now,
+            );
+            emitter.send_custom_data(CustomData::from_arc(Arc::new(result)));
+            Ok(())
+        });
+    }
+
+    fn query_spot_borrow_amount(&self, coin: Option<String>) {
+        let Some(coin) = coin else {
+            log::error!("Get borrow amount action requires 'coin' param");
+            return;
+        };
+
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+
+        self.spawn_task("get_spot_borrow_amount", async move {
+            let borrow_amount = http_client
+                .get_spot_borrow_amount(&coin)
+                .await
+                .with_context(|| format!("failed to query borrow amount for {coin}"))?;
+            let ts_now = clock.get_time_ns();
+            log::info!("Borrow amount for {coin}: {borrow_amount}");
+            let result =
+                BybitMarginStatusResult::new(coin, borrow_amount.to_string(), ts_now, ts_now);
+            emitter.send_custom_data(CustomData::from_arc(Arc::new(result)));
+            Ok(())
+        });
+    }
+
+    fn margin_quantity(
+        coin: &str,
+        amount: Option<&str>,
+        amount_given: bool,
+    ) -> anyhow::Result<Quantity> {
+        let Some(amount) = amount else {
+            if amount_given {
+                anyhow::bail!("invalid 'amount' for {coin}, was not a string or number");
+            }
+
+            anyhow::bail!("Borrow action requires an 'amount' param for {coin}");
+        };
+
+        let quantity = Quantity::from_str(amount)
+            .map_err(|e| anyhow::anyhow!("invalid 'amount' for {coin}: '{amount}', was {e}"))?;
+        anyhow::ensure!(
+            quantity.as_decimal() > rust_decimal::Decimal::ZERO,
+            "invalid 'amount' for {coin}: '{amount}', was not a positive value",
+        );
+        Ok(quantity)
+    }
+
+    /// Builds the failed result for a manual repay inside Bybit's hourly blackout,
+    /// or `None` when repayment is allowed.
+    #[must_use]
+    fn repay_blackout_rejection(
+        coin: &str,
+        amount: Option<&str>,
+        now_ns: UnixNanos,
+    ) -> Option<BybitMarginRepayResult> {
+        let wait = repay_blackout_delay(now_ns)?;
+        let retry_ns = now_ns + DurationNanos::new(wait.as_nanos() as u64);
+        let message = format!(
+            "Bybit repay blackout window (mm:04:00-mm:05:30 UTC); retry after {}",
+            unix_nanos_to_iso8601(retry_ns),
+        );
+        Some(BybitMarginRepayResult::new(
+            coin.to_string(),
+            amount.map(str::to_string),
+            false,
+            "FAIL".to_string(),
+            message,
+            now_ns,
+            now_ns,
+        ))
     }
 
     fn spawn_task<F>(&self, description: &'static str, fut: F)
@@ -529,7 +779,12 @@ impl BybitExecutionClient {
 
             let mut fetched = self
                 .http_client
-                .request_position_status_reports(self.core.account_id, product_type, None)
+                .request_position_status_reports_scoped(
+                    self.core.account_id,
+                    product_type,
+                    None,
+                    self.config.load_ids.as_deref(),
+                )
                 .await?;
             reports.append(&mut fetched);
         }
@@ -545,6 +800,7 @@ impl BybitExecutionClient {
         manual_override: Option<BybitPositionIdx>,
     ) -> Option<BybitPositionIdx> {
         let product_type = self.get_product_type_for_instrument(instrument_id);
+
         if !matches!(
             product_type,
             BybitProductType::Linear | BybitProductType::Inverse
@@ -848,7 +1104,7 @@ fn submit_rejection_reason(error: &anyhow::Error) -> Option<&str> {
             error_code,
             message,
         }) = cause.downcast_ref()
-            && !is_bybit_ambiguous_order_error_code(i64::from(*error_code))
+            && !http_order_error_is_ambiguous(*error_code)
         {
             return Some(message.as_str());
         }
@@ -892,7 +1148,9 @@ impl ExecutionClient for BybitExecutionClient {
             return false;
         };
 
-        self.product_types().contains(&product_type)
+        instrument_id.venue == *BYBIT_VENUE
+            && instrument_in_scope(instrument_id, self.config.load_ids.as_deref())
+            && self.product_types().contains(&product_type)
             && Self::provides_bulk_position_coverage_for_product_type(product_type)
     }
 
@@ -901,6 +1159,10 @@ impl ExecutionClient for BybitExecutionClient {
         {
             return Ok(());
         }
+
+        // Margin results publish as custom data, which streaming and catalog writers
+        // can only serialize once the types are registered.
+        register_bybit_custom_data();
 
         if !self.pending_tasks.is_open() || !self.session_tasks.is_open() {
             self.teardown_partial_connect().await?;
@@ -994,8 +1256,33 @@ impl ExecutionClient for BybitExecutionClient {
         Ok(())
     }
 
-    fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
-        self.update_account_state();
+    fn query_account(&self, cmd: QueryAccount) -> anyhow::Result<()> {
+        let params = cmd.params.as_ref();
+
+        let action = params
+            .and_then(|params| params.get_str("action"))
+            .and_then(parse_margin_action);
+
+        let Some(action) = action else {
+            if let Some(action_str) = params.and_then(|params| params.get_str("action")) {
+                log::warn!("Unknown query_account action: {action_str}");
+            }
+
+            self.update_account_state();
+            return Ok(());
+        };
+
+        let coin = params
+            .and_then(|params| params.get_str("coin"))
+            .map(String::from);
+        let amount_given = params.is_some_and(|params| params.contains_key("amount"));
+        let amount = params.and_then(|params| get_price_str(params, "amount"));
+        match action {
+            BybitMarginAction::Borrow => self.borrow_spot_margin(coin, amount, amount_given),
+            BybitMarginAction::Repay => self.repay_spot_margin(coin, amount, amount_given),
+            BybitMarginAction::GetBorrowAmount => self.query_spot_borrow_amount(coin),
+        }
+
         Ok(())
     }
 
@@ -1171,16 +1458,16 @@ impl ExecutionClient for BybitExecutionClient {
             )
         });
 
+        let load_ids = self.config.load_ids.clone();
         let command = cmd.clone();
         Some(ExecutionReportTask::new(
             async move {
                 let Some((instrument_id, product_type)) = instrument else {
-                    log::warn!("generate_order_status_report requires instrument_id: {command}");
-                    return Ok(None);
+                    anyhow::bail!("generate_order_status_report requires instrument_id: {command}");
                 };
 
                 let reports = http_client
-                    .request_order_status_reports(
+                    .request_order_status_reports_scoped(
                         account_id,
                         product_type,
                         Some(instrument_id),
@@ -1188,8 +1475,11 @@ impl ExecutionClient for BybitExecutionClient {
                         None,
                         None,
                         None,
+                        load_ids.as_deref(),
+                        (None, None),
                     )
-                    .await?;
+                    .await?
+                    .into_reports()?;
 
                 Ok(reports.into_iter().find(|report| {
                     command
@@ -1232,25 +1522,19 @@ impl ExecutionClient for BybitExecutionClient {
             |instrument_id| vec![self.get_product_type_for_instrument(instrument_id)],
         );
 
+        let load_ids = self.config.load_ids.clone();
         let command = cmd.clone();
         Some(ExecutionReportTask::new(
             async move {
-                let mut reports = Vec::new();
-
-                for product_type in product_types {
-                    let mut fetched = http_client
-                        .request_order_status_reports(
-                            account_id,
-                            product_type,
-                            command.instrument_id,
-                            command.open_only,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await?;
-                    reports.append(&mut fetched);
-                }
+                let mut reports = collect_order_status_reports(
+                    &http_client,
+                    account_id,
+                    product_types,
+                    &command,
+                    load_ids.as_deref(),
+                )
+                .await?
+                .into_reports()?;
 
                 if let Some(start) = command.start {
                     reports.retain(|report| report.ts_last >= start);
@@ -1305,34 +1589,18 @@ impl ExecutionClient for BybitExecutionClient {
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        let start_ms = nanos_to_millis(cmd.start);
-        let end_ms = nanos_to_millis(cmd.end);
-        let product_types = cmd.instrument_id.map_or_else(
-            || self.product_types(),
-            |instrument_id| vec![self.get_product_type_for_instrument(instrument_id)],
-        );
-        let mut reports = Vec::new();
-
-        for product_type in product_types {
-            let mut fetched = self
-                .http_client
-                .request_fill_reports(
-                    self.core.account_id,
-                    product_type,
-                    cmd.instrument_id,
-                    start_ms,
-                    end_ms,
-                    None,
-                )
-                .await?;
-            reports.append(&mut fetched);
-        }
-
-        if let Some(venue_order_id) = cmd.venue_order_id {
-            reports.retain(|report| report.venue_order_id.as_str() == venue_order_id.as_str());
-        }
-
-        Ok(reports)
+        collect_fill_reports(
+            &self.http_client,
+            self.core.account_id,
+            cmd.instrument_id.map_or_else(
+                || self.product_types(),
+                |id| vec![self.get_product_type_for_instrument(id)],
+            ),
+            &cmd,
+            self.config.load_ids.as_deref(),
+        )
+        .await?
+        .into_reports()
     }
 
     async fn generate_position_status_reports(
@@ -1342,10 +1610,11 @@ impl ExecutionClient for BybitExecutionClient {
         if let Some(instrument_id) = cmd.instrument_id {
             let product_type = self.get_product_type_for_instrument(instrument_id);
             self.http_client
-                .request_position_status_reports(
+                .request_position_status_reports_scoped(
                     self.core.account_id,
                     product_type,
                     Some(instrument_id),
+                    self.config.load_ids.as_deref(),
                 )
                 .await
         } else {
@@ -1361,11 +1630,13 @@ impl ExecutionClient for BybitExecutionClient {
         log::info!("Generating ExecutionMassStatus (lookback_mins={lookback_mins:?})");
 
         let ts_now = self.clock.get_time_ns();
-
         let start = lookback_mins
             .map(DurationNanos::try_from_mins)
             .transpose()?
-            .map(|lookback| ts_now.saturating_sub(lookback));
+            .map(|lookback| {
+                let cutoff = ts_now.saturating_sub(lookback).as_u64();
+                UnixNanos::from(cutoff / NANOSECONDS_IN_MILLISECOND * NANOSECONDS_IN_MILLISECOND)
+            });
 
         let order_cmd = GenerateOrderStatusReportsBuilder::default()
             .ts_init(ts_now)
@@ -1396,11 +1667,83 @@ impl ExecutionClient for BybitExecutionClient {
                 .await
         };
 
-        let (order_reports, fill_reports, position_reports) = tokio::try_join!(
-            self.generate_order_status_reports(&order_cmd),
-            self.generate_fill_reports(fill_cmd),
+        let (order_read, fill_read, position_reports) = tokio::try_join!(
+            collect_order_status_reports(
+                &self.http_client,
+                self.core.account_id,
+                self.product_types(),
+                &order_cmd,
+                self.config.load_ids.as_deref()
+            ),
+            collect_fill_reports(
+                &self.http_client,
+                self.core.account_id,
+                self.product_types(),
+                &fill_cmd,
+                self.config.load_ids.as_deref()
+            ),
             position_reports_fut,
         )?;
+        // Leave room for request latency in the venue's 24-hour terminal-order retention
+        let within_history = lookback_mins.is_none_or(|mins| mins < 24 * 60);
+        let option_history_covered = !self
+            .config
+            .product_types
+            .contains(&BybitProductType::Option);
+
+        let orders_linked = if start.is_some() {
+            let order_ids: AHashSet<_> = order_read
+                .reports
+                .iter()
+                .map(|report| report.venue_order_id)
+                .collect();
+            let cache = self.core.cache();
+            fill_read.reports.iter().all(|fill| {
+                order_ids.contains(&fill.venue_order_id)
+                    || fill
+                        .client_order_id
+                        .is_some_and(|id| cache.order_exists(&id))
+                    || cache
+                        .client_order_id(&fill.venue_order_id)
+                        .is_some_and(|id| cache.order_exists(id))
+            })
+        } else {
+            true
+        };
+
+        let complete = within_history
+            && option_history_covered
+            && orders_linked
+            && !order_read.historical_incomplete
+            && !fill_read.historical_incomplete;
+
+        if !within_history {
+            log::warn!(
+                "Reconciliation lookback reaches Bybit's 24-hour terminal-order retention, history is incomplete"
+            );
+        }
+
+        if !option_history_covered {
+            log::warn!("Bulk option fill history defaults to BTC, history is incomplete");
+        }
+
+        if !orders_linked {
+            log::warn!("Reconciliation fills lack order evidence, history is incomplete");
+        }
+
+        let order_reports = order_read.reports;
+        let fill_reports = fill_read.reports;
+
+        for report in &order_reports {
+            cache_reconciliation_order_identity(
+                self.core.account_id,
+                Some(&self.core),
+                &self.dispatch_state,
+                report,
+                &self.instruments_cache,
+                &self.emitter,
+            );
+        }
 
         log::info!("Received {} OrderStatusReports", order_reports.len());
         log::info!("Received {} FillReports", fill_reports.len());
@@ -1417,6 +1760,9 @@ impl ExecutionClient for BybitExecutionClient {
         mass_status.add_order_reports(order_reports);
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
+        if start.is_some() {
+            mass_status.set_report_window(start, complete);
+        }
 
         Ok(Some(mass_status))
     }
@@ -2648,6 +2994,10 @@ fn classify_modify_http_failure(error: &anyhow::Error) -> CommandFailure {
     classify_http_failure(error)
 }
 
+fn http_order_error_is_ambiguous(code: i32) -> bool {
+    is_bybit_ambiguous_order_error_code(i64::from(code))
+}
+
 fn classify_http_failure(error: &anyhow::Error) -> CommandFailure {
     let reason = error.to_string();
 
@@ -2658,7 +3008,7 @@ fn classify_http_failure(error: &anyhow::Error) -> CommandFailure {
 
         return match http_error {
             BybitHttpError::BybitError { error_code, .. }
-                if is_bybit_ambiguous_order_error_code(i64::from(*error_code)) =>
+                if http_order_error_is_ambiguous(*error_code) =>
             {
                 CommandFailure::Ambiguous(reason)
             }
@@ -2674,6 +3024,71 @@ fn classify_http_failure(error: &anyhow::Error) -> CommandFailure {
     }
 
     CommandFailure::NotSent(reason)
+}
+
+async fn collect_order_status_reports(
+    http_client: &BybitHttpClient,
+    account_id: AccountId,
+    product_types: Vec<BybitProductType>,
+    command: &GenerateOrderStatusReports,
+    load_ids: Option<&[InstrumentId]>,
+) -> anyhow::Result<ReportRead<OrderStatusReport>> {
+    // Venue history windows filter creation time; reconciliation filters update time
+    let history_window = (nanos_to_millis(command.start), nanos_to_millis(command.end));
+    let mut read = ReportRead::new();
+
+    for product_type in product_types {
+        let mut fetched = http_client
+            .request_order_status_reports_scoped(
+                account_id,
+                product_type,
+                command.instrument_id,
+                command.open_only,
+                None,
+                None,
+                None,
+                load_ids,
+                history_window,
+            )
+            .await?;
+        read.historical_incomplete |= fetched.historical_incomplete;
+        read.reports.append(&mut fetched.reports);
+    }
+
+    Ok(read)
+}
+
+async fn collect_fill_reports(
+    http_client: &BybitHttpClient,
+    account_id: AccountId,
+    product_types: Vec<BybitProductType>,
+    command: &GenerateFillReports,
+    load_ids: Option<&[InstrumentId]>,
+) -> anyhow::Result<ReportRead<FillReport>> {
+    let mut read = ReportRead::new();
+
+    for product_type in product_types {
+        let mut fetched = http_client
+            .request_fill_reports_scoped(
+                account_id,
+                product_type,
+                command.instrument_id,
+                nanos_to_millis(command.start),
+                nanos_to_millis(command.end),
+                None,
+                load_ids,
+            )
+            .await?;
+        read.historical_incomplete |= fetched.historical_incomplete;
+        read.reports.append(&mut fetched.reports);
+    }
+
+    if let Some(venue_order_id) = command.venue_order_id {
+        read.reports
+            .retain(|report| report.venue_order_id.as_str() == venue_order_id.as_str());
+    }
+
+    Ok(read)
 }
 
 fn cache_reconciliation_order_identity(
@@ -2800,6 +3215,10 @@ fn cached_order_has_terminal_quantity(
 }
 
 #[cfg(test)]
+#[path = "../tests/integration/exec_client.rs"]
+mod exec_client_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{
         cell::RefCell,
@@ -2810,6 +3229,7 @@ mod tests {
 
     use axum::{
         Json, Router,
+        extract::Query,
         routing::{get, post},
     };
     use nautilus_common::{
@@ -2829,6 +3249,7 @@ mod tests {
     use nautilus_model::{
         enums::{AccountType, OrderSide, OrderStatus, TimeInForce},
         events::OrderEventAny,
+        fees::MakerTakerFeeRates,
         identifiers::{
             ClientOrderId, OrderListId, PositionId, StrategyId, TradeId, TraderId, VenueOrderId,
         },
@@ -2837,6 +3258,7 @@ mod tests {
         types::Quantity,
     };
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use super::*;
     use crate::{
@@ -2847,6 +3269,13 @@ mod tests {
         },
         http::models::BybitInstrumentLinearResponse,
     };
+
+    fn cache_fee_rates(client: &BybitExecutionClient, instrument_id: InstrumentId) {
+        client.dispatch_state.fee_rates.insert(
+            instrument_id,
+            MakerTakerFeeRates::new(dec!(0.0001), dec!(0.0006)),
+        );
+    }
 
     fn test_execution_client() -> (BybitExecutionClient, Rc<RefCell<Cache>>) {
         let cache = Rc::new(RefCell::new(Cache::default()));
@@ -2978,8 +3407,9 @@ mod tests {
         });
         assert_eq!(
             classify_cancel_http_failure(&rate_limit),
-            CommandFailure::VenueRejected(rate_limit.to_string()),
+            CommandFailure::Ambiguous(rate_limit.to_string()),
         );
+        assert!(submit_rejection_reason(&rate_limit).is_none());
 
         let post_lookup = anyhow::Error::from(BybitCancelOrderError::PostCancelLookup {
             source: anyhow::anyhow!("history lookup failed"),
@@ -2996,6 +3426,47 @@ mod tests {
             classify_cancel_http_failure(&transport),
             CommandFailure::Ambiguous(transport.to_string()),
         );
+    }
+
+    #[rstest]
+    #[case::window_start(4, 0)]
+    #[case::window_end(5, 30)]
+    fn test_repay_blackout_rejection_publishes_failed_result_inside_window(
+        #[case] minute: u64,
+        #[case] second: u64,
+    ) {
+        let now_ns = UnixNanos::from((100 * 3600 + minute * 60 + second) * 1_000_000_000);
+
+        let result = BybitExecutionClient::repay_blackout_rejection("ETH", Some("0.500"), now_ns)
+            .expect("expected a rejection inside the blackout window");
+
+        assert_eq!(result.coin, "ETH");
+        assert_eq!(result.amount.as_deref(), Some("0.500"));
+        assert!(!result.success);
+        assert_eq!(result.result_status, "FAIL");
+        assert!(
+            result
+                .message
+                .starts_with("Bybit repay blackout window (mm:04:00-mm:05:30 UTC); retry after ")
+        );
+        assert!(result.message.contains(":05:31"), "was {}", result.message);
+        assert_eq!(result.ts_event, now_ns);
+        assert_eq!(result.ts_init, now_ns);
+    }
+
+    #[rstest]
+    #[case::before_window(3, 59)]
+    #[case::after_window(5, 31)]
+    #[case::mid_hour(30, 0)]
+    fn test_repay_blackout_rejection_allows_repayment_outside_window(
+        #[case] minute: u64,
+        #[case] second: u64,
+    ) {
+        let now_ns = UnixNanos::from((100 * 3600 + minute * 60 + second) * 1_000_000_000);
+
+        let result = BybitExecutionClient::repay_blackout_rejection("ETH", None, now_ns);
+
+        assert!(result.is_none());
     }
 
     #[rstest]
@@ -3034,6 +3505,22 @@ mod tests {
             classify_modify_http_failure(&status),
             CommandFailure::Ambiguous(status.to_string()),
         );
+    }
+
+    #[rstest]
+    #[case::visits(10006)]
+    #[case::frequency_protection(10429)]
+    fn test_rate_limit_http_order_failures_stay_ambiguous(#[case] code: i32) {
+        let error = anyhow::Error::from(BybitHttpError::BybitError {
+            error_code: code,
+            message: "Too many visits".to_string(),
+        });
+
+        let expected = CommandFailure::Ambiguous(error.to_string());
+
+        assert_eq!(classify_cancel_http_failure(&error), expected);
+        assert_eq!(classify_modify_http_failure(&error), expected);
+        assert!(submit_rejection_reason(&error).is_none());
     }
 
     #[rstest]
@@ -3650,6 +4137,7 @@ mod tests {
         client.emitter.set_sender(tx);
         let accepted =
             sample_order_status_report(client_order_id, instrument_id, OrderStatus::Accepted, None);
+        cache_fee_rates(&client, instrument_id);
         let json = crate::common::testing::load_test_json("ws_account_execution_fast.json");
         let mut fast: crate::websocket::messages::BybitWsAccountExecutionFastMsg =
             serde_json::from_str(&json).unwrap();
@@ -3802,6 +4290,7 @@ mod tests {
         client.instruments_cache = Arc::new(instruments);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(tx);
+        cache_fee_rates(&client, instrument_id);
         let json = crate::common::testing::load_test_json("ws_account_execution_fast.json");
         let mut fast: crate::websocket::messages::BybitWsAccountExecutionFastMsg =
             serde_json::from_str(&json).unwrap();
@@ -3836,7 +4325,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_refresh_execution_fee_rates_retains_previous_on_failure() {
+    async fn test_refresh_execution_fee_rates_failure_requires_previous_rates() {
         let fee_response: serde_json::Value = serde_json::from_str(
             &crate::common::testing::load_test_json("http_get_fee_rate.json"),
         )
@@ -3895,23 +4384,31 @@ mod tests {
         instruments.insert(instrument_id.symbol.inner(), instrument);
         let instruments = Arc::new(instruments);
 
-        BybitExecutionClient::refresh_execution_fee_rates(
-            client.http_client.clone(),
-            vec![BybitProductType::Linear],
-            Arc::clone(&instruments),
-            Arc::clone(&client.dispatch_state),
-        )
-        .await;
-        let previous = *client.dispatch_state.fee_rates.get(&instrument_id).unwrap();
-        failing.store(true, Ordering::Relaxed);
-        BybitExecutionClient::refresh_execution_fee_rates(
-            client.http_client.clone(),
-            vec![BybitProductType::Linear],
-            instruments,
-            Arc::clone(&client.dispatch_state),
-        )
-        .await;
+        let refresh = || {
+            BybitExecutionClient::refresh_execution_fee_rates(
+                client.http_client.clone(),
+                vec![BybitProductType::Linear],
+                Arc::clone(&instruments),
+                Arc::clone(&client.dispatch_state),
+            )
+        };
 
+        failing.store(true, Ordering::Relaxed);
+        let error = refresh().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("failed to request Linear execution fee rates: "),
+            "{error}"
+        );
+        assert!(client.dispatch_state.fee_rates.is_empty());
+
+        failing.store(false, Ordering::Relaxed);
+        refresh().await.unwrap();
+        let previous = *client.dispatch_state.fee_rates.get(&instrument_id).unwrap();
+
+        failing.store(true, Ordering::Relaxed);
+        refresh().await.unwrap();
         assert_eq!(
             *client.dispatch_state.fee_rates.get(&instrument_id).unwrap(),
             previous
@@ -4045,6 +4542,7 @@ mod tests {
             None,
         );
         report.client_order_id = None;
+        cache_fee_rates(&client, instrument_id);
         let json = crate::common::testing::load_test_json("ws_account_execution_fast.json");
         let mut fast: crate::websocket::messages::BybitWsAccountExecutionFastMsg =
             serde_json::from_str(&json).unwrap();
@@ -4485,7 +4983,6 @@ mod tests {
     )]
     #[case::client_only(Some("ETHUSDT-LINEAR.BYBIT"), Some("client-open-2"), None, Some(("client-open-2", "open-order-2")))]
     #[case::venue_only(Some("ETHUSDT-LINEAR.BYBIT"), None, Some("open-order-2"), Some(("client-open-2", "open-order-2")))]
-    #[case::missing_instrument(None, Some("client-open-1"), Some("open-order-1"), None)]
     #[tokio::test]
     async fn test_single_report_task_preserves_lookup_filters(
         #[case] instrument: Option<&str>,
@@ -4520,6 +5017,674 @@ mod tests {
                 VenueOrderId::from(venue)
             )),
         );
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_single_report_missing_instrument_returns_error() {
+        let orders = serde_json::from_str(&crate::common::testing::load_test_json(
+            "http_get_orders_realtime.json",
+        ))
+        .unwrap();
+        let (client, _, server) = order_report_client(orders).await;
+
+        let command = GenerateOrderStatusReport::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            Some(ClientOrderId::from("client-open-1")),
+            Some(VenueOrderId::from("open-order-1")),
+            None,
+            None,
+        );
+
+        for fused in [false, true] {
+            let error = if fused {
+                client
+                    .generate_order_status_report(&command)
+                    .await
+                    .unwrap_err()
+            } else {
+                let task = client.generate_order_status_report_task(&command).unwrap();
+                tokio::spawn(task.collection).await.unwrap();
+                (task.finish)().unwrap_err()
+            };
+
+            assert_eq!(
+                error.to_string(),
+                format!("generate_order_status_report requires instrument_id: {command}"),
+            );
+        }
+
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_single_report_parse_failure_returns_error() {
+        let mut orders: serde_json::Value = serde_json::from_str(
+            &crate::common::testing::load_test_json("http_get_orders_realtime.json"),
+        )
+        .unwrap();
+        orders["result"]["list"].as_array_mut().unwrap().truncate(1);
+        orders["result"]["list"][0]["qty"] = serde_json::json!("not-a-number");
+        let (client, _, server) = order_report_client(orders).await;
+
+        let command = GenerateOrderStatusReport::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(InstrumentId::from("ETHUSDT-LINEAR.BYBIT")),
+            Some(ClientOrderId::from("client-open-1")),
+            Some(VenueOrderId::from("open-order-1")),
+            None,
+            None,
+        );
+
+        for fused in [false, true] {
+            let error = if fused {
+                client
+                    .generate_order_status_report(&command)
+                    .await
+                    .unwrap_err()
+            } else {
+                let task = client.generate_order_status_report_task(&command).unwrap();
+                tokio::spawn(task.collection).await.unwrap();
+                (task.finish)().unwrap_err()
+            };
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("Failed to parse order.qty='not-a-number' as Decimal"),
+                "error was: {error}",
+            );
+        }
+
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_single_report_nonmatching_parse_failure_returns_error() {
+        let mut orders: serde_json::Value = serde_json::from_str(
+            &crate::common::testing::load_test_json("http_get_orders_realtime.json"),
+        )
+        .unwrap();
+        orders["result"]["list"][1]["qty"] = serde_json::json!("not-a-number");
+        let (client, _, server) = order_report_client(orders).await;
+
+        let command = GenerateOrderStatusReport::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(InstrumentId::from("ETHUSDT-LINEAR.BYBIT")),
+            Some(ClientOrderId::from("client-open-1")),
+            Some(VenueOrderId::from("open-order-1")),
+            None,
+            None,
+        );
+
+        for fused in [false, true] {
+            let error = if fused {
+                client
+                    .generate_order_status_report(&command)
+                    .await
+                    .unwrap_err()
+            } else {
+                let task = client.generate_order_status_report_task(&command).unwrap();
+                tokio::spawn(task.collection).await.unwrap();
+                (task.finish)().unwrap_err()
+            };
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("Failed to parse order.qty='not-a-number' as Decimal"),
+                "error was: {error}",
+            );
+        }
+
+        server.abort();
+    }
+
+    #[rstest]
+    #[case::unrestricted_miss("UNLOADEDUSDT", None, true)]
+    #[case::explicit_miss("UNLOADEDUSDT", Some("UNLOADEDUSDT-LINEAR.BYBIT"), true)]
+    #[case::excluded_miss("UNLOADEDUSDT", Some("ETHUSDT-LINEAR.BYBIT"), false)]
+    #[case::excluded_cached("ETHUSDT", Some("BTCUSDT-LINEAR.BYBIT"), false)]
+    #[case::unknown_identity("", Some("ETHUSDT-LINEAR.BYBIT"), true)]
+    #[tokio::test]
+    async fn test_bulk_order_reconciliation_scope(
+        #[case] symbol: &str,
+        #[case] scope: Option<&str>,
+        #[case] fails: bool,
+    ) {
+        let mut orders: serde_json::Value = serde_json::from_str(
+            &crate::common::testing::load_test_json("http_get_orders_realtime.json"),
+        )
+        .unwrap();
+        orders["result"]["list"].as_array_mut().unwrap().truncate(1);
+        orders["result"]["list"][0]["symbol"] = serde_json::json!(symbol);
+        let (mut client, _, server) = order_report_client(orders).await;
+        client.config.load_ids = scope.map(|id| vec![InstrumentId::from(id)]);
+        let command = GenerateOrderStatusReportsBuilder::default()
+            .ts_init(UnixNanos::default())
+            .open_only(false)
+            .build()
+            .unwrap();
+
+        let result = client.generate_order_status_reports(&command).await;
+        if fails {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains(if symbol.is_empty() {
+                    "order symbol is empty"
+                } else {
+                    "not found in cache"
+                }),
+                "{error}"
+            );
+        } else {
+            assert_eq!(result.unwrap(), vec![]);
+        }
+
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_single_report_outside_scope_is_not_absence() {
+        let orders = serde_json::from_str(&crate::common::testing::load_test_json(
+            "http_get_orders_realtime.json",
+        ))
+        .unwrap();
+        let (mut client, _, server) = order_report_client(orders).await;
+        client.config.load_ids = Some(vec![InstrumentId::from("BTCUSDT-LINEAR.BYBIT")]);
+
+        let command = GenerateOrderStatusReport::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(InstrumentId::from("ETHUSDT-LINEAR.BYBIT")),
+            Some(ClientOrderId::from("client-open-1")),
+            None,
+            None,
+            None,
+        );
+
+        let error = client
+            .generate_order_status_report(&command)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "requested instrument ETHUSDT-LINEAR.BYBIT is outside reconciliation scope"
+        );
+        assert!(
+            !client.provides_bulk_position_coverage(InstrumentId::from("ETHUSDT-LINEAR.BYBIT"))
+        );
+        assert!(client.provides_bulk_position_coverage(InstrumentId::from("BTCUSDT-LINEAR.BYBIT")));
+        server.abort();
+    }
+
+    #[rstest]
+    #[case::in_window(1761355905606, false)]
+    #[case::before_window(1761355905605, true)]
+    #[tokio::test]
+    async fn test_mass_status_historical_order_completeness(
+        #[case] updated_ms: u64,
+        #[case] complete: bool,
+    ) {
+        let mut orders: serde_json::Value = serde_json::from_str(
+            &crate::common::testing::load_test_json("http_get_orders_realtime.json"),
+        )
+        .unwrap();
+        orders["result"]["list"].as_array_mut().unwrap().truncate(1);
+        orders["result"]["list"][0]["symbol"] = serde_json::json!("UNLOADEDUSDT");
+        orders["result"]["list"][0]["orderStatus"] = serde_json::json!("Cancelled");
+        orders["result"]["list"][0]["updatedTime"] = serde_json::json!(updated_ms.to_string());
+        let mut fills: serde_json::Value = serde_json::from_str(
+            &crate::common::testing::load_test_json("http_get_executions.json"),
+        )
+        .unwrap();
+        fills["result"]["list"] = serde_json::json!([]);
+        fills["result"]["nextPageCursor"] = serde_json::json!("");
+        let (mut client, _, server) = mass_status_client(fills, false, Some(orders)).await;
+        let cutoff = UnixNanos::from(1761355905606 * NANOSECONDS_IN_MILLISECOND);
+        let now = cutoff + DurationNanos::try_from_mins(5).unwrap();
+        client.clock = Box::leak(Box::new(AtomicTime::new(
+            false,
+            now + DurationNanos::new(123),
+        )));
+
+        let mass = client.generate_mass_status(Some(5)).await.unwrap().unwrap();
+
+        assert_eq!(mass.lookback_start(), Some(cutoff));
+        assert_eq!(mass.reports_complete(), complete);
+        assert_eq!(mass.order_reports().len(), 0);
+        assert_eq!(mass.fill_reports().len(), 0);
+        assert_eq!(mass.position_reports().len(), 0);
+        server.abort();
+    }
+
+    #[rstest]
+    #[case::in_scope(None, "BTCUSDT", false)]
+    #[case::excluded(Some("ETHUSDT-LINEAR.BYBIT"), "BTCUSDT", true)]
+    #[case::unknown_identity(Some("ETHUSDT-LINEAR.BYBIT"), "", false)]
+    #[tokio::test]
+    async fn test_position_reconciliation_scope(
+        #[case] scope: Option<&str>,
+        #[case] symbol: &str,
+        #[case] succeeds: bool,
+    ) {
+        let mut response: serde_json::Value = serde_json::from_str(
+            &crate::common::testing::load_test_json("http_get_positions.json"),
+        )
+        .unwrap();
+        response["result"]["list"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(1);
+        response["result"]["nextPageCursor"] = serde_json::json!("");
+        response["result"]["list"][0]["symbol"] = serde_json::json!(symbol);
+        let router = Router::new().route(
+            "/v5/position/list",
+            get(move || std::future::ready(Json(response.clone()))),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (mut client, _) = test_execution_client();
+        client.http_client = BybitHttpClient::with_credentials(
+            "test_key".to_string(),
+            "test_secret".to_string(),
+            Some(format!("http://{addr}")),
+            1,
+            0,
+            10,
+            10,
+            5_000,
+            None,
+        )
+        .unwrap();
+        client.config.load_ids = scope.map(|id| vec![InstrumentId::from(id)]);
+
+        let result = client
+            .generate_bulk_position_status_reports(vec![BybitProductType::Linear])
+            .await;
+
+        if succeeds {
+            assert_eq!(result.unwrap(), vec![]);
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains(if symbol.is_empty() {
+                    "Position symbol is empty"
+                } else {
+                    "not found in cache"
+                }),
+                "{error}"
+            );
+        }
+
+        client.http_client.set_use_spot_position_reports(true);
+        let error = client
+            .http_client
+            .request_position_status_reports(
+                client.core.account_id,
+                BybitProductType::Spot,
+                Some(InstrumentId::from("BTCUSDT-SPOT.BYBIT")),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not found in cache"), "{error}");
+        server.abort();
+    }
+
+    #[rstest]
+    #[case::bounded_miss(Some(5), None, 1672282722429, false)]
+    #[case::bounded_excluded(Some(5), Some("ETHUSDT-LINEAR.BYBIT"), 1672282722429, true)]
+    #[case::before_window(Some(5), None, 1672282722428, true)]
+    #[case::unbounded_miss(None, None, 1672282722429, false)]
+    #[case::before_retention_limit(Some(1_439), Some("ETHUSDT-LINEAR.BYBIT"), 1672282722429, true)]
+    #[case::retention_limit(Some(1_440), Some("ETHUSDT-LINEAR.BYBIT"), 1672282722429, false)]
+    #[case::after_retention_limit(Some(1_441), Some("ETHUSDT-LINEAR.BYBIT"), 1672282722429, false)]
+    #[case::two_days(Some(2_880), Some("ETHUSDT-LINEAR.BYBIT"), 1672282722429, false)]
+    #[case::before_venue_limit(Some(10_079), Some("ETHUSDT-LINEAR.BYBIT"), 1672282722429, false)]
+    #[case::venue_limit(Some(10_080), Some("ETHUSDT-LINEAR.BYBIT"), 1672282722429, false)]
+    #[case::venue_window(Some(10_081), Some("ETHUSDT-LINEAR.BYBIT"), 1672282722429, false)]
+    #[tokio::test]
+    async fn test_mass_status_historical_fill_completeness(
+        #[case] lookback: Option<u64>,
+        #[case] scope: Option<&str>,
+        #[case] exec_ms: u64,
+        #[case] complete: bool,
+    ) {
+        let mut fills: serde_json::Value = serde_json::from_str(
+            &crate::common::testing::load_test_json("http_get_executions.json"),
+        )
+        .unwrap();
+        fills["result"]["list"].as_array_mut().unwrap().truncate(1);
+        fills["result"]["list"][0]["symbol"] = serde_json::json!("UNLOADEDUSDT");
+        fills["result"]["list"][0]["execTime"] = serde_json::json!(exec_ms.to_string());
+        fills["result"]["nextPageCursor"] = serde_json::json!("");
+        let (mut client, _, server) = mass_status_client(fills, false, None).await;
+        let cutoff = UnixNanos::from(1672282722429 * NANOSECONDS_IN_MILLISECOND);
+        client.clock = Box::leak(Box::new(AtomicTime::new(
+            false,
+            cutoff + DurationNanos::try_from_mins(lookback.unwrap_or(5)).unwrap(),
+        )));
+        client.config.load_ids = scope.map(|id| vec![InstrumentId::from(id)]);
+
+        let result = client.generate_mass_status(lookback).await;
+
+        let mass = result.unwrap().unwrap();
+        assert_eq!(mass.lookback_start(), lookback.map(|_| cutoff));
+        assert_eq!(mass.reports_complete(), lookback.is_none() || complete);
+        assert_eq!(mass.order_reports().len(), 0);
+        assert_eq!(mass.fill_reports().len(), 0);
+        assert_eq!(mass.position_reports().len(), 0);
+
+        server.abort();
+    }
+
+    #[rstest]
+    #[case::linear(BybitProductType::Linear, None, true)]
+    #[case::all_options(BybitProductType::Option, None, false)]
+    #[case::eth_option(
+        BybitProductType::Option,
+        Some("ETH-26JUN26-16000-P-OPTION.BYBIT"),
+        false
+    )]
+    #[case::btc_option(
+        BybitProductType::Option,
+        Some("BTC-26JUN26-100000-C-OPTION.BYBIT"),
+        false
+    )]
+    #[tokio::test]
+    async fn test_mass_status_option_history_completeness(
+        #[case] product_type: BybitProductType,
+        #[case] scope: Option<&str>,
+        #[case] complete: bool,
+    ) {
+        let mut fills: serde_json::Value = serde_json::from_str(
+            &crate::common::testing::load_test_json("http_get_executions.json"),
+        )
+        .unwrap();
+        fills["result"]["list"] = serde_json::json!([]);
+        fills["result"]["nextPageCursor"] = serde_json::json!("");
+        let (mut client, _, server) = mass_status_client(fills, false, None).await;
+        let cutoff = UnixNanos::from(1672282722429 * NANOSECONDS_IN_MILLISECOND);
+        client.clock = Box::leak(Box::new(AtomicTime::new(
+            false,
+            cutoff + DurationNanos::try_from_mins(5).unwrap(),
+        )));
+        client.config.product_types = vec![product_type];
+        client.config.load_ids = scope.map(|id| vec![InstrumentId::from(id)]);
+        client.config.validate().unwrap();
+
+        let mass = client.generate_mass_status(Some(5)).await.unwrap().unwrap();
+
+        assert_eq!(mass.lookback_start(), Some(cutoff));
+        assert_eq!(mass.reports_complete(), complete);
+        assert_eq!(mass.order_reports().len(), 0);
+        assert_eq!(mass.fill_reports().len(), 0);
+        assert_eq!(mass.position_reports().len(), 0);
+        server.abort();
+    }
+
+    #[rstest]
+    #[case::missing("missing", false)]
+    #[case::report("report", true)]
+    #[case::cached_client("cached_client", true)]
+    #[case::cached_venue("cached_venue", true)]
+    #[tokio::test]
+    async fn test_bounded_mass_status_fill_order_linkage(
+        #[case] evidence: &str,
+        #[case] complete: bool,
+    ) {
+        let mut fills: serde_json::Value = serde_json::from_str(
+            &crate::common::testing::load_test_json("http_get_executions.json"),
+        )
+        .unwrap();
+        fills["result"]["nextPageCursor"] = serde_json::json!("");
+        fills["result"]["list"].as_array_mut().unwrap().truncate(1);
+        fills["result"]["list"][0]["symbol"] = serde_json::json!("ETHUSDT");
+        fills["result"]["list"][0]["orderId"] = serde_json::json!("open-order-1");
+        fills["result"]["list"][0]["orderLinkId"] = serde_json::json!("fill-client");
+
+        let orders = (evidence == "report").then(|| {
+            let mut orders: serde_json::Value = serde_json::from_str(
+                &crate::common::testing::load_test_json("http_get_orders_realtime.json"),
+            )
+            .unwrap();
+            orders["result"]["list"].as_array_mut().unwrap().truncate(1);
+            orders
+        });
+
+        let (mut client, cache, server) = mass_status_client(fills, false, orders).await;
+        let cutoff = UnixNanos::from(1672282722429 * NANOSECONDS_IN_MILLISECOND);
+        client.clock = Box::leak(Box::new(AtomicTime::new(
+            false,
+            cutoff + DurationNanos::try_from_mins(5).unwrap(),
+        )));
+
+        if evidence.starts_with("cached_") {
+            let client_order_id = ClientOrderId::from(if evidence == "cached_client" {
+                "fill-client"
+            } else {
+                "cached-client"
+            });
+
+            let order = OrderTestBuilder::new(OrderType::Limit)
+                .client_order_id(client_order_id)
+                .instrument_id(InstrumentId::from("ETHUSDT-LINEAR.BYBIT"))
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from("0.100"))
+                .price(Price::from("50000.00"))
+                .build();
+            cache
+                .borrow_mut()
+                .add_order(order, None, None, false)
+                .unwrap();
+
+            if evidence == "cached_venue" {
+                cache
+                    .borrow_mut()
+                    .add_venue_order_id(
+                        &client_order_id,
+                        &VenueOrderId::from("open-order-1"),
+                        false,
+                    )
+                    .unwrap();
+            }
+        }
+
+        let mass = client.generate_mass_status(Some(5)).await.unwrap().unwrap();
+
+        assert_eq!(mass.lookback_start(), Some(cutoff));
+        assert_eq!(mass.reports_complete(), complete);
+        assert_eq!(
+            mass.order_reports().len(),
+            usize::from(evidence == "report")
+        );
+        let reports = mass.fill_reports();
+        assert_eq!(reports.len(), 1);
+        let fills = reports.get(&VenueOrderId::from("open-order-1")).unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(
+            fills[0].client_order_id,
+            Some(ClientOrderId::from("fill-client"))
+        );
+        assert_eq!(fills[0].last_qty, Quantity::from("0.100"));
+        assert_eq!(mass.position_reports().len(), 0);
+        server.abort();
+    }
+
+    #[rstest]
+    #[case::order_parse(
+        true,
+        "Failed to parse order.qty='not-a-number' as Decimal: Invalid decimal: unknown character"
+    )]
+    #[case::commission(
+        false,
+        "Failed to create commission from execFee='9999999999999999999999999999'"
+    )]
+    #[tokio::test]
+    async fn test_bounded_mass_status_parse_failures(
+        #[case] order_failure: bool,
+        #[case] message: &str,
+    ) {
+        let mut fills: serde_json::Value = serde_json::from_str(
+            &crate::common::testing::load_test_json("http_get_executions.json"),
+        )
+        .unwrap();
+        fills["result"]["nextPageCursor"] = serde_json::json!("");
+        fills["result"]["list"].as_array_mut().unwrap().truncate(1);
+        fills["result"]["list"][0]["symbol"] = serde_json::json!("ETHUSDT");
+        fills["result"]["list"][0]["execFee"] = serde_json::json!("9999999999999999999999999999");
+        let cutoff = UnixNanos::from(1672282722429 * NANOSECONDS_IN_MILLISECOND);
+
+        let orders = if order_failure {
+            fills["result"]["list"] = serde_json::json!([]);
+            let mut orders: serde_json::Value = serde_json::from_str(
+                &crate::common::testing::load_test_json("http_get_orders_realtime.json"),
+            )
+            .unwrap();
+            orders["result"]["list"].as_array_mut().unwrap().truncate(1);
+            orders["result"]["list"][0]["qty"] = serde_json::json!("not-a-number");
+            Some(orders)
+        } else {
+            None
+        };
+
+        let (mut client, _, server) = mass_status_client(fills, false, orders).await;
+        client.clock = Box::leak(Box::new(AtomicTime::new(
+            false,
+            cutoff + DurationNanos::try_from_mins(5).unwrap(),
+        )));
+
+        let error = client.generate_mass_status(Some(5)).await.unwrap_err();
+
+        assert_eq!(error.to_string(), message);
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_bounded_mass_status_retains_old_open_order() {
+        let mut orders: serde_json::Value = serde_json::from_str(
+            &crate::common::testing::load_test_json("http_get_orders_realtime.json"),
+        )
+        .unwrap();
+        orders["result"]["list"].as_array_mut().unwrap().truncate(1);
+        let mut fills: serde_json::Value = serde_json::from_str(
+            &crate::common::testing::load_test_json("http_get_executions.json"),
+        )
+        .unwrap();
+        fills["result"]["list"] = serde_json::json!([]);
+        fills["result"]["nextPageCursor"] = serde_json::json!("");
+        let (mut client, cache, server) = mass_status_client(fills, false, Some(orders)).await;
+        let cutoff = UnixNanos::from(1761356000000 * NANOSECONDS_IN_MILLISECOND);
+        client.clock = Box::leak(Box::new(AtomicTime::new(
+            false,
+            cutoff + DurationNanos::try_from_mins(5).unwrap(),
+        )));
+        let instrument_id = InstrumentId::from("ETHUSDT-LINEAR.BYBIT");
+        let client_order_id = ClientOrderId::from("client-open-1");
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(client_order_id)
+            .instrument_id(instrument_id)
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.010"))
+            .price(Price::from("3930.41"))
+            .build();
+        let strategy_id = order.strategy_id();
+        cache
+            .borrow_mut()
+            .add_order(order, None, None, false)
+            .unwrap();
+
+        let mass = client.generate_mass_status(Some(5)).await.unwrap().unwrap();
+
+        assert_eq!(mass.lookback_start(), Some(cutoff));
+        assert!(mass.reports_complete());
+        let reports = mass.order_reports();
+        assert_eq!(reports.len(), 1);
+        let report = reports.get(&VenueOrderId::from("open-order-1")).unwrap();
+        assert_eq!(
+            (report.instrument_id, report.order_status, report.ts_last),
+            (
+                instrument_id,
+                OrderStatus::Accepted,
+                UnixNanos::from(1761355905606 * NANOSECONDS_IN_MILLISECOND)
+            )
+        );
+        let identity = client
+            .dispatch_state
+            .order_identities
+            .get(&client_order_id)
+            .unwrap();
+        assert_eq!(
+            (
+                identity.instrument_id,
+                identity.strategy_id,
+                identity.order_side,
+                identity.order_type,
+                identity.venue_position_id
+            ),
+            (
+                instrument_id,
+                strategy_id,
+                OrderSide::Buy,
+                OrderType::Limit,
+                None
+            )
+        );
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_bulk_report_parse_failure_returns_error() {
+        let mut orders: serde_json::Value = serde_json::from_str(
+            &crate::common::testing::load_test_json("http_get_orders_realtime.json"),
+        )
+        .unwrap();
+        orders["result"]["list"][0]["qty"] = serde_json::json!("not-a-number");
+        let (client, _, server) = order_report_client(orders).await;
+
+        let command = GenerateOrderStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        for fused in [false, true] {
+            let error = if fused {
+                client
+                    .generate_order_status_reports(&command)
+                    .await
+                    .unwrap_err()
+            } else {
+                let task = client.generate_order_status_reports_task(&command).unwrap();
+                tokio::spawn(task.collection).await.unwrap();
+                (task.finish)().unwrap_err()
+            };
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("Failed to parse order.qty='not-a-number' as Decimal"),
+                "error was: {error}",
+            );
+        }
+
         server.abort();
     }
 
@@ -4662,6 +5827,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(tx);
+        cache_fee_rates(&client, instrument_id);
         let json = crate::common::testing::load_test_json("ws_account_execution_fast.json");
         let mut fast: crate::websocket::messages::BybitWsAccountExecutionFastMsg =
             serde_json::from_str(&json).unwrap();
@@ -4770,8 +5936,8 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(tx);
-
         if recover_pending {
+            cache_fee_rates(&client, instrument_id);
             let json = crate::common::testing::load_test_json("ws_account_execution_fast.json");
             let mut fast: crate::websocket::messages::BybitWsAccountExecutionFastMsg =
                 serde_json::from_str(&json).unwrap();
@@ -4871,6 +6037,7 @@ mod tests {
     async fn mass_status_client(
         execution_response: serde_json::Value,
         position_fails: bool,
+        order_response: Option<serde_json::Value>,
     ) -> (
         BybitExecutionClient,
         Rc<RefCell<Cache>>,
@@ -4896,8 +6063,9 @@ mod tests {
             empty.clone()
         };
 
-        let realtime = empty.clone();
-        let history = empty;
+        let realtime = order_response.clone().unwrap_or_else(|| empty.clone());
+        let history = order_response.unwrap_or(empty);
+
         let router = Router::new()
             .route(
                 "/v5/order/realtime",
@@ -4905,7 +6073,11 @@ mod tests {
             )
             .route(
                 "/v5/order/history",
-                get(move || std::future::ready(Json(history.clone()))),
+                get(move |Query(params): Query<AHashMap<String, String>>| {
+                    assert_eq!(params.get("startTime"), None);
+                    assert_eq!(params.get("endTime"), None);
+                    std::future::ready(Json(history.clone()))
+                }),
             )
             .route(
                 "/v5/execution/list",
@@ -4952,6 +6124,7 @@ mod tests {
             instrument_id.symbol.inner(),
             instrument,
         )]));
+        cache_fee_rates(client, instrument_id);
         let json = crate::common::testing::load_test_json("ws_account_execution_fast.json");
         let mut fast: crate::websocket::messages::BybitWsAccountExecutionFastMsg =
             serde_json::from_str(&json).unwrap();
@@ -5022,12 +6195,13 @@ mod tests {
         )
         .unwrap();
         response["result"]["nextPageCursor"] = serde_json::json!("");
-        let (mut client, _cache, server) = mass_status_client(response, position_fails).await;
+        let (mut client, _cache, server) = mass_status_client(response, position_fails, None).await;
         Arc::get_mut(&mut client.dispatch_state)
             .unwrap()
             .fast_execution = true;
         let client_order_id = ClientOrderId::from("test-order-002");
         let instrument_id = InstrumentId::from("ETHUSDT-LINEAR.BYBIT");
+        client.config.load_ids = Some(vec![instrument_id]);
         let venue_order_id = VenueOrderId::from("7b954230-6a41-3ba8-bc20-26d20ab44b83");
         client.dispatch_state.order_identities.insert(
             client_order_id,
@@ -5407,7 +6581,7 @@ mod tests {
             let accepted = TestOrderEventStubs::accepted(&order, account_id, venue_order_id);
             cache
                 .borrow_mut()
-                .add_order(order.clone(), None, Some(*BYBIT_CLIENT_ID), false)
+                .add_order(order, None, Some(*BYBIT_CLIENT_ID), false)
                 .unwrap();
             let order = cache.borrow_mut().update_order(&accepted).unwrap();
 

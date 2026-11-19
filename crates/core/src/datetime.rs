@@ -111,6 +111,7 @@ fn civil_from_days(days_since_epoch: u32) -> (i32, u32, u32) {
     } else {
         month_prime - 9
     };
+
     let year = year + u32::from(month <= 2);
 
     (i32::try_from(year).expect("year fits in i32"), month, day)
@@ -223,7 +224,7 @@ pub const WEEKDAYS: [Weekday; 5] = [
     Weekday::Friday,
 ];
 
-/// Converts seconds to nanoseconds (ns).
+/// Converts seconds to nanoseconds (ns), rounding to the nearest nanosecond.
 ///
 /// # Errors
 ///
@@ -236,18 +237,20 @@ pub const WEEKDAYS: [Weekday; 5] = [
 )]
 pub fn secs_to_nanos(secs: f64) -> anyhow::Result<u64> {
     anyhow::ensure!(secs.is_finite(), "seconds must be finite, was {secs}");
+
     if secs <= 0.0 {
         return Ok(0);
     }
+
     let nanos = secs * NANOSECONDS_IN_SECOND as f64;
     anyhow::ensure!(
         nanos < U64_UPPER_BOUND_F64,
         "seconds {secs} is out of range for `u64` nanoseconds"
     );
-    Ok(nanos.trunc() as u64)
+    Ok(nanos.round() as u64)
 }
 
-/// Converts seconds to milliseconds (ms).
+/// Converts seconds to milliseconds (ms), rounding to the nearest millisecond.
 ///
 /// # Errors
 ///
@@ -260,15 +263,17 @@ pub fn secs_to_nanos(secs: f64) -> anyhow::Result<u64> {
 )]
 pub fn secs_to_millis(secs: f64) -> anyhow::Result<u64> {
     anyhow::ensure!(secs.is_finite(), "seconds must be finite, was {secs}");
+
     if secs <= 0.0 {
         return Ok(0);
     }
+
     let millis = secs * MILLISECONDS_IN_SECOND as f64;
     anyhow::ensure!(
         millis < U64_UPPER_BOUND_F64,
         "seconds {secs} is out of range for `u64` milliseconds"
     );
-    Ok(millis.trunc() as u64)
+    Ok(millis.round() as u64)
 }
 
 /// Converts seconds to nanoseconds (ns), panicking on invalid input.
@@ -300,10 +305,9 @@ pub const fn checked_mins_to_secs(mins: u64) -> Option<u64> {
     mins.checked_mul(SECONDS_IN_MINUTE)
 }
 
-/// Converts milliseconds (ms) to nanoseconds (ns).
+/// Converts milliseconds (ms) to nanoseconds (ns), rounding to the nearest nanosecond.
 ///
-/// Casting f64 to u64 by truncating the fractional part is intentional for unit conversion,
-/// which may lose precision and drop negative values after clamping.
+/// Returns 0 for a negative input.
 ///
 /// # Errors
 ///
@@ -323,12 +327,13 @@ pub fn millis_to_nanos(millis: f64) -> anyhow::Result<u64> {
     if millis <= 0.0 {
         return Ok(0);
     }
+
     let nanos = millis * NANOSECONDS_IN_MILLISECOND as f64;
     anyhow::ensure!(
         nanos < U64_UPPER_BOUND_F64,
         "milliseconds {millis} is out of range for `u64` nanoseconds"
     );
-    Ok(nanos.trunc() as u64)
+    Ok(nanos.round() as u64)
 }
 
 /// Converts milliseconds (ms) to nanoseconds (ns), panicking on invalid input.
@@ -341,10 +346,9 @@ pub fn millis_to_nanos_unchecked(millis: f64) -> u64 {
     millis_to_nanos(millis).expect("millis_to_nanos_unchecked: invalid or overflowing input")
 }
 
-/// Converts microseconds (μs) to nanoseconds (ns).
+/// Converts microseconds (μs) to nanoseconds (ns), rounding to the nearest nanosecond.
 ///
-/// Casting f64 to u64 by truncating the fractional part is intentional for unit conversion,
-/// which may lose precision and drop negative values after clamping.
+/// Returns 0 for a negative input.
 ///
 /// # Errors
 ///
@@ -364,12 +368,13 @@ pub fn micros_to_nanos(micros: f64) -> anyhow::Result<u64> {
     if micros <= 0.0 {
         return Ok(0);
     }
+
     let nanos = micros * NANOSECONDS_IN_MICROSECOND as f64;
     anyhow::ensure!(
         nanos < U64_UPPER_BOUND_F64,
         "microseconds {micros} is out of range for `u64` nanoseconds"
     );
-    Ok(nanos.trunc() as u64)
+    Ok(nanos.round() as u64)
 }
 
 /// Converts microseconds (μs) to nanoseconds (ns), panicking on invalid input.
@@ -514,6 +519,7 @@ pub fn last_weekday_nanos(year: i32, month: u32, day: u32) -> anyhow::Result<Uni
         6 => 1,     // Saturday, adjust to previous Friday
         _ => 2,     // Sunday, adjust to previous Friday
     };
+
     // Calculate last closest weekday
     let last_closest = date.checked_sub(Span::new().days(offset))?;
 
@@ -680,10 +686,10 @@ pub fn datetime_to_unix_nanos(value: Option<Timestamp>) -> Option<UnixNanos> {
 /// Returns an error if the timestamp is before the UNIX epoch or out of range for `UnixNanos`.
 pub fn try_datetime_to_unix_nanos(value: Timestamp) -> anyhow::Result<UnixNanos> {
     let nanos = value.as_nanosecond();
-
     if nanos < 0 {
         anyhow::bail!("DateTime timestamp cannot be negative: {nanos}");
     }
+
     let nanos = u64::try_from(nanos)
         .map_err(|_| anyhow::anyhow!("DateTime timestamp out of range for UnixNanos: {nanos}"))?;
 
@@ -716,6 +722,9 @@ mod tests {
     #[case(0.000_000_01, 10)]
     #[case(0.000_000_001, 1)]
     #[case(9.999_999_999, 9_999_999_999)]
+    #[case(1.001, 1_001_000_000)]
+    #[case(0.000_000_001_4, 1)]
+    #[case(0.000_000_000_5, 1)]
     fn test_secs_to_nanos(#[case] value: f64, #[case] expected: u64) {
         let result = secs_to_nanos(value).unwrap();
         assert_eq!(result, expected);
@@ -728,6 +737,7 @@ mod tests {
     #[case(42.0, 42_000)]
     #[case(0.012_34, 12)]
     #[case(0.001, 1)]
+    #[case(1.001, 1_001)]
     fn test_secs_to_millis(#[case] value: f64, #[case] expected: u64) {
         let result = secs_to_millis(value).unwrap();
         assert_eq!(result, expected);
@@ -844,6 +854,7 @@ mod tests {
     #[case(0.000_01, 10)]
     #[case(0.000_001, 1)]
     #[case(9.999_999, 9_999_999)]
+    #[case(1.001, 1_001_000)]
     fn test_millis_to_nanos(#[case] value: f64, #[case] expected: u64) {
         let result = millis_to_nanos(value).unwrap();
         assert_eq!(result, expected);
@@ -866,6 +877,7 @@ mod tests {
     #[case(0.01, 10)]
     #[case(0.001, 1)]
     #[case(9.999, 9_999)]
+    #[case(1.001, 1_001)]
     fn test_micros_to_nanos(#[case] value: f64, #[case] expected: u64) {
         let result = micros_to_nanos(value).unwrap();
         assert_eq!(result, expected);

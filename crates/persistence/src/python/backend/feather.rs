@@ -37,7 +37,6 @@ use nautilus_model::{
         Bar, CustomData, Data, FundingRateUpdate, IndexPriceUpdate, InstrumentStatus,
         MarkPriceUpdate, OptionGreeks, OrderBookDelta, OrderBookDepth, QuoteTick, TradeTick,
         close::InstrumentClose,
-        greeks::{GreeksData, PortfolioGreeks},
     },
     events::{
         AccountState, OrderAccepted, OrderCancelDenied, OrderCancelRejected, OrderCanceled,
@@ -351,8 +350,6 @@ impl PyStreamingFeatherWriter {
         try_write!(FillReport, "FillReport");
         try_write!(PositionStatusReport, "PositionStatusReport");
         try_write!(ExecutionMassStatus, "ExecutionMassStatus");
-        try_write!(GreeksData, "GreeksData");
-        try_write!(PortfolioGreeks, "PortfolioGreeks");
 
         // Try instrument types (uses type_str attribute for dispatch)
         if let Ok(instrument) = pyobject_to_instrument_any(py, data.clone_ref(py)) {
@@ -471,11 +468,14 @@ impl PyStreamingFeatherWriter {
 
 fn run_environment_and_instance_id_from_path(path: &str) -> Option<(Environment, String)> {
     let normalized = normalize_path_separators(path);
-    let parsed_url = url::Url::parse(&normalized).ok();
-
-    let path = parsed_url.as_ref().map_or(normalized.as_str(), |url| {
-        url.path().trim_start_matches('/')
-    });
+    let parsed_url = normalized
+        .split_once("://")
+        .filter(|(scheme, _)| *scheme != "file")
+        .and_then(|_| url::Url::parse(&normalized).ok());
+    let path = parsed_url.as_ref().map_or_else(
+        || normalized.strip_prefix("file://").unwrap_or(&normalized),
+        |url| url.path().trim_start_matches('/'),
+    );
 
     let components: Vec<&str> = path
         .trim_matches('/')
@@ -506,6 +506,18 @@ mod tests {
     #[case(r"\\server\share\live\run-2", Environment::Live, "run-2")]
     #[case("/tmp/catalog/sandbox/run-3", Environment::Sandbox, "run-3")]
     #[case("file:///C:/catalog/backtest/run-1", Environment::Backtest, "run-1")]
+    #[case(r"C:\C# work\backtest\run-1", Environment::Backtest, "run-1")]
+    #[case("file:///C:/C# work/backtest/run-1", Environment::Backtest, "run-1")]
+    #[case("/tmp/a?b/live/run-2", Environment::Live, "run-2")]
+    #[case("file:///tmp/a?b/live/run-2", Environment::Live, "run-2")]
+    #[case(
+        "file:///tmp/a%20b/backtest/run%20id",
+        Environment::Backtest,
+        "run%20id"
+    )]
+    #[case::file_uri_space("file:///tmp/catalog/backtest/run 1", Environment::Backtest, "run 1")]
+    #[case::windows_drive_space(r"C:\catalog\backtest\run 1", Environment::Backtest, "run 1")]
+    #[case("s3://bucket/catalog/sandbox/run-3", Environment::Sandbox, "run-3")]
     fn run_environment_and_instance_id_handles_platform_paths(
         #[case] path: &str,
         #[case] environment: Environment,

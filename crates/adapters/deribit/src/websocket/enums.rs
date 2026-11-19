@@ -164,6 +164,7 @@ impl DeribitWsChannel {
         interval: Option<DeribitUpdateInterval>,
     ) -> String {
         let interval_str = interval.unwrap_or_default().as_str();
+
         match self {
             Self::Trades => format!("trades.{instrument_or_currency}.{interval_str}"),
             Self::Book => format!("book.{instrument_or_currency}.{interval_str}"),
@@ -408,7 +409,7 @@ impl From<DeribitBookAction> for BookAction {
 
 /// Deribit order book message type.
 #[derive(
-    Clone, Debug, Display, PartialEq, Eq, Hash, AsRefStr, EnumString, Serialize, Deserialize,
+    Clone, Copy, Debug, Display, PartialEq, Eq, Hash, AsRefStr, EnumString, Serialize, Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DeribitBookMsgType {

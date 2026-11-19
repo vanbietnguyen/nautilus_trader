@@ -20,7 +20,7 @@ use std::{borrow::Cow, collections::HashMap, str::FromStr, sync::Arc, time::Dura
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use http::{
-    Method,
+    Method, StatusCode,
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use http_body_util::Full;
@@ -78,6 +78,10 @@ pub(super) const REQUEST_TIMEOUT_MESSAGE: &str = "request deadline elapsed";
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HttpRedirectPolicy {
     /// Follow up to ten redirects.
+    ///
+    /// A redirect to another origin keeps only the `Accept`, `Accept-Encoding`, and `User-Agent`
+    /// request headers. The request fails when a redirect goes from HTTPS to HTTP, or when a
+    /// request with a body is redirected to another origin.
     #[default]
     Follow,
     /// Reject every redirect response.
@@ -214,10 +218,11 @@ impl HttpClient {
             let header_name = HeaderName::from_str(&key)
                 .map_err(|e| HttpClientError::Error(format!("Invalid header name '{key}': {e}")))?;
 
-            let header_value = HeaderValue::from_str(&value).map_err(|e| {
+            let mut header_value = HeaderValue::from_str(&value).map_err(|e| {
                 HttpClientError::Error(format!("Invalid header value for '{key}': {e}"))
             })?;
 
+            header_value.set_sensitive(true);
             header_map.insert(header_name, header_value);
         }
 
@@ -356,6 +361,35 @@ impl HttpClient {
         self.client
             .send_request_with_query(method, url, params, headers, body, timeout_secs)
             .await
+    }
+
+    /// Sends a GET request with query parameters and optional request headers.
+    ///
+    /// Calls `on_headers` with the final response status and headers before reading the body.
+    /// The buffered response uses the client's body size limits and content decoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out, or if the body cannot be read or decoded.
+    pub async fn get_with_params_on_headers<P: serde::Serialize>(
+        &self,
+        url: &str,
+        params: &P,
+        headers: Option<HashMap<String, String>>,
+        on_headers: impl FnOnce(StatusCode, &HeaderMap),
+    ) -> Result<HttpResponse, HttpClientError> {
+        self.await_rate_limits(None).await;
+        // Keep the callback out of the shared buffered request future to limit its size
+        let headers = self.client.buffered_request_headers(headers);
+        let stream = self
+            .client
+            .send_stream_internal(Method::GET, url, Some(params), Some(headers), None, None)
+            .await?;
+        on_headers(stream.status(), stream.headers());
+        self.client
+            .consume_response(stream.response, stream.deadline, false)
+            .await
+            .map_err(|e| response_error(e, stream.origin.as_deref()))
     }
 
     /// Sends a GET request and returns its response body as a stream.
@@ -634,6 +668,21 @@ impl InnerHttpClient {
         body: Option<RequestBody>,
         timeout_secs: Option<u64>,
     ) -> Result<HttpResponse, HttpClientError> {
+        let headers = self.buffered_request_headers(headers);
+        let is_head = method == Method::HEAD;
+        let stream = self
+            .send_stream_internal(method, url, query, Some(headers), body, timeout_secs)
+            .await?;
+        let result = self
+            .consume_response(stream.response, stream.deadline, is_head)
+            .await;
+        result.map_err(|e| response_error(e, stream.origin.as_deref()))
+    }
+
+    fn buffered_request_headers(
+        &self,
+        headers: Option<HashMap<String, String>>,
+    ) -> HashMap<String, String> {
         let mut headers = headers.unwrap_or_default();
         let has_accept_encoding = headers
             .keys()
@@ -644,14 +693,7 @@ impl InnerHttpClient {
             headers.insert(http::header::ACCEPT_ENCODING.to_string(), GZIP.to_string());
         }
 
-        let is_head = method == Method::HEAD;
-        let stream = self
-            .send_stream_internal(method, url, query, Some(headers), body, timeout_secs)
-            .await?;
-        let result = self
-            .consume_response(stream.response, stream.deadline, is_head)
-            .await;
-        result.map_err(|e| response_error(e, stream.origin.as_deref()))
+        headers
     }
 
     async fn send_stream_internal<Q: serde::Serialize>(
@@ -729,7 +771,7 @@ impl InnerHttpClient {
             header_map.insert(http::header::ACCEPT, HeaderValue::from_static("*/*"));
         }
 
-        let body = body.map(RequestBody::into_bytes).unwrap_or_default();
+        let body = body.map_or_default(RequestBody::into_bytes);
         let body_len = body.len();
         let query_len = url.query().map_or(0, str::len);
         let mut request = http::Request::new(Full::new(body));
@@ -909,6 +951,11 @@ async fn decode_content_encoding(
     }
 
     check_deadline(deadline)?;
+
+    if body.is_empty() {
+        return Ok((body.freeze(), false));
+    }
+
     let body = body.freeze();
     let mut out = Vec::new();
 
@@ -1025,7 +1072,7 @@ fn http2_adaptive_window() -> Result<bool, HttpClientError> {
 ///
 /// Returns `Cow::Borrowed` when no parameters need appending (zero-alloc fast path).
 /// Parameters can have multiple values per key (for doseq=True behavior).
-/// Preserves existing query strings in the URL by appending with '&' instead of '?'.
+/// Preserves the existing query and reuses a trailing query separator.
 /// The query is inserted before any fragment, which is preserved unchanged.
 fn encode_url_params<'a>(
     url: &'a str,
@@ -1058,7 +1105,11 @@ fn encode_url_params<'a>(
         None => (url, None),
     };
 
-    let separator = if base.contains('?') { '&' } else { '?' };
+    let separator = match base.split_once('?') {
+        None => "?",
+        Some((_, query)) if query.is_empty() || query.ends_with('&') => "",
+        Some(_) => "&",
+    };
 
     Ok(Cow::Owned(match fragment {
         Some(fragment) => format!("{base}{separator}{query_string}#{fragment}"),
@@ -1087,7 +1138,11 @@ mod encode_url_params_tests {
 
     #[rstest]
     #[case("https://x/y", "https://x/y?a=b")]
+    #[case("https://x/y&", "https://x/y&?a=b")]
+    #[case("https://x/y?", "https://x/y?a=b")]
     #[case("https://x/y?old=1", "https://x/y?old=1&a=b")]
+    #[case("https://x/y?old=?", "https://x/y?old=?&a=b")]
+    #[case("https://x/y?old=1&", "https://x/y?old=1&a=b")]
     #[case("https://x/y#frag", "https://x/y?a=b#frag")]
     #[case("https://x/y?old=1#frag", "https://x/y?old=1&a=b#frag")]
     #[case(
@@ -1095,7 +1150,7 @@ mod encode_url_params_tests {
         "https://x/y?a=b#section?display=full"
     )]
     #[case("https://x/y#", "https://x/y?a=b#")]
-    fn test_query_is_inserted_before_the_fragment(#[case] url: &str, #[case] expected: &str) {
+    fn test_appends_params_to_query(#[case] url: &str, #[case] expected: &str) {
         let params = params(&[("a", "b")]);
 
         assert_eq!(encode_url_params(url, Some(&params)).unwrap(), expected);
@@ -1144,6 +1199,24 @@ mod tests {
 
     use super::*;
     use crate::logging::tests::capture_logs;
+
+    #[rstest]
+    fn test_debug_redacts_custom_default_headers() {
+        let client = HttpClient::builder()
+            .use_system_proxy(false)
+            .headers(HashMap::from([(
+                "kalshi-access-key".into(),
+                "HEADER_DEBUG_SECRET".into(),
+            )]))
+            .build()
+            .unwrap();
+        let header = &client.client.headers["kalshi-access-key"];
+        let debug = format!("{client:?}");
+
+        assert_eq!(header.to_str().unwrap(), "HEADER_DEBUG_SECRET");
+        assert!(header.is_sensitive());
+        assert!(!debug.contains("HEADER_DEBUG_SECRET"), "{debug}");
+    }
 
     #[rstest]
     #[case("ftp://127.0.0.1:1/resource")]

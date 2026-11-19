@@ -60,7 +60,10 @@ use crate::{
     http::{
         client::{LIGHTER_REST_PAGE_SIZE, LighterHttpClient},
         models::LighterOrder,
-        query::{LighterAccountActiveOrdersQuery, LighterAccountInactiveOrdersQuery},
+        query::{
+            LighterAccountActiveOrdersQuery, LighterAccountInactiveOrdersQuery,
+            LighterAccountOrdersQuery,
+        },
     },
     signing::{auth_token::build_auth_token_for, nonce::NonceManager},
     websocket::parse::{ParsedOrderEvent, parse_ws_order_status_report},
@@ -862,11 +865,6 @@ impl TradeDedupCache {
         }
         None
     }
-
-    #[cfg(test)]
-    pub(crate) fn contains(&self, trade_id: &TradeId) -> bool {
-        self.inner.lock().entries.contains_key(trade_id)
-    }
 }
 
 #[derive(Debug, Default)]
@@ -1180,15 +1178,6 @@ impl WsDispatchState {
         self.pending_sendtx.lock().push_back(pending);
     }
 
-    /// Pop the oldest pending entry unconditionally.
-    ///
-    /// Tests and reconnect cleanup use this directly. Live hashless response
-    /// attribution must use [`Self::pop_pending_sendtx_if_only`].
-    #[cfg(test)]
-    pub(crate) fn pop_pending_sendtx_head(&self) -> Option<PendingSendTx> {
-        self.pending_sendtx.lock().pop_front()
-    }
-
     /// Pop a pending entry only when it is the sole possible match.
     ///
     /// Lighter does not always echo `tx_hash`. With two or more transactions
@@ -1274,12 +1263,6 @@ impl WsDispatchState {
 
     pub(crate) fn take_pending_sendtx(&self) -> Vec<PendingSendTx> {
         std::mem::take(&mut *self.pending_sendtx.lock()).into()
-    }
-
-    /// Returns the current pending-sendTx queue length for tests.
-    #[cfg(test)]
-    pub(crate) fn pending_sendtx_len(&self) -> usize {
-        self.pending_sendtx.lock().len()
     }
 
     /// First-time check for an `OrderTriggered` event for `cloid`. Returns
@@ -2841,6 +2824,24 @@ pub(crate) async fn collect_order_while_pending(
     };
 
     let auth = mint_auth_token(credential)?;
+
+    if let Some(order) = collect_account_order(
+        http_client,
+        credential,
+        lookup,
+        market_index,
+        &auth,
+        &is_pending,
+    )
+    .await?
+    {
+        return Ok(Some(order));
+    }
+
+    if !is_pending() {
+        return Ok(None);
+    }
+
     let query = Zeroizing::new(LighterAccountActiveOrdersQuery {
         authorization: None,
         auth: Some(auth.clone()),
@@ -2872,7 +2873,8 @@ pub(crate) async fn collect_order_while_pending(
     }
 
     if lookup.target_venue_index.is_none() {
-        // Lighter reuses client indexes, so they cannot identify terminal history
+        // Lighter reuses client indexes, so paginated inactive history cannot safely
+        // identify an order by client index alone.
         return Ok(None);
     }
 
@@ -2928,6 +2930,72 @@ pub(crate) async fn collect_order_while_pending(
             }
             _ => break,
         }
+    }
+
+    Ok(None)
+}
+
+async fn collect_account_order(
+    http_client: &LighterHttpClient,
+    credential: &Credential,
+    lookup: &OrderReportLookup,
+    market_index: i64,
+    auth: &SecretString,
+    is_pending: impl Fn() -> bool,
+) -> anyhow::Result<Option<LighterOrder>> {
+    let Some(client_order_index) = lookup.target_client_index else {
+        return Ok(None);
+    };
+
+    let query = Zeroizing::new(LighterAccountOrdersQuery {
+        authorization: None,
+        auth: Some(auth.clone()),
+        account_index: credential.account_index(),
+        client_order_indexes: vec![client_order_index],
+    });
+
+    let response = match http_client.get_account_orders(&query).await {
+        Ok(response) => response,
+        Err(_) => {
+            log::debug!(
+                "Lighter accountOrders lookup failed, falling back to per-market order queries"
+            );
+            return Ok(None);
+        }
+    };
+
+    if !is_pending() {
+        return Ok(None);
+    }
+
+    let mut matches = response.orders.iter().filter(|order| {
+        if order.market_index != market_index {
+            return false;
+        }
+
+        if lookup.target_venue_index.is_none() && order.status.is_terminal() {
+            return false;
+        }
+
+        order_matches_lookup(
+            order.order_index,
+            order.client_order_index,
+            lookup.target_venue_index,
+            lookup.target_client_index,
+        )
+    });
+
+    let account_match = matches.next();
+
+    if lookup.target_venue_index.is_none() {
+        anyhow::ensure!(
+            matches.next().is_none(),
+            "ambiguous Lighter account-order lookup for client_order_index {client_order_index}",
+        );
+    }
+
+    if let Some(order) = account_match {
+        return Ok(Some(order.clone()));
     }
 
     Ok(None)
@@ -3202,7 +3270,21 @@ mod tests {
 
     use super::*;
 
+    impl TradeDedupCache {
+        pub(crate) fn contains(&self, trade_id: &TradeId) -> bool {
+            self.inner.lock().entries.contains_key(trade_id)
+        }
+    }
+
     impl WsDispatchState {
+        pub(crate) fn pop_pending_sendtx_head(&self) -> Option<PendingSendTx> {
+            self.pending_sendtx.lock().pop_front()
+        }
+
+        pub(crate) fn pending_sendtx_len(&self) -> usize {
+            self.pending_sendtx.lock().len()
+        }
+
         pub(crate) fn set_pending_order_action(
             &self,
             cloid: ClientOrderId,

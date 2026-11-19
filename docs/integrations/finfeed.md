@@ -2,7 +2,7 @@
 
 [FinFeedAPI Prediction Markets API](https://www.finfeedapi.com/products/prediction-markets-api?ref=nautilus)
 by [API Bricks](https://www.apibricks.io/?ref=nautilus) supplies REST metadata, activity, books, and OHLCV.
-The NautilusTrader adapter supports **Polymarket binary Yes/No instruments** through requests and polling.
+The NautilusTrader adapter supports **Polymarket and Kalshi binary Yes/No instruments** through requests and polling.
 
 **Data only**: Client ID `FINFEED`; no execution client, account operations, or order routing.
 FinFeed's currencies, stock, SEC, MCP, and JSON-RPC products are outside scope.
@@ -12,13 +12,14 @@ FinFeed's currencies, stock, SEC, MCP, and JSON-RPC products are outside scope.
 The Rust adapter includes Python bindings and needs no external FinFeed library.
 `nautilus_trader.adapters.finfeed` exports:
 
-| Export                         | Purpose                                         |
-| ------------------------------ | ----------------------------------------------- |
-| `FinFeedDataClientConfig`      | Startup selections, HTTP controls, polling.     |
-| `FinFeedInstrumentSelection`   | Exact outcome IDs from one exchange.            |
-| `FinFeedDataClientFactory`     | `LiveNode` factory registration.                |
-| `FinFeedHttpClient`            | Async read-only REST queries and typed results. |
-| `FINFEED`, `FINFEED_CLIENT_ID` | Default client name and routing ID.             |
+| Export                         | Purpose                                             |
+| ------------------------------ | --------------------------------------------------- |
+| `FinFeedDataClientConfig`      | Startup selections, HTTP controls, polling.         |
+| `FinFeedInstrumentSelection`   | Exact outcome IDs from one exchange.                |
+| `FinFeedDataClientFactory`     | `LiveNode` factory registration.                    |
+| `FinFeedDataLoader`            | Cached definitions and standalone Nautilus history. |
+| `FinFeedHttpClient`            | Async read-only REST queries and typed results.     |
+| `FINFEED`, `FINFEED_CLIENT_ID` | Default client name and routing ID.                 |
 
 Start with [Python configuration](#python-configuration) or the [examples](#examples).
 
@@ -26,7 +27,7 @@ Start with [Python configuration](#python-configuration) or the [examples](#exam
 
 | Capability                 | Interface            | Support / limit                                             |
 | -------------------------- | -------------------- | ----------------------------------------------------------- |
-| Discovery / metadata       | REST                 | Raw listings; native Polymarket binary Yes/No definitions.  |
+| Discovery / metadata       | REST                 | Raw listings; native Polymarket/Kalshi binary definitions.  |
 | Quote / trade ticks        | Polling              | Sampled activity; bounded deduplication, no gap recovery.   |
 | L2 deltas                  | Polling              | Full replacement of supplied levels.                        |
 | L2 depth                   | Polling              | Snapshots, locally limited depth.                           |
@@ -43,7 +44,7 @@ Start with [Python configuration](#python-configuration) or the [examples](#exam
 
 ## Integrator attribution
 
-- **API requests**: Every managed attempt, including retries and reconnects, sends
+- **API requests**: Every managed FinFeed attempt, including retries and reconnects, sends
   `X-Referrer: nautilus`. This fixed header has no override and contains no credential or account data.
 - **Signup**: Open an [API Bricks referral link](https://www.apibricks.io/?ref=nautilus) before creating
   an account in the same browser. Signup and request attribution are separate;
@@ -63,6 +64,7 @@ Before running:
   see [installation](../getting_started/installation.md).
 - Check provider retention for the historical examples' fixed past windows.
 
+Set `MARKET_ID` in the example you plan to run to an [active Polymarket outcome ID](#selecting-an-outcome).
 Run from the repository root:
 
 ```bash tab="Rust"
@@ -81,7 +83,7 @@ examples register the factory with `LiveNode` and route `DataTester` through `FI
 
 | Setting           | Example value                                             |
 | ----------------- | --------------------------------------------------------- |
-| Outcome           | `2026-BALANCE-OF-POWER-D-SENATE-D-HOUSE-949_NO`.          |
+| Outcome           | Active Polymarket outcome ID set in `MARKET_ID`.          |
 | Subscriptions     | Quotes, trades, L2 book replacements; logs incoming data. |
 | Stop timer        | 60 seconds including startup; shutdown can take longer.   |
 | Managed allowance | Eight attempts; no application retries.                   |
@@ -90,15 +92,16 @@ examples register the factory with `LiveNode` and route `DataTester` through `FI
 No orders, bars, or history requests run. Bootstrap costs two attempts; initial activity/book polls cost one each.
 For longer runs, [size the allowance](#request-cost-and-retries).
 
-### Selecting another outcome
+### Selecting an outcome
 
-Use `POLYMARKET` with the provider's
-[active-market endpoint](https://www.finfeedapi.com/products/prediction-markets-api/docs/rest-api/markets/markets/exchange_id/active/get?ref=nautilus).
-Set `MARKET_ID` to an exact binary Yes/No outcome ID, including its suffix.
-Full metadata must pass the [definition rules](#supported-venues-and-outcomes).
+Use the provider's
+[active-market endpoint](https://www.finfeedapi.com/products/prediction-markets-api/docs/rest-api/markets/markets/exchange_id/active/get?ref=nautilus)
+with `POLYMARKET`.
+Choose an exact outcome ID ending in `_YES` or `_NO`. Check that its full metadata reports an open
+market and passes the [definition rules](#supported-venues-and-outcomes).
 
 Use the loaded precision and FinFeed instrument ID. Do not round data or substitute a native
-Polymarket ID. Closed or unavailable markets may produce no new activity.
+Polymarket ID. The adapter rejects subscriptions for closed or resolved outcomes.
 
 ### Discovering an outcome in Python
 
@@ -189,10 +192,11 @@ Larger selections need exact IDs and room for latency and account-wide quota.
 
 ### Supported venues and outcomes
 
-Native definitions and subscriptions support **Polymarket binary Yes/No outcomes only**.
-The label must match `_YES` or `_NO` and a distinct source token.
+Native definitions and subscriptions support **Polymarket and ordinary USD 1 Kalshi Yes/No outcomes**.
+Polymarket labels must match `_YES` or `_NO` and a distinct source token. Kalshi IDs must equal `<Ticker>_YES` or `<Ticker>_NO` for the source label. FinFeed `Ticker` and
+`EventTicker` must match the public market and event identities.
 
-Raw REST identity also recognizes `KALSHI`, `MYRIAD`, `MANIFOLD`, `HYPERLIQUIDOUTCOME`, `PASCAL`,
+Raw REST identity also recognizes `MYRIAD`, `MANIFOLD`, `HYPERLIQUIDOUTCOME`, `PASCAL`,
 `GEMINIPM`, `CRYPTOCOMPM`, and `FORECASTEX`. Those venues and non-binary contracts have no native mapping.
 
 ### Explicit selections
@@ -218,6 +222,8 @@ Discovery has no point-in-time catalog guarantee. Full metadata must still pass 
 
 ### Identity and precision
 
+Polymarket definitions use these conventions:
+
 | Field         | Definition                                  | Meaning                                                                                               |
 | ------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | Instrument ID | `<exact outcome ID>.FINFEED_POLYMARKET`     | Preserves the provider's case and dots.                                                               |
@@ -232,15 +238,73 @@ Definition metadata retains description, outcome, condition/token IDs, provider 
 question/tags fields. Additional order quantity, notional, and price limits stay unset.
 Metadata does not imply execution compatibility.
 
+### Kalshi metadata and precision
+
+Kalshi definitions use FinFeed outcome IDs under `FINFEED_KALSHI`. Each load or explicit refresh fetches
+public Kalshi market and event metadata to verify identity, ordinary USD 1 contract economics, and price ranges.
+A missing live market tries Kalshi's historical metadata endpoint. Supported contracts require
+`market_type=binary`, `notional_value_dollars=1`, `settlement_bounds_type=default`, and an absent or zero
+`settlement_floor_dollars`. Event `collateral_return_type` must be empty; multivariate collection and
+selected-leg fields must be absent or empty. Unsupported contracts fail without partial publication.
+
+- **Prices**: Six-decimal storage and a per-market tick scheme. Each `No` tick equals USD 1 minus an
+  allowed `Yes` tick, including singleton and non-aligned bands. FinFeed's zero `TickSize` is not a fallback tick.
+- **Currency and size**: `USD`, two decimal places, and a `0.01` contract increment and minimum quantity.
+- **Lifecycle**: `open_time` supplies activation; `latest_expiration_time` supplies expiry. The separate
+  `close_time` stays in instrument metadata. Kalshi `closed`, `determined`, `disputed`, and `amended`
+  map to `Closed`; `finalized` maps to `Resolved`. Terminal status from FinFeed or Kalshi ends polling.
+- **Metadata**: `event_id` is the public event ticker. Instrument info retains the decoded public market/event
+  fields and `finfeed_status`; it does not retain the complete public responses.
+  Retained `info.market.price_ranges` are the source Yes bands; use the instrument's tick scheme for No navigation.
+
+Public metadata requests send no FinFeed key or Kalshi credentials. They share the configured proxy,
+timeout, concurrency, pacing, retries, and cancellation, but do not consume the FinFeed attempt allowance.
+Kalshi applies its own provider quota. Size deadlines for both providers using the
+[bootstrap budget](#bootstrap-budget); see [public controls](#connection-and-instruments) for the metadata endpoint override.
+
+Use the data client or `FinFeedDataLoader.request_instrument` for enriched definitions. The synchronous raw
+`FinFeedMarket.to_instrument()` only maps Polymarket because it cannot fetch public metadata.
+Kalshi metadata does not add execution support or an authoritative settlement event.
+
 ### Coexistence with native adapters
 
 FinFeed IDs use `FINFEED_POLYMARKET`; native Polymarket IDs use `POLYMARKET` and separate condition/token
-identity. Register each factory separately, retain both definitions, and route FinFeed requests with
+identity. Kalshi similarly separates `FINFEED_KALSHI` outcomes from native `KALSHI` instruments.
+Register each factory separately, retain both definitions, and route FinFeed requests with
 `FINFEED_CLIENT_ID`. Native data or execution needs the native client and instrument IDs.
 
 :::warning
 Do not overwrite one definition with the other or route FinFeed IDs to native execution.
 :::
+
+## Standalone data loader
+
+`FinFeedDataLoader` retains checked outcome definitions and returns Nautilus market data without a node.
+Construction sends no requests and reads no credentials. The first network operation creates a shared
+HTTP client. Use `FinFeedDataLoader(api_key=api_key)` or omit the key to use `FINFEED_API_KEY`.
+Optional constructor keywords control HTTP pacing, retries, and the attempt allowance. `base_url`
+selects the REST endpoint, and `proxy_url` sets an explicit HTTP(S) proxy. `timeout_secs` bounds one
+transport request; `retry_operation_timeout_ms` also covers admission and pacing for one attempt.
+`retry_max_elapsed_ms` bounds the entire call, including retries.
+
+Call `await loader.request_instrument(instrument_id)` to fetch and retain one definition, or
+`await loader.request_instruments(instruments)` to fetch the supplied selections atomically. `add_instrument`
+registers an existing definition. Failed refreshes preserve the retained definitions. Market-data calls
+use cached metadata; they do not refresh it implicitly.
+
+`request_book_deltas`, `request_quotes`, `request_trades`, and `request_bars` take integer UNIX nanosecond
+`start` and `end` bounds and an optional positive limit. Bounds are inclusive on the adapter's ordering
+clock. These methods share the native client's historical processing and return no partial result on
+failure. Book limits preserve complete batches. See [historical books](#historical-books) for snapshot
+requirements, replay clocks, and continuation limits.
+
+The [Polymarket backtest tutorial](https://github.com/nautechsystems/nautilus_trader/blob/develop/docs/tutorials/backtest_orderbook_finfeed.py) shows definition retrieval,
+book download, catalog writes, and replay with `BacktestNode`.
+
+Kalshi definitions written to a Parquet catalog retain their exact tick schemes, including the
+complementary No grid. Catalog loading restores these schemes without credentials or metadata requests.
+Older files that contain only a custom scheme name require that scheme to be registered before loading.
+Catalog writes require any named scheme to be registered in the writing process.
 
 ## Python REST access
 
@@ -272,7 +336,8 @@ Query objects and result properties have no setters.
 
 All methods return awaitables. Collection methods use `bounds: FinFeedPagination` and return a complete
 bounded traversal or raise without partial results. Raw history methods return **one response**;
-[automatic historical pagination](#coverage-and-truncation) belongs to the native data client.
+[automatic historical pagination](#coverage-and-truncation) is available through `FinFeedDataLoader`
+and the native data client.
 
 | Method                                                       | Query type                  | Awaited result             |
 | ------------------------------------------------------------ | --------------------------- | -------------------------- |
@@ -382,6 +447,9 @@ Load a definition before history or current-book requests.
 | Quotes | Covering UTC hours; 10000 rows per page. | Order/filter by `recv_time` (`ts_init`); `entry_time` supplies `ts_event`.              |
 | Trades | Covering UTC hours; 10000 rows per page. | Sole `timestamp` for ordering and both clocks; `NO_AGGRESSOR`.                          |
 | Bars   | Period lookup; 100000 rows per page.     | Complete periods inside the window, closed by request time; both clocks use period end. |
+
+Native quote history fails with `crossed FinFeed quote` if a retrieved bid exceeds its ask.
+Raw REST access preserves the provider's values.
 
 #### Coverage and truncation
 
@@ -501,7 +569,9 @@ in a saturated cycle.
 REST subscriptions sample data. There is no WebSocket stream, continuity, automatic backfill, or completeness guarantee.
 :::
 
-`DEBUG` diagnostics report activity/OHLCV counts, limits, and saturation. Saturation does not trigger recovery.
+Activity and OHLCV polls report counts and limits. The first full result in a series logs at `WARN`.
+Other results log at `DEBUG`. A full response signals possible truncation. The adapter relies on overlapping
+responses to deduplicate records, so saturation alone cannot establish a gap or trigger recovery.
 
 ### Timestamps and deduplication
 
@@ -518,7 +588,7 @@ Quotes use entry/receive times for `ts_event`/`ts_init`; trades use their sole t
 
 | Condition                                                         | Effect                         |
 | ----------------------------------------------------------------- | ------------------------------ |
-| Invalid activity record                                           | Log and omit the record.       |
+| Invalid activity record, including a bid above its ask            | Log and omit the record.       |
 | Wire-decoding failure                                             | Reject the response.           |
 | Empty list                                                        | Publish nothing.               |
 | Exhausted transient retries, decode failure, or HTTP 404          | Allow a later scheduled poll.  |
@@ -678,7 +748,8 @@ Default: `https://api.prediction-markets.finfeedapi.com/v1/` (production).
 
 ### Python configuration
 
-Register the factory with bounded settings:
+Set `market_id` to an [active Polymarket outcome ID](#selecting-an-outcome) and register the factory
+with bounded settings:
 
 ```python
 from nautilus_trader.adapters.finfeed import FinFeedDataClientConfig
@@ -692,7 +763,7 @@ config = FinFeedDataClientConfig(
     instruments=[
         FinFeedInstrumentSelection(
             "POLYMARKET",
-            ["2026-BALANCE-OF-POWER-D-SENATE-D-HOUSE-949_NO"],
+            [market_id],
         ),
     ],
     attempt_budget=8,
@@ -718,20 +789,21 @@ and a 60-second stop timer. For general setup, see [Configure live trading](../h
 
 #### Connection and instruments
 
-| Python keyword            | Rust field                     | Default                   | Meaning                                                 |
-| ------------------------- | ------------------------------ | ------------------------- | ------------------------------------------------------- |
-| `api_key`                 | `api_key`                      | `None`                    | Resolve `FINFEED_API_KEY` at client construction.       |
-| `instruments`             | `instruments`                  | `[]`                      | Nonempty explicit selections for the data client.       |
-| `base_url_http`           | `http.base_url`                | Production endpoint above | Include the `/v1/` prefix.                              |
-| `proxy_url`               | `http.proxy_url`               | `None`                    | Explicit HTTP(S) proxy.                                 |
-| `http_timeout_secs`       | `http.timeout_secs`            | `300`                     | Transport timeout per request, in seconds.              |
-| `max_concurrent_requests` | `http.max_concurrent_requests` | `1`                       | Managed requests in flight on this instance.            |
-| `attempt_budget`          | `http.attempt_budget`          | `100`                     | Lifetime managed attempts per connection generation.    |
-| `min_request_interval_ms` | `http.min_request_interval_ms` | `10000`                   | Shared spacing between attempt starts, in milliseconds. |
-| `connect_timeout_secs`    | `connect_timeout_secs`         | `120`                     | Entire bootstrap deadline in seconds.                   |
+| Python keyword            | Rust field                     | Default                   | Meaning                                                                         |
+| ------------------------- | ------------------------------ | ------------------------- | ------------------------------------------------------------------------------- |
+| `api_key`                 | `api_key`                      | `None`                    | Resolve `FINFEED_API_KEY` at client construction.                               |
+| `instruments`             | `instruments`                  | `[]`                      | Nonempty explicit selections for the data client.                               |
+| `base_url_http`           | `http.base_url`                | Production endpoint above | Include the `/v1/` prefix.                                                      |
+| `kalshi_metadata_url`     | `http.kalshi_metadata_url`     | `None`                    | Public Kalshi metadata URL, including `/trade-api/v2/`; HTTPS or loopback HTTP. |
+| `proxy_url`               | `http.proxy_url`               | `None`                    | Explicit HTTP(S) proxy.                                                         |
+| `http_timeout_secs`       | `http.timeout_secs`            | `300`                     | Transport timeout per request, in seconds.                                      |
+| `max_concurrent_requests` | `http.max_concurrent_requests` | `1`                       | Managed requests in flight on this instance.                                    |
+| `attempt_budget`          | `http.attempt_budget`          | `100`                     | Lifetime FinFeed managed attempts per connection generation.                    |
+| `min_request_interval_ms` | `http.min_request_interval_ms` | `10000`                   | Shared spacing between attempt starts, in milliseconds.                         |
+| `connect_timeout_secs`    | `connect_timeout_secs`         | `120`                     | Entire bootstrap deadline in seconds.                                           |
 
 Each `FinFeedInstrumentSelection` requires `exchange_id` and `market_ids`, with no selection defaults.
-Use `POLYMARKET` and exact binary Yes/No outcome IDs; see [supported venues and outcomes](#supported-venues-and-outcomes).
+Use `POLYMARKET` or `KALSHI` and exact binary Yes/No outcome IDs; see [supported venues and outcomes](#supported-venues-and-outcomes).
 
 Request timeouts and pacing are positive and limited to one day. `connect_timeout_secs` accepts `[1, 86400]`;
 concurrency and attempt allowance must be positive.
@@ -773,7 +845,8 @@ and a finite factor in `[1, 100]`. Jitter can be zero.
 
 #### Bootstrap budget
 
-Bootstrap costs **one exchange-discovery GET plus one metadata GET per distinct startup or retained outcome**,
+Bootstrap spends **one exchange-discovery GET plus one metadata GET per distinct startup or retained outcome**
+from the FinFeed allowance,
 excluding retries. Refreshes, history, period lookups, and polling share the allowance:
 
 | Operation                | Minimum cost                                                            |
@@ -782,8 +855,10 @@ excluding retries. Refreshes, history, period lookups, and polling share the all
 | Historical bars          | Period lookup and OHLCV pages, possibly a final empty page.             |
 | Bar subscription         | Period lookup before first OHLCV poll per generation or resubscription. |
 
-Default 10-second pacing alone consumes the 120-second bootstrap deadline at 12 outcomes.
-At 128 outcomes, 129 bootstrap attempts exceed the default 100-attempt allowance.
+For `N` outcomes including `K` Kalshi outcomes, bootstrap makes at least `1 + N + 2K` paced requests,
+before retries or archive lookups. Only `1 + N` consumes the FinFeed allowance.
+Default 10-second pacing alone consumes the 120-second bootstrap deadline at 12 Polymarket outcomes
+or four Kalshi outcomes. At 128 outcomes, 129 FinFeed attempts exceed the default 100-attempt allowance.
 Size both adapter and node connection deadlines for selections, latency, and retries.
 
 #### Sizing a bounded collection
@@ -801,7 +876,7 @@ For unchanged subscriptions and no refreshes:
 - **Headroom**: Add period lookups, explicit requests, refreshes, and retries. Changes/refreshes can make
   scopes immediately due. Each operation can use up to `1 + max_retries` attempts, subject to deadlines.
 
-These 24-hour examples use 10-second pacing and HTTP timeouts, no retries, bars, or explicit requests;
+These Polymarket-only 24-hour examples use 10-second pacing and HTTP timeouts, no retries, bars, or explicit requests;
 allowances reserve extra room:
 
 | Outcomes | Polling scopes per outcome | Poll delay | Bootstrap attempts | Total attempt ceiling | Explicit allowance | Adapter / node connection timeout |
@@ -824,8 +899,10 @@ chosen row. See [public controls](#public-controls-and-defaults) for equivalent 
 1280 seconds per sweep, or 2560 with 128 book scopes, before latency. A 60-second poll delay cannot make
 those scopes update once per minute; reduce selections or increase the delay.
 
-`max_concurrent_requests` bounds in-flight work but does not parallelize serial bootstrap/polling or bypass
-pacing. Separate clients have independent controls; coordinate their account-wide load.
+`max_concurrent_requests` bounds requests in flight. Attempts wait for pacing before taking a slot.
+FinFeed attempts also wait for the [shared cooldown](#retryable-failures). Bootstrap and polling stay serial.
+Reconnecting the same data client preserves both delays. Separate clients have independent controls.
+Coordinate their account-wide load.
 
 | Deadline                     | Covers                                                           |
 | ---------------------------- | ---------------------------------------------------------------- |
@@ -869,12 +946,22 @@ other clients. Check provider usage before starting the next bounded window.
 
 #### Retryable failures
 
-Retry transport/timeouts and HTTP 429, 500, 502, 503, and 504, honoring integer `Retry-After` seconds.
+The client retries transport failures, timeouts, and HTTP 429, 500, 502, 503, and 504. For these status
+codes, it accepts `Retry-After` in integer seconds or as an `IMF-fixdate` HTTP date. The minimum delay
+starts at header receipt.
+If the deadline fits the local clock, a FinFeed response starts a shared cooldown for later FinFeed
+attempts, even if retries are disabled or reading the body fails. Public Kalshi metadata uses ordinary
+pacing and honors `Retry-After` for its own retries. A failed body read still returns a read error.
 Admission can expire before sending.
+
+At `DEBUG`, each completed transport attempt reports the provider, endpoint, time waiting for admission,
+HTTP elapsed time, status when received, and remaining FinFeed attempts. Use the timings to distinguish
+local admission delays from transport time. Admission includes concurrency, pacing, and the shared cooldown.
 
 #### Local attempts and provider quota
 
-Every admitted attempt counts, including failures/cancellations. **No refunds.**
+Every admitted FinFeed attempt counts, including failures/cancellations. **No refunds.**
+Public Kalshi metadata attempts do not consume this allowance; Kalshi applies its own provider quota.
 
 :::note
 Native HTTP/2 can resend twice after `REFUSED_STREAM` or `GOAWAY(NO_ERROR)` without managed allowance

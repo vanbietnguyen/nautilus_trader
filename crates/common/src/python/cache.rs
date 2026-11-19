@@ -23,8 +23,8 @@ use nautilus_core::python::to_pyvalue_err;
 use nautilus_model::defi::{Pool, PoolProfiler};
 use nautilus_model::{
     data::{
-        Bar, BarType, FundingRateUpdate, InstrumentClose, InstrumentStatus, QuoteTick, TradeTick,
-        YieldCurve,
+        Bar, BarType, CustomData, DataType, FundingRateUpdate, InstrumentClose, InstrumentStatus,
+        QuoteTick, TradeTick, YieldCurve,
         prices::{IndexPriceUpdate, MarkPriceUpdate},
     },
     enums::{AggregationSource, OmsType, OrderSide, PositionSide, PriceType},
@@ -257,6 +257,15 @@ impl PyCache {
             .map_err(to_pyvalue_err)
     }
 
+    /// Adds custom data as the newest entry in its bounded history.
+    ///
+    /// Each data type topic has its own history, limited by `CacheConfig::data_capacity`.
+    /// This operation updates memory only.
+    #[pyo3(name = "add_custom_data")]
+    fn py_add_custom_data(&mut self, data: CustomData) {
+        self.0.borrow_mut().add_custom_data(data);
+    }
+
     #[pyo3(name = "add_yield_curve")]
     fn py_add_yield_curve(&mut self, yield_curve: YieldCurve) -> PyResult<()> {
         self.0
@@ -322,6 +331,32 @@ impl PyCache {
     #[pyo3(name = "bars")]
     fn py_bars(&self, bar_type: BarType) -> Option<Vec<Bar>> {
         self.0.borrow().bars(&bar_type)
+    }
+
+    /// Returns the most recently added custom data for the `data_type`, or `None` if absent.
+    #[pyo3(name = "custom_data")]
+    fn py_custom_data(&self, data_type: &DataType) -> Option<CustomData> {
+        self.0.borrow().custom_data(data_type).cloned()
+    }
+
+    /// Returns custom data at `index` for the `data_type`.
+    ///
+    /// Index 0 is the most recently added item. Entries are not sorted by timestamp.
+    /// Returns `None` when no item exists at the index.
+    #[pyo3(name = "custom_data_at_index")]
+    fn py_custom_data_at_index(&self, data_type: &DataType, index: usize) -> Option<CustomData> {
+        self.0
+            .borrow()
+            .custom_data_at_index(data_type, index)
+            .cloned()
+    }
+
+    /// Returns custom data for the `data_type` in reverse insertion order.
+    ///
+    /// Entries are not sorted by timestamp. The history is empty when no data is cached.
+    #[pyo3(name = "custom_data_history")]
+    fn py_custom_data_history(&self, data_type: &DataType) -> Vec<CustomData> {
+        self.0.borrow().custom_data_history(data_type)
     }
 
     #[pyo3(name = "bar_types", signature = (aggregation_source, instrument_id=None, price_type=None))]
@@ -1678,7 +1713,7 @@ mod tests {
     fn test_py_cache_constructor_returns_value_error_for_invalid_config() {
         Python::initialize();
         let config = CacheConfig {
-            tick_capacity: 0,
+            data_capacity: 0,
             ..Default::default()
         };
 
@@ -1737,7 +1772,7 @@ impl CacheConfig {
         use_instance_id=None,
         flush_on_start=None,
         drop_instruments_on_reset=None,
-        tick_capacity=None,
+        data_capacity=None,
         bar_capacity=None,
         save_market_data=None,
         persist_account_events=None,
@@ -1751,7 +1786,7 @@ impl CacheConfig {
         use_instance_id: Option<bool>,
         flush_on_start: Option<bool>,
         drop_instruments_on_reset: Option<bool>,
-        tick_capacity: Option<usize>,
+        data_capacity: Option<usize>,
         bar_capacity: Option<usize>,
         save_market_data: Option<bool>,
         persist_account_events: Option<bool>,
@@ -1765,7 +1800,7 @@ impl CacheConfig {
             use_instance_id: use_instance_id.unwrap_or(false),
             flush_on_start: flush_on_start.unwrap_or(false),
             drop_instruments_on_reset: drop_instruments_on_reset.unwrap_or(true),
-            tick_capacity: tick_capacity.unwrap_or(10_000),
+            data_capacity: data_capacity.unwrap_or(10_000),
             bar_capacity: bar_capacity.unwrap_or(10_000),
             persist_account_events: persist_account_events.unwrap_or(true),
             save_market_data: save_market_data.unwrap_or(false),
@@ -1823,8 +1858,8 @@ impl CacheConfig {
     }
 
     #[getter]
-    fn tick_capacity(&self) -> usize {
-        self.tick_capacity
+    fn data_capacity(&self) -> usize {
+        self.data_capacity
     }
 
     #[getter]
@@ -1883,9 +1918,11 @@ impl Cache {
     ///
     /// When `purge_from_database` is true, also requests deletion from the backing database.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the database deletion cannot be queued.
+    /// Returns an error if the backing reports a DeFi currency integrity error.
     #[pyo3(name = "purge_closed_orders", signature = (ts_now, buffer_secs=0, purge_from_database=false))]
     fn py_purge_closed_orders(
         &mut self,
@@ -1901,9 +1938,11 @@ impl Cache {
     ///
     /// When `purge_from_database` is true, also requests deletion from the backing database.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the database deletion cannot be queued.
+    /// Returns an error if the backing reports a DeFi currency integrity error.
     #[pyo3(name = "purge_closed_positions", signature = (ts_now, buffer_secs=0, purge_from_database=false))]
     fn py_purge_closed_positions(
         &mut self,
@@ -1917,9 +1956,11 @@ impl Cache {
 
     /// Deletes persisted actor state. Does nothing without a database.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if deleting the state fails.
+    /// Returns an error if the backing reports a DeFi currency integrity error.
     #[pyo3(name = "delete_actor")]
     fn py_delete_actor(&self, actor_id: ActorId) -> PyResult<()> {
         self.delete_actor(&actor_id).map_err(to_pyvalue_err)
@@ -1927,9 +1968,11 @@ impl Cache {
 
     /// Deletes persisted strategy state. Does nothing without a database.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if deleting the state fails.
+    /// Returns an error if the backing reports a DeFi currency integrity error.
     #[pyo3(name = "delete_strategy")]
     fn py_delete_strategy(&self, strategy_id: StrategyId) -> PyResult<()> {
         self.delete_strategy(&strategy_id).map_err(to_pyvalue_err)
@@ -1937,9 +1980,11 @@ impl Cache {
 
     /// Persists the heartbeat timestamp. Does nothing without a database.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if persisting the timestamp fails.
+    /// Returns an error if the backing reports a DeFi currency integrity error.
     #[pyo3(name = "heartbeat")]
     fn py_heartbeat(&self, timestamp: u64) -> PyResult<()> {
         self.heartbeat(timestamp.into()).map_err(to_pyvalue_err)
@@ -1983,9 +2028,11 @@ impl Cache {
     ///
     /// When `purge_from_database` is true, also requests deletion from the backing database.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the database deletion cannot be queued.
+    /// Returns an error if the backing reports a DeFi currency integrity error.
     #[pyo3(name = "purge_order", signature = (client_order_id, purge_from_database=false))]
     fn py_purge_order(
         &mut self,
@@ -2002,9 +2049,11 @@ impl Cache {
     ///
     /// When `purge_from_database` is true, also requests deletion from the backing database.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the database deletion cannot be queued.
+    /// Returns an error if the backing reports a DeFi currency integrity error.
     #[pyo3(name = "purge_position", signature = (position_id, purge_from_database=false))]
     fn py_purge_position(
         &mut self,
@@ -2032,9 +2081,11 @@ impl Cache {
     /// When `purge_from_database` is true, also requests deletion from the backing database.
     /// Redis and PostgreSQL log the request and retain the full account history for replay.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the database deletion cannot be queued.
+    /// Returns an error if the backing reports a DeFi currency integrity error.
     #[pyo3(name = "purge_account_events", signature = (ts_now, lookback_secs=0, purge_from_database=false))]
     fn py_purge_account_events(
         &mut self,
@@ -2048,9 +2099,12 @@ impl Cache {
 
     /// Adds the `currency` to the cache.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if persisting the currency to the backing database fails.
+    /// Returns an error if the currency definition conflicts with existing state or the backing
+    /// reports a DeFi currency integrity error.
     #[pyo3(name = "add_currency")]
     fn py_add_currency(&mut self, currency: Currency) -> PyResult<()> {
         self.add_currency(currency).map_err(to_pyvalue_err)
@@ -2058,9 +2112,12 @@ impl Cache {
 
     /// Adds the `instrument` to the cache.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if persisting the instrument to the backing database fails.
+    /// Returns an error if the instrument or its currency identities conflict with existing state,
+    /// or the backing reports a DeFi currency integrity error.
     #[pyo3(name = "add_instrument")]
     fn py_add_instrument(&mut self, py: Python, instrument: Py<PyAny>) -> PyResult<()> {
         let instrument_any = pyobject_to_instrument_any(py, instrument)?;
@@ -2113,6 +2170,8 @@ impl Cache {
 
     /// Adds the `order` to the cache indexed with any given identifiers.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Parameters
     ///
     /// `replace_existing`: Replaces an existing order with the same client order ID. Emulated
@@ -2121,9 +2180,8 @@ impl Cache {
     /// # Errors
     ///
     /// Returns an error if the client order ID exists and `replace_existing` is false, a
-    /// replacement claims another order's venue order ID, or persistence fails. The order and
-    /// every index are committed to memory before persistence is attempted, so a persistence
-    /// error leaves the cache internally consistent.
+    /// replacement claims another order's venue order ID, or the backing reports a DeFi currency
+    /// integrity error.
     #[pyo3(name = "add_order")]
     fn py_add_order(
         &mut self,
@@ -2290,11 +2348,12 @@ impl Cache {
     /// For `OmsType.Unspecified`, IDs matching `{instrument_id}-{strategy_id}` resolve to
     /// `OmsType.Netting`. Other IDs retain the supplied OMS type.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if persisting the position to the backing database fails. After
-    /// serialization succeeds, the complete operation is committed to memory before persistence
-    /// is attempted, so a persistence error leaves the cache internally consistent.
+    /// Returns an error if validating or serializing the position metadata fails, or the backing
+    /// reports a DeFi currency integrity error.
     #[pyo3(name = "add_position")]
     #[expect(clippy::needless_pass_by_value)]
     fn py_add_position(
@@ -2316,9 +2375,12 @@ impl Cache {
     /// encodes only when a consumer asks for the bytes, so this call stays off the encode path
     /// unless a backing database has to persist the frame.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if serializing or storing the position snapshot fails.
+    /// Returns an error if serializing the snapshot or validating its cache entry fails, or the
+    /// backing reports a DeFi currency integrity error.
     #[pyo3(name = "snapshot_position")]
     #[expect(clippy::needless_pass_by_value)]
     fn py_snapshot_position(&mut self, py: Python, position: Py<PyAny>) -> PyResult<()> {
@@ -2415,9 +2477,11 @@ impl Cache {
 
     /// Adds the `quote` tick to the cache.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if persisting the quote tick to the backing database fails.
+    /// Returns an error if the backing reports a DeFi currency integrity error.
     #[pyo3(name = "add_quote")]
     fn py_add_quote(&mut self, quote: QuoteTick) -> PyResult<()> {
         self.add_quote(quote).map_err(to_pyvalue_err)
@@ -2425,9 +2489,11 @@ impl Cache {
 
     /// Adds the `trade` tick to the cache.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if persisting the trade tick to the backing database fails.
+    /// Returns an error if the backing reports a DeFi currency integrity error.
     #[pyo3(name = "add_trade")]
     fn py_add_trade(&mut self, trade: TradeTick) -> PyResult<()> {
         self.add_trade(trade).map_err(to_pyvalue_err)
@@ -2438,9 +2504,11 @@ impl Cache {
     /// A newer bar is pushed, an older `ts_event` is skipped, and an equal
     /// `ts_event` replaces the front bar for time bars.
     ///
+    /// Persistence failures are logged without failing the operation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if persisting the bar to the backing database fails.
+    /// Returns an error if the backing reports a DeFi currency integrity error.
     #[pyo3(name = "add_bar")]
     fn py_add_bar(&mut self, bar: Bar) -> PyResult<()> {
         self.add_bar(bar).map_err(to_pyvalue_err)

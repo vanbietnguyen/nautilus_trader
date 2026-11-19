@@ -24,20 +24,20 @@ crate-type = ["rlib"]
 default = []
 arrow = ["dep:arrow", "dep:nautilus-macros", "nautilus-model/arrow"]
 arrow-display = ["arrow"]
-sbe = []
+sbe = ["dep:nautilus-model"]
 extension-module = [
   "nautilus-core/extension-module",
-  "nautilus-model/extension-module",
+  "nautilus-model?/extension-module",
   "python",
   "pyo3/extension-module",
 ]
 python = [
   "nautilus-core/python",
-  "nautilus-model/python",
+  "nautilus-model?/python",
   "pyo3",
   "pyo3-stub-gen",
 ]
-high-precision = ["nautilus-model/high-precision"]
+high-precision = ["nautilus-model?/high-precision"]
 
 [package.metadata.docs.rs]
 # Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
@@ -47,7 +47,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 nautilus-core = { workspace = true }
 nautilus-macros = { workspace = true, optional = true }
-nautilus-model = { workspace = true }
+nautilus-model = { workspace = true, optional = true }
 
 anyhow = { workspace = true }
 indexmap = { workspace = true }
@@ -80,7 +80,8 @@ path = "benches/sbe_decoding.rs"
 harness = false
 required-features = ["sbe"]
 
-[[test]]
-name = "arrow_custom_data_macro"
-path = "tests/arrow_custom_data_macro.rs"
+[[bench]]
+name = "generated_custom_data"
+path = "benches/generated_custom_data.rs"
+harness = false
 required-features = ["arrow"]

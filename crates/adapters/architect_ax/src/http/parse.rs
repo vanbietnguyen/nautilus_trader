@@ -446,17 +446,15 @@ pub fn parse_account_state(
         balances.push(AccountBalance::new(zero_money, zero_money, zero_money));
     }
 
-    let margins = risk
-        .map(|risk| {
-            vec![MarginBalance::new(
-                Money::from_decimal(risk.initial_margin_required_total, Currency::USD())
-                    .unwrap_or_else(|_| Money::zero(Currency::USD())),
-                Money::from_decimal(risk.maintenance_margin_required, Currency::USD())
-                    .unwrap_or_else(|_| Money::zero(Currency::USD())),
-                None,
-            )]
-        })
-        .unwrap_or_default();
+    let margins = risk.map_or_default(|risk| {
+        vec![MarginBalance::new(
+            Money::from_decimal(risk.initial_margin_required_total, Currency::USD())
+                .unwrap_or_else(|_| Money::zero(Currency::USD())),
+            Money::from_decimal(risk.maintenance_margin_required, Currency::USD())
+                .unwrap_or_else(|_| Money::zero(Currency::USD())),
+            None,
+        )]
+    });
 
     Ok(AccountState::new(
         account_id,
@@ -1764,6 +1762,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(instruments.len(), 2);
+
         for (instrument, expected_symbol, expected_expiration) in [
             (&instruments[0], "XAU-2026-SEP", "2026-09-30T15:00:00Z"),
             (&instruments[1], "XAU-2026-DEC", "2026-12-31T16:00:00Z"),

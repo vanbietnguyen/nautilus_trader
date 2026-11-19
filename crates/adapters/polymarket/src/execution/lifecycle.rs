@@ -526,21 +526,26 @@ impl PolymarketExecutionClient {
 
                             let future = async move {
                                 match fetch_and_emit_account_state(
-                                    &http, &emit, clock, signature_type, &reservations, &settlement,
+                                    &http,
+                                    &emit,
+                                    clock,
+                                    signature_type,
+                                    &reservations,
+                                    &settlement,
                                 )
                                 .await
                                 {
                                     Ok(()) => log::debug!(
-                                        "Account state refreshed after finalized trade for {account_id}"
+                                        "Account state refreshed after user event for {account_id}"
                                     ),
                                     Err(e) => log::warn!(
-                                        "Failed to refresh account after finalized trade: {e}"
+                                        "Failed to refresh account after user event: {e}"
                                     ),
                                 }
                             };
 
                             if let Err(e) = session_spawner.spawn(future) {
-                                log::debug!("Skipping finalized trade refresh during shutdown: {e}");
+                                log::debug!("Skipping user event refresh during shutdown: {e}");
                             }
                         }
                     }
@@ -553,7 +558,9 @@ impl PolymarketExecutionClient {
                         settlement.note_stream_gap(clock.get_time_ns());
 
                         if stopping.load(Ordering::Acquire) {
-                            log::debug!("Skipping account refresh because execution client is stopping");
+                            log::debug!(
+                                "Skipping account refresh because execution client is stopping"
+                            );
                             continue;
                         }
 
@@ -561,9 +568,17 @@ impl PolymarketExecutionClient {
                         let emit = emitter.clone();
                         let reservations = collateral_locks.clone();
                         let settlement = settlement.clone();
+
                         let future = async move {
-                            match fetch_and_emit_account_state(&http, &emit, clock, signature_type, &reservations, &settlement)
-                                .await
+                            match fetch_and_emit_account_state(
+                                &http,
+                                &emit,
+                                clock,
+                                signature_type,
+                                &reservations,
+                                &settlement,
+                            )
+                            .await
                             {
                                 Ok(()) => {
                                     log::info!("Account state refreshed after WebSocket reconnect");
@@ -816,11 +831,27 @@ impl PolymarketExecutionClient {
                 self.order_contexts
                     .register_context(venue_order_id, OrderContext::from(order));
                 self.order_contexts.mark_accepted(venue_order_id);
+
+                // An integer-sized order can receive fractional fills. Recovery uses the
+                // instrument precision, as live reconciliation does, without rounding history.
+                let Some(size_precision) = self
+                    .core
+                    .cache()
+                    .instrument(&order.instrument_id())
+                    .map(|instrument| instrument.size_precision())
+                else {
+                    log::error!(
+                        "Cannot restore Polymarket order {}: instrument {} not cached",
+                        order.client_order_id(),
+                        order.instrument_id(),
+                    );
+                    continue;
+                };
                 let (prior_filled, current_leg_quantity) =
                     match venue_leg_filled_before_and_quantity(
                         order,
                         venue_order_id,
-                        order.quantity().precision,
+                        size_precision,
                     ) {
                         Ok(quantities) => quantities,
                         Err(e) => {
@@ -1009,6 +1040,7 @@ impl PolymarketExecutionClient {
 
         if let Err(e) = post_ws.await {
             log::warn!("Connect failed after WS started, tearing down: {e}");
+
             if let Err(teardown_error) = self.teardown_partial_connect().await {
                 return Err(e.context(format!(
                     "Polymarket startup teardown failed: {teardown_error}"
@@ -1867,6 +1899,7 @@ mod tests {
         msgbus::{publish_order_event, publish_position_event, switchboard},
     };
     use nautilus_core::{UUID4, UnixNanos, nanos::DurationNanos};
+    use nautilus_execution::reconciliation::create_inferred_reconciliation_trade_id;
     use nautilus_live::ExecutionClientCore;
     use nautilus_model::{
         enums::{
@@ -1881,8 +1914,8 @@ mod tests {
             },
         },
         identifiers::{
-            AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, StrategyId, Symbol,
-            TradeId, TraderId, VenueOrderId,
+            AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId,
+            Symbol, TradeId, TraderId, VenueOrderId,
         },
         instruments::stubs::binary_option,
         orders::{
@@ -2221,6 +2254,106 @@ mod tests {
     }
 
     #[rstest]
+    #[case::open_partial("0.200000", false, true, true)]
+    #[case::canceled_partial("0.200000", true, true, true)]
+    #[case::minimum_fill("0.000001", true, true, true)]
+    #[case::unrepresentable_fill("0.0000001", true, true, false)]
+    #[case::missing_instrument("0.200000", false, false, false)]
+    fn load_orders_from_cache_preserves_fractional_fills_of_integer_orders(
+        #[case] filled_quantity: &str,
+        #[case] canceled: bool,
+        #[case] instrument_cached: bool,
+        #[case] restored: bool,
+    ) {
+        let (client, cache) = test_client();
+        let mut instrument = test_binary_option("0xFRACTIONAL-RESTART", false, false);
+        let InstrumentAny::BinaryOption(ref mut binary) = instrument else {
+            unreachable!();
+        };
+        binary.size_precision = 6;
+        binary.size_increment = ModelQuantity::from("0.000001");
+        let venue_order_id = VenueOrderId::from("V-001");
+        let trade_id = TradeId::from("trade-fractional-restart");
+        let filled_quantity = ModelQuantity::from(filled_quantity);
+        let order = {
+            let mut cache = cache.borrow_mut();
+            if instrument_cached {
+                cache.add_instrument(instrument.clone()).unwrap();
+            }
+            let mut order = cache_accepted(
+                &mut cache,
+                OrderTestBuilder::new(OrderType::Limit)
+                    .instrument_id(instrument.id())
+                    .side(OrderSide::Buy)
+                    .price(ModelPrice::from("0.5000"))
+                    .quantity(ModelQuantity::from("5"))
+                    .build(),
+            );
+            let fill = TestOrderEventStubs::filled(
+                &order,
+                &instrument,
+                Some(trade_id),
+                None,
+                Some(ModelPrice::from("0.5000")),
+                Some(filled_quantity),
+                None,
+                None,
+                None,
+                Some(client.core.account_id),
+            );
+            order = cache.update_order(&fill).unwrap();
+
+            if canceled {
+                let cancel = TestOrderEventStubs::canceled(
+                    &order,
+                    client.core.account_id,
+                    Some(venue_order_id),
+                );
+                order = cache.update_order(&cancel).unwrap();
+            }
+            order
+        };
+        assert_eq!(order.quantity().precision, 0);
+        let before = serde_json::to_value(&order).unwrap();
+
+        client.load_orders_from_cache();
+
+        // Repeating recovery preserves the same quantities and event-derived settlement state
+        client.load_orders_from_cache();
+
+        assert_eq!(
+            client.fill_tracker.get_cumulative_filled(&venue_order_id),
+            restored.then_some(filled_quantity),
+        );
+        assert_eq!(
+            leg_application(&client.settlement, &trade_id),
+            restored.then_some(LegApplication::FillObserved),
+        );
+
+        if restored {
+            assert_eq!(
+                client.fill_tracker.prior_filled(&venue_order_id),
+                Some(ModelQuantity::from("0"))
+            );
+            assert_eq!(
+                client.fill_tracker.submitted_qty(&venue_order_id),
+                Some(ModelQuantity::from("5"))
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(
+                cache
+                    .borrow()
+                    .order(&order.client_order_id())
+                    .unwrap()
+                    .cloned()
+            )
+            .unwrap(),
+            before,
+        );
+    }
+
+    #[rstest]
     fn load_orders_from_cache_restores_failed_trade_correction_state() {
         let (client, cache) = test_client();
         let instrument = test_binary_option("0xRESTART", false, false);
@@ -2440,7 +2573,14 @@ mod tests {
         #[case] voided_qty: &str,
     ) {
         let (client, cache) = test_client();
-        let instrument = test_binary_option("0xDUST-AFTER-VOID", false, false);
+        let mut instrument = test_binary_option("0xDUST-AFTER-VOID", false, false);
+        let InstrumentAny::BinaryOption(ref mut binary) = instrument else {
+            unreachable!();
+        };
+
+        // Match the adapter's six-decimal instrument precision for the 9.9950 fill below
+        binary.size_precision = 6;
+        binary.size_increment = ModelQuantity::from("0.000001");
         let new_venue_order_id = VenueOrderId::from("V-002");
         let voided_qty = ModelQuantity::from(voided_qty);
 
@@ -3468,6 +3608,111 @@ mod tests {
                 Money::from("100 pUSD"),
                 Money::from("0 pUSD"),
                 Money::from("100 pUSD")
+            )
+        );
+    }
+
+    #[rstest]
+    #[case::inferred(true, true, "0 pUSD", "100 pUSD")]
+    #[case::reconciled_venue_trade(true, false, "5.125 pUSD", "94.875 pUSD")]
+    #[case::live_trade_with_inferred_id_format(false, true, "5.125 pUSD", "94.875 pUSD")]
+    fn buy_fill_locks_unless_inferred_by_reconciliation(
+        #[case] reconciliation: bool,
+        #[case] inferred_id_format: bool,
+        #[case] locked: &str,
+        #[case] free: &str,
+    ) {
+        let (mut client, cache) = test_client();
+        let instrument = test_binary_option("0xSTARTUP_BUY", false, false);
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        client.ensure_order_event_subscription();
+        let client_order_id = ClientOrderId::from("O-STARTUP");
+        let venue_order_id = VenueOrderId::from("V-STARTUP");
+        let last_qty = Quantity::from("10");
+        let last_px = Price::from("0.5000");
+        let ts_startup = UnixNanos::from(20_500_000_000_u64);
+
+        let trade_id = if inferred_id_format {
+            create_inferred_reconciliation_trade_id(
+                client.core.account_id,
+                instrument.id(),
+                client_order_id,
+                Some(venue_order_id),
+                OrderSide::Buy,
+                OrderType::Market,
+                last_qty,
+                last_qty,
+                last_px,
+                PositionId::from(format!("{}-EXTERNAL", instrument.id()).as_str()),
+                ts_startup,
+            )
+        } else {
+            TradeId::from("VENUE-TRADE")
+        };
+
+        let ticket = client
+            .collateral_locks
+            .lock()
+            .begin_refresh(&client.settlement);
+        client
+            .collateral_locks
+            .lock()
+            .apply_refresh(
+                ticket,
+                Money::from("100 pUSD"),
+                UnixNanos::from(20_000_000_000_u64),
+            )
+            .unwrap();
+        let filled = OrderEventAny::Filled(
+            OrderFilledSpec::builder()
+                .trader_id(TraderId::from("TESTER-001"))
+                .strategy_id(StrategyId::from("S-001"))
+                .instrument_id(instrument.id())
+                .client_order_id(client_order_id)
+                .venue_order_id(venue_order_id)
+                .account_id(client.core.account_id)
+                .trade_id(trade_id)
+                .order_side(OrderSide::Buy)
+                .order_type(OrderType::Market)
+                .last_qty(last_qty)
+                .last_px(last_px)
+                .currency(Currency::pUSD())
+                .commission(Money::from("0.125 pUSD"))
+                .ts_event(ts_startup)
+                .reconciliation(reconciliation)
+                .build(),
+        );
+        publish_order_event(
+            msgbus::switchboard::get_event_order_topic(StrategyId::from("S-001")),
+            &filled,
+        );
+        let ticket = client
+            .collateral_locks
+            .lock()
+            .begin_refresh(&client.settlement);
+        let after_fill = match client
+            .collateral_locks
+            .lock()
+            .apply_refresh(
+                ticket,
+                Money::from("100 pUSD"),
+                UnixNanos::from(21_000_000_000_u64),
+            )
+            .unwrap()
+        {
+            AppliedBalance::Fresh(balance) => balance,
+            AppliedBalance::Stale => panic!("refresh was stale"),
+        };
+
+        assert_eq!(
+            after_fill,
+            AccountBalance::new(
+                Money::from("100 pUSD"),
+                Money::from(locked),
+                Money::from(free)
             )
         );
     }

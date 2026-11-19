@@ -48,16 +48,17 @@ use nautilus_common::{
     messages::{
         DataEvent, ExecutionEvent,
         execution::{
-            BatchCancelOrders, CancelOrder, ExecutionReport as CommonExecutionReport,
-            GeneratePositionStatusReports, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
-            SubmitOrderList, TradingCommand,
+            CancelOrder, ExecutionReport as CommonExecutionReport, GeneratePositionStatusReports,
+            ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
             report::{GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports},
         },
     },
     msgbus::{self, MessagingSwitchboard, TypedIntoHandler},
     testing::wait_until_async,
 };
-use nautilus_core::{AtomicMap, DurationNanos, UUID4, UnixNanos, time::get_atomic_clock_realtime};
+use nautilus_core::{
+    AtomicMap, DurationNanos, UUID4, UnixNanos, params::Params, time::get_atomic_clock_realtime,
+};
 use nautilus_live::{
     ExecutionClientCore, ExecutionEventEmitter,
     execution::context::OrderIdentity,
@@ -68,13 +69,12 @@ use nautilus_model::{
     data::Data,
     enums::{
         AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSide,
-        TimeInForce, TriggerType,
+        TimeInForce, TrailingOffsetType, TriggerType,
     },
     events::{
-        AccountState, OrderEventAny, OrderInitialized, OrderUpdated,
+        AccountState, OrderEventAny, OrderInitialized,
         order::spec::{
-            OrderAcceptedSpec, OrderPendingCancelSpec, OrderPendingUpdateSpec, OrderSubmittedSpec,
-            OrderTriggeredSpec, OrderUpdatedSpec,
+            OrderPendingCancelSpec, OrderPendingUpdateSpec, OrderTriggeredSpec, OrderUpdatedSpec,
         },
     },
     identifiers::{
@@ -84,8 +84,8 @@ use nautilus_model::{
     instruments::{
         CryptoFuturesSpread, Instrument, InstrumentAny,
         stubs::{
-            crypto_option_btc_deribit, crypto_perpetual_ethusdt, currency_pair_btcusdt,
-            currency_pair_ethusdt,
+            binary_option, crypto_option_btc_deribit, crypto_perpetual_ethusdt,
+            currency_pair_btcusdt, currency_pair_ethusdt,
         },
     },
     orders::{Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs},
@@ -106,14 +106,14 @@ use nautilus_okx::{
             OKXOrderType, OKXSide, OKXTradeMode,
         },
         models::OKXInstrument,
-        parse::parse_instrument_any,
+        parse::{parse_instrument_any, parse_spread_instrument},
     },
     config::OKXExecutionClientConfig,
     execution::OKXExecutionClient,
     http::{
         client::{OKXHttpClient, OKXResponse},
         error::OKXHttpError,
-        models::{OKXCancelAlgoOrderResponse, OKXSpreadOrder},
+        models::{OKXCancelAlgoOrderResponse, OKXSpread, OKXSpreadOrder},
     },
     websocket::{
         dispatch::{
@@ -157,22 +157,7 @@ fn test_emitter() -> (
 }
 
 fn make_fill_report(cid: &str) -> FillReport {
-    FillReport::new(
-        AccountId::from("OKX-001"),
-        InstrumentId::from("ETH-USDT-SWAP.OKX"),
-        VenueOrderId::new("v-1"),
-        TradeId::new("t-1"),
-        OrderSide::Buy,
-        Quantity::new(1.0, 0),
-        Price::new(2000.0, 2),
-        Money::new(0.01, Currency::USDT()),
-        LiquiditySide::Taker,
-        Some(ClientOrderId::new(cid)),
-        None,
-        UnixNanos::default(),
-        UnixNanos::default(),
-        None,
-    )
+    make_fill_report_with_trade_id(cid, "t-1")
 }
 
 fn make_order_status_report(cid: &str, status: OrderStatus) -> OrderStatusReport {
@@ -839,95 +824,6 @@ fn cache_limit_order(cache: &Rc<RefCell<Cache>>, client_order_id: ClientOrderId)
 }
 
 #[rstest]
-fn test_batch_cancel_orders_builds_payload() {
-    let trader_id = TraderId::from("TRADER-001");
-    let strategy_id = StrategyId::from("STRATEGY-001");
-    let client_id = Some(*OKX_CLIENT_ID);
-    let instrument_id = InstrumentId::from("BTC-USDT.OKX");
-    let client_order_id1 = ClientOrderId::new("order1");
-    let client_order_id2 = ClientOrderId::new("order2");
-    let venue_order_id1 = VenueOrderId::new("venue1");
-    let venue_order_id2 = VenueOrderId::new("venue2");
-
-    let cmd = BatchCancelOrders {
-        trader_id,
-        client_id,
-        strategy_id,
-        instrument_id,
-        cancels: vec![
-            CancelOrder {
-                trader_id,
-                client_id,
-                strategy_id,
-                instrument_id,
-                client_order_id: client_order_id1,
-                venue_order_id: Some(venue_order_id1),
-                command_id: UUID4::default(),
-                ts_init: UnixNanos::default(),
-                params: None,
-                correlation_id: None,
-                causation_id: None,
-            },
-            CancelOrder {
-                trader_id,
-                client_id,
-                strategy_id,
-                instrument_id,
-                client_order_id: client_order_id2,
-                venue_order_id: Some(venue_order_id2),
-                command_id: UUID4::default(),
-                ts_init: UnixNanos::default(),
-                params: None,
-                correlation_id: None,
-                causation_id: None,
-            },
-        ],
-        command_id: UUID4::default(),
-        ts_init: UnixNanos::default(),
-        params: None,
-        correlation_id: None,
-        causation_id: None,
-    };
-
-    let mut payload = Vec::with_capacity(cmd.cancels.len());
-    for cancel in &cmd.cancels {
-        payload.push((
-            cancel.instrument_id,
-            Some(cancel.client_order_id),
-            cancel.venue_order_id,
-        ));
-    }
-
-    assert_eq!(payload.len(), 2);
-    assert_eq!(payload[0].0, instrument_id);
-    assert_eq!(payload[0].1, Some(client_order_id1));
-    assert_eq!(payload[0].2, Some(venue_order_id1));
-    assert_eq!(payload[1].0, instrument_id);
-    assert_eq!(payload[1].1, Some(client_order_id2));
-    assert_eq!(payload[1].2, Some(venue_order_id2));
-}
-
-#[rstest]
-fn test_batch_cancel_orders_with_empty_cancels() {
-    let cmd = BatchCancelOrders {
-        trader_id: TraderId::from("TRADER-001"),
-        client_id: Some(*OKX_CLIENT_ID),
-        strategy_id: StrategyId::from("STRATEGY-001"),
-        instrument_id: InstrumentId::from("BTC-USDT.OKX"),
-        cancels: vec![],
-        command_id: UUID4::default(),
-        ts_init: UnixNanos::default(),
-        params: None,
-        correlation_id: None,
-        causation_id: None,
-    };
-
-    let payload: Vec<(InstrumentId, Option<ClientOrderId>, Option<VenueOrderId>)> =
-        Vec::with_capacity(cmd.cancels.len());
-    assert_eq!(payload.len(), 0);
-}
-
-#[rstest]
 fn test_dispatch_order_accepted_passes_through() {
     let (emitter, mut rx) = test_emitter();
     let state = WsDispatchState::default();
@@ -988,21 +884,6 @@ fn test_dispatch_fill_report_passes_through() {
 }
 
 #[rstest]
-fn test_dispatch_order_status_report_accepted_passes_through() {
-    let (emitter, mut rx) = test_emitter();
-    let state = WsDispatchState::default();
-    let reports = vec![ExecutionReport::Order(make_order_status_report(
-        "O-001",
-        OrderStatus::Accepted,
-    ))];
-
-    dispatch_execution_reports(reports, &emitter, &state);
-
-    let events = drain_events(&mut rx);
-    assert_eq!(events.len(), 1);
-}
-
-#[rstest]
 fn test_dispatch_order_accepted_skipped_when_already_triggered() {
     let (emitter, mut rx) = test_emitter();
     let state = WsDispatchState::default();
@@ -1048,70 +929,6 @@ fn test_dispatch_order_triggered_skipped_when_already_filled() {
 
     let events = drain_events(&mut rx);
     assert_eq!(events.len(), 0);
-}
-
-#[rstest]
-fn test_dispatch_status_report_accepted_skipped_when_triggered() {
-    let (emitter, mut rx) = test_emitter();
-    let state = WsDispatchState::default();
-    state.insert_triggered(ClientOrderId::new("O-001"));
-
-    let reports = vec![ExecutionReport::Order(make_order_status_report(
-        "O-001",
-        OrderStatus::Accepted,
-    ))];
-    dispatch_execution_reports(reports, &emitter, &state);
-
-    let events = drain_events(&mut rx);
-    assert_eq!(events.len(), 0);
-}
-
-#[rstest]
-fn test_dispatch_status_report_accepted_skipped_when_filled() {
-    let (emitter, mut rx) = test_emitter();
-    let state = WsDispatchState::default();
-    state.insert_filled(ClientOrderId::new("O-001"));
-
-    let reports = vec![ExecutionReport::Order(make_order_status_report(
-        "O-001",
-        OrderStatus::Accepted,
-    ))];
-    dispatch_execution_reports(reports, &emitter, &state);
-
-    let events = drain_events(&mut rx);
-    assert_eq!(events.len(), 0);
-}
-
-#[rstest]
-fn test_dispatch_status_report_triggered_skipped_when_filled() {
-    let (emitter, mut rx) = test_emitter();
-    let state = WsDispatchState::default();
-    state.insert_filled(ClientOrderId::new("O-001"));
-
-    let reports = vec![ExecutionReport::Order(make_order_status_report(
-        "O-001",
-        OrderStatus::Triggered,
-    ))];
-    dispatch_execution_reports(reports, &emitter, &state);
-
-    let events = drain_events(&mut rx);
-    assert_eq!(events.len(), 0);
-}
-
-#[rstest]
-fn test_dispatch_status_report_triggered_records_state() {
-    let (emitter, mut rx) = test_emitter();
-    let state = WsDispatchState::default();
-
-    let reports = vec![ExecutionReport::Order(make_order_status_report(
-        "O-001",
-        OrderStatus::Triggered,
-    ))];
-    dispatch_execution_reports(reports, &emitter, &state);
-
-    let events = drain_events(&mut rx);
-    assert_eq!(events.len(), 1);
-    assert!(state.contains_triggered(&ClientOrderId::new("O-001")));
 }
 
 #[rstest]
@@ -1599,8 +1416,17 @@ fn test_dispatch_tracked_algo_child_fill_with_empty_client_order_id(#[case] send
 }
 
 #[rstest]
-fn test_dispatch_untracked_algo_child_fill_with_empty_client_order_id_as_report() {
-    let (_, order_msgs) = load_order_messages("ws_orders_algo_child_filled_empty_cl_ord_id.json");
+#[case::filled("0.003", OKXOrderStatus::Filled, OrderStatus::Filled)]
+#[case::partial("0.004", OKXOrderStatus::PartiallyFilled, OrderStatus::PartiallyFilled)]
+fn test_dispatch_untracked_algo_child_fill_with_empty_client_order_id_as_report(
+    #[case] order_qty: &str,
+    #[case] venue_status: OKXOrderStatus,
+    #[case] expected_status: OrderStatus,
+) {
+    let (_, mut order_msgs) =
+        load_order_messages("ws_orders_algo_child_filled_empty_cl_ord_id.json");
+    order_msgs[0].sz = order_qty.to_string();
+    order_msgs[0].state = venue_status;
     let client_order_id = ClientOrderId::new("OEEADEMOSTOPLIMIT001");
     let instrument_id = InstrumentId::from("ETH-USDT.OKX");
     let venue_order_id = VenueOrderId::new("2497956918703120501");
@@ -1619,7 +1445,7 @@ fn test_dispatch_untracked_algo_child_fill_with_empty_client_order_id_as_report(
     let mut order_state_cache = AHashMap::new();
 
     dispatch_ws_message(
-        OKXWsMessage::Orders(order_msgs),
+        OKXWsMessage::Orders(order_msgs.clone()),
         &emitter,
         &state,
         AccountId::from("OKX-001"),
@@ -1633,24 +1459,59 @@ fn test_dispatch_untracked_algo_child_fill_with_empty_client_order_id_as_report(
 
     let events = drain_events(&mut rx);
     assert_eq!(events.len(), 1);
+
     match &events[0] {
-        ExecutionEvent::Report(CommonExecutionReport::Fill(report)) => {
-            assert_eq!(report.account_id, AccountId::from("OKX-001"));
-            assert_eq!(report.instrument_id, instrument_id);
-            assert_eq!(report.client_order_id, Some(client_order_id));
-            assert_eq!(report.venue_order_id, venue_order_id);
-            assert_eq!(report.trade_id, TradeId::new("1518905600"));
-            assert_eq!(report.order_side, OrderSide::Buy);
-            assert_eq!(report.last_qty, Quantity::from("0.003"));
-            assert_eq!(report.last_px, Price::from("1886.00"));
-            assert_eq!(report.commission, Money::from("0.000006 ETH"));
-            assert_eq!(report.liquidity_side, LiquiditySide::Taker);
-            assert_eq!(report.venue_position_id, None);
+        ExecutionEvent::Report(CommonExecutionReport::OrderWithFills(order, fills)) => {
+            assert_eq!(order.account_id, AccountId::from("OKX-001"));
+            assert_eq!(order.instrument_id, instrument_id);
+            assert_eq!(order.client_order_id, Some(client_order_id));
+            assert_eq!(order.venue_order_id, venue_order_id);
+            assert_eq!(order.order_side, Some(OrderSide::Buy));
+            assert_eq!(order.order_type, OrderType::Limit);
+            assert_eq!(order.time_in_force, TimeInForce::Gtc);
+            assert_eq!(order.order_status, expected_status);
+            assert_eq!(order.quantity, Quantity::from(order_qty));
+            assert_eq!(order.filled_qty, Quantity::from("0.003"));
+            assert_eq!(order.price, Some(Price::from("1886.00")));
+            assert!(!order.reduce_only);
+
+            assert_eq!(fills.len(), 1);
+            let fill = &fills[0];
+            assert_eq!(fill.account_id, AccountId::from("OKX-001"));
+            assert_eq!(fill.instrument_id, instrument_id);
+            assert_eq!(fill.client_order_id, Some(client_order_id));
+            assert_eq!(fill.venue_order_id, venue_order_id);
+            assert_eq!(fill.trade_id, TradeId::new("1518905600"));
+            assert_eq!(fill.order_side, OrderSide::Buy);
+            assert_eq!(fill.last_qty, Quantity::from("0.003"));
+            assert_eq!(fill.last_px, Price::from("1886.00"));
+            assert_eq!(fill.commission, Money::from("0.000006 ETH"));
+            assert_eq!(fill.liquidity_side, LiquiditySide::Taker);
+            assert_eq!(fill.venue_position_id, None);
         }
-        other => panic!("Expected untracked child fill report, was {other:?}"),
+        other => panic!("Expected untracked child order with fills, was {other:?}"),
     }
     assert!(state.order_identities.is_empty());
     assert!(state.contains_filled(&client_order_id));
+    assert_eq!(
+        state.contains_terminal(&client_order_id),
+        expected_status == OrderStatus::Filled,
+    );
+
+    dispatch_ws_message(
+        OKXWsMessage::Orders(order_msgs),
+        &emitter,
+        &state,
+        AccountId::from("OKX-001"),
+        AccountType::Margin,
+        &instruments,
+        &mut fee_cache,
+        &mut filled_qty_cache,
+        &mut order_state_cache,
+        get_atomic_clock_realtime(),
+    );
+
+    assert!(drain_events(&mut rx).is_empty());
 }
 
 struct VenueFillCase {
@@ -1741,10 +1602,18 @@ fn test_dispatch_venue_initiated_order_fill_as_report(#[case] case: VenueFillCas
 
     let events = drain_events(&mut rx);
     assert_eq!(events.len(), 1);
+
     match &events[0] {
-        ExecutionEvent::Report(CommonExecutionReport::Fill(report)) => {
-            // Venue-initiated flow (liquidation or ADL): no client order ID,
-            // surfaced as a fill report
+        ExecutionEvent::Report(CommonExecutionReport::OrderWithFills(order, fills)) => {
+            assert_eq!(order.account_id, AccountId::from("OKX-001"));
+            assert_eq!(order.instrument_id, case.instrument_id);
+            assert_eq!(order.client_order_id, None);
+            assert_eq!(order.venue_order_id, VenueOrderId::new(case.venue_order_id));
+            assert_eq!(order.order_status, OrderStatus::Filled);
+            assert_eq!(order.quantity, Quantity::from(case.qty));
+            assert_eq!(order.filled_qty, Quantity::from(case.qty));
+            assert_eq!(fills.len(), 1);
+            let report = &fills[0];
             assert_eq!(report.account_id, AccountId::from("OKX-001"));
             assert_eq!(report.instrument_id, case.instrument_id);
             assert_eq!(report.client_order_id, None);
@@ -1759,7 +1628,7 @@ fn test_dispatch_venue_initiated_order_fill_as_report(#[case] case: VenueFillCas
             assert_eq!(report.commission, Money::from(case.fee));
             assert_eq!(report.liquidity_side, LiquiditySide::Taker);
         }
-        other => panic!("Expected venue-initiated fill report, was {other:?}"),
+        other => panic!("Expected venue-initiated order with fills, was {other:?}"),
     }
 }
 
@@ -2224,149 +2093,6 @@ fn test_dispatch_untracked_spread_order_emits_status_report() {
     }
 }
 
-fn make_order_init(
-    client_order_id: ClientOrderId,
-    instrument_id: InstrumentId,
-) -> OrderInitialized {
-    OrderInitialized {
-        client_order_id,
-        instrument_id,
-        ..Default::default()
-    }
-}
-
-#[rstest]
-fn test_submit_order_list_builds_individual_commands() {
-    let trader_id = TraderId::from("TESTER-001");
-    let strategy_id = StrategyId::from("STRATEGY-001");
-    let client_id = Some(*OKX_CLIENT_ID);
-    let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
-
-    let cid1 = ClientOrderId::new("order1");
-    let cid2 = ClientOrderId::new("order2");
-    let cid3 = ClientOrderId::new("order3");
-
-    let order_list = OrderList::new(
-        OrderListId::new("OL-001"),
-        instrument_id,
-        strategy_id,
-        vec![cid1, cid2, cid3],
-        UnixNanos::default(),
-    );
-
-    let order_inits = vec![
-        make_order_init(cid1, instrument_id),
-        make_order_init(cid2, instrument_id),
-        make_order_init(cid3, instrument_id),
-    ];
-
-    let cmd = SubmitOrderList::new(
-        trader_id,
-        client_id,
-        strategy_id,
-        order_list,
-        order_inits,
-        None,
-        None,
-        None,
-        UUID4::default(),
-        UnixNanos::default(),
-        None, // correlation_id
-    );
-
-    // Verify each SubmitOrder can be constructed from the list
-    let submits: Vec<SubmitOrder> = cmd
-        .order_list
-        .client_order_ids
-        .iter()
-        .zip(cmd.order_inits.iter())
-        .map(|(cid, init)| SubmitOrder {
-            trader_id: cmd.trader_id,
-            client_id: cmd.client_id,
-            strategy_id: cmd.strategy_id,
-            instrument_id: cmd.instrument_id,
-            client_order_id: *cid,
-            order_init: init.clone(),
-            exec_algorithm_id: cmd.exec_algorithm_id,
-            position_id: cmd.position_id,
-            params: cmd.params.clone(),
-            command_id: cmd.command_id,
-            ts_init: cmd.ts_init,
-            correlation_id: None,
-            causation_id: None,
-        })
-        .collect();
-
-    assert_eq!(submits.len(), 3);
-    assert_eq!(submits[0].client_order_id, cid1);
-    assert_eq!(submits[1].client_order_id, cid2);
-    assert_eq!(submits[2].client_order_id, cid3);
-
-    for submit in &submits {
-        assert_eq!(submit.trader_id, trader_id);
-        assert_eq!(submit.strategy_id, strategy_id);
-        assert_eq!(submit.client_id, client_id);
-        assert_eq!(submit.instrument_id, instrument_id);
-    }
-}
-
-#[rstest]
-fn test_submit_order_list_single_order() {
-    let trader_id = TraderId::from("TESTER-001");
-    let strategy_id = StrategyId::from("STRATEGY-001");
-    let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
-    let cid = ClientOrderId::new("order1");
-
-    let order_list = OrderList::new(
-        OrderListId::new("OL-001"),
-        instrument_id,
-        strategy_id,
-        vec![cid],
-        UnixNanos::default(),
-    );
-
-    let order_inits = vec![make_order_init(cid, instrument_id)];
-
-    let cmd = SubmitOrderList::new(
-        trader_id,
-        Some(*OKX_CLIENT_ID),
-        strategy_id,
-        order_list,
-        order_inits,
-        None,
-        None,
-        None,
-        UUID4::default(),
-        UnixNanos::default(),
-        None, // correlation_id
-    );
-
-    let submits: Vec<SubmitOrder> = cmd
-        .order_list
-        .client_order_ids
-        .iter()
-        .zip(cmd.order_inits.iter())
-        .map(|(cid, init)| SubmitOrder {
-            trader_id: cmd.trader_id,
-            client_id: cmd.client_id,
-            strategy_id: cmd.strategy_id,
-            instrument_id: cmd.instrument_id,
-            client_order_id: *cid,
-            order_init: init.clone(),
-            exec_algorithm_id: cmd.exec_algorithm_id,
-            position_id: cmd.position_id,
-            params: cmd.params.clone(),
-            command_id: cmd.command_id,
-            ts_init: cmd.ts_init,
-            correlation_id: None,
-            causation_id: None,
-        })
-        .collect();
-
-    assert_eq!(submits.len(), 1);
-    assert_eq!(submits[0].client_order_id, cid);
-}
-
 fn make_algo_cancel_response(
     algo_id: &str,
     s_code: &str,
@@ -2409,29 +2135,12 @@ fn make_fill_report_with_trade_id(cid: &str, trade_id: &str) -> FillReport {
 }
 
 #[rstest]
-fn test_trade_dedup_first_insert_returns_false() {
+fn test_trade_dedup_state_sequence() {
     let state = WsDispatchState::default();
     let trade_id = TradeId::new("t-100");
 
     assert!(!state.check_and_insert_trade(trade_id));
-}
-
-#[rstest]
-fn test_trade_dedup_second_insert_returns_true() {
-    let state = WsDispatchState::default();
-    let trade_id = TradeId::new("t-100");
-
-    state.check_and_insert_trade(trade_id);
-
     assert!(state.check_and_insert_trade(trade_id));
-}
-
-#[rstest]
-fn test_trade_dedup_different_trade_ids_are_independent() {
-    let state = WsDispatchState::default();
-
-    state.check_and_insert_trade(TradeId::new("t-100"));
-
     assert!(!state.check_and_insert_trade(TradeId::new("t-200")));
 }
 
@@ -2463,22 +2172,6 @@ fn test_dispatch_fills_with_different_trade_ids_both_emitted() {
 
     let events = drain_events(&mut rx);
     assert_eq!(events.len(), 2, "different trade_ids should both emit");
-}
-
-#[rstest]
-fn test_dispatch_duplicate_fill_still_updates_filled_state() {
-    let (emitter, _rx) = test_emitter();
-    let state = WsDispatchState::default();
-    let cid = ClientOrderId::new("O-001");
-
-    let fill = make_fill_report_with_trade_id("O-001", "t-dup-2");
-    dispatch_execution_reports(vec![ExecutionReport::Fill(fill.clone())], &emitter, &state);
-
-    assert!(state.contains_filled(&cid));
-
-    dispatch_execution_reports(vec![ExecutionReport::Fill(fill)], &emitter, &state);
-
-    assert!(state.contains_filled(&cid));
 }
 
 #[rstest]
@@ -2757,6 +2450,106 @@ async fn test_cancel_algo_order_venue_rejection_emits_order_cancel_rejected() {
 }
 
 #[rstest]
+#[case::regular(OrderType::StopMarket, "/api/v5/trade/cancel-algos")]
+#[case::advance(OrderType::TrailingStopMarket, "/api/v5/trade/cancel-advance-algos")]
+#[tokio::test]
+async fn test_cancel_algo_order_transient_failure_emits_no_rejection(
+    #[case] order_type: OrderType,
+    #[case] path: &'static str,
+    #[values(StatusCode::TOO_MANY_REQUESTS, StatusCode::SERVICE_UNAVAILABLE)] status: StatusCode,
+) {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&attempts);
+
+    let router = Router::new()
+        .route(
+            "/api/v5/account/balance",
+            get(|| async { Json(load_test_data("http_get_account_balance.json")).into_response() }),
+        )
+        .route(
+            path,
+            post(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        status.into_response()
+                    } else {
+                        Json(load_test_data("http_cancel_algo_order_rejected.json")).into_response()
+                    }
+                }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let base_url = format!("http://{addr}");
+
+    let (mut client, mut rx, cache) =
+        create_test_execution_client_configured(&base_url, |config| {
+            config.max_retries = 2;
+            config.retry_delay_initial_ms = 1;
+            config.retry_delay_max_ms = 1;
+        });
+
+    client.start().unwrap();
+    let _ = drain_events(&mut rx);
+    let client_order_id = ClientOrderId::new("OALGOCANCELAMBIGUOUS1");
+    let order = OrderTestBuilder::new(order_type)
+        .trader_id(TraderId::from("TESTER-001"))
+        .strategy_id(StrategyId::from("STRATEGY-001"))
+        .instrument_id(InstrumentId::from("ETH-USDT-SWAP.OKX"))
+        .client_order_id(client_order_id)
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("1"))
+        .trigger_price(Price::from("1000.00"))
+        .trigger_type(TriggerType::MarkPrice)
+        .trailing_offset(dec!(1))
+        .trailing_offset_type(TrailingOffsetType::Price)
+        .time_in_force(TimeInForce::Gtc)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(*OKX_CLIENT_ID), false)
+        .unwrap();
+    client
+        .cancel_order(CancelOrder {
+            trader_id: order.trader_id(),
+            client_id: Some(*OKX_CLIENT_ID),
+            strategy_id: order.strategy_id(),
+            instrument_id: order.instrument_id(),
+            client_order_id,
+            venue_order_id: Some(VenueOrderId::new("algo-1")),
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            params: None,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .unwrap();
+
+    wait_until_async(
+        || async { attempts.load(Ordering::SeqCst) != 0 },
+        Duration::from_secs(5),
+    )
+    .await;
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+    client.disconnect().await.unwrap();
+    server.abort();
+    assert!(
+        event.is_err(),
+        "ambiguous cancel emitted an event: {event:?}"
+    );
+    assert!(drain_events(&mut rx).is_empty());
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[rstest]
 fn test_batch_cancel_failure_does_not_emit_rejections() {
     let (emitter, mut rx) = test_emitter();
     let clock = get_atomic_clock_realtime();
@@ -2848,39 +2641,21 @@ async fn test_dispatch_fill_reports_claim_trade_id_across_tasks() {
 }
 
 fn load_test_data(filename: &str) -> serde_json::Value {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("test_data")
-        .join(filename);
-    let content = std::fs::read_to_string(path).unwrap();
-    serde_json::from_str(&content).unwrap()
+    crate::common::load_test_json(filename)
 }
 
-fn query_order_instrument() -> InstrumentAny {
+fn swap_instrument(symbol: &str) -> InstrumentAny {
     let response: OKXResponse<OKXInstrument> =
         serde_json::from_value(load_test_data("http_get_instruments_swap.json")).unwrap();
     let raw = response
         .data
         .iter()
-        .find(|instrument| instrument.inst_id == Ustr::from("ETH-USDT-SWAP"))
-        .expect("expected ETH-USDT-SWAP fixture");
+        .find(|instrument| instrument.inst_id == Ustr::from(symbol))
+        .unwrap_or_else(|| panic!("expected {symbol} fixture"));
 
     parse_instrument_any(raw, None, None, UnixNanos::default())
         .unwrap()
-        .expect("expected parsed ETH-USDT-SWAP instrument")
-}
-
-fn btc_usdt_swap_instrument() -> InstrumentAny {
-    let response: OKXResponse<OKXInstrument> =
-        serde_json::from_value(load_test_data("http_get_instruments_swap.json")).unwrap();
-    let raw = response
-        .data
-        .iter()
-        .find(|instrument| instrument.inst_id == Ustr::from("BTC-USDT-SWAP"))
-        .expect("expected BTC-USDT-SWAP fixture");
-
-    parse_instrument_any(raw, None, None, UnixNanos::default())
-        .unwrap()
-        .expect("expected parsed BTC-USDT-SWAP instrument")
+        .unwrap_or_else(|| panic!("expected parsed {symbol} instrument"))
 }
 
 fn regular_order_detail_response(params: &HashMap<String, String>) -> serde_json::Value {
@@ -3140,7 +2915,8 @@ async fn create_query_order_test_client() -> (
         create_test_execution_client_configured(&base_url, |config| {
             config.instrument_types = vec![OKXInstrumentType::Swap];
         });
-    client.on_instrument(query_order_instrument());
+
+    client.on_instrument(swap_instrument("ETH-USDT-SWAP"));
     client.start().unwrap();
     let _ = drain_events(&mut rx);
 
@@ -3166,16 +2942,20 @@ struct WsTeardownState {
     opened: Arc<AtomicUsize>,
     closed: Arc<AtomicUsize>,
     messages: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    order_requests: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    subscriptions: Arc<tokio::sync::Mutex<Vec<(String, Value)>>>,
+    startup_messages: Arc<tokio::sync::Mutex<Vec<Value>>>,
 }
 
 async fn handle_exec_ws_upgrade(
     ws: WebSocketUpgrade,
+    uri: Uri,
     State(state): State<Arc<WsTeardownState>>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_exec_ws_socket(socket, state))
+    ws.on_upgrade(move |socket| handle_exec_ws_socket(socket, uri.path().to_string(), state))
 }
 
-async fn handle_exec_ws_socket(mut socket: WebSocket, state: Arc<WsTeardownState>) {
+async fn handle_exec_ws_socket(mut socket: WebSocket, path: String, state: Arc<WsTeardownState>) {
     state.opened.fetch_add(1, Ordering::Relaxed);
 
     let mut messages = state
@@ -3211,6 +2991,37 @@ async fn handle_exec_ws_socket(mut socket: WebSocket, state: Arc<WsTeardownState
                 continue;
             }
         };
+
+        if let Message::Text(text) = &message
+            && let Ok(request) = serde_json::from_str::<Value>(text)
+        {
+            if request["op"] == "subscribe" {
+                state
+                    .subscriptions
+                    .lock()
+                    .await
+                    .push((path.clone(), request.clone()));
+
+                if request["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|arg| arg["channel"] == "positions")
+                {
+                    let messages = std::mem::take(&mut *state.startup_messages.lock().await);
+                    for message in messages {
+                        let text = message.to_string();
+                        socket.send(Message::Text(text.into())).await.unwrap();
+                    }
+                }
+            }
+
+            if matches!(request["op"].as_str(), Some("order" | "batch-orders"))
+                && let Some(tx) = &state.order_requests
+            {
+                tx.send(request).unwrap();
+            }
+        }
 
         if let Message::Text(text) = message
             && text.contains("\"op\":\"login\"")
@@ -3278,6 +3089,8 @@ struct ReportRouteState {
     include_regular_orders: bool,
     regular_child_response: Option<serde_json::Value>,
     regular_pending_response: Option<serde_json::Value>,
+    balance_response: Option<serde_json::Value>,
+    position_response: Option<serde_json::Value>,
     regular_order_detail_queries: tokio::sync::Mutex<Vec<HashMap<String, String>>>,
     regular_order_pending_queries: tokio::sync::Mutex<Vec<HashMap<String, String>>>,
     regular_order_history_queries: tokio::sync::Mutex<Vec<HashMap<String, String>>>,
@@ -3352,7 +3165,9 @@ fn create_exec_report_test_router(state: Arc<ReportRouteState>) -> Router {
     let spread_history_state = Arc::clone(&state);
     let regular_fill_state = Arc::clone(&state);
     let regular_fill_history_state = Arc::clone(&state);
-    let spread_trade_state = state;
+    let spread_trade_state = Arc::clone(&state);
+    let position_state = Arc::clone(&state);
+    let balance_state = state;
 
     Router::new()
         .route("/health", get(|| async { Json(json!({"ok": true})) }))
@@ -3546,11 +3361,33 @@ fn create_exec_report_test_router(state: Arc<ReportRouteState>) -> Router {
         )
         .route(
             "/api/v5/account/positions",
-            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() }),
+            get(move || {
+                let state = Arc::clone(&position_state);
+                async move {
+                    Json(
+                        state
+                            .position_response
+                            .clone()
+                            .unwrap_or_else(|| json!({"code": "0", "msg": "", "data": []})),
+                    )
+                    .into_response()
+                }
+            }),
         )
         .route(
             "/api/v5/account/balance",
-            get(|| async { Json(load_test_data("http_get_account_balance.json")).into_response() }),
+            get(move || {
+                let state = Arc::clone(&balance_state);
+                async move {
+                    Json(
+                        state
+                            .balance_response
+                            .clone()
+                            .unwrap_or_else(|| load_test_data("http_get_account_balance.json")),
+                    )
+                    .into_response()
+                }
+            }),
         )
 }
 
@@ -3578,17 +3415,6 @@ fn create_test_execution_client_configured(
 
     let cache = Rc::new(RefCell::new(Cache::default()));
 
-    let core = ExecutionClientCore::new(
-        trader_id,
-        client_id,
-        *OKX_VENUE,
-        OmsType::Hedging,
-        account_id,
-        AccountType::Margin,
-        None,
-        cache.clone(),
-    );
-
     let mut config = OKXExecutionClientConfig {
         account_id,
         base_url_http: Some(base_url.to_string()),
@@ -3600,6 +3426,17 @@ fn create_test_execution_client_configured(
         ..Default::default()
     };
     configure(&mut config);
+
+    let core = ExecutionClientCore::new(
+        trader_id,
+        client_id,
+        *OKX_VENUE,
+        config.oms_type.unwrap_or(OmsType::Hedging),
+        account_id,
+        AccountType::Margin,
+        None,
+        cache.clone(),
+    );
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     set_exec_event_sender(tx);
@@ -3658,6 +3495,32 @@ async fn test_position_check_preserves_spot_position_without_reports(
             config.instrument_types = instrument_types;
         });
 
+    let position = add_open_spot_position(&mut client, &cache);
+    let position_id = position.id;
+    let mut manager = position_check_manager(cache.clone());
+
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        events.extend(manager.check_positions_consistency(&[&client]).await);
+    }
+
+    assert!(
+        events.is_empty(),
+        "Unexpected reconciliation events: {events:?}"
+    );
+    let cache = cache.borrow();
+    assert!(cache.orders_refs(None, None, None, None, None).is_empty());
+    assert_eq!(cache.positions_open(None, None, None, None, None).len(), 1);
+    let retained = cache.position(&position_id).unwrap();
+    assert_eq!(retained.quantity, position.quantity);
+    assert_eq!(retained.signed_decimal_qty(), position.signed_decimal_qty());
+    assert_eq!(retained.side, position.side);
+    assert_eq!(retained.avg_px_open, position.avg_px_open);
+    assert_eq!(retained.event_count(), position.event_count());
+}
+
+/// Adds a margin account and an open LONG `ETH-USDT` position of 1 ETH at 50,000 to `cache`.
+fn add_open_spot_position(client: &mut OKXExecutionClient, cache: &Rc<RefCell<Cache>>) -> Position {
     let instrument = make_margin_spot_report_instrument();
     client.on_instrument(instrument.clone());
 
@@ -3685,12 +3548,11 @@ async fn test_position_check_preserves_spot_position_without_reports(
         .side(OrderSide::Buy)
         .quantity(Quantity::from("1.000000"))
         .build();
-    let position_id = PositionId::from("P-SPOT-RETAINED");
     let fill = TestOrderEventStubs::filled(
         &order,
         &instrument,
         Some(TradeId::from("T-SPOT-OPEN")),
-        Some(position_id),
+        Some(PositionId::from("P-SPOT-RETAINED")),
         Some(Price::from("50000.00")),
         None,
         None,
@@ -3704,36 +3566,297 @@ async fn test_position_check_preserves_spot_position_without_reports(
         .borrow_mut()
         .add_position(&position, OmsType::Hedging)
         .unwrap();
-    let clock = Rc::new(RefCell::new(VirtualClock::new()));
 
-    let mut manager = ExecutionManager::new(
-        clock,
-        cache.clone(),
+    position
+}
+
+fn position_check_manager(cache: Rc<RefCell<Cache>>) -> ExecutionManager {
+    ExecutionManager::new(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        cache,
         ExecutionManagerConfig {
             position_check_threshold_ns: DurationNanos::ZERO,
             ..Default::default()
         },
     )
-    .unwrap();
+    .unwrap()
+}
 
-    let mut events = Vec::new();
-    for _ in 0..2 {
-        events.extend(manager.check_positions_consistency(&[&client]).await);
-    }
+#[rstest]
+#[case::matching(&[("ETH", "1", "")], "USDT", vec![])]
+#[case::reduced(&[("ETH", "0.4", "")], "USDT", vec!["0.600000"])]
+#[case::zero_balance(&[("ETH", "0", "")], "USDT", vec![])]
+#[case::no_balance_row(&[("USDT", "100", "")], "USDT", vec![])]
+#[case::borrowed_long(&[("ETH", "0.4", "0.1")], "USDT", vec!["0.600000"])]
+#[case::borrowed_short_closes_long_without_entry_price(&[("ETH", "-1", "1")], "USDT", vec!["1.000000"])]
+#[case::unreadable(&[("ETH", "0.4", "x")], "USDT", vec![])]
+#[case::other_quote(&[("ETH", "0.4", "")], "USDC", vec![])]
+#[tokio::test]
+async fn test_position_check_reconciles_spot_position_reports(
+    #[case] details: &[(&str, &str, &str)],
+    #[case] quote_currency: &str,
+    #[case] expected_sells: Vec<&str>,
+) {
+    let state = Arc::new(ReportRouteState {
+        balance_response: Some(crate::common::balance_response(details)),
+        ..Default::default()
+    });
 
-    assert!(
-        events.is_empty(),
-        "Unexpected reconciliation events: {events:?}"
+    let addr = start_exec_report_test_server(state).await;
+
+    let (mut client, _rx, cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.oms_type = Some(OmsType::Netting);
+            config.use_spot_position_reports = true;
+            config.spot_positions_quote_currency = quote_currency.to_string();
+        });
+
+    add_open_spot_position(&mut client, &cache);
+    let mut manager = position_check_manager(cache);
+
+    let events = manager.check_positions_consistency(&[&client]).await;
+
+    let sells: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some((fill.order_side, fill.last_qty, fill.last_px)),
+            _ => None,
+        })
+        .collect();
+
+    let expected_sells: Vec<_> = expected_sells
+        .into_iter()
+        .map(|quantity| {
+            (
+                OrderSide::Sell,
+                Quantity::from(quantity),
+                Price::from("50000.00"),
+            )
+        })
+        .collect();
+
+    assert_eq!(sells, expected_sells, "{events:?}");
+}
+
+#[rstest]
+#[case::hedging(true, OmsType::Hedging, false)]
+#[case::unspecified(true, OmsType::Unspecified, false)]
+#[case::netting(true, OmsType::Netting, true)]
+#[case::disabled_hedging(false, OmsType::Hedging, true)]
+fn test_spot_position_reports_require_netting_oms(
+    #[case] use_spot_position_reports: bool,
+    #[case] oms_type: OmsType,
+    #[case] expected: bool,
+) {
+    let account_id = AccountId::from("OKX-001");
+
+    let core = ExecutionClientCore::new(
+        TraderId::from("TESTER-001"),
+        *OKX_CLIENT_ID,
+        *OKX_VENUE,
+        oms_type,
+        account_id,
+        AccountType::Cash,
+        None,
+        Rc::new(RefCell::new(Cache::default())),
     );
-    let cache = cache.borrow();
-    assert!(cache.orders_refs(None, None, None, None, None).is_empty());
-    assert_eq!(cache.positions_open(None, None, None, None, None).len(), 1);
-    let retained = cache.position(&position_id).unwrap();
-    assert_eq!(retained.quantity, position.quantity);
-    assert_eq!(retained.signed_decimal_qty(), position.signed_decimal_qty());
-    assert_eq!(retained.side, position.side);
-    assert_eq!(retained.avg_px_open, position.avg_px_open);
-    assert_eq!(retained.event_count(), position.event_count());
+
+    let config = OKXExecutionClientConfig {
+        account_id,
+        api_key: Some("test_key".into()),
+        api_secret: Some("test_secret".into()),
+        api_passphrase: Some("test_passphrase".into()),
+        use_spot_position_reports,
+        ..Default::default()
+    };
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    set_exec_event_sender(tx);
+
+    let error = OKXExecutionClient::new(core, config)
+        .err()
+        .map(|e| e.to_string());
+
+    let expected = (!expected).then(|| {
+        format!(
+            "`use_spot_position_reports` requires a NETTING OMS, was {oms_type}; set `oms_type` to NETTING"
+        )
+    });
+
+    assert_eq!(error, expected);
+}
+
+#[rstest]
+#[case::spot(vec![OKXInstrumentType::Spot], "ETH-USDT.OKX", false)]
+#[case::mixed_spot(vec![OKXInstrumentType::Spot, OKXInstrumentType::Swap], "ETH-USDT.OKX", false)]
+#[case::mixed_swap(vec![OKXInstrumentType::Spot, OKXInstrumentType::Swap], "BTC-USDT-SWAP.OKX", true)]
+fn test_bulk_position_coverage_with_spot_position_reports(
+    #[case] instrument_types: Vec<OKXInstrumentType>,
+    #[case] instrument_id: &str,
+    #[case] expected: bool,
+) {
+    let (mut client, _rx, _cache) =
+        create_test_execution_client_configured("http://127.0.0.1:1", |config| {
+            config.oms_type = Some(OmsType::Netting);
+            config.instrument_types = instrument_types;
+            config.use_spot_position_reports = true;
+        });
+
+    client.on_instrument(make_margin_spot_report_instrument());
+
+    assert_eq!(
+        client.provides_bulk_position_coverage(InstrumentId::from(instrument_id)),
+        expected
+    );
+}
+
+#[rstest]
+#[case::enabled(true, None, vec![("ETH-USDT.OKX", PositionSide::Long, "1.500000")])]
+#[case::enabled_scoped(true, Some("ETH-USDT.OKX"), vec![("ETH-USDT.OKX", PositionSide::Long, "1.500000")])]
+#[case::enabled_scoped_derivative(true, Some("ETH-USDT-SWAP.OKX"), vec![])]
+#[case::disabled(false, None, vec![])]
+#[case::disabled_scoped(false, Some("ETH-USDT.OKX"), vec![])]
+#[tokio::test]
+async fn test_generate_position_status_reports_with_spot_position_reports(
+    #[case] use_spot_position_reports: bool,
+    #[case] instrument_id: Option<&str>,
+    #[case] expected: Vec<(&str, PositionSide, &str)>,
+) {
+    let state = Arc::new(ReportRouteState {
+        balance_response: Some(crate::common::balance_response(&[("ETH", "1.5", "")])),
+        ..Default::default()
+    });
+
+    let addr = start_exec_report_test_server(state).await;
+
+    let (mut client, _rx, _cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.oms_type = Some(OmsType::Netting);
+            config.instrument_types = vec![OKXInstrumentType::Spot, OKXInstrumentType::Swap];
+            config.use_spot_position_reports = use_spot_position_reports;
+        });
+
+    client.on_instrument(make_margin_spot_report_instrument());
+    client.on_instrument(swap_instrument("ETH-USDT-SWAP"));
+
+    let command = GeneratePositionStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        instrument_id.map(InstrumentId::from),
+        None,
+        None,
+        None,
+        None,
+    );
+    let reports = client
+        .generate_position_status_reports(&command)
+        .await
+        .unwrap();
+
+    let actual: Vec<_> = reports
+        .iter()
+        .map(|report| {
+            (
+                report.instrument_id,
+                report.position_side,
+                report.quantity,
+                report.avg_px_open,
+            )
+        })
+        .collect();
+
+    let expected: Vec<_> = expected
+        .into_iter()
+        .map(|(instrument_id, position_side, quantity)| {
+            (
+                InstrumentId::from(instrument_id),
+                position_side,
+                Quantity::from(quantity),
+                None,
+            )
+        })
+        .collect();
+
+    assert_eq!(actual, expected);
+}
+
+#[rstest]
+#[case::spot(false, OKXInstrumentType::Spot)]
+#[case::spot_margin(true, OKXInstrumentType::Spot)]
+#[case::margin_type(false, OKXInstrumentType::Margin)]
+#[tokio::test]
+async fn test_generate_spot_position_reports_with_borrowing(
+    #[case] use_spot_margin: bool,
+    #[case] instrument_type: OKXInstrumentType,
+    #[values(None, Some("ETH-USDT.OKX"))] instrument_id: Option<&str>,
+) {
+    let state = Arc::new(ReportRouteState {
+        balance_response: Some(crate::common::balance_response(&[("ETH", "-1.5", "1.5")])),
+        ..Default::default()
+    });
+
+    let addr = start_exec_report_test_server(state).await;
+
+    let (mut client, _rx, _cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.oms_type = Some(OmsType::Netting);
+            config.instrument_types = vec![instrument_type];
+            config.use_spot_position_reports = true;
+            config.use_spot_margin = use_spot_margin;
+        });
+
+    client.on_instrument(make_margin_spot_report_instrument());
+
+    let command = GeneratePositionStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        instrument_id.map(InstrumentId::from),
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let reports = client
+        .generate_position_status_reports(&command)
+        .await
+        .unwrap();
+
+    assert_eq!(reports.len(), 1);
+    let report = &reports[0];
+    assert_eq!(report.account_id, AccountId::from("OKX-001"));
+    assert_eq!(report.instrument_id, InstrumentId::from("ETH-USDT.OKX"));
+    assert_eq!(report.position_side, PositionSide::Short);
+    assert_eq!(report.quantity, Quantity::from("1.500000"));
+    assert_eq!(report.avg_px_open, None);
+    assert_eq!(report.venue_position_id, None);
+    assert_eq!(report.ts_last, report.ts_init);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_fails_on_spot_position_report_error() {
+    let state = Arc::new(ReportRouteState {
+        balance_response: Some(crate::common::balance_response(&[("ETH", "1", "x")])),
+        position_response: Some(load_test_data("http_get_positions.json")),
+        ..Default::default()
+    });
+
+    let addr = start_exec_report_test_server(state).await;
+
+    let (mut client, _rx, _cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.oms_type = Some(OmsType::Netting);
+            config.instrument_types = vec![OKXInstrumentType::Spot, OKXInstrumentType::Swap];
+            config.use_spot_position_reports = true;
+        });
+
+    client.on_instrument(make_margin_spot_report_instrument());
+    client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
+
+    let error = client.generate_mass_status(None).await.unwrap_err();
+
+    assert_eq!(error.to_string(), "invalid liab 'x' for ETH");
 }
 
 fn make_margin_spot_report_instrument() -> InstrumentAny {
@@ -4288,7 +4411,7 @@ async fn test_generate_order_status_reports_honors_open_only(
             config.instrument_types = vec![OKXInstrumentType::Swap];
         });
 
-    client.on_instrument(btc_usdt_swap_instrument());
+    client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
 
     let cmd = GenerateOrderStatusReports::new(
         UUID4::new(),
@@ -4756,28 +4879,15 @@ async fn test_generate_fill_reports_includes_spreads_when_enabled(
 }
 
 fn make_report_spread_instrument() -> InstrumentAny {
-    let instrument = CryptoFuturesSpread::builder()
-        .instrument_id(InstrumentId::from("ETH-USD-SWAP_ETH-USD-231229.OKX"))
-        .raw_symbol(Symbol::from("ETH-USD-SWAP_ETH-USD-231229"))
-        .underlying(Currency::get_or_create_crypto("ETH"))
-        .quote_currency(Currency::USD())
-        .settlement_currency(Currency::USD())
-        .is_inverse(false)
-        .strategy_type(Ustr::from("inverse"))
-        .activation_ns(UnixNanos::default())
-        .expiration_ns(UnixNanos::default())
-        .price_precision(2)
-        .size_precision(0)
-        .price_increment(Price::from("0.01"))
-        .size_increment(Quantity::from("1"))
-        .lot_size(Quantity::from("1"))
-        .min_quantity(Quantity::from("1"))
-        .ts_event(UnixNanos::default())
-        .ts_init(UnixNanos::default())
-        .build()
-        .unwrap();
+    let response: OKXResponse<OKXSpread> =
+        serde_json::from_value(load_test_data("http_get_spreads.json")).unwrap();
+    let raw = response
+        .data
+        .iter()
+        .find(|spread| spread.sprd_id == Ustr::from("ETH-USD-SWAP_ETH-USD-231229"))
+        .expect("expected ETH-USD-SWAP_ETH-USD-231229 fixture");
 
-    InstrumentAny::CryptoFuturesSpread(instrument)
+    parse_spread_instrument(raw, None, None, UnixNanos::default()).unwrap()
 }
 
 fn build_test_limit_order(instrument_id: InstrumentId, client_order_id: ClientOrderId) -> OrderAny {
@@ -4811,21 +4921,11 @@ fn build_test_conditional_order_with_single_venue_id(
     client_order_id: ClientOrderId,
     venue_order_id: VenueOrderId,
 ) -> OrderAny {
-    let trader_id = TraderId::from("TESTER-001");
-    let strategy_id = StrategyId::from("STRATEGY-001");
-    let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
     let account_id = AccountId::from("OKX-001");
     let mut order = build_test_submitted_conditional_order(client_order_id);
-    let accepted = OrderAcceptedSpec::builder()
-        .trader_id(trader_id)
-        .strategy_id(strategy_id)
-        .instrument_id(instrument_id)
-        .client_order_id(client_order_id)
-        .venue_order_id(venue_order_id)
-        .account_id(account_id)
-        .build();
+    let accepted = TestOrderEventStubs::accepted(&order, account_id, venue_order_id);
 
-    order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+    order.apply(accepted).unwrap();
 
     assert_eq!(order.is_triggered(), Some(false));
     assert_eq!(order.venue_order_ids(), vec![&venue_order_id]);
@@ -4850,15 +4950,9 @@ fn build_test_submitted_conditional_order(client_order_id: ClientOrderId) -> Ord
         .trigger_type(TriggerType::MarkPrice)
         .time_in_force(TimeInForce::Gtc)
         .build();
-    let submitted = OrderSubmittedSpec::builder()
-        .trader_id(trader_id)
-        .strategy_id(strategy_id)
-        .instrument_id(instrument_id)
-        .client_order_id(client_order_id)
-        .account_id(account_id)
-        .build();
+    let submitted = TestOrderEventStubs::submitted(&order, account_id);
 
-    order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+    order.apply(submitted).unwrap();
 
     assert_eq!(order.is_triggered(), Some(false));
     assert_eq!(order.status(), OrderStatus::Submitted);
@@ -4886,21 +4980,9 @@ fn build_test_triggered_conditional_order(
         .trigger_type(TriggerType::MarkPrice)
         .time_in_force(TimeInForce::Gtc)
         .build();
-    let submitted = OrderSubmittedSpec::builder()
-        .trader_id(trader_id)
-        .strategy_id(strategy_id)
-        .instrument_id(instrument_id)
-        .client_order_id(client_order_id)
-        .account_id(account_id)
-        .build();
-    let accepted = OrderAcceptedSpec::builder()
-        .trader_id(trader_id)
-        .strategy_id(strategy_id)
-        .instrument_id(instrument_id)
-        .client_order_id(client_order_id)
-        .venue_order_id(VenueOrderId::from("parent-algo-id"))
-        .account_id(account_id)
-        .build();
+    let submitted = TestOrderEventStubs::submitted(&order, account_id);
+    let accepted =
+        TestOrderEventStubs::accepted(&order, account_id, VenueOrderId::from("parent-algo-id"));
     let triggered = OrderTriggeredSpec::builder()
         .trader_id(trader_id)
         .strategy_id(strategy_id)
@@ -4919,8 +5001,8 @@ fn build_test_triggered_conditional_order(
         .quantity(Quantity::from("1"))
         .build();
 
-    order.apply(OrderEventAny::Submitted(submitted)).unwrap();
-    order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+    order.apply(submitted).unwrap();
+    order.apply(accepted).unwrap();
     order.apply(OrderEventAny::Triggered(triggered)).unwrap();
     order.apply(OrderEventAny::Updated(updated)).unwrap();
 
@@ -4938,21 +5020,12 @@ fn build_test_market_conditional_order_with_child(
     let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
     let account_id = AccountId::from("OKX-001");
     let mut order = build_test_stop_order(client_order_id);
-    let submitted = OrderSubmittedSpec::builder()
-        .trader_id(trader_id)
-        .strategy_id(strategy_id)
-        .instrument_id(instrument_id)
-        .client_order_id(client_order_id)
-        .account_id(account_id)
-        .build();
-    let accepted = OrderAcceptedSpec::builder()
-        .trader_id(trader_id)
-        .strategy_id(strategy_id)
-        .instrument_id(instrument_id)
-        .client_order_id(client_order_id)
-        .venue_order_id(VenueOrderId::from("parent-market-algo-id"))
-        .account_id(account_id)
-        .build();
+    let submitted = TestOrderEventStubs::submitted(&order, account_id);
+    let accepted = TestOrderEventStubs::accepted(
+        &order,
+        account_id,
+        VenueOrderId::from("parent-market-algo-id"),
+    );
     let updated = OrderUpdatedSpec::builder()
         .trader_id(trader_id)
         .strategy_id(strategy_id)
@@ -4963,8 +5036,8 @@ fn build_test_market_conditional_order_with_child(
         .quantity(Quantity::from("1"))
         .build();
 
-    order.apply(OrderEventAny::Submitted(submitted)).unwrap();
-    order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+    order.apply(submitted).unwrap();
+    order.apply(accepted).unwrap();
     order.apply(OrderEventAny::Updated(updated)).unwrap();
 
     assert_eq!(order.is_triggered(), Some(false));
@@ -4977,29 +5050,14 @@ fn build_test_regular_order_with_venue_id(
     client_order_id: ClientOrderId,
     venue_order_id: VenueOrderId,
 ) -> OrderAny {
-    let trader_id = TraderId::from("TESTER-001");
-    let strategy_id = StrategyId::from("STRATEGY-001");
     let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
     let account_id = AccountId::from("OKX-001");
     let mut order = build_test_limit_order(instrument_id, client_order_id);
-    let submitted = OrderSubmittedSpec::builder()
-        .trader_id(trader_id)
-        .strategy_id(strategy_id)
-        .instrument_id(instrument_id)
-        .client_order_id(client_order_id)
-        .account_id(account_id)
-        .build();
-    let accepted = OrderAcceptedSpec::builder()
-        .trader_id(trader_id)
-        .strategy_id(strategy_id)
-        .instrument_id(instrument_id)
-        .client_order_id(client_order_id)
-        .venue_order_id(venue_order_id)
-        .account_id(account_id)
-        .build();
+    let submitted = TestOrderEventStubs::submitted(&order, account_id);
+    let accepted = TestOrderEventStubs::accepted(&order, account_id, venue_order_id);
 
-    order.apply(OrderEventAny::Submitted(submitted)).unwrap();
-    order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+    order.apply(submitted).unwrap();
+    order.apply(accepted).unwrap();
 
     assert_eq!(order.venue_order_id(), Some(venue_order_id));
     order
@@ -5032,6 +5090,578 @@ fn collect_order_denied_events(events: Vec<ExecutionEvent>) -> HashMap<ClientOrd
         }
     }
     by_cid
+}
+
+#[rstest]
+#[case::gtd(
+    OrderType::Limit,
+    TimeInForce::Gtd,
+    false,
+    "ETH-USDT-SWAP.OKX",
+    "Unsupported time in force: Gtd"
+)]
+#[case::market_fok(
+    OrderType::Market,
+    TimeInForce::Fok,
+    false,
+    "ETH-USDT-SWAP.OKX",
+    "Market orders with FOK time-in-force are not supported by OKX. Use Limit order with FOK instead."
+)]
+#[case::rpi_market(
+    OrderType::Market,
+    TimeInForce::Gtc,
+    true,
+    "ETH-USDT-SWAP.OKX",
+    "OKX RPI orders require a limit order"
+)]
+#[case::event_outcome(
+    OrderType::Limit,
+    TimeInForce::Gtc,
+    false,
+    "BTC-ABOVE-DAILY-260224-1600-65000.OKX",
+    "OKX event contract orders require `outcome`"
+)]
+#[case::cached_event_outcome(
+    OrderType::Limit,
+    TimeInForce::Gtc,
+    false,
+    "EVENT.OKX",
+    "OKX event contract orders require `outcome`"
+)]
+#[tokio::test]
+async fn test_submit_order_denies_invalid_request_before_submitted(
+    #[case] order_type: OrderType,
+    #[case] time_in_force: TimeInForce,
+    #[case] rpi: bool,
+    #[case] instrument_id: &str,
+    #[case] reason: &str,
+) {
+    let addr = start_exec_test_server().await;
+    let base_url = format!("http://{addr}");
+    let (mut client, mut rx, cache) = create_test_execution_client(&base_url);
+    client.start().unwrap();
+    let _ = drain_events(&mut rx);
+    let instrument_id = InstrumentId::from(instrument_id);
+    if instrument_id.symbol.as_str() == "EVENT" {
+        let mut instrument = binary_option();
+        instrument.id = instrument_id;
+        instrument.raw_symbol = instrument_id.symbol;
+        client.on_instrument(InstrumentAny::BinaryOption(instrument));
+    }
+
+    let client_order_id = ClientOrderId::from("OLOCALINVALID001");
+    let order = OrderTestBuilder::new(order_type)
+        .trader_id(TraderId::from("TESTER-001"))
+        .strategy_id(StrategyId::from("STRATEGY-001"))
+        .instrument_id(instrument_id)
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .price(Price::from("2000.00"))
+        .quantity(Quantity::from("1"))
+        .time_in_force(time_in_force)
+        .expire_time(UnixNanos::from(1_900_000_000_000_000_000))
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(*OKX_CLIENT_ID), false)
+        .unwrap();
+    let mut cmd = SubmitOrder::from_order(
+        &order,
+        TraderId::from("TESTER-001"),
+        Some(*OKX_CLIENT_ID),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    );
+    cmd.params = Some(Params::new(
+        [
+            ("rpi".to_string(), json!(rpi)),
+            ("td_mode".to_string(), json!("isolated")),
+        ]
+        .into(),
+    ));
+
+    client.submit_order(cmd).unwrap();
+
+    let events = drain_events(&mut rx);
+
+    let [ExecutionEvent::Order(OrderEventAny::Denied(denied))] = events.as_slice() else {
+        panic!("Expected only OrderDenied, was {events:?}");
+    };
+
+    assert_eq!(denied.trader_id, TraderId::from("TESTER-001"));
+    assert_eq!(denied.strategy_id, StrategyId::from("STRATEGY-001"));
+    assert_eq!(denied.instrument_id, instrument_id);
+    assert_eq!(denied.client_order_id, client_order_id);
+    assert_eq!(denied.reason, format!("VALIDATION_FAILED: {reason}"));
+    assert_eq!(denied.causation_id, None);
+}
+
+#[rstest]
+#[case::rpi(false)]
+#[case::event_outcome(true)]
+#[tokio::test]
+async fn test_submit_order_list_denies_invalid_params_before_submitted(#[case] event: bool) {
+    let addr = start_exec_test_server().await;
+    let base_url = format!("http://{addr}");
+    let (mut client, mut rx, cache) = create_test_execution_client(&base_url);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from(if event {
+        "BTC-ABOVE-DAILY-260224-1600-65000.OKX"
+    } else {
+        "ETH-USDT-SWAP.OKX"
+    });
+
+    let trader_id = TraderId::from("TESTER-001");
+    let strategy_id = StrategyId::from("STRATEGY-001");
+    let ids = [
+        ClientOrderId::from("OLISTVALID001"),
+        ClientOrderId::from("OLISTINVALID002"),
+    ];
+
+    let orders: Vec<_> = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let order_type = if event || index == 0 {
+                OrderType::Limit
+            } else {
+                OrderType::Market
+            };
+
+            OrderTestBuilder::new(order_type)
+                .trader_id(trader_id)
+                .strategy_id(strategy_id)
+                .instrument_id(instrument_id)
+                .client_order_id(*id)
+                .side(OrderSide::Buy)
+                .price(Price::from("2000.00"))
+                .quantity(Quantity::from("2"))
+                .time_in_force(TimeInForce::Gtc)
+                .build()
+        })
+        .collect();
+
+    for order in &orders {
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(*OKX_CLIENT_ID), false)
+            .unwrap();
+    }
+
+    let order_list = OrderList::new(
+        OrderListId::from("OLINVALID"),
+        instrument_id,
+        strategy_id,
+        ids.to_vec(),
+        UnixNanos::default(),
+    );
+
+    let params = Params::new(
+        [
+            ("rpi".to_string(), json!(!event)),
+            ("td_mode".to_string(), json!("isolated")),
+        ]
+        .into(),
+    );
+
+    let cmd = SubmitOrderList::new(
+        trader_id,
+        Some(*OKX_CLIENT_ID),
+        strategy_id,
+        order_list,
+        orders.iter().map(OrderInitialized::from).collect(),
+        None,
+        None,
+        Some(params),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    );
+
+    client.submit_order_list(cmd).unwrap();
+
+    let events = drain_events(&mut rx);
+    assert_eq!(events.len(), 2);
+
+    for (index, emitted) in events.iter().enumerate() {
+        let ExecutionEvent::Order(OrderEventAny::Denied(denied)) = emitted else {
+            panic!("Expected only OrderDenied, was {events:?}");
+        };
+
+        let reason = if event {
+            "VALIDATION_FAILED: OKX event contract orders require `outcome`"
+        } else if index == 0 {
+            "ORDER_LIST_DENIED: OLINVALID"
+        } else {
+            "VALIDATION_FAILED: OKX RPI orders require a limit order"
+        };
+
+        assert_eq!(denied.trader_id, trader_id);
+        assert_eq!(denied.strategy_id, strategy_id);
+        assert_eq!(denied.instrument_id, instrument_id);
+        assert_eq!(denied.client_order_id, ids[index]);
+        assert_eq!(denied.reason, reason);
+        assert_eq!(denied.causation_id, None);
+    }
+}
+
+#[rstest]
+#[case::zero(Some(false), "0.0", "PRICE_NOT_POSITIVE: field=PRICE, price=0.0")]
+#[case::negative(Some(false), "-0.2", "PRICE_NOT_POSITIVE: field=PRICE, price=-0.2")]
+#[case::option_zero(Some(true), "0.0", "PRICE_NOT_POSITIVE: field=PRICE, price=0.0")]
+#[case::option_negative(Some(true), "-0.2", "PRICE_NOT_POSITIVE: field=PRICE, price=-0.2")]
+#[case::uncached_zero(None, "0.0", "PRICE_NOT_POSITIVE: field=PRICE, price=0.0")]
+#[case::precision(
+    Some(false),
+    "1.23",
+    "VALIDATION_FAILED: `price` requires rounding to instrument price precision 1, was 1.23"
+)]
+#[case::increment(
+    Some(false),
+    "1.1",
+    "VALIDATION_FAILED: `price` is not aligned to price increment 0.2, was 1.1"
+)]
+#[tokio::test]
+async fn test_submit_order_denies_invalid_limit_price_before_submitted(
+    #[case] option: Option<bool>,
+    #[case] price: &str,
+    #[case] reason: &str,
+    #[values(false, true)] batch: bool,
+) {
+    let (mut client, mut rx, cache) = create_test_execution_client("http://127.0.0.1:1");
+    client.start().unwrap();
+
+    let instrument_id = if option == Some(true) {
+        let mut instrument =
+            crypto_option_btc_deribit(4, 0, Price::from("0.0001"), Quantity::from("1"));
+        instrument.id = InstrumentId::from("BTC-USD-241217-92000-C.OKX");
+        instrument.raw_symbol = instrument.id.symbol;
+        let instrument_id = instrument.id;
+        client.on_instrument(InstrumentAny::CryptoOption(instrument));
+        instrument_id
+    } else {
+        let mut instrument = crypto_perpetual_ethusdt();
+        instrument.id = InstrumentId::from("ETH-USDT-SWAP.OKX");
+        instrument.raw_symbol = instrument.id.symbol;
+        instrument.price_precision = 1;
+        instrument.price_increment = Price::from("0.2");
+        let instrument_id = instrument.id;
+        if option.is_some() {
+            client.on_instrument(InstrumentAny::CryptoPerpetual(instrument));
+        }
+
+        instrument_id
+    };
+
+    let trader_id = TraderId::from("TESTER-001");
+    let strategy_id = StrategyId::from("STRATEGY-001");
+    let ids = [
+        ClientOrderId::from("OPRICEINVALID"),
+        ClientOrderId::from("OPRICEVALID"),
+    ];
+
+    let orders: Vec<_> = ids[..if batch { 2 } else { 1 }]
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            OrderTestBuilder::new(OrderType::Limit)
+                .trader_id(trader_id)
+                .strategy_id(strategy_id)
+                .instrument_id(instrument_id)
+                .client_order_id(*id)
+                .side(OrderSide::Buy)
+                .price(Price::from(if index == 0 { price } else { "2.0" }))
+                .quantity(Quantity::from("1"))
+                .build()
+        })
+        .collect();
+
+    for order in &orders {
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(*OKX_CLIENT_ID), false)
+            .unwrap();
+    }
+
+    if batch {
+        let order_list = OrderList::new(
+            OrderListId::from("OLPRICE"),
+            instrument_id,
+            strategy_id,
+            ids.to_vec(),
+            UnixNanos::default(),
+        );
+        let params = Params::new([("px_usd".to_string(), json!(100.5))].into());
+        client
+            .submit_order_list(SubmitOrderList::new(
+                trader_id,
+                Some(*OKX_CLIENT_ID),
+                strategy_id,
+                order_list,
+                orders.iter().map(OrderInitialized::from).collect(),
+                None,
+                None,
+                Some(params),
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+            ))
+            .unwrap();
+    } else {
+        let mut command = SubmitOrder::from_order(
+            &orders[0],
+            trader_id,
+            Some(*OKX_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+        );
+        command.params = Some(Params::new([("px_usd".to_string(), Value::Null)].into()));
+        client.submit_order(command).unwrap();
+    }
+
+    let events = drain_events(&mut rx);
+    assert_eq!(events.len(), orders.len());
+
+    for (index, event) in events.iter().enumerate() {
+        let ExecutionEvent::Order(OrderEventAny::Denied(denied)) = event else {
+            panic!("Expected only OrderDenied, was {events:?}");
+        };
+
+        assert_eq!(denied.trader_id, trader_id);
+        assert_eq!(denied.strategy_id, strategy_id);
+        assert_eq!(denied.instrument_id, instrument_id);
+        assert_eq!(denied.client_order_id, ids[index]);
+        assert_eq!(
+            denied.reason,
+            if index == 0 {
+                reason
+            } else {
+                "ORDER_LIST_DENIED: OLPRICE"
+            }
+        );
+        assert_eq!(denied.causation_id, None);
+    }
+}
+
+#[rstest]
+#[case::swap("http_get_instruments_swap.json", None, "0.1")]
+#[case::option("http_get_instruments_option.json", None, "0.0001")]
+#[case::usd("http_get_instruments_option.json", Some(("px_usd", json!(100.5))), "0")]
+#[case::iv("http_get_instruments_option.json", Some(("px_vol", json!("0.55"))), "0")]
+#[tokio::test]
+async fn test_submit_order_preserves_valid_limit_price_on_wire(
+    #[case] fixture: &str,
+    #[case] pricing: Option<(&str, Value)>,
+    #[case] price: &str,
+) {
+    let (tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+
+    let state = Arc::new(WsTeardownState {
+        order_requests: Some(tx),
+        ..Default::default()
+    });
+
+    let mut instruments = load_test_data(fixture);
+    let definition = &mut instruments["data"][0];
+    definition["instIdCode"] = json!(10458);
+    let raw: OKXInstrument = serde_json::from_value(definition.clone()).unwrap();
+    let instrument = parse_instrument_any(&raw, None, None, UnixNanos::default())
+        .unwrap()
+        .unwrap();
+    instruments["data"] = json!([definition.clone()]);
+    let instrument_id = instrument.id();
+
+    let router = create_exec_test_router()
+        .route(
+            "/api/v5/public/instruments",
+            get(move || {
+                let response = instruments.clone();
+                async move { Json(response) }
+            }),
+        )
+        .route(
+            "/api/v5/account/positions",
+            get(|| async { Json(json!({"code":"0", "msg":"", "data":[]})) }),
+        )
+        .route(
+            "/api/v5/trade/orders-pending",
+            get(|| async { Json(json!({"code":"0", "msg":"", "data":[]})) }),
+        )
+        .route(
+            "/api/v5/trade/orders-algo-pending",
+            get(|| async { Json(json!({"code":"0", "msg":"", "data":[]})) }),
+        )
+        .route(
+            "/ws/v5/private",
+            get(handle_exec_ws_upgrade).with_state(Arc::clone(&state)),
+        )
+        .route(
+            "/ws/v5/business",
+            get(handle_exec_ws_upgrade).with_state(state),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (data_tx, _data_rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_data_event_sender(data_tx);
+
+    let (mut client, mut rx, cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.instrument_types = vec![raw.inst_type];
+            if raw.inst_type == OKXInstrumentType::Option {
+                config.instrument_families = Some(vec!["BTC-USD".to_string()]);
+            }
+
+            config.base_url_ws_private = Some(format!("ws://{addr}/ws/v5/private"));
+            config.base_url_ws_business = Some(format!("ws://{addr}/ws/v5/business"));
+            config.max_retries = 0;
+        });
+
+    client.start().unwrap();
+    finish_bootstrap_connect(client.connect(), &mut rx, &cache)
+        .await
+        .unwrap();
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from("TESTER-001"))
+        .strategy_id(StrategyId::from("STRATEGY-001"))
+        .instrument_id(instrument_id)
+        .client_order_id(ClientOrderId::from("OPRICEWIRE"))
+        .side(OrderSide::Buy)
+        .price(Price::from(price))
+        .quantity(Quantity::from("1"))
+        .post_only(true)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(*OKX_CLIENT_ID), false)
+        .unwrap();
+    let mut command = SubmitOrder::from_order(
+        &order,
+        order.trader_id(),
+        Some(*OKX_CLIENT_ID),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    if let Some((key, value)) = &pricing {
+        command.params = Some(Params::new([(key.to_string(), value.clone())].into()));
+    }
+
+    client.submit_order(command).unwrap();
+    let request = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let event = recv_order_event_matching(&mut rx, |_| true).await;
+    client.disconnect().await.unwrap();
+    server.abort();
+
+    let OrderEventAny::Submitted(submitted) = event else {
+        panic!("Expected OrderSubmitted, was {event:?}");
+    };
+
+    assert_eq!(submitted.trader_id, order.trader_id());
+    assert_eq!(submitted.strategy_id, order.strategy_id());
+    assert_eq!(submitted.instrument_id, instrument_id);
+    assert_eq!(submitted.client_order_id, order.client_order_id());
+    assert_eq!(submitted.account_id, AccountId::from("OKX-001"));
+    assert_eq!(request["op"], "order");
+    let args = &request["args"][0];
+    assert_eq!(args["clOrdId"], "OPRICEWIRE");
+    assert_eq!(args["instIdCode"], 10458);
+    assert_eq!(args["ordType"], "post_only");
+    assert_eq!(args["sz"], "1");
+
+    match pricing {
+        Some(("px_usd", _)) => {
+            assert_eq!(args["pxUsd"], "100.5");
+            assert_eq!(args.get("px"), None);
+        }
+        Some(("px_vol", _)) => {
+            assert_eq!(args["pxVol"], "0.55");
+            assert_eq!(args.get("px"), None);
+        }
+        None => assert_eq!(args["px"], price),
+        _ => panic!("unexpected pricing mode"),
+    }
+}
+
+#[rstest]
+#[case::gtc("ETH-USDT-SWAP.OKX", TimeInForce::Gtc, false, None)]
+#[case::ioc("ETH-USDT-SWAP.OKX", TimeInForce::Ioc, false, None)]
+#[case::fok("ETH-USDT-SWAP.OKX", TimeInForce::Fok, false, None)]
+#[case::rpi("ETH-USDT-SWAP.OKX", TimeInForce::Gtc, true, None)]
+#[case::event(
+    "BTC-ABOVE-DAILY-260224-1600-65000.OKX",
+    TimeInForce::Gtc,
+    false,
+    Some("yes")
+)]
+#[tokio::test]
+async fn test_submit_order_preserves_supported_params(
+    #[case] instrument_id: &str,
+    #[case] time_in_force: TimeInForce,
+    #[case] rpi: bool,
+    #[case] outcome: Option<&str>,
+) {
+    let addr = start_exec_test_server().await;
+    let base_url = format!("http://{addr}");
+    let (mut client, mut rx, cache) = create_test_execution_client(&base_url);
+    client.start().unwrap();
+    let client_order_id = ClientOrderId::from("OVALIDTIF001");
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from("TESTER-001"))
+        .strategy_id(StrategyId::from("STRATEGY-001"))
+        .instrument_id(InstrumentId::from(instrument_id))
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .price(Price::from("2000.00"))
+        .quantity(Quantity::from("1"))
+        .time_in_force(time_in_force)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(*OKX_CLIENT_ID), false)
+        .unwrap();
+    let mut cmd = SubmitOrder::from_order(
+        &order,
+        TraderId::from("TESTER-001"),
+        Some(*OKX_CLIENT_ID),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    let mut params: indexmap::IndexMap<String, Value> = [
+        ("rpi".to_string(), json!(rpi)),
+        ("td_mode".to_string(), json!("isolated")),
+    ]
+    .into_iter()
+    .collect();
+
+    if let Some(outcome) = outcome {
+        params.insert("outcome".to_string(), json!(outcome));
+    }
+
+    cmd.params = Some(Params::new(params));
+    client.submit_order(cmd).unwrap();
+
+    let event = recv_order_event_matching(&mut rx, |_| true).await;
+
+    let OrderEventAny::Submitted(submitted) = event else {
+        panic!("Expected OrderSubmitted, was {event:?}");
+    };
+
+    assert_eq!(submitted.trader_id, TraderId::from("TESTER-001"));
+    assert_eq!(submitted.strategy_id, StrategyId::from("STRATEGY-001"));
+    assert_eq!(submitted.instrument_id, InstrumentId::from(instrument_id));
+    assert_eq!(submitted.client_order_id, client_order_id);
+    assert_eq!(submitted.account_id, AccountId::from("OKX-001"));
 }
 
 #[rstest]
@@ -5080,16 +5710,28 @@ async fn test_submit_spread_order_denies_reduce_only() {
 }
 
 #[rstest]
+#[case::cash(None)]
+#[case::cross(Some(OKXMarginMode::Cross))]
+#[case::isolated(Some(OKXMarginMode::Isolated))]
 #[tokio::test]
-async fn test_submit_cash_order_denies_reduce_only() {
+async fn test_submit_spot_order_denies_reduce_only(
+    #[case] margin_mode: Option<OKXMarginMode>,
+    #[values(OrderType::Market, OrderType::Limit)] order_type: OrderType,
+) {
     let addr = start_exec_test_server().await;
     let base_url = format!("http://{addr}");
-    let (mut client, mut rx, cache) = create_test_execution_client(&base_url);
+
+    let (mut client, mut rx, cache) =
+        create_test_execution_client_configured(&base_url, |config| {
+            config.margin_mode = margin_mode;
+            config.use_spot_margin = margin_mode.is_some();
+        });
+
     client.start().unwrap();
     let _ = drain_events(&mut rx);
     let instrument_id = InstrumentId::from("BTC-USDT.OKX");
     let client_order_id = ClientOrderId::from("OREDUCECASH1");
-    let order = OrderTestBuilder::new(OrderType::Limit)
+    let order = OrderTestBuilder::new(order_type)
         .trader_id(TraderId::from("TESTER-001"))
         .strategy_id(StrategyId::from("STRATEGY-001"))
         .instrument_id(instrument_id)
@@ -5513,7 +6155,8 @@ async fn test_generate_mass_status_sets_report_window(
     let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
         config.instrument_types = vec![OKXInstrumentType::Swap];
     });
-    client.on_instrument(query_order_instrument());
+
+    client.on_instrument(swap_instrument("ETH-USDT-SWAP"));
 
     let mass_status = client
         .generate_mass_status(lookback_mins)
@@ -5704,7 +6347,8 @@ async fn test_generate_mass_status_fails_when_pending_algo_report_conversion_is_
         create_test_execution_client_configured(&format!("http://{addr}"), |config| {
             config.instrument_types = vec![OKXInstrumentType::Swap];
         });
-    client.on_instrument(btc_usdt_swap_instrument());
+
+    client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
 
     let error = client.generate_mass_status(None).await.unwrap_err();
 
@@ -5755,7 +6399,8 @@ async fn test_generate_mass_status_fails_when_old_pending_algo_state_is_unknown(
         create_test_execution_client_configured(&format!("http://{addr}"), |config| {
             config.instrument_types = vec![OKXInstrumentType::Swap];
         });
-    client.on_instrument(btc_usdt_swap_instrument());
+
+    client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
 
     let error = client.generate_mass_status(None).await.unwrap_err();
 
@@ -5858,7 +6503,9 @@ async fn test_generate_order_status_reports_fails_after_pending_not_found(
         create_test_execution_client_configured(&format!("http://{addr}"), |config| {
             config.instrument_types = vec![OKXInstrumentType::Swap];
         });
-    client.on_instrument(query_order_instrument());
+
+    client.on_instrument(swap_instrument("ETH-USDT-SWAP"));
+
     let cmd = GenerateOrderStatusReports::new(
         UUID4::new(),
         UnixNanos::default(),
@@ -5939,7 +6586,9 @@ async fn test_generate_order_status_reports_preserves_pending_after_history_not_
         create_test_execution_client_configured(&format!("http://{addr}"), |config| {
             config.instrument_types = vec![OKXInstrumentType::Swap];
         });
-    client.on_instrument(btc_usdt_swap_instrument());
+
+    client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
+
     let cmd = GenerateOrderStatusReports::new(
         UUID4::new(),
         UnixNanos::default(),
@@ -6028,12 +6677,12 @@ async fn test_active_order_conversion_fails_report_request(
             config.load_spreads = true;
         });
 
-    client.on_instrument(btc_usdt_swap_instrument());
+    client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
     let spread = make_report_spread_instrument();
     let instrument_id = if path.contains("sprd") {
         spread.id()
     } else {
-        btc_usdt_swap_instrument().id()
+        swap_instrument("BTC-USDT-SWAP").id()
     };
 
     client.on_instrument(spread);
@@ -6153,7 +6802,7 @@ async fn test_failed_active_coverage_preserves_missing_cached_order(
             config.max_retries = 0;
         });
 
-    let instrument = btc_usdt_swap_instrument();
+    let instrument = swap_instrument("BTC-USDT-SWAP");
     client.on_instrument(instrument.clone());
     cache
         .borrow_mut()
@@ -6235,7 +6884,7 @@ async fn test_active_order_conversion_fails_mass_status(
             config.load_spreads = true;
         });
 
-    client.on_instrument(btc_usdt_swap_instrument());
+    client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
     client.on_instrument(make_report_spread_instrument());
 
     let error = client.generate_mass_status(None).await.unwrap_err();
@@ -6380,7 +7029,7 @@ async fn test_partial_order_history_preserves_authoritative_pending_reports(
             config.max_retries = 0;
         });
 
-    client.on_instrument(btc_usdt_swap_instrument());
+    client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
     client.on_instrument(make_report_spread_instrument());
 
     let status = client.generate_mass_status(None).await.unwrap().unwrap();
@@ -6477,7 +7126,7 @@ async fn test_active_algo_history_conversion_fails_report_request(
             config.instrument_types = vec![OKXInstrumentType::Swap];
         });
 
-    client.on_instrument(btc_usdt_swap_instrument());
+    client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
 
     let cmd = GenerateOrderStatusReports::new(
         UUID4::new(),
@@ -6556,7 +7205,7 @@ async fn test_malformed_pending_order_is_not_hidden_by_terminal_history(
             config.load_spreads = true;
         });
 
-    client.on_instrument(btc_usdt_swap_instrument());
+    client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
     client.on_instrument(make_report_spread_instrument());
 
     let cmd = GenerateOrderStatusReports::new(
@@ -6703,7 +7352,9 @@ async fn test_generate_order_status_reports_excludes_old_terminal_pending_record
         create_test_execution_client_configured(&format!("http://{addr}"), |config| {
             config.instrument_types = vec![OKXInstrumentType::Swap];
         });
-    client.on_instrument(btc_usdt_swap_instrument());
+
+    client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
+
     let cmd = GenerateOrderStatusReports::new(
         UUID4::new(),
         UnixNanos::default(),
@@ -6795,7 +7446,8 @@ async fn test_generate_mass_status_preserves_reports_when_algo_history_is_unavai
             config.retry_delay_initial_ms = 1;
             config.retry_delay_max_ms = 1;
         });
-    client.on_instrument(btc_usdt_swap_instrument());
+
+    client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
 
     let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
 
@@ -6818,7 +7470,8 @@ async fn test_generate_mass_status_does_not_invent_net_flat_for_cached_hedge_pos
     let (mut client, _rx, cache) = create_test_execution_client_configured(&base_url, |config| {
         config.instrument_types = vec![OKXInstrumentType::Swap];
     });
-    let instrument = query_order_instrument();
+
+    let instrument = swap_instrument("ETH-USDT-SWAP");
     client.on_instrument(instrument.clone());
 
     let order = OrderTestBuilder::new(OrderType::Market)
@@ -6887,7 +7540,8 @@ async fn test_generate_mass_status_fails_on_malformed_fill_quantity() {
         create_test_execution_client_configured(&format!("http://{addr}"), |config| {
             config.instrument_types = vec![OKXInstrumentType::Swap];
         });
-    client.on_instrument(query_order_instrument());
+
+    client.on_instrument(swap_instrument("ETH-USDT-SWAP"));
 
     let error = client.generate_mass_status(None).await.unwrap_err();
 
@@ -6916,7 +7570,8 @@ async fn test_generate_mass_status_recovers_historical_triggered_child_status() 
     let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
         config.instrument_types = vec![OKXInstrumentType::Swap];
     });
-    client.on_instrument(query_order_instrument());
+
+    client.on_instrument(swap_instrument("ETH-USDT-SWAP"));
 
     let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
     let reports = mass_status.order_reports();
@@ -6990,7 +7645,8 @@ async fn test_generate_mass_status_preserves_triggered_child_status(
     let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
         config.instrument_types = vec![OKXInstrumentType::Swap];
     });
-    client.on_instrument(query_order_instrument());
+
+    client.on_instrument(swap_instrument("ETH-USDT-SWAP"));
 
     let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
     let reports = mass_status.order_reports();
@@ -7028,7 +7684,8 @@ async fn test_generate_mass_status_uses_live_child_quantity_for_close_fraction_p
     let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
         config.instrument_types = vec![OKXInstrumentType::Swap];
     });
-    client.on_instrument(query_order_instrument());
+
+    client.on_instrument(swap_instrument("ETH-USDT-SWAP"));
 
     let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
     let reports = mass_status.order_reports();
@@ -7100,7 +7757,7 @@ async fn test_generate_mass_status_uses_linked_position_size_for_pending_close_f
             config.instrument_types = vec![OKXInstrumentType::Swap];
         });
 
-    client.on_instrument(btc_usdt_swap_instrument());
+    client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
 
     let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
     let reports = mass_status.order_reports();
@@ -7177,7 +7834,7 @@ async fn test_generate_mass_status_fails_when_close_fraction_position_lookup_is_
             config.retry_delay_max_ms = 1;
         });
 
-    client.on_instrument(btc_usdt_swap_instrument());
+    client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
 
     let error = client.generate_mass_status(None).await.unwrap_err();
 
@@ -7209,7 +7866,8 @@ async fn test_generate_mass_status_preserves_external_triggered_child_identity()
     let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
         config.instrument_types = vec![OKXInstrumentType::Swap];
     });
-    client.on_instrument(query_order_instrument());
+
+    client.on_instrument(swap_instrument("ETH-USDT-SWAP"));
 
     let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
     let reports = mass_status.order_reports();
@@ -7315,7 +7973,8 @@ async fn test_generate_mass_status_omits_unresolved_triggered_child(
     let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
         config.instrument_types = vec![OKXInstrumentType::Swap];
     });
-    client.on_instrument(query_order_instrument());
+
+    client.on_instrument(swap_instrument("ETH-USDT-SWAP"));
 
     let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
     let detail_queries = detail_queries.lock().await;
@@ -7347,7 +8006,8 @@ async fn test_generate_mass_status_preserves_rejected_algo_parent() {
     let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
         config.instrument_types = vec![OKXInstrumentType::Swap];
     });
-    client.on_instrument(query_order_instrument());
+
+    client.on_instrument(swap_instrument("ETH-USDT-SWAP"));
 
     let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
     let reports = mass_status.order_reports();
@@ -7384,7 +8044,8 @@ async fn test_generate_mass_status_preserves_regular_child_for_ambiguous_algo_pa
     let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
         config.instrument_types = vec![OKXInstrumentType::Swap];
     });
-    client.on_instrument(query_order_instrument());
+
+    client.on_instrument(swap_instrument("ETH-USDT-SWAP"));
 
     let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
     let reports = mass_status.order_reports();
@@ -7422,7 +8083,8 @@ async fn test_generate_mass_status_preserves_external_regular_child_when_detail_
     let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
         config.instrument_types = vec![OKXInstrumentType::Swap];
     });
-    client.on_instrument(query_order_instrument());
+
+    client.on_instrument(swap_instrument("ETH-USDT-SWAP"));
 
     let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
     let reports = mass_status.order_reports();
@@ -7460,7 +8122,8 @@ async fn test_generate_mass_status_recovers_sole_listed_child_order_id() {
     let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
         config.instrument_types = vec![OKXInstrumentType::Swap];
     });
-    client.on_instrument(query_order_instrument());
+
+    client.on_instrument(swap_instrument("ETH-USDT-SWAP"));
 
     let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
     let reports = mass_status.order_reports();
@@ -7485,7 +8148,8 @@ async fn test_generate_mass_status_bounds_triggered_child_recovery() {
     let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
         config.instrument_types = vec![OKXInstrumentType::Swap];
     });
-    client.on_instrument(query_order_instrument());
+
+    client.on_instrument(swap_instrument("ETH-USDT-SWAP"));
 
     let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
     let reports = mass_status.order_reports();
@@ -8258,11 +8922,16 @@ async fn test_filtered_stream_registers_metadata_before_replaying_orders_and_fil
                     assert_eq!(report.order_status, OrderStatus::Accepted);
                     order_ids.push(report.venue_order_id.to_string());
                 }
-                ExecutionEvent::Report(CommonExecutionReport::Fill(report)) => {
+                ExecutionEvent::Report(CommonExecutionReport::OrderWithFills(order, reports)) => {
+                    assert_eq!(order.instrument_id, target);
+                    assert_eq!(order.order_status, OrderStatus::Filled);
+                    order_ids.push(order.venue_order_id.to_string());
+                    assert_eq!(reports.len(), 1);
+                    let report = &reports[0];
                     assert_eq!(report.instrument_id, target);
                     assert_eq!(report.trade_id, TradeId::from("stream-fill-17"));
                     assert_eq!(report.last_qty, Quantity::from("1"));
-                    fills.push(report);
+                    fills.push(report.clone());
                 }
                 event => panic!("unexpected recovered event: {event:?}"),
             }
@@ -8287,7 +8956,7 @@ async fn test_filtered_stream_registers_metadata_before_replaying_orders_and_fil
                 {
                     controls += 1;
                 }
-                ExecutionEvent::Report(CommonExecutionReport::Fill(report)) => fills.push(report),
+                ExecutionEvent::Report(CommonExecutionReport::Fill(report)) => fills.push(*report),
                 event => panic!("unexpected duplicate-stream outcome: {event:?}"),
             }
         }
@@ -8303,7 +8972,8 @@ async fn test_filtered_stream_registers_metadata_before_replaying_orders_and_fil
             "stream-first",
             "stream-second",
             "stream-first",
-            "stream-second"
+            "stream-second",
+            "stream-first"
         ]
     );
     assert_eq!(fills.len(), 1);
@@ -8656,7 +9326,6 @@ async fn test_filtered_stream_session_transition_preserves_generation(
                 event = rx.recv() => {
                     let event = event.unwrap();
                     if let ExecutionEvent::Account(account) = &event {
-                        assert!(restart);
                         assert_eq!(account.account_id, AccountId::from("OKX-001"));
                         continue;
                     }
@@ -8762,6 +9431,320 @@ async fn test_bootstrap_rejects_scope_without_selected_contract_type(#[case] fam
     assert!(error.to_string().contains("No usable instruments for Swap"));
     assert_eq!(server.ws.opened.load(Ordering::Relaxed), 0);
     assert!(!client.is_connected());
+}
+
+#[rstest]
+#[case::default(vec![], false, vec![])]
+#[case::spot(vec![OKXInstrumentType::Spot], false, vec![])]
+#[case::spot_margin(vec![OKXInstrumentType::Spot], true, vec!["MARGIN"])]
+#[case::margin(vec![OKXInstrumentType::Margin], false, vec!["MARGIN"])]
+#[case::swap(vec![OKXInstrumentType::Swap], false, vec!["SWAP"])]
+#[case::futures(vec![OKXInstrumentType::Futures], false, vec!["FUTURES"])]
+#[case::option(vec![OKXInstrumentType::Option], false, vec!["OPTION"])]
+#[case::mixed(
+    vec![OKXInstrumentType::Spot, OKXInstrumentType::Margin, OKXInstrumentType::Swap, OKXInstrumentType::Futures],
+    true,
+    vec!["MARGIN", "SWAP", "FUTURES"],
+)]
+#[tokio::test]
+async fn test_connect_subscribes_position_channels(
+    #[case] instrument_types: Vec<OKXInstrumentType>,
+    #[case] use_spot_margin: bool,
+    #[case] expected_types: Vec<&str>,
+) {
+    let mut server = BootstrapServer::start_with_active_orders(false).await;
+
+    let (mut client, mut rx, cache) =
+        create_test_execution_client_configured(&format!("http://{}", server.addr), |config| {
+            config.instrument_types = instrument_types.clone();
+            config.use_spot_margin = use_spot_margin;
+            if instrument_types.contains(&OKXInstrumentType::Option) {
+                config.instrument_families = Some(vec!["BTC-USD".into()]);
+            }
+
+            config.base_url_ws_private = Some(format!("ws://{}/ws/v5/private", server.addr));
+            config.base_url_ws_business = Some(format!("ws://{}/ws/v5/business", server.addr));
+            config.max_retries = 0;
+        });
+
+    client.start().unwrap();
+    let mut connect = Box::pin(client.connect());
+    for _ in 0..instrument_types.len().max(1) {
+        let request = server.next_request(&mut connect).await;
+
+        let fixture = match request.params["instType"].as_str() {
+            "SPOT" | "MARGIN" => "http_get_instruments_spot.json",
+            "SWAP" => "http_get_instruments_swap.json",
+            "FUTURES" => "http_get_instruments_futures.json",
+            "OPTION" => "http_get_instruments_option.json",
+            other => panic!("Unexpected instrument type: {other}"),
+        };
+
+        request.respond(Json(load_test_data(fixture)).into_response());
+    }
+
+    finish_bootstrap_connect(connect, &mut rx, &cache)
+        .await
+        .unwrap();
+    client.disconnect().await.unwrap();
+    server.assert_closed().await;
+
+    let subscriptions = server.ws.subscriptions.lock().await;
+
+    let actual: Vec<_> = subscriptions
+        .iter()
+        .flat_map(|(path, request)| {
+            request["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|arg| {
+                    (arg["channel"] == "positions").then_some((path.as_str(), arg.clone()))
+                })
+        })
+        .collect();
+
+    let expected: Vec<_> = expected_types
+        .iter()
+        .map(|inst_type| {
+            (
+                "/ws/v5/private",
+                json!({
+                    "channel":"positions",
+                    "instType":inst_type,
+                    "extraParams":json!({"updateInterval":"0"}).to_string(),
+                }),
+            )
+        })
+        .collect();
+
+    assert_eq!(actual, expected);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_initial_position_snapshot_recovers_in_batches_without_blocking_connect() {
+    let mut server = BootstrapServer::start_with_active_orders(false).await;
+    let mut definitions = load_test_data("http_get_instruments_swap.json");
+    let template = definitions["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["instId"] == "BTC-USDT-SWAP")
+        .unwrap()
+        .clone();
+    let ready_definition = definitions["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["instId"] == "ETH-USDT-SWAP")
+        .unwrap()
+        .clone();
+    let symbols: Vec<_> = (0..66)
+        .map(|index| format!("ASSET{index}-USDT-SWAP"))
+        .collect();
+
+    let instruments: Vec<_> = symbols
+        .iter()
+        .enumerate()
+        .map(|(index, symbol)| {
+            let mut row = template.clone();
+            row["instId"] = json!(symbol);
+            row["instFamily"] = json!(format!("ASSET{index}-USDT"));
+            row["instIdCode"] = json!(20_000 + index);
+            row
+        })
+        .chain(std::iter::once(ready_definition))
+        .collect();
+
+    definitions["data"] = json!(instruments);
+
+    let mut snapshot = load_test_data("ws_positions.json");
+    let position = snapshot["data"][0].clone();
+    let rows: Vec<_> = symbols[..65]
+        .iter()
+        .enumerate()
+        .map(|(index, symbol)| {
+            let mut row = position.clone();
+            row["instId"] = json!(symbol);
+            row["posSide"] = json!("net");
+            row["pos"] = json!((index + 1).to_string());
+            row
+        })
+        .collect();
+
+    snapshot["data"] = json!(rows);
+    let mut updated = snapshot.clone();
+    updated["data"] = json!([snapshot["data"][64].clone()]);
+    updated["data"][0]["pos"] = json!("100");
+    let mut frames = vec![snapshot];
+
+    for (symbol, order_id) in [(&symbols[65], "1000001"), (&symbols[64], "1000002")] {
+        let mut order = external_stream_order(symbol, "live");
+        order["data"][0]["ordId"] = json!(order_id);
+        frames.push(order);
+    }
+
+    frames.push(updated);
+    let mut ready_order = external_stream_order("ETH-USDT-SWAP", "live");
+    ready_order["data"][0]["ordId"] = json!("1000003");
+    frames.push(ready_order);
+    *server.ws.startup_messages.lock().await = frames;
+
+    let (mut client, mut events, cache) =
+        create_test_execution_client_configured(&format!("http://{}", server.addr), |config| {
+            config.instrument_types = vec![OKXInstrumentType::Swap];
+            config.base_url_ws_private = Some(format!("ws://{}/ws/v5/private", server.addr));
+            config.base_url_ws_business = Some(format!("ws://{}/ws/v5/business", server.addr));
+            config.max_retries = 0;
+        });
+
+    let ready_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
+    cache
+        .borrow_mut()
+        .add_instrument(swap_instrument("ETH-USDT-SWAP"))
+        .unwrap();
+    client.start().unwrap();
+    let mut connect = Box::pin(client.connect());
+    server
+        .next_request(&mut connect)
+        .await
+        .respond(Json(definitions).into_response());
+    let mut data = server.data_events.lock().await;
+    let mut registrations = Vec::new();
+    let mut account = None;
+    let mut orders = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while registrations.len() < 64 || account.is_none() || orders.is_empty() {
+            tokio::select! {
+                result = &mut connect => panic!("connect completed before registration barrier: {result:?}"),
+                event = data.recv() => {
+                    let DataEvent::Data(Data::Instrument(instrument)) = event.unwrap() else {
+                        panic!("expected instrument registration");
+                    };
+                    registrations.push(instrument);
+                }
+                event = events.recv() => match event.unwrap() {
+                    ExecutionEvent::Account(state) => account = Some(state),
+                    ExecutionEvent::Report(CommonExecutionReport::Order(report)) => {
+                        assert_eq!(report.instrument_id, ready_id);
+                        orders.push(report.instrument_id);
+                    }
+                    other => panic!("report emitted before instrument registration: {other:?}"),
+                }
+            }
+        }
+    }).await.expect("snapshot stalled before connect could finish");
+
+    assert!(events.try_recv().is_err());
+    let account = account.unwrap();
+    let account = MarginAccount::new(account, true);
+    cache
+        .borrow_mut()
+        .add_account(AccountAny::Margin(account))
+        .unwrap();
+    finish_bootstrap_connect(connect, &mut events, &cache)
+        .await
+        .unwrap();
+
+    let mut registered = Vec::new();
+    for instrument in registrations {
+        registered.push(instrument.id());
+        register_stream_definition(&cache, &instrument);
+    }
+
+    for _ in 0..2 {
+        let event = tokio::time::timeout(Duration::from_secs(5), data.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let DataEvent::Data(Data::Instrument(instrument)) = event else {
+            panic!("expected instrument registration");
+        };
+
+        registered.push(instrument.id());
+        register_stream_definition(&cache, &instrument);
+    }
+
+    let last_id = InstrumentId::from(format!("{}.OKX", symbols[64]).as_str());
+    let mut last_events = Vec::new();
+    let mut positions = HashMap::<InstrumentId, Vec<Quantity>>::new();
+
+    for _ in 0..68 {
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        match event {
+            ExecutionEvent::Report(CommonExecutionReport::Position(report)) => {
+                assert_eq!(report.account_id, AccountId::from("OKX-001"));
+                assert_eq!(report.position_side, PositionSide::Long);
+                assert_eq!(report.signed_decimal_qty, report.quantity.as_decimal());
+                assert_eq!(report.venue_position_id, None);
+                assert_eq!(report.avg_px_open, Some(dec!(10000)));
+                assert_eq!(report.ts_last, UnixNanos::from(1_622_559_930_237_000_000));
+
+                if report.instrument_id == last_id {
+                    last_events.push("position");
+                }
+
+                positions
+                    .entry(report.instrument_id)
+                    .or_default()
+                    .push(report.quantity);
+            }
+            ExecutionEvent::Report(CommonExecutionReport::Order(report)) => {
+                if report.instrument_id == last_id {
+                    last_events.push("order");
+                }
+
+                orders.push(report.instrument_id);
+            }
+            other => panic!("unexpected execution event: {other:?}"),
+        }
+    }
+
+    let mut expected: HashMap<_, _> = symbols[..65]
+        .iter()
+        .enumerate()
+        .map(|(index, symbol)| {
+            (
+                InstrumentId::from(format!("{symbol}.OKX").as_str()),
+                vec![Quantity::from((index + 1).to_string().as_str())],
+            )
+        })
+        .collect();
+
+    expected
+        .get_mut(&last_id)
+        .unwrap()
+        .push(Quantity::from("100"));
+    registered.sort();
+    let mut expected_registered: Vec<_> = symbols
+        .iter()
+        .map(|symbol| InstrumentId::from(format!("{symbol}.OKX").as_str()))
+        .collect();
+    expected_registered.sort();
+    orders.sort();
+    let mut expected_orders = [
+        ready_id,
+        last_id,
+        InstrumentId::from(format!("{}.OKX", symbols[65]).as_str()),
+    ];
+    expected_orders.sort();
+    let connected = client.is_connected();
+    client.disconnect().await.unwrap();
+    server.assert_closed().await;
+
+    assert!(connected);
+    assert_eq!(registered, expected_registered);
+    assert_eq!(positions, expected);
+    assert_eq!(last_events, ["position", "order", "position"]);
+    assert_eq!(orders, expected_orders);
+    assert!(events.try_recv().is_err());
+    assert!(server.requests.try_recv().is_err());
 }
 
 struct BootstrapRequest {
@@ -9190,7 +10173,8 @@ async fn test_open_order_outside_report_window_is_reported(
     let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
         config.instrument_types = vec![OKXInstrumentType::Swap];
     });
-    client.on_instrument(btc_usdt_swap_instrument());
+
+    client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
 
     let cmd = GenerateOrderStatusReports::new(
         UUID4::new(),
@@ -9294,7 +10278,8 @@ async fn test_generate_order_status_report_http_failure_is_error() {
         create_test_execution_client_configured(&format!("http://{addr}"), |config| {
             config.instrument_types = vec![OKXInstrumentType::Swap];
         });
-    client.on_instrument(query_order_instrument());
+
+    client.on_instrument(swap_instrument("ETH-USDT-SWAP"));
 
     let error = client
         .generate_order_status_report(&generate_order_status_report_cmd(
@@ -9611,23 +10596,21 @@ async fn test_imported_order_first_amend_confirmation(
         panic!("expected imported amendment first, was {first:?}");
     };
 
-    let expected = OrderUpdated::new(
-        order.trader_id(),
-        order.strategy_id(),
-        order.instrument_id(),
-        cid,
-        Quantity::from("3"),
-        updated.event_id,
-        UnixNanos::from(1_746_947_317_402_000_000),
-        updated.ts_init,
-        false,
-        Some(vid),
-        Some(client.account_id()),
-        Some(Price::from("50100.0")),
-        None,
-        None,
-        false,
-    );
+    let expected = OrderUpdatedSpec::builder()
+        .trader_id(order.trader_id())
+        .strategy_id(order.strategy_id())
+        .instrument_id(order.instrument_id())
+        .client_order_id(cid)
+        .quantity(Quantity::from("3"))
+        .event_id(updated.event_id)
+        .ts_event(UnixNanos::from(1_746_947_317_402_000_000))
+        .ts_init(updated.ts_init)
+        .reconciliation(false)
+        .venue_order_id(vid)
+        .account_id(client.account_id())
+        .price(Price::from("50100.0"))
+        .is_quote_quantity(false)
+        .build();
     assert_eq!(updated, expected);
     order.apply(OrderEventAny::Updated(updated)).unwrap();
 
@@ -9840,7 +10823,7 @@ async fn test_generate_mass_status_history_page_limits(
             config.max_reconciliation_history_pages = max_pages;
         });
 
-    client.on_instrument(btc_usdt_swap_instrument());
+    client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
     client.on_instrument(make_report_spread_instrument());
 
     let status = client
@@ -9971,7 +10954,7 @@ async fn test_history_page_limit_leaves_standalone_reports_unchanged(
             config.max_reconciliation_history_pages = Some(max_pages);
         });
 
-    client.on_instrument(btc_usdt_swap_instrument());
+    client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
     client.on_instrument(make_report_spread_instrument());
 
     let order_cmd = GenerateOrderStatusReports::new(
@@ -10242,7 +11225,7 @@ async fn test_filtered_execution_recovers_current_instrument(
         });
 
     if cached_definition {
-        client.on_instrument(btc_usdt_swap_instrument());
+        client.on_instrument(swap_instrument("BTC-USDT-SWAP"));
     }
 
     let cache_sink = Rc::clone(&cache);

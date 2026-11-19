@@ -7,6 +7,15 @@ sequencing. The adapter supports both Lighter and its Robinhood Chain deployment
 The `nautilus-lighter` crate provides Rust data and execution clients, typed REST and WebSocket
 models, and an in-tree L2 signer using Schnorr signatures over ECgFp5.
 
+:::warning[Signing safety]
+Do not create NautilusTrader instances with Python `os.fork()` or the `multiprocessing` `fork` start
+method, including when it is the default. Start each instance in a fresh interpreter, for example with
+the `spawn` start method. A forked child inherits runtime state that is unsafe to reuse.
+
+Do not modify the adapter's signing path, including generation of the secret per-signature nonce.
+Reusing or predicting that nonce can expose your API private key and put your funds at risk.
+:::
+
 For L2 signing benchmarks and the official Go SDK comparison, see
 [`crates/adapters/lighter/benches/BENCHMARKS.md`](../../crates/adapters/lighter/benches/BENCHMARKS.md).
 Compare benchmark deltas only on the same machine; absolute timings vary.
@@ -86,7 +95,7 @@ Capability matrices describe adapter support. *Not supported by Lighter* identif
 Lighter provides a [binary options API](https://apidocs.lighter.xyz/docs/binary-options-trading-and-fees).
 The adapter does not discover or map binary-options instruments; its binary-options trading and
 settlement support remain unverified. Shared transaction formats and 64-bit market IDs do not
-establish support.
+establish support. The adapter also skips unfamiliar market types in venue metadata.
 
 ## Limitations
 
@@ -327,7 +336,8 @@ Nautilus bars. Later valid rows still load.
 ### Instrument status and trades
 
 Instrument status subscriptions replay cached `orderBookDetails` status or fetch a REST snapshot.
-Lighter exposes no WebSocket status-change stream.
+Lighter exposes no WebSocket status-change stream. A venue status other than `active` or `inactive`
+produces no `InstrumentStatus`; the adapter logs a warning.
 
 Trade subscriptions use the public WebSocket stream. History uses public `/api/v1/recentTrades` without
 credentials. The adapter filters at most 100 trades to the requested time range without pagination.
@@ -600,6 +610,11 @@ The adapter sends both defaults explicitly. Each native group uses one pair for 
 Unknown names, non-string values, and `reduce` with `master_account_index` deny the order before
 submission. Non-default modes require zero integrator fees, which the adapter uses.
 
+Robinhood Mainnet can still reject non-default modes with `21159` (nonzero fees), even with zero integrator
+fees. Use the default modes unless the venue permits the requested settings for the account.
+Rejections without a transaction hash can leave concurrent or batched submissions unresolved. Restart
+and reconcile venue state before managing affected orders again.
+
 **Reduction**: `reduce` nets overlapping quantities without a fill. Working-order quantities and
 reports show the remainder plus actual fills; price-only amendments preserve this quantity.
 
@@ -665,9 +680,9 @@ Use `post_only` on limit-style orders. The adapter does not synthesize maker-onl
 The adapter maps Lighter's `canceled-post-only` status to `OrderCanceled` after acceptance or fills,
 otherwise to `OrderRejected` with `due_post_only=true`.
 
-Lighter Mainnet testing confirms `reduce_only=true` closes perpetual positions. Invalid reduce-only
-opens can be dropped without a venue order report and reconcile as `INFLIGHT_TIMEOUT`, without
-a venue rejection reason.
+Lighter Mainnet testing confirms `reduce_only=true` closes perpetual positions. Invalid reduce-only opens can
+be dropped without a venue order report. `ResolveLocally` reconciles them as `INFLIGHT_TIMEOUT` without a venue
+rejection reason; the default `RetainUnresolved` leaves them `SUBMITTED`.
 
 ### Advanced order features
 
@@ -987,6 +1002,7 @@ Create, cancel, modify, grouped orders, and leverage updates include market IDs 
 | Feature              | Perpetuals | Spot | Notes                                                        |
 | -------------------- | ---------- | ---- | ------------------------------------------------------------ |
 | Query open orders    | ✓          | ✓    | REST `accountActiveOrders` scoped by market.                 |
+| Targeted lookup      | ✓          | ✓    | REST `accountOrders` with active/inactive fallback.          |
 | Query order history  | ✓          | ✓    | REST `accountInactiveOrders` with cursor pagination.         |
 | Order status updates | ✓          | ✓    | Private WebSocket order streams plus status reports.         |
 | Trade history        | ✓          | ✓    | REST `trades`; credentials are required for account history. |
@@ -994,6 +1010,22 @@ Create, cancel, modify, grouped orders, and leverage updates include market IDs 
 | Position reports     | ✓          | -    | Perp only; replays cached position stream.                   |
 | Account state        | ✓          | ✓    | Replays the cached merged account state snapshot.            |
 | Mass status          | ✓          | ✓    | Combines orders, fills, and cached positions.                |
+
+- **Targeted lookup**: with a client order ID, the adapter queries `accountOrders` first. If the request
+  fails or finds no match, it queries `accountActiveOrders`, then paginated `accountInactiveOrders` only
+  when the venue order ID is known. A direct response with no match adds one request before fallback;
+  a failed request can also use the shared REST retry policy.
+- **`accountOrders` query**: the raw `LighterAccountOrdersQuery` takes 1 to 20 client-order indexes (the
+  venue limit); targeted lookups send one. Invalid counts are rejected before any HTTP request.
+- **`trades` filters**: the raw `LighterTradesQuery` also accepts `integrator_account_index` and
+  `order_index_str` (Lighter Core, per [API update 184](https://t.me/lighter_api_updates/184)). The venue
+  gives `order_index_str` precedence over `order_index`; use it for indexes above `i64::MAX`.
+- **Unmapped orders**: orders whose venue type, status, or time in force has no Nautilus equivalent
+  produce no order status report; the adapter logs the failure. This includes literal `Unknown`
+  time in force and unrecognized values.
+- **Report collection**: WebSocket and REST processing continue with other orders. Bulk REST order
+  report generation fails as incomplete; mass status retains the collected reports.
+- **Fill reports**: order classification does not affect fill report mapping.
 
 Authenticated inactive-order and fill pagination rejects repeated cursors and stops after 1,000 pages.
 Fill reconciliation is repeatable across calls and suppresses fills already emitted by WebSocket.
@@ -1048,8 +1080,30 @@ Execution clients authenticate and subscribe to six private streams:
 
 The adapter emits merged `account_all_assets` and `user_stats` state only after both first frames arrive.
 
+`LighterWsFrame` preserves optional `transaction_time` integers on `account_all_positions` and
+`account_all_assets` frames, including zero. The field uses
+[venue microseconds](https://docs.lighter.xyz/developers/reference/timestamps).
+It is available through `NautilusWsMessage::Raw` only without an execution context; trading nodes do
+not expose it in typed account or position reports. Frames are processed in receive order without
+timestamp filtering or deduplication, and report timestamps remain unchanged.
+
+`NautilusWsMessage::Raw` carries each frame as received, including its `subscribed/` or `update/`
+type and fields the adapter does not model.
+
 Construction allows missing credentials, but `connect()` requires `private_key`, `account_index`, and
 `api_key_index`. Private streams and nonce refresh are mandatory.
+
+### Account balances
+
+Each asset's `total` is `balance + margin_balance`. Settlement-currency free balance is the lesser of
+`total - locked_balance` and `max(user_stats.available_balance, 0)`. The remainder is `locked`, including
+margin in use and any funds outside the venue's reported availability.
+
+An account-wide `MarginBalance` reports `initial = max(collateral - available_balance, 0)`. See
+[margin accounts](../concepts/accounting.md#margin-accounts) for initialization and risk checks.
+
+Classic mode keeps spot and perpetual funds separate. Risk checks for both products use this single free
+balance, so a Classic spot order can be denied even when separate spot funds would cover it.
 
 ### Position snapshots and updates
 
@@ -1235,6 +1289,10 @@ non-transaction traffic. Reconcile pending outcomes; do not resend blindly.
 One execution limiter enforces `sendtx_quota_per_min` across WebSocket `sendTx`/`sendTxBatch` trading,
 including account-wide cancellation and schedule control, and startup HTTP `sendTx` integrator approval.
 Raw calls use it when configured, falling back to the raw client's REST limiter otherwise.
+HTTP `sendTx` and `sendTxBatch` responses expose optional `remaining_send_tx`, the transactions still
+available in the venue's rolling minute (Lighter Core, per
+[`sendTx`](https://docs.lighter.xyz/api/transactions/sendtx)). Premium accounts return it; the adapter does
+not use it for pacing, which still uses `sendtx_quota_per_min`.
 
 Clients with identical WebSocket URL strings share a 200-message/minute non-transaction control limiter. The default
 data URL's `readonly=true` separates it from execution. Budget combined control traffic within the per-IP limit.

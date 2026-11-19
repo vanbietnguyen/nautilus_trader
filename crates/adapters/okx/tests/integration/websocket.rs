@@ -16,9 +16,7 @@
 //! Integration tests for the OKX WebSocket client using a mock Axum server.
 
 use std::{
-    collections::HashSet,
     net::SocketAddr,
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -43,9 +41,10 @@ use nautilus_common::{
     messages::{SystemEvent, system::SocketState},
     testing::wait_until_async,
 };
-use nautilus_core::UnixNanos;
+use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::{SocketControl, SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
+    data::BarType,
     enums::{OrderSide, OrderType, PositionSide, TimeInForce},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue, VenueOrderId,
@@ -106,17 +105,12 @@ struct TestServerState {
     control_ping_count: Arc<tokio::sync::Mutex<usize>>,
     fail_next_login: Arc<AtomicBool>,
     reject_upgrades: Arc<AtomicBool>,
+    rejected_upgrades: Arc<AtomicUsize>,
     upgrade_delay: Duration,
 }
 
-fn data_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data")
-}
-
 fn load_json(filename: &str) -> Value {
-    let content = std::fs::read_to_string(data_path().join(filename))
-        .unwrap_or_else(|_| panic!("failed to read {filename}"));
-    serde_json::from_str(&content).expect("invalid json")
+    crate::common::load_test_json(filename)
 }
 
 fn load_margin_instruments() -> Vec<InstrumentAny> {
@@ -327,6 +321,7 @@ async fn handle_ws_upgrade(
     State(state): State<Arc<TestServerState>>,
 ) -> Response {
     if state.reject_upgrades.load(Ordering::Relaxed) {
+        state.rejected_upgrades.fetch_add(1, Ordering::Relaxed);
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
 
@@ -580,7 +575,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<TestServerState>) {
                         let data = payload
                             .get("args")
                             .and_then(Value::as_array)
-                            .map(|args| {
+                            .map_or_default(|args| {
                                 args.iter()
                                     .map(|arg| {
                                         json!({
@@ -593,8 +588,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<TestServerState>) {
                                         })
                                     })
                                     .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default();
+                            });
+
                         let ack = json!({
                             "id": payload.get("id").cloned().unwrap_or(Value::Null),
                             "op": op,
@@ -749,6 +744,92 @@ async fn test_submit_event_order_omits_speed_bump() {
     client.close().await.expect("close failed");
 }
 
+#[rstest]
+#[case::option("http_get_instruments_option.json", OKXTradeMode::Cross)]
+#[case::spot("http_get_instruments_spot.json", OKXTradeMode::Cash)]
+#[case::swap("http_get_instruments_swap.json", OKXTradeMode::Cross)]
+#[tokio::test]
+async fn test_submit_limit_fok_order_uses_fok_on_wire(
+    #[case] fixture: &str,
+    #[case] td_mode: OKXTradeMode,
+) {
+    let payload = load_json(fixture);
+    let response: OKXResponse<OKXInstrument> = serde_json::from_value(payload).unwrap();
+    let instrument = parse_instrument_any(&response.data[0], None, None, UnixNanos::default())
+        .unwrap()
+        .unwrap();
+    let instrument_id = instrument.id();
+    let quote_currency = instrument.quote_currency();
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let ws_url = format!("ws://{addr}/ws");
+    let mut client = connect_client(&ws_url);
+    client.cache_instruments(&[instrument]);
+    client.cache_inst_id_code(instrument_id.symbol.inner(), 1_000_000_287);
+    client.connect().await.unwrap();
+    client.wait_until_active(5.0).await.unwrap();
+
+    client
+        .submit_order(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("STRATEGY-001"),
+            instrument_id,
+            td_mode,
+            ClientOrderId::from("Ofokwire001"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            Quantity::from("3"),
+            Some(TimeInForce::Fok),
+            Some(Price::from("0.0002")),
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { !state.order_messages.lock().await.is_empty() }
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+
+    let messages = state.order_messages().await;
+    let mut expected = json!({
+        "instIdCode": 1_000_000_287,
+        "tdMode": td_mode,
+        "ccy": quote_currency.to_string(),
+        "clOrdId": "Ofokwire001",
+        "tag": OKX_NAUTILUS_BROKER_ID,
+        "side": "buy",
+        "ordType": "fok",
+        "sz": "3",
+        "px": "0.0002",
+    });
+
+    if td_mode == OKXTradeMode::Cross {
+        expected["posSide"] = json!("net");
+    }
+
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["op"], "order");
+    assert_eq!(messages[0]["args"], json!([expected]));
+
+    client.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn test_submit_event_post_only_order_omits_speed_bump() {
     let state = Arc::new(TestServerState::default());
@@ -877,7 +958,7 @@ async fn test_rejected_subscription_emits_subscription_failed_message() {
 }
 
 #[tokio::test]
-async fn test_submit_margin_cross_order_preserves_reduce_only_on_wire() {
+async fn test_submit_margin_cross_order_without_reduce_only() {
     let state = Arc::new(TestServerState::default());
     let addr = start_ws_server(state.clone()).await;
     let ws_url = format!("ws://{addr}/ws");
@@ -905,7 +986,7 @@ async fn test_submit_margin_cross_order_preserves_reduce_only_on_wire() {
             None,
             None,
             Some(false),
-            Some(true),
+            Some(false),
             None,
             None,
             None,
@@ -934,7 +1015,7 @@ async fn test_submit_margin_cross_order_preserves_reduce_only_on_wire() {
 
     assert_eq!(messages[0]["op"], "order");
     assert_eq!(arg["tdMode"], "cross");
-    assert_eq!(arg["reduceOnly"], true);
+    assert!(arg.get("reduceOnly").is_none());
 
     client.close().await.expect("close failed");
 }
@@ -1095,7 +1176,11 @@ async fn test_order_operations_during_reconnect_are_replayed(
 
     let stream = client.stream();
     pin_mut!(stream);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_until_async(
+        || async { state.rejected_upgrades.load(Ordering::Relaxed) > 0 },
+        Duration::from_secs(10),
+    )
+    .await;
     state.reject_upgrades.store(false, Ordering::Relaxed);
 
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -1164,8 +1249,24 @@ async fn test_order_operations_during_reconnect_are_replayed(
     client.close().await.expect("close failed");
 }
 
+#[rstest]
+#[case::cash(
+    OKXTradeMode::Cash,
+    "Client error: OKX cash orders do not support reduce-only instructions"
+)]
+#[case::cross(
+    OKXTradeMode::Cross,
+    "Client error: OKX spot orders do not support reduce-only instructions"
+)]
+#[case::isolated(
+    OKXTradeMode::Isolated,
+    "Client error: OKX spot orders do not support reduce-only instructions"
+)]
 #[tokio::test]
-async fn test_submit_cash_spot_order_rejects_reduce_only() {
+async fn test_submit_spot_order_rejects_reduce_only(
+    #[case] trade_mode: OKXTradeMode,
+    #[case] expected_reason: &str,
+) {
     let state = Arc::new(TestServerState::default());
     let addr = start_ws_server(state.clone()).await;
     let ws_url = format!("ws://{addr}/ws");
@@ -1184,7 +1285,7 @@ async fn test_submit_cash_spot_order_rejects_reduce_only() {
             TraderId::from("TRADER-001"),
             StrategyId::from("STRATEGY-001"),
             InstrumentId::from("BTC-USD.OKX"),
-            OKXTradeMode::Cash,
+            trade_mode,
             ClientOrderId::from("Ocashspotnoreduceonly00001"),
             OrderSide::Sell,
             OrderType::Limit,
@@ -1208,10 +1309,7 @@ async fn test_submit_cash_spot_order_rejects_reduce_only() {
         .await
         .unwrap_err();
 
-    assert_eq!(
-        error.to_string(),
-        "Client error: OKX cash orders do not support reduce-only instructions"
-    );
+    assert_eq!(error.to_string(), expected_reason);
     assert!(state.order_messages().await.is_empty());
 
     client.close().await.expect("close failed");
@@ -1657,6 +1755,167 @@ async fn test_batch_submit_event_order_omits_speed_bump() {
     assert_eq!(messages[0]["op"], "batch-orders");
     assert!(arg.get("speedBump").is_none());
     assert_eq!(arg["outcome"], "yes");
+
+    client.close().await.expect("close failed");
+}
+
+async fn send_event_order_operation(client: &OKXWebSocketClient, operation: &str) {
+    let instrument_id = InstrumentId::from(EVENT_INSTRUMENT_ID);
+    let client_order_id = ClientOrderId::from("O-event-exp-time");
+
+    match operation {
+        "order" => client
+            .submit_order(
+                TraderId::from("TRADER-001"),
+                StrategyId::from("STRATEGY-001"),
+                instrument_id,
+                OKXTradeMode::Cash,
+                client_order_id,
+                OrderSide::Buy,
+                OrderType::Limit,
+                Quantity::from("10"),
+                Some(TimeInForce::Gtc),
+                Some(Price::from("0.420")),
+                None,
+                Some(false),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("yes".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("submit failed"),
+        "batch-orders" => client
+            .batch_submit_orders(vec![(
+                OKXInstrumentType::Events,
+                instrument_id,
+                OKXTradeMode::Cash,
+                client_order_id,
+                OrderSide::Buy,
+                None,
+                OrderType::Limit,
+                Quantity::from("10"),
+                Some(Price::from("0.420")),
+                None,
+                Some(false),
+                None,
+                None,
+                Some("yes".to_string()),
+                None,
+                None,
+                None,
+            )])
+            .await
+            .expect("batch submit failed"),
+        "amend-order" => client
+            .modify_order(
+                TraderId::from("TRADER-001"),
+                StrategyId::from("STRATEGY-001"),
+                instrument_id,
+                Some(client_order_id),
+                Some(Price::from("0.430")),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("modify failed"),
+        "batch-amend-orders" => client
+            .batch_modify_orders(vec![(
+                OKXInstrumentType::Events,
+                instrument_id,
+                client_order_id,
+                None,
+                Some(Price::from("0.430")),
+                None,
+                None,
+                None,
+            )])
+            .await
+            .expect("batch modify failed"),
+        "cancel-order" => client
+            .cancel_order(
+                TraderId::from("TRADER-001"),
+                StrategyId::from("STRATEGY-001"),
+                instrument_id,
+                Some(client_order_id),
+                None,
+            )
+            .await
+            .expect("cancel failed"),
+        other => panic!("unsupported operation {other}"),
+    }
+}
+
+#[rstest]
+#[case::order("order", Some(5_000), true)]
+#[case::batch_orders("batch-orders", Some(5_000), true)]
+#[case::amend_order("amend-order", Some(5_000), true)]
+#[case::batch_amend_orders("batch-amend-orders", Some(5_000), true)]
+#[case::cancel_order("cancel-order", Some(5_000), false)]
+#[case::order_without_ttl("order", None, false)]
+#[case::amend_order_without_ttl("amend-order", None, false)]
+#[tokio::test]
+async fn test_order_request_exp_time_on_wire(
+    #[case] operation: &str,
+    #[case] ttl_ms: Option<u64>,
+    #[case] expects_exp_time: bool,
+) {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let ws_url = format!("ws://{addr}/ws");
+
+    let mut client = connect_client(&ws_url).with_order_request_ttl_ms(ttl_ms);
+    cache_event_instrument(&client);
+    client.connect().await.expect("connect failed");
+    client
+        .wait_until_active(5.0)
+        .await
+        .expect("client inactive");
+
+    let clock = get_atomic_clock_realtime();
+    let before_ms = clock.get_time_ms();
+    send_event_order_operation(&client, operation).await;
+    let after_ms = clock.get_time_ms();
+
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { !state.order_messages.lock().await.is_empty() }
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+
+    let messages = state.order_messages().await;
+    assert_eq!(messages[0]["op"], operation);
+
+    if expects_exp_time {
+        let ttl_ms = ttl_ms.unwrap();
+        let exp_time: u64 = messages[0]["expTime"]
+            .as_str()
+            .expect("expTime must be a string")
+            .parse()
+            .expect("expTime must be unix milliseconds");
+        assert!(
+            (before_ms + ttl_ms..=after_ms + ttl_ms).contains(&exp_time),
+            "expTime {exp_time} outside [{}, {}]",
+            before_ms + ttl_ms,
+            after_ms + ttl_ms,
+        );
+    } else {
+        assert!(messages[0].get("expTime").is_none());
+    }
 
     client.close().await.expect("close failed");
 }
@@ -2257,76 +2516,41 @@ async fn test_reconnection_retries_failed_subscriptions() {
         .await
         .expect("subscribe trades failed");
 
-    if tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if state
+    wait_until_async(
+        || async {
+            state
                 .subscription_events()
                 .await
                 .iter()
                 .any(|(key, _, ok)| key.starts_with("trades") && !ok)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .is_err()
-    {
-        let events = state.subscription_events().await;
-        panic!("missing initial subscription failure: events={events:?}");
-    }
+        },
+        Duration::from_secs(10),
+    )
+    .await;
 
-    if tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if *state.login_count.lock().await >= 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .is_err()
-    {
-        let count = *state.login_count.lock().await;
-        let events = state.subscription_events().await;
-        panic!("login did not retry: count={count}, events={events:?}");
-    }
+    wait_until_async(
+        || async { *state.login_count.lock().await >= 2 },
+        Duration::from_secs(10),
+    )
+    .await;
 
     client
         .subscribe_trades(InstrumentId::from("BTC-USD.OKX"), false)
         .await
         .expect("retry subscribe trades failed");
 
-    if tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
+    wait_until_async(
+        || async {
             let events = state.subscription_events().await;
-            let mut trade_count = 0;
-            let mut has_success = false;
-
-            for (_, _, ok) in events
+            let trades: Vec<_> = events
                 .iter()
                 .filter(|(key, _, _)| key.starts_with("trades"))
-            {
-                trade_count += 1;
-
-                if *ok {
-                    has_success = true;
-                }
-            }
-
-            if trade_count >= 2 && has_success {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .is_err()
-    {
-        let events = state.subscription_events().await;
-        panic!("subscription did not recover: events={events:?}");
-    }
+                .collect();
+            trades.len() >= 2 && trades.iter().any(|(_, _, ok)| *ok)
+        },
+        Duration::from_secs(10),
+    )
+    .await;
 
     let events = state.subscription_events().await;
     assert!(
@@ -2474,6 +2698,7 @@ async fn test_reconnect_during_authentication_does_not_repeat_login() {
         reconnect.request_reconnect(),
         SocketReconnectRequestOutcome::Accepted
     );
+    // Outlast the one second authentication timeout of the interrupted attempt
     tokio::time::sleep(Duration::from_secs(3)).await;
     state.reject_upgrades.store(false, Ordering::Relaxed);
     wait_until_async(
@@ -2687,32 +2912,20 @@ async fn test_subscription_restoration_tracking() {
         .await
         .expect("resubscribe orders failed");
 
-    if tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
+    wait_until_async(
+        || async {
             let events = state.subscription_events().await;
-            let mut restored = HashSet::new();
-
-            for (key, _, ok) in &events {
-                if *ok {
-                    restored.insert(key.clone());
-                }
-            }
-
-            if restored.contains("trades:BTC-USD")
-                && restored.contains("trades:ETH-USD")
-                && restored.contains("orders:SPOT")
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .is_err()
-    {
-        let events = state.subscription_events().await;
-        panic!("subscriptions not restored: events={events:?}");
-    }
+            ["trades:BTC-USD", "trades:ETH-USD", "orders:SPOT"]
+                .iter()
+                .all(|topic| {
+                    events
+                        .iter()
+                        .any(|(key, _, ok)| *ok && key.as_str() == *topic)
+                })
+        },
+        Duration::from_secs(10),
+    )
+    .await;
 
     client.close().await.expect("close failed");
 }
@@ -3629,6 +3842,67 @@ async fn test_reconnection_race_condition() {
 }
 
 #[tokio::test]
+async fn test_bar_subscription_flow() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let ws_url = format!("ws://{addr}/ws");
+
+    let instruments = load_instruments();
+
+    let mut client = connect_client(&ws_url);
+    client.cache_instruments(&instruments);
+    client.connect().await.expect("connect failed");
+    client.wait_until_active(5.0).await.expect("wait failed");
+
+    let bar_type = BarType::from("BTC-USD.OKX-1-MINUTE-LAST-EXTERNAL");
+    client
+        .subscribe_bars(bar_type)
+        .await
+        .expect("subscribe bars failed");
+
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { !state.subscription_events().await.is_empty() }
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+
+    assert_eq!(
+        state.subscription_events().await,
+        vec![(
+            "candle1m:BTC-USD".to_string(),
+            Some("BTC-USD".to_string()),
+            true,
+        )],
+    );
+
+    client
+        .unsubscribe_bars(bar_type)
+        .await
+        .expect("unsubscribe bars failed");
+
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { !state.unsubscriptions.lock().await.is_empty() }
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+
+    let unsubscriptions = state.unsubscriptions.lock().await;
+    assert_eq!(
+        unsubscriptions.as_slice(),
+        &[json!({"channel": "candle1m", "instId": "BTC-USD"})],
+    );
+    drop(unsubscriptions);
+
+    client.close().await.expect("close failed");
+}
+
+#[tokio::test]
 async fn test_subscribe_after_stream_call() {
     let state = Arc::new(TestServerState::default());
     let addr = start_ws_server(state.clone()).await;
@@ -3725,47 +3999,7 @@ async fn test_is_active_lifecycle() {
         !client.is_active(),
         "Client should not be active after close"
     );
-}
-
-#[tokio::test]
-async fn test_is_active_false_after_close() {
-    let state = Arc::new(TestServerState::default());
-    let addr = start_ws_server(state.clone()).await;
-    let ws_url = format!("ws://{addr}/ws");
-
-    let instruments = load_instruments();
-
-    let mut client = connect_client(&ws_url);
-    client.cache_instruments(&instruments);
-
-    client.connect().await.expect("connect failed");
-    client
-        .wait_until_active(5.0)
-        .await
-        .expect("wait until active failed");
-
-    assert!(
-        client.is_active(),
-        "Expected is_active() to be true after connect"
-    );
-
-    client.close().await.expect("close failed");
-
-    let client_ref = &client;
-    wait_until_async(
-        || async move { !client_ref.is_active() },
-        Duration::from_secs(2),
-    )
-    .await;
-
-    assert!(
-        !client.is_active(),
-        "Expected is_active() to be false after close"
-    );
-    assert!(
-        client.is_closed(),
-        "Expected is_closed() to be true after close"
-    );
+    assert!(client.is_closed(), "Client should be closed after close");
 }
 
 #[tokio::test]

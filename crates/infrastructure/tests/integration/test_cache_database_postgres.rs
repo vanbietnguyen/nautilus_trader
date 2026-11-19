@@ -33,6 +33,7 @@ mod serial_tests {
     use nautilus_core::{Params, UUID4, UnixNanos};
     use nautilus_infrastructure::sql::{
         cache::{PostgresCacheConfig, PostgresCacheDatabase, get_pg_cache_database},
+        models::instruments::{InstrumentAnyRow, OptionSpreadRow},
         pg::{connect_pg, get_postgres_connect_options, init_postgres},
         queries::DatabaseQueries,
     };
@@ -58,13 +59,13 @@ mod serial_tests {
             Symbol, TradeId, TraderId, VenueOrderId, stubs::account_id,
         },
         instruments::{
-            Instrument, InstrumentAny, SyntheticInstrument,
+            Instrument, InstrumentAny, OptionSpread, SyntheticInstrument,
             stubs::{
                 audusd_sim, binary_option, cfd_gold, commodity_gold, crypto_future_btcusdt,
                 crypto_futures_spread_btc_deribit, crypto_option_btc_deribit,
                 crypto_option_spread_btc_deribit, crypto_perpetual_ethusdt, currency_pair_ethusdt,
                 equity_aapl, futures_contract_es, index_instrument_spx, option_contract_appl,
-                perpetual_contract_eurusd,
+                option_spread, perpetual_contract_eurusd,
             },
         },
         orders::{Order, OrderAny, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
@@ -76,8 +77,10 @@ mod serial_tests {
     use rstest::rstest;
     use rust_decimal::Decimal;
     use serde::Serialize;
-    use sqlx::{AssertSqlSafe, PgPool, postgres::PgConnectOptions};
+    use sqlx::{AssertSqlSafe, FromRow, PgPool, postgres::PgConnectOptions};
     use ustr::Ustr;
+
+    use crate::position_reopen::{ReplayMode, check_netting_position_reopen};
 
     pub(crate) fn assert_entirely_equal<T: Serialize>(a: T, b: T) {
         let a_serialized = serde_json::to_string(&a).unwrap();
@@ -571,7 +574,7 @@ mod serial_tests {
     #[case::rho(|g: &mut GreeksData, value| g.greeks.rho = value)]
     #[case::itm_prob(|g: &mut GreeksData, value| g.itm_prob = value)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_greeks_persistence_rejects_non_finite_values(
+    async fn test_greeks_persistence_failure_keeps_non_finite_values_in_memory(
         #[case] set_value: fn(&mut GreeksData, f64),
         #[values(f64::NAN, f64::INFINITY, f64::NEG_INFINITY)] invalid: f64,
     ) {
@@ -589,7 +592,7 @@ mod serial_tests {
         let mut rejected = expected.clone();
         set_value(&mut rejected, invalid);
 
-        let result = cache.add_greeks(rejected);
+        let result = cache.add_greeks(rejected.clone());
         let cached = cache.greeks(&expected.instrument_id);
         cache.dispose();
         let mut adapter = get_test_pg_cache_database().await.unwrap();
@@ -597,11 +600,13 @@ mod serial_tests {
         reset_test_database(&adapter).await;
         adapter.close().unwrap();
 
+        result.unwrap();
+
+        // MessagePack preserves non-finite values, which JSON equality would collapse to null
         assert_eq!(
-            result.unwrap_err().to_string(),
-            "Cannot persist non-finite GreeksData"
+            rmp_serde::to_vec_named(&cached.unwrap()).unwrap(),
+            rmp_serde::to_vec_named(&rejected).unwrap()
         );
-        assert_eq!(cached, Some(expected.clone()));
         assert_eq!(
             recovered.unwrap(),
             AHashMap::from([(expected.instrument_id, expected)])
@@ -1105,6 +1110,411 @@ mod serial_tests {
 
         reset_test_database(&pg_cache).await;
         pg_cache.close().unwrap();
+    }
+
+    #[rstest]
+    #[case("underlying_instrument_id")]
+    #[case("exercise_style")]
+    #[case("settlement_type")]
+    #[case("tick_scheme")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connect_requires_option_terms_schema_migration(#[case] column: &str) {
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        reset_test_database(&database).await;
+        database.close().unwrap();
+        let options = get_postgres_connect_options(None, None, None, None, None);
+        let pool = connect_test_pg(options.into()).await.unwrap();
+        sqlx::query(AssertSqlSafe(format!(
+            "ALTER TABLE instrument DROP COLUMN {column}"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let blocked = get_test_pg_cache_database().await;
+        sqlx::query(AssertSqlSafe(format!(
+            "ALTER TABLE instrument ADD COLUMN {column} TEXT"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut restored = get_test_pg_cache_database().await.unwrap();
+        restored.close().unwrap();
+        pool.close().await;
+        assert!(
+            blocked
+                .unwrap_err()
+                .to_string()
+                .contains(&format!("missing cache columns instrument.{column}"))
+        );
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_option_spread_round_trip(mut option_spread: OptionSpread) {
+        option_spread.raw_symbol = Symbol::from("SR3-VERTICAL-LOCAL");
+        option_spread.price_precision = 3;
+        option_spread.price_increment = Price::from("0.025");
+        option_spread.multiplier = Quantity::from("25");
+        option_spread.lot_size = Quantity::from("5");
+        option_spread.margin_init = Decimal::from_str("0.17").unwrap();
+        option_spread.margin_maint = Decimal::from_str("0.09").unwrap();
+        option_spread.ts_event = UnixNanos::from(1_700_000_000_000_000_123_u64);
+        option_spread.ts_init = UnixNanos::from(1_700_000_000_000_000_456_u64);
+        for populated in [true, false] {
+            option_spread.exchange = populated.then(|| Ustr::from("XCME"));
+            option_spread.max_quantity = populated.then(|| Quantity::from("137"));
+            option_spread.min_quantity = populated.then(|| Quantity::from("2"));
+            option_spread.max_price = populated.then(|| Price::from("8.625"));
+            option_spread.min_price = populated.then(|| Price::from("-3.125"));
+            option_spread.tick_scheme = populated.then(|| Ustr::from("FIXED_PRECISION_3"));
+            option_spread.info = populated.then(|| {
+                let info = serde_json::json!({
+                    "legs": [
+                        {"instrument_id": "SR3H4-C95.GLBX", "ratio": 1},
+                        {"instrument_id": "SR3H4-C96.GLBX", "ratio": -1}
+                    ],
+                    "strategy": "vertical"
+                });
+                serde_json::from_value(info).unwrap()
+            });
+
+            let expected = option_spread.clone().into_any();
+            let mut database = get_test_pg_cache_database().await.unwrap();
+            database.add_currency(&expected.quote_currency()).unwrap();
+            database.add_instrument(&expected).unwrap();
+            database.close().unwrap();
+
+            let mut restarted = get_test_pg_cache_database().await.unwrap();
+            let loaded = restarted
+                .load_instrument(&expected.id())
+                .await
+                .unwrap()
+                .unwrap();
+            let all = restarted.load_instruments().await.unwrap();
+
+            assert_entirely_equal(&loaded, &expected);
+            assert_entirely_equal(&all[&expected.id()], &expected);
+
+            if !populated {
+                reset_test_database(&restarted).await;
+            }
+
+            restarted.close().unwrap();
+        }
+    }
+
+    #[rstest]
+    #[case("id", "'BROKEN'")]
+    #[case("raw_symbol", "''")]
+    #[case("asset_class", "NULL")]
+    #[case("exchange", "chr(233)")]
+    #[case("underlying", "NULL")]
+    #[case("strategy_type", "''")]
+    #[case("quote_currency", "NULL")]
+    #[case("activation_ns", "'invalid'")]
+    #[case("expiration_ns", "'-1'")]
+    #[case("price_precision", "-1")]
+    #[case("price_precision", "256")]
+    #[case("price_precision", "3")]
+    #[case("price_increment", "'invalid'")]
+    #[case("price_increment", "'0.00'")]
+    #[case("size_precision", "1")]
+    #[case("size_increment", "'0'")]
+    #[case("size_increment", "'1.0'")]
+    #[case("multiplier", "'0'")]
+    #[case("lot_size", "'0'")]
+    #[case("max_quantity", "'invalid'")]
+    #[case("min_quantity", "'invalid'")]
+    #[case("max_price", "'invalid'")]
+    #[case("min_price", "'invalid'")]
+    #[case("margin_init", "'invalid'")]
+    #[case("margin_maint", "'invalid'")]
+    #[case("tick_scheme", "'UNKNOWN'")]
+    #[case("info", "'[]'::json")]
+    #[case("ts_event", "'invalid'")]
+    #[case("ts_init", "'invalid'")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_option_spread_invalid_rows(
+        option_spread: OptionSpread,
+        #[case] column: &str,
+        #[case] value: &str,
+    ) {
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        DatabaseQueries::add_currency(&database.pool, option_spread.currency)
+            .await
+            .unwrap();
+        DatabaseQueries::add_instrument(
+            &database.pool,
+            "OPTION_SPREAD",
+            Box::new(option_spread.clone()),
+        )
+        .await
+        .unwrap();
+        let row = sqlx::query(AssertSqlSafe(format!(
+            "UPDATE instrument SET {column} = {value} WHERE id = $1 RETURNING *"
+        )))
+        .bind(option_spread.id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+
+        let direct_error = OptionSpreadRow::from_row(&row).unwrap_err().to_string();
+        let dispatch_error = InstrumentAnyRow::from_row(&row).unwrap_err().to_string();
+        let load_error = database.load_instruments().await.unwrap_err().to_string();
+        for error in [direct_error, dispatch_error, load_error] {
+            assert!(error.contains("OptionSpread row"), "{error}");
+
+            let column_context = if column == "id" { "column id:" } else { column };
+
+            assert!(error.contains(column_context), "{error}");
+
+            let id = if column == "id" {
+                "BROKEN".to_string()
+            } else {
+                option_spread.id.to_string()
+            };
+
+            assert!(error.contains(&id), "{error}");
+        }
+
+        reset_test_database(&database).await;
+        database.close().unwrap();
+    }
+
+    #[rstest]
+    #[case("", "raw_symbol")]
+    #[case(
+        ", 'TEST'::text AS raw_symbol, 'FX'::asset_class AS asset_class",
+        "exchange"
+    )]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_option_spread_missing_column(#[case] projection: &str, #[case] column: &str) {
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        let row = sqlx::query(AssertSqlSafe(format!(
+            "SELECT 'OPTION_SPREAD'::text AS kind, 'TEST.GLBX'::text AS id{projection}"
+        )))
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+
+        let error = InstrumentAnyRow::from_row(&row).unwrap_err().to_string();
+
+        assert!(error.contains("TEST.GLBX"), "{error}");
+        assert!(error.contains(column), "{error}");
+        database.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_instrument_null_kind_returns_error() {
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        let row = sqlx::query("SELECT NULL::text AS kind")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+
+        let error = InstrumentAnyRow::from_row(&row).unwrap_err();
+
+        let sqlx::Error::ColumnDecode { index, .. } = error else {
+            panic!("expected column decode error, was {error:?}");
+        };
+
+        assert_eq!(index, "\"kind\"");
+        database.close().unwrap();
+    }
+
+    #[rstest]
+    #[case::option_contract(option_contract_appl().into_any())]
+    #[case::crypto_option(crypto_option_btc_deribit(3, 1, Price::from("0.001"), Quantity::from("0.1")).into_any())]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_option_terms_round_trip(
+        #[case] instrument: InstrumentAny,
+        #[values(false, true)] boxed: bool,
+    ) {
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        for currency in [
+            instrument.base_currency(),
+            Some(instrument.quote_currency()),
+            Some(instrument.settlement_currency()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            DatabaseQueries::add_currency(&database.pool, currency)
+                .await
+                .unwrap();
+        }
+
+        let id = instrument.id();
+        let (underlying_id, option_kind) = match &instrument {
+            InstrumentAny::OptionContract(_) => ("AAPL.NASDAQ", "CALL"),
+            InstrumentAny::CryptoOption(_) => ("BTCUSDT.BINANCE", "PUT"),
+            _ => unreachable!("option fixtures only"),
+        };
+
+        for (known, style, settlement) in [
+            (true, Some("AMERICAN"), Some("CASH")),
+            (true, Some("EUROPEAN"), Some("PHYSICAL")),
+            (false, Some("BERMUDAN"), Some("CASH")),
+            (true, Some("EUROPEAN"), None),
+            (true, None, Some("PHYSICAL")),
+            (false, None, None),
+        ] {
+            let mut encoded = serde_json::to_value(&instrument).unwrap();
+            let fields = encoded
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+                .next()
+                .unwrap();
+            fields["underlying_instrument_id"] =
+                serde_json::to_value(known.then_some(underlying_id)).unwrap();
+            fields["exercise_style"] = serde_json::to_value(style).unwrap();
+            fields["settlement_type"] = serde_json::to_value(settlement).unwrap();
+            let expected: InstrumentAny = serde_json::from_value(encoded.clone()).unwrap();
+            if boxed {
+                let kind = match &expected {
+                    InstrumentAny::OptionContract(_) => "OPTION_CONTRACT",
+                    InstrumentAny::CryptoOption(_) => "CRYPTO_OPTION",
+                    _ => unreachable!("option fixtures only"),
+                };
+
+                DatabaseQueries::add_instrument(&database.pool, kind, Box::new(expected.clone()))
+                    .await
+                    .unwrap();
+            } else {
+                database.add_instrument(&expected).unwrap();
+                wait_until_async(
+                    || async {
+                        database
+                            .load_instrument(&id)
+                            .await
+                            .unwrap()
+                            .is_some_and(|loaded| serde_json::to_value(loaded).unwrap() == encoded)
+                    },
+                    Duration::from_secs(5),
+                )
+                .await;
+            }
+
+            let loaded = database.load_instrument(&id).await.unwrap().unwrap();
+            let all = database.load_instruments().await.unwrap();
+            let stored: (Option<String>, Option<String>) =
+                sqlx::query_as("SELECT option_kind, exercise_style FROM instrument WHERE id = $1")
+                    .bind(id.to_string())
+                    .fetch_one(&database.pool)
+                    .await
+                    .unwrap();
+            assert_entirely_equal(&loaded, &expected);
+            assert_entirely_equal(&all[&id], &expected);
+            assert_eq!(
+                stored,
+                (Some(option_kind.to_string()), style.map(str::to_string))
+            );
+        }
+
+        reset_test_database(&database).await;
+        database.close().unwrap();
+    }
+
+    #[rstest]
+    #[case::option_contract(option_contract_appl().into_any())]
+    #[case::crypto_option(crypto_option_btc_deribit(3, 1, Price::from("0.001"), Quantity::from("0.1")).into_any())]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_invalid_option_terms_return_field_error(
+        #[case] instrument: InstrumentAny,
+        #[values("single", "bulk", "all")] load: &str,
+    ) {
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        reset_test_database(&database).await;
+        let valid = currency_pair_ethusdt().into_any();
+
+        for currency in [
+            instrument.base_currency(),
+            Some(instrument.quote_currency()),
+            Some(instrument.settlement_currency()),
+            valid.base_currency(),
+            Some(valid.quote_currency()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            DatabaseQueries::add_currency(&database.pool, currency)
+                .await
+                .unwrap();
+        }
+
+        let id = instrument.id();
+        database.add_instrument(&instrument).unwrap();
+        database.add_instrument(&valid).unwrap();
+        wait_until_async(
+            || async { database.load_instruments().await.unwrap().len() == 2 },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        for field in [
+            "underlying_instrument_id",
+            "exercise_style",
+            "settlement_type",
+        ] {
+            sqlx::query(AssertSqlSafe(format!(
+                "UPDATE instrument SET {field} = 'INVALID' WHERE id = $1"
+            )))
+            .bind(id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+
+            let error = match load {
+                "single" => database.load_instrument(&id).await.unwrap_err(),
+                "bulk" => database.load_instruments().await.unwrap_err(),
+                "all" => database.load_all().await.unwrap_err(),
+                _ => unreachable!("cache load methods only"),
+            };
+
+            let valid_loaded = database
+                .load_instrument(&valid.id())
+                .await
+                .unwrap()
+                .unwrap();
+
+            if load == "all" {
+                assert!(error.to_string().contains(field));
+            } else {
+                let sqlx::Error::ColumnDecode { index, source } =
+                    error.downcast_ref::<sqlx::Error>().unwrap()
+                else {
+                    panic!("expected column decode error, was {error:?}");
+                };
+
+                assert_eq!(index, field);
+
+                if field != "underlying_instrument_id" {
+                    assert_eq!(
+                        source.downcast_ref::<strum::ParseError>(),
+                        Some(&strum::ParseError::VariantNotFound),
+                    );
+                }
+            }
+
+            assert_entirely_equal(&valid_loaded, &valid);
+
+            sqlx::query(AssertSqlSafe(format!(
+                "UPDATE instrument SET {field} = NULL WHERE id = $1"
+            )))
+            .bind(id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+            let restored = database.load_all().await.unwrap().instruments;
+
+            assert_eq!(restored.len(), 2);
+            assert_entirely_equal(&restored[&id], &instrument);
+            assert_entirely_equal(&restored[&valid.id()], &valid);
+        }
+
+        reset_test_database(&database).await;
+        database.close().unwrap();
     }
 
     #[rstest]
@@ -2156,6 +2566,160 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_account_info_round_trip() {
+        let mut pg_cache = get_test_pg_cache_database().await.unwrap();
+        reset_test_database(&pg_cache).await;
+
+        let initial_info = Params::new(indexmap! {
+            "venue".to_string() => serde_json::json!("BINANCE"),
+            "wallet".to_string() => serde_json::json!({
+                "total": "123.456789012345678901",
+                "components": ["1.000000000000000001", null, true],
+            }),
+            "large_number".to_string() => serde_json::Value::from(1e16),
+        });
+        let initial_event = cash_account_state_million_usd("1000000 USD", "0 USD", "1000000 USD")
+            .with_info(Some(initial_info.clone()));
+        let mut account = AccountAny::Cash(CashAccount::new(initial_event, false, false));
+        pg_cache.add_currency(&Currency::USD()).unwrap();
+        pg_cache.add_account(&account).unwrap();
+        wait_until_async(
+            || async {
+                pg_cache
+                    .load_account(&account.id())
+                    .await
+                    .unwrap()
+                    .is_some()
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let updated_info = Params::new(indexmap! {
+            "available".to_string() => serde_json::json!("0.000000000000000001"),
+            "status".to_string() => serde_json::json!("NORMAL"),
+        });
+        let updated_event =
+            cash_account_state_million_usd("1000000 USD", "100000 USD", "900000 USD")
+                .with_info(Some(updated_info.clone()));
+        account.apply(updated_event).unwrap();
+        pg_cache.update_account(&account).unwrap();
+        wait_until_async(
+            || async {
+                pg_cache
+                    .load_account(&account.id())
+                    .await
+                    .unwrap()
+                    .is_some_and(|loaded| loaded.events().len() == 2)
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        pg_cache.close().unwrap();
+
+        let mut restarted = get_test_pg_cache_database().await.unwrap();
+        let restored = restarted
+            .load_account(&account.id())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_entirely_equal(&restored, &account);
+        let restored_events = restored.events();
+        let restored_info = restored_events[0].info.as_ref().unwrap();
+        assert_eq!(restored_info.get_u64("large_number"), None);
+
+        let empty_info = Params::default();
+        let mut replacement = account.events()[1].clone();
+        for replacement_info in [Some(empty_info), None] {
+            replacement.info = replacement_info.clone();
+            DatabaseQueries::add_account(
+                &restarted.pool,
+                true,
+                replacement.clone(),
+                &TraderId::default(),
+            )
+            .await
+            .unwrap();
+            let updated_events = DatabaseQueries::load_account_events(
+                &restarted.pool,
+                &account.id(),
+                &TraderId::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(updated_events.len(), 2);
+            assert_eq!(updated_events[1].info, replacement_info);
+        }
+
+        reset_test_database(&restarted).await;
+        restarted.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_account_info_migration_preserves_legacy_rows() {
+        let options = get_postgres_connect_options(None, None, None, None, None);
+        let pg = connect_test_pg(options.clone().into()).await.unwrap();
+        let schema_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../schema/sql").to_string();
+        init_postgres(
+            &pg,
+            options.database.clone(),
+            options.password.clone(),
+            Some(schema_dir.clone()),
+        )
+        .await
+        .unwrap();
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        reset_test_database(&database).await;
+        let event = cash_account_state_million_usd("1000000 USD", "0 USD", "1000000 USD");
+        DatabaseQueries::add_currency(&database.pool, Currency::USD())
+            .await
+            .unwrap();
+        DatabaseQueries::add_account(&database.pool, false, event.clone(), &TraderId::default())
+            .await
+            .unwrap();
+        database.close().unwrap();
+        sqlx::query("ALTER TABLE account_event DROP COLUMN info")
+            .execute(&pg)
+            .await
+            .unwrap();
+
+        let connection_result = get_test_pg_cache_database().await;
+
+        for _ in 0..2 {
+            init_postgres(
+                &pg,
+                options.database.clone(),
+                options.password.clone(),
+                Some(schema_dir.clone()),
+            )
+            .await
+            .unwrap();
+        }
+
+        let error = connection_result.unwrap_err().to_string();
+        assert!(
+            error.contains("missing cache columns account_event.info"),
+            "{error}"
+        );
+
+        let mut restored_database = get_test_pg_cache_database().await.unwrap();
+        let restored = DatabaseQueries::load_account_events(
+            &restored_database.pool,
+            &event.account_id,
+            &TraderId::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_entirely_equal(&restored[0], &event);
+        reset_test_database(&restored_database).await;
+        restored_database.close().unwrap();
+        pg.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_exact_usd_account_restart() {
         let mut pg_cache = get_test_pg_cache_database().await.unwrap();
         let total = Money::from_str_exact("1.0001 USD").unwrap();
@@ -3157,6 +3721,27 @@ mod serial_tests {
         );
         cache.flush_db().unwrap();
         cache.dispose();
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_netting_position_reopen_survives_cache_restart(
+        #[values(ReplayMode::Fresh, ReplayMode::Carry, ReplayMode::Corrected)] mode: ReplayMode,
+    ) {
+        let trader_id = TraderId::from(format!("reopen-{}", UUID4::new()));
+        let adapter = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        let mut restarted = check_netting_position_reopen(
+            Box::new(adapter),
+            &PostgresCacheConfig::default(),
+            CacheConfig::default(),
+            trader_id,
+            mode,
+        )
+        .await;
+        restarted.flush().unwrap();
+        restarted.close().unwrap();
     }
 
     async fn get_test_pg_cache_database_for_trader(

@@ -47,11 +47,12 @@ use std::{
 
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
+use indexmap::IndexMap;
 use jiff::Timestamp;
 use nautilus_common::{cache::InstrumentLookupError, live::dst::time};
 use nautilus_core::{
-    AtomicMap, AtomicTime, UnixNanos, datetime::NANOSECONDS_IN_MILLISECOND, env::get_or_env_var,
-    string::secret::REDACTED, time::get_atomic_clock_realtime,
+    AtomicMap, AtomicTime, Params, UnixNanos, datetime::NANOSECONDS_IN_MILLISECOND,
+    env::get_or_env_var, string::secret::REDACTED, time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
     data::{
@@ -63,12 +64,12 @@ use nautilus_model::{
         AccountType, AggregationSource, BarAggregation, BookAction, BookType, OrderSide,
         OrderStatus, OrderType, PositionSide, RecordFlag, TimeInForce, TriggerType,
     },
-    events::AccountState,
+    events::{AccountState, account::state::BALANCES_SNAPSHOT_COMPLETE_INFO_KEY},
     identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
-    types::{Price, Quantity},
+    types::{Currency, Price, Quantity},
 };
 use nautilus_network::{
     http::{
@@ -121,9 +122,9 @@ use crate::{
         consts::{
             OKX_FIELD_SCODE, OKX_FIELD_SMSG, OKX_HTTP_URL, OKX_NAUTILUS_BROKER_ID,
             OKX_POST_ONLY_CANCEL_REASON, OKX_POST_ONLY_CANCEL_SOURCE, OKX_SUPPORTED_ORDER_TYPES,
-            OKX_SUPPORTED_TIME_IN_FORCE, okx_algo_target_currency, okx_market_target_currency,
-            okx_reduce_only_wire_value, spot_trade_quote_ccy_wire_value,
-            validate_algo_trigger_type,
+            okx_algo_target_currency, okx_market_target_currency, okx_reduce_only_wire_value,
+            spot_trade_quote_ccy_wire_value, validate_algo_trigger_type,
+            validate_order_time_in_force, validate_regular_order_params,
         },
         credential::Credential,
         enums::{
@@ -134,13 +135,13 @@ use crate::{
         models::OKXInstrument,
         parse::{
             extract_inst_family, is_okx_spread_symbol, is_order_status_report_more_advanced,
-            okx_instrument_type, okx_instrument_type_from_symbol, parse_account_state,
-            parse_base_quote_from_symbol, parse_candlestick, parse_fill_report, parse_funding_rate,
-            parse_index_price_update, parse_instrument_any, parse_mark_price_update,
-            parse_millisecond_timestamp, parse_order_status_report, parse_position_status_report,
-            parse_price, parse_quantity, parse_spot_margin_position_from_balance,
-            parse_spread_fill_report, parse_spread_instrument, parse_spread_order_status_report,
-            parse_trade_tick, prefer_rpi_response_fields,
+            okx_instrument_type, okx_instrument_type_from_symbol,
+            parse_account_state_with_completeness, parse_base_quote_from_symbol, parse_candlestick,
+            parse_fill_report, parse_funding_rate, parse_index_price_update, parse_instrument_any,
+            parse_mark_price_update, parse_millisecond_timestamp, parse_order_status_report,
+            parse_position_status_report, parse_price, parse_quantity,
+            parse_spot_position_quantity, parse_spread_fill_report, parse_spread_instrument,
+            parse_spread_order_status_report, parse_trade_tick, prefer_rpi_response_fields,
         },
     },
     http::models::{OKXCandlestick, OKXTrade},
@@ -183,19 +184,6 @@ impl OKXPendingAlgoOrderReportsError {
     fn new(source: anyhow::Error) -> Self {
         Self { source }
     }
-}
-
-/// Ranks a spot instrument's quote currency for deterministic tie-breaking
-/// when multiple pairs share the same base. Matches OKX's dominant-quote
-/// ordering so spot-margin position reports stay on a stable instrument id
-/// across restarts.
-fn spot_quote_priority(symbol: &str) -> u8 {
-    symbol.rsplit_once('-').map_or(4, |(_, quote)| match quote {
-        "USDT" => 0,
-        "USDC" => 1,
-        "USD" => 2,
-        _ => 3,
-    })
 }
 
 // OKX omits `data` from gateway errors such as authentication failures
@@ -1383,6 +1371,7 @@ impl OKXRawHttpClient {
                     let status = StatusCode::from_u16(resp.status.as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     let error_body = String::from_utf8_lossy(&resp.body);
+
                     if status == StatusCode::NOT_FOUND {
                         log::debug!("HTTP 404 with body: {error_body}");
                     } else {
@@ -1434,6 +1423,7 @@ impl OKXRawHttpClient {
         // outcome is left for stream updates and reconciliation to resolve.
         // Algo amendments also run once: a retry can reject after an earlier
         // attempt applied and the order triggered, leaving the original outcome ambiguous.
+        // Cancel retries can reject after the first attempt applied, obscuring its outcome.
         let is_order_mutation = method == Method::POST
             && matches!(
                 path,
@@ -1441,7 +1431,11 @@ impl OKXRawHttpClient {
                     | "/api/v5/trade/batch-orders"
                     | "/api/v5/trade/order-algo"
                     | "/api/v5/trade/amend-algos"
+                    | "/api/v5/trade/cancel-algos"
+                    | "/api/v5/trade/cancel-advance-algos"
                     | "/api/v5/sprd/order"
+                    | "/api/v5/sprd/cancel-order"
+                    | "/api/v5/sprd/mass-cancel"
             );
         let should_retry = |error: &OKXHttpError| !is_order_mutation && error.is_retryable();
 
@@ -1625,6 +1619,11 @@ impl OKXRawHttpClient {
         &self,
         request: OKXPlaceSpreadOrderRequest,
     ) -> Result<Vec<OKXPlaceOrderResponse>, OKXHttpError> {
+        let request = OKXPlaceSpreadOrderRequest {
+            tag: Some(OKX_NAUTILUS_BROKER_ID.to_string()),
+            ..request
+        };
+
         let body = serde_json::to_vec(&request)?;
 
         self.send_request(
@@ -2870,7 +2869,18 @@ impl OKXHttpClient {
         let raw = resp
             .first()
             .ok_or_else(|| anyhow::anyhow!("No account state returned from OKX"))?;
-        let account_state = parse_account_state(raw, account_id, account_type, ts_init)?;
+        let (account_state, balances_complete) =
+            parse_account_state_with_completeness(raw, account_id, account_type, ts_init);
+
+        // Only a fully parsed, unfiltered REST response authoritatively zeros omitted currencies
+        let info = balances_complete.then(|| {
+            Params::new(IndexMap::from([(
+                BALANCES_SNAPSHOT_COMPLETE_INFO_KEY.to_string(),
+                serde_json::Value::Bool(true),
+            )]))
+        });
+
+        let account_state = account_state.with_info(info);
 
         Ok(account_state)
     }
@@ -2974,11 +2984,13 @@ impl OKXHttpClient {
     /// Requests all instruments for the `instrument_type` from OKX.
     ///
     /// Option requests require `instrument_family` (OKX `instFamily`), for example `BTC-USD`.
+    /// A definition that fails to parse is logged and left out.
     ///
     /// # Errors
     ///
-    /// Returns an error if `instrument_type` is option and `instrument_family` is missing,
-    /// the HTTP request fails, or instrument parsing fails.
+    /// Returns an error if:
+    /// - The `instrument_type` is option and `instrument_family` is missing.
+    /// - The HTTP request fails.
     ///
     /// # Returns
     ///
@@ -2990,6 +3002,22 @@ impl OKXHttpClient {
         instrument_type: OKXInstrumentType,
         instrument_family: Option<String>,
     ) -> anyhow::Result<(Vec<InstrumentAny>, Vec<(Ustr, u64)>)> {
+        let (instruments, inst_id_codes, parse_failures) = self
+            .request_instruments_with_parse_failures(instrument_type, instrument_family)
+            .await?;
+
+        for failure in parse_failures {
+            log::warn!("{failure}");
+        }
+
+        Ok((instruments, inst_id_codes))
+    }
+
+    pub(crate) async fn request_instruments_with_parse_failures(
+        &self,
+        instrument_type: OKXInstrumentType,
+        instrument_family: Option<String>,
+    ) -> anyhow::Result<(Vec<InstrumentAny>, Vec<(Ustr, u64)>, Vec<String>)> {
         if instrument_type == OKXInstrumentType::Option && instrument_family.is_none() {
             anyhow::bail!(
                 "option instruments require instrument_family (OKX instFamily), for example BTC-USD"
@@ -3045,6 +3073,7 @@ impl OKXHttpClient {
         let mut instruments: Vec<InstrumentAny> = Vec::new();
         let mut inst_id_codes: Vec<(Ustr, u64)> = Vec::new();
         let mut trade_quote_ccy_lists: Vec<(Ustr, Vec<Ustr>)> = Vec::new();
+        let mut parse_failures: Vec<String> = Vec::new();
 
         for inst in &resp {
             // Collect inst_id_code mappings for WebSocket order operations
@@ -3070,7 +3099,8 @@ impl OKXHttpClient {
                     // Unsupported instrument type, skip silently
                 }
                 Err(e) => {
-                    log::warn!("Failed to parse instrument {}: {e}", inst.inst_id);
+                    parse_failures
+                        .push(format!("Failed to parse instrument {}: {e}", inst.inst_id));
                 }
             }
         }
@@ -3079,18 +3109,35 @@ impl OKXHttpClient {
         self.inst_id_codes
             .rcu(|codes| codes.extend(inst_id_codes.iter().copied()));
 
-        Ok((instruments, inst_id_codes))
+        Ok((instruments, inst_id_codes, parse_failures))
     }
 
     /// Requests spread instruments from OKX.
     ///
+    /// A definition that fails to parse is logged and left out.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the HTTP request fails or spread parsing fails.
+    /// Returns an error if the HTTP request fails.
     pub async fn request_spread_instruments(
         &self,
         params: GetSpreadsParams,
     ) -> anyhow::Result<Vec<InstrumentAny>> {
+        let (instruments, parse_failures) = self
+            .request_spread_instruments_with_parse_failures(params)
+            .await?;
+
+        for failure in parse_failures {
+            log::warn!("{failure}");
+        }
+
+        Ok(instruments)
+    }
+
+    pub(crate) async fn request_spread_instruments_with_parse_failures(
+        &self,
+        params: GetSpreadsParams,
+    ) -> anyhow::Result<(Vec<InstrumentAny>, Vec<String>)> {
         let resp = self
             .inner
             .get_spreads(params)
@@ -3099,15 +3146,18 @@ impl OKXHttpClient {
 
         let ts_init = self.generate_ts_init();
         let mut instruments = Vec::new();
+        let mut parse_failures = Vec::new();
 
         for spread in &resp {
             match parse_spread_instrument(spread, None, None, ts_init) {
                 Ok(instrument) => instruments.push(instrument),
-                Err(e) => log::warn!("Failed to parse spread {}: {e}", spread.sprd_id),
+                Err(e) => {
+                    parse_failures.push(format!("Failed to parse spread {}: {e}", spread.sprd_id));
+                }
             }
         }
 
-        Ok(instruments)
+        Ok((instruments, parse_failures))
     }
 
     /// Requests a single instrument by `instrument_id` from OKX.
@@ -4913,7 +4963,7 @@ impl OKXHttpClient {
                 }
             };
 
-            let report = match parse_order_status_report(
+            let mut report = match parse_order_status_report(
                 &order,
                 account_id,
                 inst.id(),
@@ -4930,6 +4980,7 @@ impl OKXHttpClient {
                 }
             };
 
+            apply_post_only_rejection(&order, &mut report);
             reports.push(report);
         }
 
@@ -5045,20 +5096,7 @@ impl OKXHttpClient {
             }
         })?;
 
-        let post_only_rejected = order.state == OKXOrderStatus::Canceled
-            && report.filled_qty.is_zero()
-            && (order.cancel_source == OKX_POST_ONLY_CANCEL_SOURCE
-                || order.cancel_source_reason.contains("POST_ONLY"));
-        if post_only_rejected {
-            report.order_status = OrderStatus::Rejected;
-            report.post_only = true;
-            let reason = if order.cancel_source_reason.is_empty() {
-                OKX_POST_ONLY_CANCEL_REASON.to_string()
-            } else {
-                order.cancel_source_reason.clone()
-            };
-            report.cancel_reason = Some(reason);
-        }
+        apply_post_only_rejection(order, &mut report);
 
         Ok(Some(report))
     }
@@ -6133,97 +6171,87 @@ impl OKXHttpClient {
         })
     }
 
-    /// Requests spot margin position status reports from account balance.
+    /// Requests spot position status reports derived from net wallet balances.
     ///
-    /// Spot margin positions appear in `/api/v5/account/balance` as balance sheet items
-    /// with non-zero `liab` (liability) or `spotInUseAmt` fields, rather than in the
-    /// positions endpoint. This method fetches the balance and converts any margin
-    /// positions into position status reports.
+    /// Reports the signed base currency `cashBal` of each cached spot pair quoted in
+    /// `quote_currency`, as `LONG` or `SHORT` according to its sign. A balance that rounds to
+    /// zero is omitted from bulk requests and reported `FLAT` for a targeted request. A pair
+    /// quoted in another currency gets no report.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or parsing fails.
+    /// Returns an error if the request fails, the response contains no account, `cashBal` or `liab`
+    /// cannot be parsed exactly, the balance sum overflows or loses precision, or the quantity
+    /// cannot be represented.
     ///
     /// # References
     ///
     /// <https://www.okx.com/docs-v5/en/#trading-account-rest-api-get-balance>
-    pub async fn request_spot_margin_position_reports(
+    pub async fn request_spot_position_reports(
         &self,
         account_id: AccountId,
+        instrument_id: Option<InstrumentId>,
+        quote_currency: Ustr,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        let covered: Vec<(InstrumentId, Ustr, u8)> = {
+            let cache = self.instruments_cache.load();
+            let instruments: Vec<&InstrumentAny> = match instrument_id {
+                Some(instrument_id) => cache
+                    .get(&instrument_id.symbol.inner())
+                    .into_iter()
+                    .collect(),
+                None => cache.values().collect(),
+            };
+
+            instruments
+                .into_iter()
+                .filter_map(|instrument| {
+                    let base_currency = spot_position_base_currency(instrument, quote_currency)?;
+                    Some((
+                        instrument.id(),
+                        base_currency.code,
+                        instrument.size_precision(),
+                    ))
+                })
+                .collect()
+        };
+
+        if covered.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let accounts = self
             .inner
             .get_balance()
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(
+            !accounts.is_empty(),
+            "OKX balance response contained no account"
+        );
 
         let ts_init = self.generate_ts_init();
         let mut reports = Vec::new();
 
-        // Build a base-currency lookup over the cached spot pairs once per
-        // call. Restricting to `CurrencyPair` (spot) ensures a derivative
-        // sharing the same base (e.g. `BTC-USDT-SWAP`) is never reported as
-        // a spot margin position with the wrong instrument id or size
-        // precision.
-        //
-        // When multiple spot pairs share the same base currency, prefer the
-        // dominant OKX quote (USDT, then USDC, then USD) so a live
-        // `BTC-USDT` margin position stays reported under `BTC-USDT.OKX`
-        // rather than being redirected to `BTC-USD.OKX` or any other
-        // lexically-earlier pair. Unknown quotes fall back to a stable
-        // lexical order by symbol, matching OKX's own listing precedence
-        // and keeping the selection deterministic across runs.
-        let cache_snapshot = self.instruments_cache.load();
-        let mut candidates: Vec<&InstrumentAny> = cache_snapshot
-            .values()
-            .filter(|inst| matches!(inst, InstrumentAny::CurrencyPair(_)))
-            .collect();
-        candidates.sort_by(|a, b| {
-            let a_sym = a.id().symbol.as_str().to_string();
-            let b_sym = b.id().symbol.as_str().to_string();
-            spot_quote_priority(&a_sym)
-                .cmp(&spot_quote_priority(&b_sym))
-                .then_with(|| a_sym.cmp(&b_sym))
-        });
+        for (covered_id, base_code, size_precision) in covered {
+            let (position_side, quantity) =
+                parse_spot_position_quantity(&accounts, base_code, size_precision)?;
 
-        let mut by_base: AHashMap<Ustr, (InstrumentId, u8)> = AHashMap::new();
-
-        for inst in candidates {
-            if let Some(base) = inst.base_currency() {
-                let base_code = base.code;
-                by_base
-                    .entry(base_code)
-                    .or_insert_with(|| (inst.id(), inst.size_precision()));
+            if quantity.is_zero() && instrument_id.is_none() {
+                continue;
             }
-        }
 
-        for account in accounts {
-            for balance in account.details {
-                let ccy_str = balance.ccy.as_str();
-
-                let Some((instrument_id, size_precision)) =
-                    by_base.get(&Ustr::from(ccy_str)).copied()
-                else {
-                    log::debug!("Skipping balance for {ccy_str} - no matching instrument in cache");
-                    continue;
-                };
-
-                match parse_spot_margin_position_from_balance(
-                    &balance,
-                    account_id,
-                    instrument_id,
-                    size_precision,
-                    ts_init,
-                ) {
-                    Ok(Some(report)) => reports.push(report),
-                    Ok(None) => {} // No margin position for this currency
-                    Err(e) => {
-                        log::error!(
-                            "Failed to parse spot margin position from balance for {ccy_str}: {e}"
-                        );
-                    }
-                }
-            }
+            reports.push(PositionStatusReport::new(
+                account_id,
+                covered_id,
+                position_side,
+                quantity,
+                ts_init,
+                ts_init,
+                None,
+                None,
+                None,
+            ));
         }
 
         Ok(reports)
@@ -6242,6 +6270,11 @@ impl OKXHttpClient {
         &self,
         request: OKXPlaceOrderRequest,
     ) -> Result<OKXPlaceOrderResponse, OKXHttpError> {
+        let request = OKXPlaceOrderRequest {
+            tag: Some(OKX_NAUTILUS_BROKER_ID.to_string()),
+            ..request
+        };
+
         let body = serde_json::to_vec(&request)?;
 
         let resp: Vec<OKXPlaceOrderResponse> = self
@@ -6264,6 +6297,14 @@ impl OKXHttpClient {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+
+        let requests: Vec<_> = requests
+            .into_iter()
+            .map(|request| OKXPlaceOrderRequest {
+                tag: Some(OKX_NAUTILUS_BROKER_ID.to_string()),
+                ..request
+            })
+            .collect();
 
         let body = serde_json::to_vec(&requests)?;
         self.inner
@@ -6548,6 +6589,11 @@ impl OKXHttpClient {
         &self,
         request: OKXPlaceAlgoOrderRequest,
     ) -> Result<OKXPlaceAlgoOrderResponse, OKXHttpError> {
+        let request = OKXPlaceAlgoOrderRequest {
+            tag: Some(OKX_NAUTILUS_BROKER_ID.to_string()),
+            ..request
+        };
+
         let body = serde_json::to_vec(&request)?;
 
         let resp: Vec<OKXPlaceAlgoOrderResponse> = self
@@ -6872,13 +6918,7 @@ impl OKXHttpClient {
             ));
         }
 
-        if let Some(tif) = time_in_force
-            && !OKX_SUPPORTED_TIME_IN_FORCE.contains(&tif)
-        {
-            return Err(OKXHttpError::ValidationError(format!(
-                "Unsupported time in force: {tif:?}",
-            )));
-        }
+        validate_order_time_in_force(time_in_force).map_err(OKXHttpError::ValidationError)?;
 
         if !matches!(order_side, OrderSide::Buy | OrderSide::Sell) {
             return Err(OKXHttpError::ValidationError(
@@ -6918,11 +6958,15 @@ impl OKXHttpClient {
             okx_market_target_currency(instrument_type, order_side, order_type, quote_quantity)
                 .map_err(|e| OKXHttpError::ValidationError(e.to_string()))?;
 
-        if rpi && order_type != OrderType::Limit {
-            return Err(OKXHttpError::ValidationError(
-                "OKX RPI orders require a limit order".to_string(),
-            ));
-        }
+        validate_regular_order_params(
+            instrument_type,
+            order_type,
+            time_in_force,
+            post_only.unwrap_or(false),
+            rpi,
+            outcome.as_deref(),
+        )
+        .map_err(OKXHttpError::ValidationError)?;
 
         let (ord_type, px) = if rpi {
             (OKXOrderType::Rpi, price)
@@ -6930,11 +6974,6 @@ impl OKXHttpClient {
             (OKXOrderType::PostOnly, price)
         } else if let Some(tif) = time_in_force {
             match (order_type, tif) {
-                (OrderType::Market, TimeInForce::Fok) => {
-                    return Err(OKXHttpError::ValidationError(
-                        "Market orders with FOK time-in-force are not supported by OKX. Use Limit order with FOK instead.".to_string(),
-                    ));
-                }
                 (OrderType::Market, TimeInForce::Ioc) => {
                     // optimal_limit_ioc only works for SWAP/FUTURES
                     if matches!(
@@ -6946,26 +6985,13 @@ impl OKXHttpClient {
                         (OKXOrderType::OptimalLimitIoc, price)
                     }
                 }
-                (OrderType::Limit, TimeInForce::Fok) => {
-                    // OKX uses op_fok for options FOK orders
-                    if instrument_type == OKXInstrumentType::Option {
-                        (OKXOrderType::OpFok, price)
-                    } else {
-                        (OKXOrderType::Fok, price)
-                    }
-                }
+                (OrderType::Limit, TimeInForce::Fok) => (OKXOrderType::Fok, price),
                 (OrderType::Limit, TimeInForce::Ioc) => (OKXOrderType::Ioc, price),
                 _ => (OKXOrderType::from(order_type), price),
             }
         } else {
             (OKXOrderType::from(order_type), price)
         };
-
-        if instrument_type == OKXInstrumentType::Events && outcome.is_none() {
-            return Err(OKXHttpError::ValidationError(
-                "OKX event contract orders require `outcome`".to_string(),
-            ));
-        }
 
         let reduce_only = if reduce_only == Some(true) || position_side.is_some() {
             okx_reduce_only_wire_value(
@@ -7962,6 +7988,28 @@ fn parse_historical_candlestick(
     Ok(bar)
 }
 
+fn apply_post_only_rejection(order: &OKXOrderHistory, report: &mut OrderStatusReport) {
+    let post_only_rejected = order.state == OKXOrderStatus::Canceled
+        && report.filled_qty.is_zero()
+        && (order.cancel_source == OKX_POST_ONLY_CANCEL_SOURCE
+            || order.cancel_source_reason.contains("POST_ONLY"));
+
+    if !post_only_rejected {
+        return;
+    }
+
+    report.order_status = OrderStatus::Rejected;
+    report.post_only = true;
+
+    let reason = if order.cancel_source_reason.is_empty() {
+        OKX_POST_ONLY_CANCEL_REASON.to_string()
+    } else {
+        order.cancel_source_reason.clone()
+    };
+
+    report.cancel_reason = Some(reason);
+}
+
 fn is_open_okx_order(state: OKXOrderStatus, from_pending_source: bool) -> bool {
     matches!(
         state,
@@ -8077,4 +8125,19 @@ fn reconciliation_history_page_limit(max_pages: Option<u32>) -> usize {
     max_pages.map_or(MAX_RECONCILIATION_PAGES, |pages| {
         (pages as usize).min(MAX_RECONCILIATION_PAGES)
     })
+}
+
+/// Returns the base currency whose cash balance a wallet-derived position report covers for
+/// `instrument`, or `None` when the instrument is not a spot pair quoted in `quote_currency`.
+fn spot_position_base_currency(
+    instrument: &InstrumentAny,
+    quote_currency: Ustr,
+) -> Option<Currency> {
+    if !matches!(instrument, InstrumentAny::CurrencyPair(_))
+        || instrument.quote_currency().code != quote_currency
+    {
+        return None;
+    }
+
+    instrument.base_currency()
 }

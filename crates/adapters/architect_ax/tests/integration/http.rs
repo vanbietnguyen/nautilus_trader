@@ -46,7 +46,9 @@ use rust_decimal_macros::dec;
 use serde_json::{Value, json};
 use ustr::Ustr;
 
-use crate::common::server::start_test_server as start_common_test_server;
+use crate::common::server::{
+    create_test_instrument, start_test_server as start_common_test_server,
+};
 
 #[derive(Debug, Clone, Copy)]
 enum RequiredInstrumentCachePath {
@@ -1185,6 +1187,106 @@ async fn test_domain_http_report_fetches_and_caches_uncached_instrument(
 }
 
 #[rstest]
+#[case::start_overflow(Some(i64::MAX as u64 + 1), None, "start")]
+#[case::start_max(Some(u64::MAX), None, "start")]
+#[case::end_overflow(None, Some(i64::MAX as u64 + 1), "end")]
+#[case::end_max(None, Some(u64::MAX), "end")]
+#[tokio::test]
+async fn test_domain_http_reports_reject_out_of_range_timestamps(
+    #[values(ReportFamily::HistoricalOrders, ReportFamily::Fills)] family: ReportFamily,
+    #[case] start: Option<u64>,
+    #[case] end: Option<u64>,
+    #[case] bound: &str,
+) {
+    let (addr, state) = start_common_test_server().await.unwrap();
+    let base_url = format!("http://{addr}");
+    let client =
+        AxHttpClient::new(Some(base_url.clone()), Some(base_url), 60, 0, 1, 1, None).unwrap();
+    client.set_session_token("test_session_token".into());
+    let account_id = AccountId::from("AX-001");
+    let start = start.map(UnixNanos::from);
+    let end = end.map(UnixNanos::from);
+
+    let error = match family {
+        ReportFamily::HistoricalOrders => client
+            .request_historical_order_status_reports(
+                account_id,
+                start,
+                end,
+                None::<fn(u64) -> Option<ClientOrderId>>,
+            )
+            .await
+            .unwrap_err(),
+        ReportFamily::Fills => client
+            .request_fill_reports(account_id, start, end)
+            .await
+            .unwrap_err(),
+        _ => unreachable!(),
+    };
+
+    assert_eq!(
+        error.to_string(),
+        format!("{bound} timestamp exceeds the signed nanosecond range")
+    );
+    assert_eq!(state.orders_queries.lock().await.len(), 0);
+    assert_eq!(state.fills_queries.lock().await.len(), 0);
+}
+
+#[rstest]
+#[case::orders(ReportFamily::HistoricalOrders)]
+#[case::fills(ReportFamily::Fills)]
+#[tokio::test]
+async fn test_domain_http_reports_accept_signed_timestamp_limit(#[case] family: ReportFamily) {
+    let (addr, state) = start_common_test_server().await.unwrap();
+    let mut orders = load_test_data("http_get_orders.json");
+    orders["orders"].as_array_mut().unwrap().clear();
+    *state.orders_payload.lock().await = Some(orders);
+    let mut fills = load_test_data("http_get_fills.json");
+    fills["fills"].as_array_mut().unwrap().clear();
+    *state.fills_payload.lock().await = Some(fills);
+    let base_url = format!("http://{addr}");
+    let client =
+        AxHttpClient::new(Some(base_url.clone()), Some(base_url), 60, 0, 1, 1, None).unwrap();
+    client.set_session_token("test_session_token".into());
+    let account_id = AccountId::from("AX-001");
+    let start = Some(UnixNanos::from(i64::MAX as u64 - 1));
+    let end = Some(UnixNanos::from(i64::MAX as u64));
+
+    match family {
+        ReportFamily::HistoricalOrders => {
+            let reports = client
+                .request_historical_order_status_reports(
+                    account_id,
+                    start,
+                    end,
+                    None::<fn(u64) -> Option<ClientOrderId>>,
+                )
+                .await
+                .unwrap();
+            let queries = state.orders_queries.lock().await;
+
+            assert_eq!(reports, Vec::new());
+            assert_eq!(queries.len(), 1);
+            assert_eq!(queries[0].start_timestamp_ns, Some(i64::MAX - 1));
+            assert_eq!(queries[0].end_timestamp_ns, Some(i64::MAX));
+        }
+        ReportFamily::Fills => {
+            let reports = client
+                .request_fill_reports(account_id, start, end)
+                .await
+                .unwrap();
+            let queries = state.fills_queries.lock().await;
+
+            assert_eq!(reports, Vec::new());
+            assert_eq!(queries.len(), 1);
+            assert_eq!(queries[0].start_timestamp_ns, i64::MAX - 1);
+            assert_eq!(queries[0].end_timestamp_ns, i64::MAX);
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[rstest]
 #[case::with_fills(
     100,
     false,
@@ -1552,13 +1654,6 @@ async fn test_unknown_order_classification_aborts_complete_snapshot(
     1,
     "AX orders returned an empty next_cursor"
 )]
-#[case::empty_page(
-    Some(1),
-    Some(100),
-    Some("next"),
-    0,
-    "AX orders returned an empty page with a next_cursor"
-)]
 #[tokio::test]
 async fn test_order_history_rejects_invalid_page_metadata(
     #[case] total: Option<i64>,
@@ -1605,6 +1700,63 @@ async fn test_order_history_rejects_invalid_page_metadata(
         .unwrap_err();
     assert_eq!(error.to_string(), expected);
     server.abort();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_order_history_follows_cursor_through_empty_page() {
+    let mut payload = load_test_data("http_get_orders.json");
+    payload["orders"][1]["o"] = json!("CANCELED");
+    payload["orders"][1]["xq"] = json!(0);
+
+    let app = Router::new().route(
+        "/orders",
+        get(move |Query(query): Query<HashMap<String, String>>| {
+            let payload = payload.clone();
+
+            async move {
+                let (orders, next_cursor) = match query.get("cursor").map(String::as_str) {
+                    None => (vec![payload["orders"][0].clone()], Some("empty")),
+                    Some("empty") => (vec![], Some("remaining")),
+                    Some("remaining") => (vec![payload["orders"][1].clone()], None),
+                    cursor => panic!("Unexpected orders cursor {cursor:?}"),
+                };
+
+                Json(json!({
+                    "orders": orders,
+                    "total_count": 2,
+                    "limit": 100,
+                    "next_cursor": next_cursor,
+                }))
+            }
+        }),
+    );
+
+    let addr = start_server(app).await;
+    let url = format!("http://{addr}");
+    let client = AxHttpClient::new(Some(url.clone()), Some(url), 5, 0, 1, 1, None).unwrap();
+    client.set_session_token("test-token".into());
+    client.cache_instrument(create_test_instrument("EURUSD-PERP"));
+    client.cache_instrument(create_test_instrument("GBPUSD-PERP"));
+
+    let reports = client
+        .request_historical_order_status_reports(
+            AccountId::from("AX-001"),
+            None,
+            None,
+            None::<fn(u64) -> Option<ClientOrderId>>,
+        )
+        .await
+        .unwrap();
+
+    let ids: Vec<_> = reports.iter().map(|report| report.venue_order_id).collect();
+    assert_eq!(
+        ids,
+        [
+            VenueOrderId::from("O-01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            VenueOrderId::from("O-01ARZ3NDEKTSV4RRFFQ69G5FBW"),
+        ]
+    );
 }
 
 #[rstest]

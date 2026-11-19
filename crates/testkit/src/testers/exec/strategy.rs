@@ -191,8 +191,6 @@ nautilus_strategy!(ExecTester, {
 
 impl DataActor for ExecTester {
     fn on_start(&mut self) -> anyhow::Result<()> {
-        Strategy::on_start(self)?;
-
         let instrument_id = self.config.instrument_id;
         let client_id = self.config.client_id;
 
@@ -678,28 +676,13 @@ impl ExecTester {
         let Some(instrument) = &self.instrument else {
             return;
         };
-        let Some(price_offset_ticks) = self.price_offset else {
+
+        let Some(price) = self.limit_price(OrderSide::Buy, best_bid, best_ask) else {
             return;
         };
 
         let increment = instrument.price_increment();
         let precision = instrument.price_precision();
-
-        // `test_reject_post_only` and `limit_aggressive` both cross the spread for
-        // BUY (place at/above the ask). `test_reject_post_only` additionally sets
-        // post_only=true downstream to trigger venue rejection; `limit_aggressive`
-        // pairs with IOC/FOK TIF for marketable-fill scenarios.
-        let cross_spread = self.config.test_reject_post_only || self.config.limit_aggressive;
-        let unclamped_price = if cross_spread {
-            add_price_ticks(best_ask, increment, price_offset_ticks, precision)
-        } else {
-            sub_price_ticks(best_bid, increment, price_offset_ticks, precision)
-        };
-        let price = clamp_price_to_range(
-            unclamped_price,
-            instrument,
-            self.config.clamp_to_instrument_price_range,
-        );
 
         if self.limit_order_maintenance_suppressed(OrderSide::Buy) {
             return;
@@ -756,6 +739,7 @@ impl ExecTester {
             {
                 if self.config.modify_orders_to_maintain_tob_offset {
                     let order_clone = order.clone();
+
                     if let Err(e) = self.modify_order(
                         order_clone.client_order_id(),
                         None,
@@ -783,25 +767,13 @@ impl ExecTester {
         let Some(instrument) = &self.instrument else {
             return;
         };
-        let Some(price_offset_ticks) = self.price_offset else {
+
+        let Some(price) = self.limit_price(OrderSide::Sell, best_bid, best_ask) else {
             return;
         };
 
         let increment = instrument.price_increment();
         let precision = instrument.price_precision();
-
-        // See `maintain_buy_orders` for the cross_spread and refresh rationale.
-        let cross_spread = self.config.test_reject_post_only || self.config.limit_aggressive;
-        let unclamped_price = if cross_spread {
-            sub_price_ticks(best_bid, increment, price_offset_ticks, precision)
-        } else {
-            add_price_ticks(best_ask, increment, price_offset_ticks, precision)
-        };
-        let price = clamp_price_to_range(
-            unclamped_price,
-            instrument,
-            self.config.clamp_to_instrument_price_range,
-        );
 
         if self.limit_order_maintenance_suppressed(OrderSide::Sell) {
             return;
@@ -857,6 +829,7 @@ impl ExecTester {
             {
                 if self.config.modify_orders_to_maintain_tob_offset {
                     let order_clone = order.clone();
+
                     if let Err(e) = self.modify_order(
                         order_clone.client_order_id(),
                         None,
@@ -897,6 +870,7 @@ impl ExecTester {
                 let accepted_at_expected_price = self
                     .tracked_limit_order(side)
                     .is_some_and(|order| order.price() == Some(price) && order.is_open());
+
                 if !accepted_at_expected_price {
                     log::error!(
                         "Replacement {side} order {client_order_id} was accepted with unexpected state"
@@ -962,6 +936,7 @@ impl ExecTester {
         replacement_price: Price,
     ) {
         let state = self.limit_order_maintenance_state(side);
+
         if !matches!(
             state,
             LimitOrderMaintenanceState::AwaitingAcceptance {
@@ -1006,6 +981,7 @@ impl ExecTester {
             && self
                 .tracked_limit_order(side)
                 .is_some_and(|order| order.price() == Some(price) && order.is_open());
+
         if !updated_at_expected_price {
             log::error!(
                 "Updated {side} limit order {client_order_id} has unexpected price or state"
@@ -1163,9 +1139,6 @@ impl ExecTester {
         let Some(instrument) = &self.instrument else {
             return;
         };
-        let Some(price_offset_ticks) = self.price_offset else {
-            return;
-        };
 
         let buy_needs = match &self.buy_order {
             None => true,
@@ -1180,27 +1153,14 @@ impl ExecTester {
             return;
         }
 
-        let increment = instrument.price_increment();
-        let precision = instrument.price_precision();
-
-        // `test_reject_post_only` and `limit_aggressive` flip the BUY/SELL
-        // pricing to cross the spread; mirrored from `maintain_buy_orders` /
-        // `maintain_sell_orders` so batch mode supports the same scenarios.
-        let cross_spread = self.config.test_reject_post_only || self.config.limit_aggressive;
-        let (unclamped_buy_price, unclamped_sell_price) = if cross_spread {
-            (
-                add_price_ticks(best_ask, increment, price_offset_ticks, precision),
-                sub_price_ticks(best_bid, increment, price_offset_ticks, precision),
-            )
-        } else {
-            (
-                sub_price_ticks(best_bid, increment, price_offset_ticks, precision),
-                add_price_ticks(best_ask, increment, price_offset_ticks, precision),
-            )
+        let Some(buy_price) = self.limit_price(OrderSide::Buy, best_bid, best_ask) else {
+            return;
         };
-        let clamp = self.config.clamp_to_instrument_price_range;
-        let buy_price = clamp_price_to_range(unclamped_buy_price, instrument, clamp);
-        let sell_price = clamp_price_to_range(unclamped_sell_price, instrument, clamp);
+
+        let Some(sell_price) = self.limit_price(OrderSide::Sell, best_bid, best_ask) else {
+            return;
+        };
+
         let quantity = instrument.make_qty_from_decimal(self.config.order_qty.as_decimal(), None);
         let (time_in_force, expire_time) =
             self.resolve_time_in_force(self.config.limit_time_in_force);
@@ -1257,6 +1217,36 @@ impl ExecTester {
         {
             log::error!("Failed to submit batch limit pair: {e}");
         }
+    }
+
+    fn limit_price(&self, side: OrderSide, best_bid: Price, best_ask: Price) -> Option<Price> {
+        let instrument = self.instrument.as_ref()?;
+        let offset_ticks = self.price_offset?;
+        let increment = instrument.price_increment();
+        let precision = instrument.price_precision();
+        let cross_spread = self.config.test_reject_post_only || self.config.limit_aggressive;
+
+        let price = match (side, cross_spread) {
+            (OrderSide::Buy, false) | (OrderSide::Sell, true) => {
+                sub_price_ticks(best_bid, increment, offset_ticks, precision)
+            }
+            (OrderSide::Buy, true) | (OrderSide::Sell, false) => {
+                add_price_ticks(best_ask, increment, offset_ticks, precision)
+            }
+        };
+
+        let price = clamp_price_to_range(
+            price,
+            instrument,
+            self.config.clamp_to_instrument_price_range,
+        );
+
+        if !price.is_positive() {
+            log_warn!("Skipping {side} limit order with non-positive price {price}");
+            return None;
+        }
+
+        Some(price)
     }
 
     /// Maintain stop buy orders.

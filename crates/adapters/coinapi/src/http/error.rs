@@ -17,7 +17,7 @@
 
 use nautilus_network::{http::HttpClientError, retry::RetryError};
 
-/// A failure at the CoinAPI REST boundary.
+/// A failure at the CoinAPI HTTP or file boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -35,6 +35,8 @@ pub enum Error {
     },
     #[error("CoinAPI response parsing failed: {0}")]
     Parse(#[from] serde_json::Error),
+    #[error("CoinAPI file I/O failed: {0}")]
+    Io(#[from] std::io::Error),
     #[error("Invalid CoinAPI request: {0}")]
     Validation(String),
     #[error("Unexpected CoinAPI response: {0}")]
@@ -55,10 +57,14 @@ impl Error {
             )
             | Self::Retry(RetryError::OperationTimeout { .. }) => true,
             Self::Http { status, .. } | Self::Venue { status, .. } => {
-                *status == 429 || matches!(status, 500 | 502 | 503 | 504)
+                Self::is_retryable_status(*status)
             }
             _ => false,
         }
+    }
+
+    pub(super) const fn is_retryable_status(status: u16) -> bool {
+        matches!(status, 429 | 500 | 502 | 503 | 504)
     }
 
     pub(super) fn retry_delay(&self) -> Option<std::time::Duration> {

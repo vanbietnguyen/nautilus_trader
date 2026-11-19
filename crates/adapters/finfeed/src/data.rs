@@ -15,9 +15,6 @@
 
 //! Data client with generation-owned requests, polling subscriptions, and bounded shutdown.
 
-mod book;
-mod history;
-mod parse;
 mod poll;
 
 use std::{collections::HashMap, future::Future, num::NonZeroUsize, sync::Arc, time::Duration};
@@ -33,7 +30,6 @@ use nautilus_common::{
 use nautilus_core::{
     Params,
     datetime::datetime_to_unix_nanos,
-    string::secret::SecretString,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::task::{TaskGroup, TaskGroupGuard};
@@ -47,10 +43,13 @@ use parking_lot::Mutex;
 use serde::{Deserialize, de::IntoDeserializer};
 
 use crate::{
-    common::{consts::FINFEED, credential::resolve_api_key},
+    book,
+    common::consts::FINFEED,
     config::FinFeedDataClientConfig,
+    history,
     http::{client::FinFeedHttpClient, error::Error, models::MarketStatus, query::PAGE_LIMIT_MAX},
     instruments::{FinFeedInstrumentProvider, selected_ids},
+    parse,
 };
 
 const TASK_GRACE: Duration = Duration::from_secs(1);
@@ -126,7 +125,6 @@ pub struct FinFeedDataClient {
     clock: &'static AtomicTime,
     client_id: ClientId,
     config: FinFeedDataClientConfig,
-    api_key: SecretString,
     http: Arc<FinFeedHttpClient>,
     provider: Arc<tokio::sync::Mutex<FinFeedInstrumentProvider>>,
     session_tasks: TaskGroup,
@@ -168,10 +166,9 @@ impl FinFeedDataClient {
             "invalid FinFeed polling controls: poll_limit must be in [1, {PAGE_LIMIT_MAX}], was {}",
             config.poll_limit
         );
-        let api_key = resolve_api_key(config.api_key.clone())?;
 
         let http = Arc::new(FinFeedHttpClient::new(
-            Some(api_key.clone()),
+            config.api_key.clone(),
             config.http.clone(),
         )?);
         let provider = FinFeedInstrumentProvider::new(Arc::clone(&http));
@@ -179,7 +176,6 @@ impl FinFeedDataClient {
             clock: get_atomic_clock_realtime(),
             client_id,
             config,
-            api_key,
             http,
             provider: Arc::new(tokio::sync::Mutex::new(provider)),
             session_tasks: TaskGroup::new(),
@@ -241,10 +237,7 @@ impl DataClient for FinFeedDataClient {
             self.begin_shutdown();
             self.finish_shutdown().await?;
 
-            self.http = Arc::new(FinFeedHttpClient::new(
-                Some(self.api_key.clone()),
-                self.config.http.clone(),
-            )?);
+            self.http = Arc::new(self.http.new_generation(self.config.http.clone())?);
             self.session_tasks.start_generation()?;
             self.command_tasks.start_generation()?;
         }
@@ -1311,7 +1304,7 @@ mod tests {
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
 
         let config = FinFeedDataClientConfig {
-            api_key: Some(SecretString::from("test-api-key")),
+            api_key: Some("test-api-key".into()),
             instruments: vec![FinFeedInstrumentSelection {
                 exchange_id: "POLYMARKET".into(),
                 market_ids: vec!["first_NO".into(), "last_NO".into()],
@@ -1343,7 +1336,7 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 
         let config = FinFeedDataClientConfig {
-            api_key: Some(SecretString::from("test-api-key")),
+            api_key: Some("test-api-key".into()),
             instruments: vec![FinFeedInstrumentSelection {
                 exchange_id: "POLYMARKET".into(),
                 market_ids: vec!["contract_NO".into()],

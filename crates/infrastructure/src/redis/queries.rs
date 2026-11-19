@@ -49,7 +49,7 @@ use ustr::Ustr;
 
 use super::get_index_key;
 #[cfg(feature = "defi")]
-use crate::defi::{contract_conflict, integrity_error, validate_marker};
+use crate::defi::{contract_conflict, integrity_error, redis_read_error, validate_marker};
 
 /// Persisted representation of a [`Currency`].
 ///
@@ -139,6 +139,7 @@ const ACCOUNTS: &str = "accounts";
 const ORDERS: &str = "orders";
 const POSITIONS: &str = "positions";
 const SNAPSHOTS: &str = "snapshots";
+pub(super) const POSITION_SNAPSHOTS_PREFIX: &str = "snapshots:positions:";
 const ACTORS: &str = "actors";
 const STRATEGIES: &str = "strategies";
 const CUSTOM: &str = "custom";
@@ -156,6 +157,7 @@ const INDEX_ORDERS_INFLIGHT: &str = "index:orders_inflight";
 const INDEX_POSITIONS: &str = "index:positions";
 const INDEX_POSITIONS_OPEN: &str = "index:positions_open";
 const INDEX_POSITIONS_CLOSED: &str = "index:positions_closed";
+pub(super) const INDEX_POSITIONS_REPLAY_SOURCE: &str = "index:positions_replay_source";
 
 #[derive(Debug)]
 pub struct DatabaseQueries;
@@ -262,7 +264,9 @@ impl DatabaseQueries {
         );
 
         for _ in 0..4 {
-            let previous = Self::read_bulk(con, &keys).await.map_err(integrity_error)?;
+            let previous = Self::read_bulk(con, &keys)
+                .await
+                .map_err(redis_read_error)?;
             let mut replacement =
                 Self::check_currency_records(encoding, codes, payloads, &previous)?;
 
@@ -303,7 +307,9 @@ impl DatabaseQueries {
             command
                 .arg(
                     "for i = 1, #KEYS do
-                    local value = redis.call('GET', KEYS[i])
+                    -- Keep command error codes intact on Redis 6.x
+                    local value = redis.pcall('GET', KEYS[i])
+                    if type(value) == 'table' and value.err then return value end
                     local offset = 1 + (i - 1) * 3
                     if ARGV[offset + 1] == '0' then
                         if value then return 0 end
@@ -331,15 +337,13 @@ impl DatabaseQueries {
                     .arg(new.as_ref());
             }
 
-            let written: i32 = command.query_async(con).await.map_err(integrity_error)?;
+            let written: i32 = command.query_async(con).await.map_err(redis_read_error)?;
             if written == 1 {
                 return Ok(());
             }
         }
 
-        Err(integrity_error(
-            "Token dependencies changed concurrently; retry the write",
-        ))
+        anyhow::bail!("Token dependencies changed concurrently; retry the write")
     }
 
     #[cfg(feature = "defi")]
@@ -426,11 +430,11 @@ impl DatabaseQueries {
     ) -> anyhow::Result<()> {
         let keys = Self::scan_keys(con, format!("{trader_key}:currencies:*"))
             .await
-            .map_err(integrity_error)?;
+            .map_err(redis_read_error)?;
 
         for bytes in Self::read_bulk(con, &keys)
             .await
-            .map_err(integrity_error)?
+            .map_err(redis_read_error)?
             .into_iter()
             .flatten()
         {
@@ -578,7 +582,7 @@ impl DatabaseQueries {
 
         for key in Self::scan_keys(con, format!("{prefix}*"))
             .await
-            .map_err(integrity_error)?
+            .map_err(redis_read_error)?
         {
             let code = key
                 .strip_prefix(&prefix)
@@ -586,7 +590,7 @@ impl DatabaseQueries {
             let id = ClientOrderId::new_checked(code).map_err(integrity_error)?;
             let order = Self::load_order(con, trader_key, &id, encoding)
                 .await
-                .map_err(integrity_error)?
+                .map_err(redis_read_error)?
                 .ok_or_else(|| integrity_error(format!("Missing order state at {key}")))?;
 
             if order.instrument_id() == instrument_id && !order.is_closed() {
@@ -600,9 +604,9 @@ impl DatabaseQueries {
 
         for key in Self::scan_keys(con, format!("{prefix}*"))
             .await
-            .map_err(integrity_error)?
+            .map_err(redis_read_error)?
         {
-            let values: Vec<Vec<u8>> = con.lrange(&key, 0, -1).await.map_err(integrity_error)?;
+            let values: Vec<Vec<u8>> = con.lrange(&key, 0, -1).await.map_err(redis_read_error)?;
             for bytes in values {
                 let snapshot: OrderSnapshot =
                     Self::deserialize_payload(encoding, &bytes).map_err(integrity_error)?;
@@ -632,10 +636,10 @@ impl DatabaseQueries {
 
             for key in Self::scan_keys(con, format!("{prefix}*"))
                 .await
-                .map_err(integrity_error)?
+                .map_err(redis_read_error)?
             {
                 let values: Vec<Vec<u8>> =
-                    con.lrange(&key, 0, -1).await.map_err(integrity_error)?;
+                    con.lrange(&key, 0, -1).await.map_err(redis_read_error)?;
 
                 if values.is_empty() {
                     return Err(integrity_error(format!(
@@ -678,9 +682,9 @@ impl DatabaseQueries {
 
         for key in Self::scan_keys(con, format!("{prefix}*"))
             .await
-            .map_err(integrity_error)?
+            .map_err(redis_read_error)?
         {
-            let blob: Vec<u8> = con.get(&key).await.map_err(integrity_error)?;
+            let blob: Vec<u8> = con.get(&key).await.map_err(redis_read_error)?;
             if CacheSnapshotRef::position_instrument_id(&blob).map_err(integrity_error)?
                 == instrument_id
             {
@@ -1661,32 +1665,80 @@ impl DatabaseQueries {
         position_id: &PositionId,
         encoding: SerializationEncoding,
     ) -> anyhow::Result<Option<Position>> {
+        let key = format!("{trader_key}{REDIS_DELIMITER}{POSITIONS}{REDIS_DELIMITER}{position_id}");
         let snapshot_key =
-            format!("{SNAPSHOTS}{REDIS_DELIMITER}{POSITIONS}{REDIS_DELIMITER}{position_id}");
-        let snapshots = Self::read(con, trader_key, &snapshot_key).await?;
-        for payload in snapshots.iter().rev() {
-            let snapshot: PositionSnapshot = Self::deserialize_payload(encoding, payload)?;
-            if let Some(replay_state) = snapshot.replay_state {
-                let position: Position = serde_json::from_value(replay_state)
-                    .map_err(|e| anyhow::anyhow!("Failed to decode position replay state: {e}"))?;
-                position.check_accounting()?;
+            format!("{trader_key}{REDIS_DELIMITER}{POSITION_SNAPSHOTS_PREFIX}{position_id}");
+        let source_key = format!("{trader_key}{REDIS_DELIMITER}{INDEX_POSITIONS_REPLAY_SOURCE}");
+        let mut con = con.clone();
+        let member = position_id.to_string();
+        let uses_snapshot: Option<bool> = con.hget(&source_key, &member).await?;
+        let read_snapshots = uses_snapshot != Some(false);
+        let records_key = if read_snapshots { &snapshot_key } else { &key };
+
+        let mut source = redis::pipe();
+        source.atomic().hget(source_key, member);
+        let (uses_snapshot, payloads): (Option<bool>, Vec<Bytes>) = source
+            .clone()
+            .lrange(records_key, 0, -1)
+            .query_async(&mut con)
+            .await?;
+
+        let fills = 'selected: {
+            if !read_snapshots && uses_snapshot == Some(false) {
+                break 'selected payloads;
+            }
+
+            if read_snapshots && uses_snapshot != Some(false) {
+                if let Some(position) = Self::decode_position_replay(encoding, &payloads)? {
+                    return Ok(Some(position));
+                }
+
+                // A new replay snapshot records its source in the same write
+                let (uses_snapshot, fills): (Option<bool>, Vec<Bytes>) = source
+                    .clone()
+                    .lrange(&key, 0, -1)
+                    .query_async(&mut con)
+                    .await?;
+
+                if uses_snapshot != Some(true) {
+                    break 'selected fills;
+                }
+            }
+
+            // A source change can invalidate the selected list
+            let (uses_snapshot, snapshots, fills): (Option<bool>, Vec<Bytes>, Vec<Bytes>) = source
+                .lrange(snapshot_key, 0, -1)
+                .lrange(key, 0, -1)
+                .query_async(&mut con)
+                .await?;
+
+            if uses_snapshot != Some(false)
+                && let Some(position) = Self::decode_position_replay(encoding, &snapshots)?
+            {
                 return Ok(Some(position));
             }
-        }
 
-        let key = format!("{POSITIONS}{REDIS_DELIMITER}{position_id}");
-        let result = Self::read(con, trader_key, &key).await?;
-        if result.is_empty() {
-            return Ok(None);
-        }
+            fills
+        };
 
-        let fills: Vec<OrderFilled> = result
+        Self::replay_position_fills(&con, trader_key, position_id, encoding, &fills).await
+    }
+
+    async fn replay_position_fills(
+        con: &ConnectionManager,
+        trader_key: &str,
+        position_id: &PositionId,
+        encoding: SerializationEncoding,
+        fills: &[Bytes],
+    ) -> anyhow::Result<Option<Position>> {
+        let fills: Vec<OrderFilled> = fills
             .iter()
             .map(|payload| Self::deserialize_payload(encoding, payload))
             .collect::<anyhow::Result<_>>()?;
         let Some((first_fill, remaining_fills)) = fills.split_first() else {
             return Ok(None);
         };
+
         let Some(instrument) =
             Self::load_instrument(con, trader_key, &first_fill.instrument_id, encoding).await?
         else {
@@ -1712,6 +1764,23 @@ impl DatabaseQueries {
         Ok(Some(position))
     }
 
+    fn decode_position_replay(
+        encoding: SerializationEncoding,
+        snapshots: &[Bytes],
+    ) -> anyhow::Result<Option<Position>> {
+        for payload in snapshots.iter().rev() {
+            let snapshot: PositionSnapshot = Self::deserialize_payload(encoding, payload)?;
+            if let Some(replay_state) = snapshot.replay_state {
+                let position: Position = serde_json::from_value(replay_state)
+                    .map_err(|e| anyhow::anyhow!("Failed to decode position replay state: {e}"))?;
+                position.check_accounting()?;
+                return Ok(Some(position));
+            }
+        }
+
+        Ok(None)
+    }
+
     fn get_collection_key(key: &str) -> anyhow::Result<&str> {
         key.split_once(REDIS_DELIMITER)
             .map(|(collection, _)| collection)
@@ -1732,7 +1801,9 @@ impl DatabaseQueries {
             | INDEX_POSITIONS
             | INDEX_POSITIONS_OPEN
             | INDEX_POSITIONS_CLOSED => Self::read_set(conn, key).await,
-            INDEX_ORDER_POSITION | INDEX_ORDER_CLIENT => Self::read_hset(conn, key).await,
+            INDEX_ORDER_POSITION | INDEX_ORDER_CLIENT | INDEX_POSITIONS_REPLAY_SOURCE => {
+                Self::read_hset(conn, key).await
+            }
             _ => anyhow::bail!("Index unknown '{index_key}' on read"),
         }
     }
