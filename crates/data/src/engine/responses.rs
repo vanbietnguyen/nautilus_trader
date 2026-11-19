@@ -301,8 +301,9 @@ pub(super) fn keep_open_end(rebuilt: &mut DataResponse) {
     }
 }
 
-/// The most rows one part of a merged answer carries (the catalog's chunk size): a run of one
-/// type that reaches it is sent as a part, and a new run starts.
+/// The most rows one part of a merged answer carries (the catalog's chunk size): a run of quotes
+/// that reaches it is sent as a part, a run of trades when the next trade arrives, and a new run
+/// starts.
 const MERGED_PART_ROWS: usize = 10_000;
 
 /// Sends the rows of `quote_sources` and `trade_sources` in one time order through `send` as
@@ -313,9 +314,10 @@ const MERGED_PART_ROWS: usize = 10_000;
 /// every quotes source first, then every trades source, each feed's in slot order, so a quote
 /// comes before a trade at an equal stamp (the backtest's order), also where a source's next
 /// batch starts at that stamp, and rows of one feed at an equal stamp go in slot order. A run of
-/// one type is cut where the type changes and where it reaches 10,000 rows; each run is sent as
-/// it is cut, so no two parts are held at once. Each part carries the identity and window of
-/// `quotes` or `trades`, whose rows are not read.
+/// one type is cut where the type changes and at 10,000 rows (a run of trades only when another
+/// trade follows, so the last run of trades, the answer's last part, holds up to 10,000); each
+/// run is sent as it is cut, so no two parts are held at once. Each part carries the identity
+/// and window of `quotes` or `trades`, whose rows are not read.
 ///
 /// # Errors
 ///
@@ -508,12 +510,14 @@ fn cut_quote_and_trade_runs(
                     let run = std::mem::take(&mut quote_run);
                     send(DataResponse::Quotes(quotes_part(quotes, run)));
                 }
-                trade_run.push(trade);
 
+                // A full run of trades waits for the next trade, so one that ends the answer
+                // completes it
                 if trade_run.len() == MERGED_PART_ROWS {
                     let run = std::mem::take(&mut trade_run);
                     send(DataResponse::Trades(trades_part(trades, run)));
                 }
+                trade_run.push(trade);
             }
             ReplayPoll::Ready(other) => {
                 anyhow::bail!("The replay of quotes and trades yielded {other:?}")

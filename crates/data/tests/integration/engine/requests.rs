@@ -11251,6 +11251,80 @@ fn test_merged_request_with_update_catalog_writes_back_only_the_feed_its_catalog
     assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
 }
 
+/// Quote file A (30,000 quotes a millisecond apart from 09:59), quote file B right after it (one
+/// quote, to 10:00:30), and the client asked the quotes after B: its empty answer extends B's
+/// name to the window's end (`update_catalog`) while the catalog leg's quotes session has listed
+/// B and not opened it (its first chunk is A's). The write-back waits until the session has been
+/// read: the answer is whole, and the catalog then holds B under its extended name.
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_merged_request_with_update_catalog_extends_a_file_its_open_session_lists_after_reading_it(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let t = edge_ns;
+    let (start, end) = edge_window();
+    let file_a = (start, t("10:00:00") - 1);
+    let file_b = (t("10:00:00"), t("10:00:30") - 1);
+    let a_stamps: Vec<u64> = (0..30_000).map(|row| start + row * 1_000_000).collect();
+    let a_quotes: Vec<_> = a_stamps.iter().copied().map(quote_at).collect();
+    let b_quotes = [quote_at(t("10:00:01"))];
+    let trades = [(t("09:59:30"), "t1"), (t("10:00:06"), "t2")];
+    let catalog_dir = register_quoted_catalog(
+        &fixture,
+        "merged-deferred-write-back",
+        &[
+            merged_run((start, end), &[], &trades),
+            merged_run(file_a, &a_quotes, &[]),
+            merged_run(file_b, &b_quotes, &[]),
+        ],
+    );
+    let request = windowed_trades_request(
+        &fixture,
+        (start, end),
+        json!({"quotes": true, "update_catalog": true}),
+    );
+    let delivered = tap_merged(&fixture, *request.request_id(), &[]);
+    fixture
+        .engine
+        .borrow_mut()
+        .execute_request(request)
+        .unwrap();
+
+    let legs = client_legs(&fixture);
+    assert_eq!(leg_windows(&legs), vec![("quotes", t("10:00:30"), end)]);
+    answer_leg(&fixture, legs[0], &[], &[]);
+
+    // The cache keeps the last 10,000 quotes
+    let cached = [10_000];
+    assert_eq!(
+        delivered.take(),
+        vec![
+            merged_quotes(&a_stamps[..10_000], &cached),
+            merged_quotes(&a_stamps[10_000..20_000], &cached),
+            merged_quotes(&a_stamps[20_000..], &cached),
+            merged_trades(&["t1"], &cached),
+            merged_quotes(&[t("10:00:01")], &cached),
+            merged_trades(&["t2"], &cached),
+            Merged::End(None),
+        ]
+    );
+    let catalog = ParquetDataCatalog::new(catalog_dir.path(), None, None, None, None);
+    let quotes = nautilus_persistence::catalog::types::CatalogDataType::Data(
+        nautilus_model::data::NautilusDataType::QuoteTick,
+    );
+    let identifier = fixture.instrument_id.to_string();
+    assert_eq!(
+        catalog.get_intervals(&quotes, Some(&identifier)).unwrap(),
+        vec![file_a, (file_b.0, end)]
+    );
+    assert_eq!(fixture.engine.borrow().request_pipeline_count(), 0);
+}
+
 /// A merged request whose catalog covers none of its window (its files hold another window) is
 /// served by its client alone: a trades and a quotes leg over the whole window, their rows
 /// merged by `ts_init`, a quote before a trade at one stamp (10:00:06), and once both have

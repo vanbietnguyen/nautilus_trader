@@ -56,7 +56,7 @@ use super::{
         has_continuous_future_params, request_params, sets_quotes, trading_days,
         uncovered_window_reason,
     },
-    responses::{PlacedSource, WindowSource, parent_request_window},
+    responses::{PlacedSource, WindowSource, append_failure, parent_request_window},
     time_range::has_time_range_pipeline_params,
 };
 use crate::replay::ReplaySource;
@@ -318,6 +318,54 @@ impl DataEngine {
             anyhow::bail!(failures.join("; "));
         }
         Ok(())
+    }
+
+    /// Writes the answer `response` of the request `request`, which `leg_id` names, back to a
+    /// catalog on its arrival (see [`Self::update_catalog_from_response`]), unless it answers a
+    /// leg of a `quotes` request whose catalog leg holds open sessions: a write-back can rename
+    /// a file such a session has listed and not yet opened (an empty answer extends the name of
+    /// the file next to it), so it then waits with the sessions until they have been read (see
+    /// [`Self::write_back_deferred`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a write-back run on arrival fails.
+    pub(super) fn update_catalog_on_arrival(
+        &mut self,
+        leg_id: &UUID4,
+        response: &DataResponse,
+        request: RequestCommand,
+    ) -> anyhow::Result<()> {
+        let sessions = self
+            .request_pipeline_parent_request_id
+            .get(leg_id)
+            .and_then(|(parent_id, _)| self.catalog_leg_sessions.get_mut(parent_id));
+
+        if let Some(sessions) = sessions {
+            sessions.write_backs.push((response.clone(), request));
+            return Ok(());
+        }
+
+        self.update_catalog_from_response(response, &request)
+    }
+
+    /// Runs the write-backs of a `quotes` request's client legs that waited for its catalog
+    /// leg's sessions (see [`Self::update_catalog_on_arrival`]), in their arrival order, once
+    /// the sessions have been read and dropped and before `answer`, the request's terminal, is
+    /// sent. A write-back that fails fails `answer` with its reason, as a failed leg does.
+    pub(super) fn write_back_deferred(
+        &mut self,
+        answer: DataResponseEnvelope,
+        write_backs: Vec<(DataResponse, RequestCommand)>,
+    ) -> DataResponseEnvelope {
+        write_backs
+            .into_iter()
+            .fold(answer, |answer, (response, request)| {
+                match self.update_catalog_from_response(&response, &request) {
+                    Ok(()) => answer,
+                    Err(e) => append_failure(answer, e.to_string()),
+                }
+            })
     }
 
     fn write_response_batch(
@@ -1341,6 +1389,7 @@ impl DataEngine {
                 slot,
                 quotes: Box::new(quotes),
                 trades: Box::new(trades),
+                write_backs: Vec::new(),
             },
         );
 
@@ -1670,15 +1719,25 @@ struct CatalogCoverage {
 /// The open catalog sessions of a `quotes` request's catalog leg, each a source of its merged
 /// answer that holds the chunk it reads (see [`DataEngine::open_catalog_leg_sessions`]). They
 /// are kept under the request from the leg's dispatch for as long as its slots: its completion
-/// or expiry takes them before anything is sent, and a `reset` or `dispose` drops them.
+/// or expiry takes them before anything is sent, and a `reset` or `dispose` drops them, with
+/// the write-backs waiting on them unwritten.
 pub(super) struct CatalogLegSessions {
     /// The leg's slot among its request's.
     slot: usize,
     quotes: Box<dyn ReplaySource>,
     trades: Box<dyn ReplaySource>,
+    /// The answers of the request's client legs to write back once the sessions have been read,
+    /// each with its leg's request, in arrival order (see
+    /// [`DataEngine::update_catalog_on_arrival`]).
+    write_backs: Vec<(DataResponse, RequestCommand)>,
 }
 
 impl CatalogLegSessions {
+    /// Takes the client legs' write-backs waiting on the sessions.
+    pub(super) fn take_write_backs(&mut self) -> Vec<(DataResponse, RequestCommand)> {
+        std::mem::take(&mut self.write_backs)
+    }
+
     /// Returns its quotes and its trades sources, each placed in its feed's slot order: after
     /// the responses of that feed `slots` hold before its slot.
     pub(super) fn placed(

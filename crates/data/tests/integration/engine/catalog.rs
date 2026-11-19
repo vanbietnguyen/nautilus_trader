@@ -5252,6 +5252,80 @@ mod quotes_sessions {
         assert_eq!(fixture.counts.dropped(), 2);
     }
 
+    /// Exactly 10,000 trades from the catalog and no quote: one trades part of 10,000, which
+    /// completes the answer (a full run of trades waits for a next trade, and none comes).
+    #[rstest]
+    fn test_quotes_request_over_exactly_ten_thousand_trades_alone_answers_one_completed_part(
+        audusd_sim: CurrencyPair,
+        stub_msgbus: Rc<RefCell<MessageBus>>,
+        client_id: ClientId,
+        venue: Venue,
+    ) {
+        let _ = stub_msgbus;
+        let instrument_id = audusd_sim.id;
+        let stamps = every(T0, 1_000_000, 10_000);
+        let mut fixture = Fixture::new(
+            vec![audusd_sim],
+            client_id,
+            venue,
+            feed(Vec::new()),
+            feed(stamps.clone()),
+        );
+
+        let (_, tapped) = fixture.request(instrument_id, json!({}));
+
+        assert_eq!(
+            tapped.borrow().sent,
+            vec![trades_of(&stamps), Sent::End(None)]
+        );
+        assert_eq!(fixture.counts.dropped(), 2);
+    }
+
+    /// The catalog's quotes cannot be read when the request is sent, and its client is asked the
+    /// trades the catalog lacks: the client's trades still go out before the one failed
+    /// terminal, the catalog's trade does not.
+    #[rstest]
+    fn test_quotes_request_whose_catalog_cannot_be_read_when_sent_still_sends_its_client_trades(
+        audusd_sim: CurrencyPair,
+        stub_msgbus: Rc<RefCell<MessageBus>>,
+        client_id: ClientId,
+        venue: Venue,
+    ) {
+        let _ = stub_msgbus;
+        let instrument_id = audusd_sim.id;
+        let quotes = Feed {
+            fails_after: Some(0),
+            ..feed(vec![at_second(1)])
+        };
+        let trades = Feed {
+            missing: vec![CLIENT_PART],
+            ..feed(vec![at_second(2)])
+        };
+        let mut fixture = Fixture::new(vec![audusd_sim], client_id, venue, quotes, trades);
+
+        let (_, tapped) = fixture.request(instrument_id, json!({}));
+        assert_eq!(fixture.counts.dropped(), 2);
+        let legs = fixture.client_legs();
+        assert_eq!(
+            legs.iter()
+                .map(|&(_, id, quotes)| (id, quotes))
+                .collect::<Vec<_>>(),
+            vec![(instrument_id, false)]
+        );
+        assert!(tapped.borrow().sent.is_empty());
+        fixture.answer_leg(legs[0], &[at_second(85), at_second(86)]);
+
+        let reason = "the made-up quotes page after row 0 is unreadable";
+        assert_eq!(
+            tapped.borrow().sent,
+            vec![
+                trades_of(&[at_second(85), at_second(86)]),
+                Sent::End(Some(reason.to_owned())),
+            ]
+        );
+        assert_eq!(fixture.engine.request_pipeline_count(), 0);
+    }
+
     /// What the engine is told while a request waits on its client leg.
     #[derive(Clone, Copy, Debug)]
     enum Interruption {

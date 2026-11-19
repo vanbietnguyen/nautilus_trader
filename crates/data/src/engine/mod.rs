@@ -2197,11 +2197,11 @@ impl DataEngine {
 
         let request = self.inflight_requests.remove(envelope.correlation_id());
         #[cfg(feature = "streaming")]
-        let envelope = match (&request, envelope.response()) {
+        let envelope = match (request, envelope.response()) {
             (Some(request), Some(response))
                 if envelope.completed() && envelope.failure_reason().is_none() =>
             {
-                match self.update_catalog_from_response(response, request) {
+                match self.update_catalog_on_arrival(envelope.correlation_id(), response, request) {
                     Ok(()) => envelope,
                     Err(e) => envelope.with_failure(e.to_string()),
                 }
@@ -2495,7 +2495,9 @@ impl DataEngine {
 
     /// Rebuilds a pipeline's answer from the envelopes its legs' slots hold, into one completed
     /// envelope; shared by the pipeline's completion and a joined request's expiry. Its reason
-    /// is `first_reason`, if any, followed by the reasons the legs carry.
+    /// is `first_reason`, if any, followed by the reasons the legs carry. A `quotes` request's
+    /// client legs' write-backs that waited for its catalog leg's sessions run once the answer
+    /// is built, before its terminal is sent, and a failed one fails the terminal.
     fn finish_request_pipeline(
         &mut self,
         parent_id: UUID4,
@@ -2506,13 +2508,34 @@ impl DataEngine {
         // A `quotes` request's catalog leg's open sessions leave the engine first, before
         // anything is sent; any return that does not merge them drops them
         #[cfg(feature = "streaming")]
-        let catalog_leg = self
-            .catalog_leg_sessions
-            .remove(&parent_id)
-            .map(|sessions| sessions.placed(&slots));
+        let (catalog_leg, write_backs) = match self.catalog_leg_sessions.remove(&parent_id) {
+            Some(mut sessions) => {
+                let write_backs = sessions.take_write_backs();
+                (Some(sessions.placed(&slots)), write_backs)
+            }
+            None => (None, Vec::new()),
+        };
         #[cfg(not(feature = "streaming"))]
         let catalog_leg = None;
 
+        let answer =
+            self.answer_request_pipeline(parent_id, parent, slots, first_reason, catalog_leg);
+
+        // The sessions have been read or dropped by now
+        #[cfg(feature = "streaming")]
+        let answer = self.write_back_deferred(answer, write_backs);
+        answer
+    }
+
+    // The body of `finish_request_pipeline`, given the catalog leg's sessions it took
+    fn answer_request_pipeline(
+        &mut self,
+        parent_id: UUID4,
+        parent: Option<&RequestCommand>,
+        slots: Vec<Option<Vec<DataResponseEnvelope>>>,
+        first_reason: Option<&str>,
+        catalog_leg: Option<(PlacedSource, PlacedSource)>,
+    ) -> DataResponseEnvelope {
         let mut failures = first_reason.into_iter().collect::<Vec<_>>();
         failures.extend(
             slots
