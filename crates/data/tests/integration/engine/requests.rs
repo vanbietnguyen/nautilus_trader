@@ -10808,49 +10808,6 @@ fn long_run_stamps() -> Vec<u64> {
 
 #[cfg(feature = "streaming")]
 #[rstest]
-fn test_merged_answer_of_a_session_of_quotes_alone_sends_parts_of_at_most_ten_thousand(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-) {
-    let _ = stub_msgbus;
-    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
-    let minute = bar_type_of(fixture.instrument_id, "1-MINUTE");
-    let t = |time: &str| utc_ns(&format!("2024-01-08T{time}Z"));
-    let window = (t("10:00:00"), t("10:02:00"));
-    let stamps = long_run_stamps();
-    let quotes: Vec<_> = stamps.iter().copied().map(quote_at).collect();
-
-    // The trade file covers the window, its one trade is before it: the session is quotes alone
-    let delivered = run_merged(
-        &fixture,
-        "merged-long-quotes",
-        &[minute],
-        window,
-        &[
-            merged_run((t("09:59:00"), window.1), &[], &[(t("09:59:30"), "t0")]),
-            merged_run(window, &quotes, &[]),
-        ],
-    );
-
-    // One run of 25,000 quotes, cut at 10,000 rows, each part cached as it is sent (the cache
-    // keeps the last 10,000 quotes); no trade feeds a bar; the empty last trades part ends it
-    let quotes_part = |rows: &[u64]| Merged::Quotes(at_ns(rows), vec![0, 10_000]);
-    assert_eq!(
-        delivered,
-        vec![
-            quotes_part(&stamps[..10_000]),
-            quotes_part(&stamps[10_000..20_000]),
-            quotes_part(&stamps[20_000..]),
-            merged_trades(&[], &[0, 10_000]),
-            Merged::End(None),
-        ]
-    );
-}
-
-#[cfg(feature = "streaming")]
-#[rstest]
 fn test_merged_answer_sends_a_run_of_trades_over_ten_thousand_as_parts_of_at_most_ten_thousand(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,

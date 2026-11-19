@@ -2641,7 +2641,7 @@ impl DataEngine {
     /// when `trim` is set (see [`quote_and_trade_runs`]). The catalog leg answered its slot with
     /// no rows: its open sessions, `catalog_leg` (its quotes, then its trades), are its sources,
     /// each at its slot's place in its feed's order and narrowed to the request's window when
-    /// they were opened (see [`streaming::CatalogLegSessions`]).
+    /// they were opened (see `streaming::CatalogLegSessions`).
     ///
     /// The parts take the ordinary route: trades parts feed the request's aggregators (through
     /// the interleaved path when the request interleaves); quotes parts reach only its
@@ -2651,8 +2651,8 @@ impl DataEngine {
     /// response route and one handler call, and the parts number the runs of quotes plus the
     /// runs of trades (plus, when interleaving, the splits and the bars): about twice the runs
     /// of trades, so a window whose quotes and trades alternate tick by tick sends about two
-    /// parts per trade. A run is cut at 10,000 rows as well (see [`quote_and_trade_runs`]), so
-    /// a longer run of one type is several parts.
+    /// parts per trade. A run is cut at 10,000 rows as well, at the end of a stamp (see
+    /// [`quote_and_trade_runs`]), so a longer run of one type is several parts.
     ///
     /// Memory, per request (the parts are new buffers, not views of the answer): the catalog
     /// leg holds no rows of its window; each of its sessions holds the chunk it is read from
@@ -2661,12 +2661,12 @@ impl DataEngine {
     /// legs' answers of the parts the catalog does not cover are held whole until the pipeline
     /// completes, each leg's source keeping views of its rows (a sorted copy if they come
     /// unsorted). [`quote_and_trade_runs`] copies each run into its part and sends it as it is
-    /// cut, so one part of at most 10,000 rows is held at a time (a split run is copied once
-    /// more, stretch by stretch, as it is sent), and a handler's return paces the reading of
-    /// the rows after its part. The peak is therefore about the client legs' rows, plus one
-    /// part, plus each session's chunk and read-ahead, whatever the window's size, while a
-    /// stamp's rows and a feed's overlapping files stay few. Part counts, wall time and memory
-    /// of a real session are unmeasured.
+    /// cut, so one part of 10,000 rows (more only where its last stamp's rows carry it past) is
+    /// held at a time (a split run is copied once more, stretch by stretch, as it is sent), and
+    /// a handler's return paces the reading of the rows after its part. The peak is therefore
+    /// about the client legs' rows, plus one part, plus each session's chunk and read-ahead,
+    /// whatever the window's size, while a stamp's rows and a feed's overlapping files stay few.
+    /// Part counts, wall time and memory of a real session are unmeasured.
     ///
     /// # Errors
     ///

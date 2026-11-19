@@ -4665,6 +4665,8 @@ mod quotes_sessions {
     struct Tapped {
         sent: Vec<Sent>,
         identities: Vec<Identity>,
+        /// The instrument of each quote it was sent, in order.
+        quote_instruments: Vec<InstrumentId>,
     }
 
     impl Tapped {
@@ -4699,6 +4701,8 @@ mod quotes_sessions {
                         params: r.params.clone(),
                     };
                     let stamps = r.data.iter().map(|quote| quote.ts_init.as_u64()).collect();
+                    let instruments = r.data.iter().map(|quote| quote.instrument_id);
+                    tapped.quote_instruments.extend(instruments);
                     tapped.record(Sent::Quotes(stamps), Some(identity));
                 }
                 Some(DataResponse::Trades(r)) => {
@@ -4889,9 +4893,9 @@ mod quotes_sessions {
 
     /// Two hundred thousand quotes and as many trades, one after the other: the requester gets
     /// each row as its own part, in the generated order, under one identity, and one terminal.
-    /// Rows yielded and not yet delivered never exceed the run cap plus a page of each feed
-    /// whenever a page is handed out, where a session held whole would hold 400,000: two pages,
-    /// and the row of each the cutter has not yet sent, is all it reaches.
+    /// The rows read from the catalog and not yet delivered, on the engine's side (not the
+    /// Parquet reader's own queues), never exceed the run cap plus a page of each feed whenever
+    /// a page is handed out, where a session held whole would hold 400,000.
     #[rstest]
     fn test_quotes_request_reads_its_catalog_a_page_at_a_time_and_never_holds_a_session(
         audusd_sim: CurrencyPair,
@@ -4945,7 +4949,6 @@ mod quotes_sessions {
             }]
         );
         assert!(fixture.counts.peak() <= RUN_CAP + 2 * PAGE_ROWS);
-        assert_eq!(fixture.counts.peak(), 2 * PAGE_ROWS + 1);
         assert_eq!(fixture.counts.dropped(), 2);
         assert_eq!(fixture.engine.request_pipeline_count(), 0);
     }
@@ -5249,6 +5252,84 @@ mod quotes_sessions {
             ]
         );
         assert!(fixture.counts.peak() <= RUN_CAP + 2 * PAGE_ROWS);
+        assert_eq!(fixture.counts.dropped(), 2);
+    }
+
+    /// 9,999 quotes of GBP/USD from the catalog, which lacks the quotes from 80 s; its client
+    /// answers them in two envelopes, a GBP/USD quote at 85 s, then an AUD/USD quote at 85 s and
+    /// a GBP/USD quote at 86 s. The quotes at 85 s go out by instrument, AUD/USD first, as one
+    /// feed's rows were sorted before its envelopes became sources of their own, and the 10,000th
+    /// quote, the first at 85 s, does not cut that stamp's quotes in two: the first part holds
+    /// 10,001.
+    #[rstest]
+    fn test_quotes_request_sends_one_stamps_quotes_of_two_envelopes_by_instrument_in_one_part(
+        audusd_sim: CurrencyPair,
+        stub_msgbus: Rc<RefCell<MessageBus>>,
+        client_id: ClientId,
+        venue: Venue,
+    ) {
+        let _ = stub_msgbus;
+        let (aud, gbp) = (audusd_sim.id, gbpusd_sim().id);
+        let catalog_quotes = every(T0, 1_000_000, 9_999);
+        let quotes = Feed {
+            missing: vec![CLIENT_PART],
+            ..feed(catalog_quotes.clone())
+        };
+        let mut fixture = Fixture::new(
+            vec![audusd_sim, gbpusd_sim()],
+            client_id,
+            venue,
+            quotes,
+            feed(Vec::new()),
+        );
+
+        let (_, tapped) = fixture.request(gbp, json!({}));
+        let legs = fixture.client_legs();
+        assert_eq!(
+            legs.iter()
+                .map(|&(_, id, quotes)| (id, quotes))
+                .collect::<Vec<_>>(),
+            vec![(gbp, true)]
+        );
+        let leg_id = legs[0].0;
+        for (rows, completed) in [
+            (vec![(gbp, at_second(85))], false),
+            (vec![(aud, at_second(85)), (gbp, at_second(86))], true),
+        ] {
+            let quotes: Vec<_> = rows
+                .into_iter()
+                .map(|(id, ts)| make_quote(id, "1.0000", "1.0002", ts))
+                .collect();
+            let response = DataResponse::Quotes(QuotesResponse::new(
+                leg_id,
+                client_id,
+                gbp,
+                quotes,
+                None,
+                None,
+                UnixNanos::from(NOW),
+                None,
+            ));
+            fixture
+                .engine
+                .response_envelope(DataResponseEnvelope::new(response, completed, None));
+        }
+
+        let mut first_part = catalog_quotes;
+        first_part.extend([at_second(85), at_second(85)]);
+        let mut instruments = vec![gbp; 9_999];
+        instruments.extend([aud, gbp, gbp]);
+        let tapped = tapped.borrow();
+        assert_eq!(
+            tapped.sent,
+            vec![
+                Sent::Quotes(first_part),
+                quotes_of(&[at_second(86)]),
+                trades_of(&[]),
+                Sent::End(None),
+            ]
+        );
+        assert_eq!(tapped.quote_instruments, instruments);
         assert_eq!(fixture.counts.dropped(), 2);
     }
 

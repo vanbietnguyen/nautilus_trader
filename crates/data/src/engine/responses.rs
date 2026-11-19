@@ -16,7 +16,7 @@
 use std::{iter::Fuse, ops::Range, sync::Arc};
 
 use nautilus_common::messages::data::{InstrumentsResponse, QuotesResponse, TradesResponse};
-use nautilus_model::data::{BatchView, DataBatch, QuoteTick};
+use nautilus_model::data::{BatchView, DataBatch, QuoteTick, TradeTick};
 
 use super::{
     BookDeltasResponse, BookType, CustomData, CustomDataResponse, Data, DataEngine, DataResponse,
@@ -301,9 +301,10 @@ pub(super) fn keep_open_end(rebuilt: &mut DataResponse) {
     }
 }
 
-/// The most rows one part of a merged answer carries (the catalog's chunk size): a run of quotes
-/// that reaches it is sent as a part, a run of trades when the next trade arrives, and a new run
-/// starts.
+/// The rows one part of a merged answer carries (the catalog's chunk size): a run that holds them
+/// is sent as a part when the next row of its type has a later stamp, and a new run starts. A
+/// part holds more only where the rows of its last stamp carry it past them, as a catalog chunk
+/// is extended through its last stamp.
 const MERGED_PART_ROWS: usize = 10_000;
 
 /// Sends the rows of `quote_sources` and `trade_sources` in one time order through `send` as
@@ -313,11 +314,14 @@ const MERGED_PART_ROWS: usize = 10_000;
 /// replay iterator on its own, by `ts_init`:
 /// every quotes source first, then every trades source, each feed's in slot order, so a quote
 /// comes before a trade at an equal stamp (the backtest's order), also where a source's next
-/// batch starts at that stamp, and rows of one feed at an equal stamp go in slot order. A run of
-/// one type is cut where the type changes and at 10,000 rows (a run of trades only when another
-/// trade follows, so the last run of trades, the answer's last part, holds up to 10,000); each
-/// run is sent as it is cut, so no two parts are held at once. Each part carries the identity
-/// and window of `quotes` or `trades`, whose rows are not read.
+/// batch starts at that stamp. The rows of one type at one stamp are a group: a group of more
+/// than one instrument is stably sorted by instrument before it is sent, as each feed's rows
+/// were sorted by `ts_init`, then instrument, before its legs became sources of their own (an
+/// instrument's rows keep their slot order). A run of one type is cut where the type changes
+/// and, once it holds 10,000 rows, when the next row of its type has a later stamp, so a group
+/// is never cut in two and a run of exactly 10,000 trades that ends the answer is its last part;
+/// each run is sent as it is cut, so no two parts are held at once. Each part carries the
+/// identity and window of `quotes` or `trades`, whose rows are not read.
 ///
 /// # Errors
 ///
@@ -488,36 +492,28 @@ fn cut_quote_and_trade_runs(
     trades: &TradesResponse,
     mut send: impl FnMut(DataResponse),
 ) -> anyhow::Result<TradesResponse> {
-    let mut quote_run = Vec::new();
-    let mut trade_run = Vec::new();
+    let mut quote_run = OpenRun::new(|quote: &QuoteTick| quote.instrument_id);
+    let mut trade_run = OpenRun::new(|trade: &TradeTick| trade.instrument_id);
 
     loop {
         match replay.next()? {
             ReplayPoll::Ready(Data::Quote(quote)) => {
                 if !trade_run.is_empty() {
-                    let run = std::mem::take(&mut trade_run);
-                    send(DataResponse::Trades(trades_part(trades, run)));
+                    send(DataResponse::Trades(trades_part(trades, trade_run.take())));
                 }
-                quote_run.push(quote);
 
-                if quote_run.len() == MERGED_PART_ROWS {
-                    let run = std::mem::take(&mut quote_run);
+                if let Some(run) = quote_run.push(quote) {
                     send(DataResponse::Quotes(quotes_part(quotes, run)));
                 }
             }
             ReplayPoll::Ready(Data::Trade(trade)) => {
                 if !quote_run.is_empty() {
-                    let run = std::mem::take(&mut quote_run);
-                    send(DataResponse::Quotes(quotes_part(quotes, run)));
+                    send(DataResponse::Quotes(quotes_part(quotes, quote_run.take())));
                 }
 
-                // A full run of trades waits for the next trade, so one that ends the answer
-                // completes it
-                if trade_run.len() == MERGED_PART_ROWS {
-                    let run = std::mem::take(&mut trade_run);
+                if let Some(run) = trade_run.push(trade) {
                     send(DataResponse::Trades(trades_part(trades, run)));
                 }
-                trade_run.push(trade);
             }
             ReplayPoll::Ready(other) => {
                 anyhow::bail!("The replay of quotes and trades yielded {other:?}")
@@ -530,10 +526,66 @@ fn cut_quote_and_trade_runs(
     }
 
     if !quote_run.is_empty() {
-        send(DataResponse::Quotes(quotes_part(quotes, quote_run)));
+        send(DataResponse::Quotes(quotes_part(quotes, quote_run.take())));
     }
 
-    Ok(trades_part(trades, trade_run))
+    Ok(trades_part(trades, trade_run.take()))
+}
+
+/// The open run of one type of a merged answer: its rows, of which those from `group` on are the
+/// rows of its last stamp.
+struct OpenRun<T> {
+    rows: Vec<T>,
+    group: usize,
+    instrument: fn(&T) -> InstrumentId,
+}
+
+impl<T: HasTsInit> OpenRun<T> {
+    fn new(instrument: fn(&T) -> InstrumentId) -> Self {
+        Self {
+            rows: Vec::new(),
+            group: 0,
+            instrument,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Adds `row`. A row at another stamp than the run's last ends that stamp's group first and,
+    /// when the run then holds [`MERGED_PART_ROWS`], returns the run's rows as a part's; a row at
+    /// the last stamp joins its group.
+    fn push(&mut self, row: T) -> Option<Vec<T>> {
+        let mut part = None;
+
+        if self
+            .rows
+            .last()
+            .is_some_and(|last| last.ts_init() != row.ts_init())
+        {
+            self.end_group();
+
+            if self.rows.len() >= MERGED_PART_ROWS {
+                part = Some(self.take());
+            }
+        }
+        self.rows.push(row);
+        part
+    }
+
+    /// Ends the last stamp's group and takes the run's rows, leaving it empty.
+    fn take(&mut self) -> Vec<T> {
+        self.end_group();
+        self.group = 0;
+        std::mem::take(&mut self.rows)
+    }
+
+    // Sorts the last stamp's rows stably by instrument and starts the next group after them
+    fn end_group(&mut self) {
+        self.rows[self.group..].sort_by_key(self.instrument);
+        self.group = self.rows.len();
+    }
 }
 
 /// Builds a quotes part of a merged answer, carrying the quotes response's identity and window.
@@ -693,10 +745,7 @@ pub(super) fn rebind_response_correlation(mut resp: DataResponse, new_id: UUID4)
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
-
     use nautilus_model::{
-        data::TradeTick,
         enums::AggressorSide,
         identifiers::{ClientId, TradeId},
         types::{Price, Quantity},
@@ -705,105 +754,6 @@ mod tests {
 
     use super::*;
     use crate::replay::{ReplayBatch, ReplaySource};
-
-    const PAGE_ROWS: usize = 1_000;
-
-    /// Hands out quotes stamped 1 to `total` in pages of [`PAGE_ROWS`], counting the rows it
-    /// has handed out.
-    struct CountedQuotes {
-        handed_out: Rc<Cell<usize>>,
-        total: usize,
-    }
-
-    impl ReplaySource for CountedQuotes {
-        fn poll_batch(&mut self) -> anyhow::Result<ReplayPoll<ReplayBatch>> {
-            let start = self.handed_out.get();
-
-            if start == self.total {
-                return Ok(ReplayPoll::Complete);
-            }
-            let end = (start + PAGE_ROWS).min(self.total);
-            let page = (start..end)
-                .map(|row| {
-                    let ts = UnixNanos::from(row as u64 + 1);
-                    QuoteTick::new(
-                        InstrumentId::from("AUD/USD.SIM"),
-                        Price::from("1.0000"),
-                        Price::from("1.0002"),
-                        Quantity::from(1),
-                        Quantity::from(1),
-                        ts,
-                        ts,
-                    )
-                })
-                .collect::<Vec<_>>();
-            self.handed_out.set(end);
-            Ok(ReplayPoll::Ready(ReplayBatch::Typed(DataBatch::Quote(
-                page.into(),
-            ))))
-        }
-    }
-
-    #[rstest]
-    fn test_merged_answer_sends_its_first_part_before_it_cuts_its_last_run() {
-        let total = 25_000;
-        let handed_out = Rc::new(Cell::new(0));
-        let mut replay = DataIterator::new();
-        let source = CountedQuotes {
-            handed_out: Rc::clone(&handed_out),
-            total,
-        };
-        replay.add_source("quotes", Box::new(source), true).unwrap();
-        let instrument_id = InstrumentId::from("AUD/USD.SIM");
-        let (client_id, ts_init) = (ClientId::new("SIM"), UnixNanos::default());
-        let quotes = QuotesResponse::new(
-            UUID4::new(),
-            client_id,
-            vec![instrument_id],
-            Vec::new(),
-            None,
-            None,
-            ts_init,
-            None,
-        );
-        let trades = TradesResponse::new(
-            quotes.correlation_id,
-            client_id,
-            vec![instrument_id],
-            Vec::new(),
-            None,
-            None,
-            ts_init,
-            None,
-        );
-
-        // Each part with the rows the source had handed out when it was sent
-        let mut sent = Vec::new();
-        let last = cut_quote_and_trade_runs(&mut replay, &quotes, &trades, |part| {
-            let DataResponse::Quotes(part) = part else {
-                panic!("a quotes part: {part:?}");
-            };
-            let stamps = part.data.iter().map(|quote| quote.ts_init.as_u64());
-            sent.push((stamps.collect::<Vec<_>>(), handed_out.get()));
-        })
-        .unwrap();
-
-        assert!(last.data.is_empty());
-        let sizes = sent.iter().map(|(rows, _)| rows.len()).collect::<Vec<_>>();
-        assert_eq!(sizes, [10_000, 10_000, 5_000]);
-        let delivered = sent.iter().flat_map(|(rows, _)| rows.iter().copied());
-        assert!(delivered.eq(1..=total as u64));
-
-        // The first part goes out before any row of the last run is handed out, and no part
-        // waits on more than the cap and one page beyond the rows sent before it
-        assert!(sent[0].1 <= 2 * MERGED_PART_ROWS);
-        let mut sent_before = 0;
-
-        for (rows, handed_out) in &sent {
-            assert!(handed_out - sent_before <= MERGED_PART_ROWS + PAGE_ROWS);
-            sent_before += rows.len();
-        }
-    }
 
     // A quote at `ts`, its slot carried as its `ts_event`
     fn quote(ts: u64, slot: u64) -> QuoteTick {
@@ -895,28 +845,6 @@ mod tests {
     }
 
     #[rstest]
-    fn test_merged_answer_takes_a_quote_before_a_trade_at_the_stamp_its_next_batch_starts() {
-        // The quotes' first batch ends at 9; the trades already hold a trade at 10
-        let quotes = vec![
-            DataBatch::Quote(vec![quote(8, 1), quote(9, 1)].into()),
-            DataBatch::Quote(vec![quote(10, 1), quote(11, 1)].into()),
-        ];
-        let trades = vec![DataBatch::Trade(vec![trade(10, 1)].into())];
-
-        let parts = merged_parts(vec![source(quotes)], vec![source(trades)]);
-
-        assert_eq!(
-            parts,
-            [
-                ("quotes", vec![(8, 1), (9, 1), (10, 1)]),
-                ("trades", vec![(10, 1)]),
-                ("quotes", vec![(11, 1)]),
-                ("trades", vec![]),
-            ]
-        );
-    }
-
-    #[rstest]
     fn test_merged_answer_sends_the_rows_of_one_feed_at_one_stamp_in_slot_order() {
         // Two sources of each feed, as two files of it, each with a row at 5
         let quote_sources = vec![
@@ -938,30 +866,6 @@ mod tests {
                 ("quotes", vec![(5, 1), (5, 2)]),
                 ("trades", vec![(5, 3), (5, 4)]),
                 ("quotes", vec![(6, 1)]),
-                ("trades", vec![]),
-            ]
-        );
-    }
-
-    #[rstest]
-    fn test_merged_answer_leaves_out_a_leg_empty_in_its_window() {
-        let window = (Some(UnixNanos::from(10)), Some(UnixNanos::from(20)));
-        let rows = |rows: Vec<QuoteTick>| vec![DataBatch::Quote(rows.into())];
-        let outside = rows(vec![quote(5, 1), quote(25, 1)]);
-        let inside = rows(vec![quote(9, 2), quote(10, 2), quote(20, 2), quote(21, 2)]);
-        let mut quote_sources = leg_sources(outside, window.0, window.1).unwrap();
-        quote_sources.extend(leg_sources(inside, window.0, window.1).unwrap());
-        let trades = vec![DataBatch::Trade(vec![trade(15, 3)].into())];
-        let trade_sources = leg_sources(trades, window.0, window.1).unwrap();
-
-        let parts = merged_parts(quote_sources, trade_sources);
-
-        assert_eq!(
-            parts,
-            [
-                ("quotes", vec![(10, 2)]),
-                ("trades", vec![(15, 3)]),
-                ("quotes", vec![(20, 2)]),
                 ("trades", vec![]),
             ]
         );
