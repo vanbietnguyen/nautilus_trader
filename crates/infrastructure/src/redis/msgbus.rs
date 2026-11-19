@@ -700,6 +700,8 @@ struct PendingEntries {
     discarded: usize,
     /// Set by the close message, after which nothing more is admitted.
     closing: bool,
+    /// Set when the close has taken its counts, after which a message is refused uncounted.
+    closed: bool,
     /// What the publish task has counted in its state, kept here so the close reads it whether
     /// the task ended or was aborted.
     counts: StreamCounts,
@@ -800,12 +802,12 @@ impl PublishSender {
     /// entry this thread last numbered through [`RedisMessageBusBacking::reserve_source`]; one past
     /// [`MAX_PENDING_AGE`] is dropped and counted as discarded. The close message stops admission
     /// instead: each message sent after it is dropped and counted as discarded, whether or not the
-    /// publish task has ended.
+    /// publish task has ended, until the close takes its counts.
     ///
     /// # Errors
     ///
     /// Returns an error, and admits nothing, if the publish task has ended before the close
-    /// message.
+    /// message, or the close has taken its counts.
     fn send(&self, message: BusMessage) -> Result<(), tokio::sync::mpsc::error::SendError<()>> {
         // Its age runs from the call, not from when the lock is free
         let now = tokio::time::Instant::now();
@@ -817,7 +819,7 @@ impl PublishSender {
         let dropped = {
             let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
 
-            if message.topic != CLOSE_TOPIC && pending.closing {
+            if message.topic != CLOSE_TOPIC && pending.closing && !pending.closed {
                 pending.discarded += 1;
                 Vec::new()
             } else if self.wake.is_closed() {
@@ -844,9 +846,11 @@ impl PublishSender {
 
     /// Returns the publish task's counts once it has ended, with what it left pending: the
     /// messages it never took into a batch, or dropped at admission and did not count, as
-    /// discarded, and those of the batch it was writing as uncertain.
+    /// discarded, and those of the batch it was writing as uncertain. A message sent after this is
+    /// refused, not counted.
     fn closed_counts(&self) -> StreamCounts {
-        let pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        pending.closed = true;
         StreamCounts {
             written: pending.counts.written,
             discarded: pending.counts.discarded + pending.discarded + pending.buffer.len(),
@@ -1457,7 +1461,8 @@ impl StreamState {
         }
     }
 
-    /// Moves to `link`, logging one record when it changes.
+    /// Moves to `link`, logging one record when it changes: at information level when it becomes
+    /// connected, and at warning level when it becomes degraded.
     fn change(&mut self, link: StreamLink) {
         if self.link == Some(link) {
             return;
@@ -1465,7 +1470,10 @@ impl StreamState {
         self.link = Some(link);
         self.since = get_atomic_clock_realtime().get_time_ns();
 
-        log::warn!("Stream {self}");
+        match link {
+            StreamLink::Connected => log::info!("Stream {self}"),
+            StreamLink::Degraded => log::warn!("Stream {self}"),
+        }
     }
 }
 
@@ -5566,6 +5574,59 @@ mod tests {
 
     #[rstest]
     #[tokio::test(start_paused = true)]
+    async fn test_backing_clean_start_logs_its_connected_records_without_a_warning() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let writer = FakeRedis::start("unused").await;
+        writer.accept_writes.store(true, Ordering::SeqCst);
+        let stream_keys = vec!["trader-PUBLISHER-007:stream".to_string()];
+        let reader = FakeRedisStreams::start(&stream_keys, 0).await;
+        let config = MessageBusConfig {
+            stream_per_topic: false,
+            external_streams: Some(stream_keys),
+            ..Default::default()
+        };
+        let (mut backing, _) = backing_on_this_runtime(writer.config(), reader.config(), config);
+        backing.publish(fake_bus_message());
+        let record_count = || {
+            thread_logs()
+                .iter()
+                .filter(|(_, line)| line.starts_with("Stream "))
+                .count()
+        };
+        drive_until(
+            || writer.written_len() == 1 && record_count() == 2,
+            Duration::from_secs(5),
+        )
+        .await;
+        let logs = thread_logs();
+        let waits = tasks_wait(&backing, &writer, Some(&reader));
+        close_on_clock(&mut backing, waits).await;
+
+        let mut records = state_records(&logs);
+        records.sort();
+        assert_eq!(
+            records,
+            [
+                ("connected".to_string(), true, 0, 0),
+                ("connected".to_string(), true, 0, 0),
+            ]
+        );
+        assert!(logs.iter().any(|(level, line)| *level == log::Level::Info
+            && line.starts_with("Stream connected since ")
+            && line.contains(", last write ")));
+        assert!(logs.iter().any(|(level, line)| *level == log::Level::Info
+            && line.starts_with("Stream connected since ")
+            && line.contains(", last read ")));
+        let warnings: Vec<_> = logs
+            .iter()
+            .filter(|(level, _)| *level <= log::Level::Warn)
+            .collect();
+        assert_eq!(warnings, Vec::<&(log::Level, String)>::new());
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
     async fn test_backing_close_writes_what_is_pending_and_logs_its_counts_once() {
         capture_logs();
         let _clock = ManualClock::hold();
@@ -6116,6 +6177,42 @@ mod tests {
             )]
         );
         assert_eq!(error_lines(&logs), Vec::<String>::new());
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_backing_refuses_a_publication_after_its_close_has_taken_its_counts() {
+        capture_logs();
+        let _clock = ManualClock::hold();
+        let writer = FakeRedis::start("unused").await;
+        writer.accept_writes.store(true, Ordering::SeqCst);
+        let config = MessageBusConfig {
+            stream_per_topic: false,
+            ..Default::default()
+        };
+        let (mut backing, _) = backing_on_this_runtime(writer.config(), writer.config(), config);
+        backing.publish(fake_bus_message());
+        drive_until(|| writer.written_len() == 1, Duration::from_secs(5)).await;
+        let waits = tasks_wait(&backing, &writer, None);
+        let took = close_on_clock(&mut backing, waits).await;
+
+        backing.publish(fake_bus_message());
+
+        let logs = thread_logs();
+        assert!(took.is_some_and(|took| took < CLOSE_DEADLINE), "{took:?}");
+        assert_eq!(writer.written_len(), 1);
+        assert_eq!(
+            close_lines(&logs),
+            [(
+                log::Level::Info,
+                "Closed the stream: 1 written, 0 discarded, 0 uncertain".to_string()
+            )]
+        );
+        assert_eq!(
+            error_lines(&logs),
+            ["Failed to send message: channel closed".to_string()]
+        );
+        assert_eq!(backing.pub_tx.closed_counts().discarded, 0);
     }
 
     // Redis is away when the backing starts, and the close takes its first connect in flight
@@ -7090,17 +7187,23 @@ mod tests {
             .collect()
     }
 
-    /// Returns each state record of the stream, all at warning level, as its state, whether it
-    /// names a last write or read, and its discarded and uncertain counts.
+    /// Returns each state record of the stream, a connected one at information level and a
+    /// degraded one at warning level, as its state, whether it names a last write or read, and its
+    /// discarded and uncertain counts.
     fn state_records(logs: &[(log::Level, String)]) -> Vec<(String, bool, usize, usize)> {
         logs.iter()
             .filter(|(_, line)| line.starts_with("Stream "))
             .map(|(level, line)| {
-                assert_eq!(*level, log::Level::Warn, "{line}");
                 let (head, values) = line.split_once(", last ").unwrap();
                 // The publish task's last write or the stream task's last read
                 let (_, values) = values.split_once(' ').unwrap();
                 let link = head.split(' ').nth(1).unwrap().to_string();
+                let expected_level = if link == "connected" {
+                    log::Level::Info
+                } else {
+                    log::Level::Warn
+                };
+                assert_eq!(*level, expected_level, "{line}");
                 let [last_write, discarded, uncertain] =
                     values.split(", ").collect::<Vec<_>>().try_into().unwrap();
                 (
