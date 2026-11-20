@@ -52,8 +52,7 @@ use ustr::Ustr;
 use super::{
     DataEngine,
     requests::{
-        AdmittedJoin, FILTER_EXPR, QUOTES_REFUSED, describe_missing_sessions,
-        has_continuous_future_params, request_params, sets_quotes, trading_days,
+        FILTER_EXPR, QUOTES_REFUSED, has_continuous_future_params, request_params, sets_quotes,
         uncovered_window_reason,
     },
     responses::{PlacedSource, WindowSource, append_failure, parent_request_window},
@@ -67,7 +66,6 @@ const PARAM_FORCE_INSTRUMENT_UPDATE: &str = "force_instrument_update";
 const PARAM_SUBSCRIPTION_NAME: &str = "subscription_name";
 pub(super) const PARAM_FROM_DAY_START: &str = "from_day_start";
 const CATALOG_CLIENT_ID: &str = "CATALOG";
-const PARAM_REPLAY_START: &str = "replay_start";
 /// Why a part of the window of a request that builds bars has no source.
 const NO_SOURCE: &str = "no catalog file holds it and no client resolves";
 
@@ -637,11 +635,7 @@ impl DataEngine {
         if !skip_catalog_data && let Some(catalog) = winning_catalog {
             let request =
                 with_dates_for_pipeline(req, Some(catalog_start_dt), Some(end_dt), now_ns);
-            plan.push(RequestLeg::Catalog {
-                request,
-                catalog,
-                unavailable: Vec::new(),
-            });
+            plan.push(RequestLeg::Catalog { request, catalog });
         }
 
         let leg_request = |(start, end): (u64, u64)| {
@@ -720,7 +714,6 @@ impl DataEngine {
                 plan.push(RequestLeg::Catalog {
                     request: member,
                     catalog,
-                    unavailable: Vec::new(),
                 });
             }
 
@@ -806,125 +799,16 @@ impl DataEngine {
         Ok(None)
     }
 
-    /// Plans and dispatches the legs of an admitted join through the request pipeline.
-    pub(super) fn dispatch_join_plan(
-        &mut self,
-        req: RequestCommand,
-        session_opens: &[UnixNanos],
-    ) -> anyhow::Result<()> {
-        let plan = self.plan_join(&req, session_opens)?;
-        if !plan.missing_sessions.is_empty() {
-            log::warn!(
-                "Join {} misses {} past sessions of its depth",
-                req.request_id(),
-                plan.missing_sessions.len(),
-            );
-        }
-        self.dispatch_request_plan(req, plan.legs)
-    }
-
-    /// Returns the plan of an admitted join over `session_opens` (strictly increasing trading-day
-    /// opens, the last the current one, `H`).
-    ///
-    /// Past sessions come from one catalog leg over `[first open, H)`, asked up to `H - 1 ns`
-    /// (the catalog's upper bound is inclusive), only when a catalog is registered. Rows own
-    /// their trading day by `ts_init` against the civil 18:00 New York boundaries, so a catalog
-    /// row at or after `H` stays outside the catalog leg. The asker lists in `session_opens` the
-    /// past days it verified; a day of the depth it does not list is not held: none of its rows
-    /// is used, and the day is named and counted in `missing_sessions`, as is every past day
-    /// when no catalog is registered. The current session always comes from one open-ended tail
-    /// from `H` with `replay_start = H`. The terminal's reason names the missing sessions and
-    /// says when no catalog is registered: a payload-free leg carries it, so it reaches the
-    /// rebuilt answer's failure reason with the other legs' failures.
-    fn plan_join(
-        &mut self,
-        req: &RequestCommand,
-        session_opens: &[UnixNanos],
-    ) -> anyhow::Result<JoinPlan> {
-        let (&current_open, past) = session_opens
-            .split_last()
-            .context("a join names the current trading day's open")?;
-        let key = request_identifier(req).context("a join is a trades request")?;
-        let instrument = key.identifier.as_deref().unwrap_or_default().to_owned();
-        let now = self.clock.borrow().timestamp_ns();
-        let days = match past.first() {
-            Some(&first) => trading_days(first, current_open)?,
-            None => Vec::new(),
-        };
-
-        let mut legs = Vec::with_capacity(3);
-        let mut missing_sessions = Vec::new();
-        let mut reasons = Vec::new();
-
-        if self.catalogs_registered() {
-            let mut unavailable = Vec::new();
-            for (open, next_open) in days {
-                if past.binary_search(&open).is_err() {
-                    missing_sessions.push(open);
-                    unavailable.push((open, next_open));
-                }
-            }
-
-            if let Some(&first) = past.first() {
-                let params = request_params(req).context("a join carries its parameters")?;
-                let catalog =
-                    self.catalog_for_update(&key.data_type, key.identifier.as_deref(), params)?;
-                let last = UnixNanos::from(current_open.as_u64() - 1);
-                let request = with_dates_for_pipeline(
-                    req,
-                    Some(first.to_datetime_utc()),
-                    Some(last.to_datetime_utc()),
-                    now,
-                );
-                legs.push(RequestLeg::Catalog {
-                    request,
-                    catalog,
-                    unavailable,
-                });
-            }
-        } else {
-            missing_sessions.extend(days.into_iter().map(|(open, _)| open));
-            reasons.push(
-                "no catalog is registered, so only the current session's replay was requested"
-                    .to_owned(),
-            );
-        }
-
-        let mut tail =
-            with_dates_for_pipeline(req, Some(current_open.to_datetime_utc()), None, now);
-        set_replay_start(&mut tail, current_open);
-        legs.push(RequestLeg::Client(tail));
-
-        if !missing_sessions.is_empty() {
-            reasons.push(describe_missing_sessions(&missing_sessions)?);
-        }
-        if !reasons.is_empty() {
-            legs.push(RequestLeg::Terminal {
-                request_id: UUID4::new(),
-                reason: format!("The join for {instrument}: {}", reasons.join("; ")),
-            });
-        }
-
-        Ok(JoinPlan {
-            legs,
-            missing_sessions,
-        })
-    }
-
     /// Executes a trades request that carries `quotes`: admitted on its whole route and plan
     /// ([`Self::admit_quotes`]), then its aggregators are prepared and its plan is dispatched
-    /// through the request pipeline. `join` is the request's admitted `cut_warmup`, if any.
+    /// through the request pipeline.
     ///
     /// # Errors
     ///
     /// Returns an error if the request is refused, its aggregators cannot be prepared, or its
     /// plan cannot be dispatched; nothing of a refused request was dispatched.
-    pub(super) fn execute_quotes_request(
-        &mut self,
-        req: RequestCommand,
-        join: Option<&AdmittedJoin>,
-    ) -> anyhow::Result<()> {
-        let plan = self.admit_quotes(&req, join)?;
+    pub(super) fn execute_quotes_request(&mut self, req: RequestCommand) -> anyhow::Result<()> {
+        let plan = self.admit_quotes(&req)?;
         let request_id = *req.request_id();
         self.prepare_request_bar_aggregators(&req)?;
         let result = self.dispatch_request_plan(req, plan);
@@ -938,8 +822,8 @@ impl DataEngine {
     /// the instrument's quotes, before anything of the request is dispatched.
     ///
     /// It sees the request's whole route in the engine's routing order: its client, the
-    /// pipeline it is a leg of, the pipeline it nests itself in, its join, its catalogs, its
-    /// `schema`, its instruments, and then the legs of its plan. The one admitted shape is a
+    /// pipeline it is a leg of, the pipeline it nests itself in, its catalogs, its `schema`, its
+    /// instruments, and then the legs of its plan. The one admitted shape is a
     /// single-instrument date-range request whose plan has one catalog leg over the whole
     /// window, from the catalog that won on trades coverage, and for each part of the window
     /// that catalog does not cover in either feed a trades and a quotes leg its client serves;
@@ -954,18 +838,12 @@ impl DataEngine {
     /// - It is a leg of a `RequestJoin` (whose rebuilt answer holds one data type).
     /// - It sets continuous-future or time-range pipeline params (the pipeline answers child
     ///   requests, not one time order).
-    /// - Its plan has no catalog leg (no catalog registered, a `schema`, `skip_catalog_data`,
-    ///   or for a joined request no catalog covering any of the window) or a joined request's
-    ///   replay tail, which every join plans.
+    /// - Its plan has no catalog leg (no catalog registered, a `schema` or `skip_catalog_data`).
     /// - It does not name exactly one instrument (a batch).
     /// - Its plan cannot be made.
     ///
-    /// The error names the first such reason on the route, or every such leg of the plan.
-    fn admit_quotes(
-        &mut self,
-        req: &RequestCommand,
-        join: Option<&AdmittedJoin>,
-    ) -> anyhow::Result<Vec<RequestLeg>> {
+    /// The error names the first such reason on the route.
+    fn admit_quotes(&mut self, req: &RequestCommand) -> anyhow::Result<Vec<RequestLeg>> {
         let RequestCommand::Trades(cmd) = req else {
             anyhow::bail!("{QUOTES_REFUSED}: only a trades request can set `quotes`");
         };
@@ -1007,54 +885,45 @@ impl DataEngine {
             );
         }
 
-        let plan = if let Some(join) = join {
-            let plan = self.plan_join(req, &join.session_opens)?.legs;
-            if let Some(reason) = quotes_plan_refusal(&plan) {
-                anyhow::bail!("{QUOTES_REFUSED}: {reason}");
-            }
-            plan
-        } else {
-            if has_time_range_pipeline_params(params) {
-                anyhow::bail!(
-                    "{QUOTES_REFUSED}: its `time_range_generator` nests it in a time-range \
-                     pipeline, which answers each child window apart"
-                );
-            }
+        if has_time_range_pipeline_params(params) {
+            anyhow::bail!(
+                "{QUOTES_REFUSED}: its `time_range_generator` nests it in a time-range \
+                 pipeline, which answers each child window apart"
+            );
+        }
 
-            if !self.catalogs_registered() {
-                anyhow::bail!(
-                    "{QUOTES_REFUSED}: no catalog is registered, so its plan has no catalog leg"
-                );
-            }
+        if !self.catalogs_registered() {
+            anyhow::bail!(
+                "{QUOTES_REFUSED}: no catalog is registered, so its plan has no catalog leg"
+            );
+        }
 
-            if request_has_schema(req) {
-                anyhow::bail!(
-                    "{QUOTES_REFUSED}: its `schema` sends it to its client, so its plan has no \
-                     catalog leg"
-                );
-            }
+        if request_has_schema(req) {
+            anyhow::bail!(
+                "{QUOTES_REFUSED}: its `schema` sends it to its client, so its plan has no \
+                 catalog leg"
+            );
+        }
 
-            if cmd.instrument_ids.len() != 1 {
-                anyhow::bail!(
-                    "{QUOTES_REFUSED}: it must name exactly one instrument (batches are \
-                     refused), received {}",
-                    cmd.instrument_ids.len(),
-                );
-            }
-            let Some(key) = request_identifier(req) else {
-                anyhow::bail!("{QUOTES_REFUSED}: its plan has no catalog leg");
-            };
-            let plan = self.plan_date_range_request(req, &key)?;
-            // With `skip_catalog_data` it has no catalog leg; with no catalog covering any of
-            // the window its client serves it whole (see `plan_date_range_request`)
-            if request_params(req)
-                .and_then(|p| p.get_bool(PARAM_SKIP_CATALOG_DATA))
-                .unwrap_or(false)
-            {
-                anyhow::bail!("{QUOTES_REFUSED}: its plan has no catalog leg");
-            }
-            plan
+        if cmd.instrument_ids.len() != 1 {
+            anyhow::bail!(
+                "{QUOTES_REFUSED}: it must name exactly one instrument (batches are \
+                 refused), received {}",
+                cmd.instrument_ids.len(),
+            );
+        }
+        let Some(key) = request_identifier(req) else {
+            anyhow::bail!("{QUOTES_REFUSED}: its plan has no catalog leg");
         };
+        let plan = self.plan_date_range_request(req, &key)?;
+        // With `skip_catalog_data` it has no catalog leg; with no catalog covering any of
+        // the window its client serves it whole (see `plan_date_range_request`)
+        if request_params(req)
+            .and_then(|p| p.get_bool(PARAM_SKIP_CATALOG_DATA))
+            .unwrap_or(false)
+        {
+            anyhow::bail!("{QUOTES_REFUSED}: its plan has no catalog leg");
+        }
 
         Ok(plan)
     }
@@ -1116,23 +985,12 @@ impl DataEngine {
             let request_id = leg.request_id();
 
             let result = match leg {
-                RequestLeg::Catalog {
-                    request,
-                    catalog,
-                    unavailable,
-                } if sets_quotes(&request) => {
-                    self.open_catalog_leg_sessions(&request, catalog, &unavailable)
+                RequestLeg::Catalog { request, catalog } if sets_quotes(&request) => {
+                    self.open_catalog_leg_sessions(&request, catalog)
                 }
-                RequestLeg::Catalog {
-                    request,
-                    catalog,
-                    unavailable,
-                } => self
+                RequestLeg::Catalog { request, catalog } => self
                     .query_catalog_leg(&request, catalog)
-                    .map(|mut response| {
-                        drop_rows_of_unavailable_days(&mut response, &unavailable);
-                        self.payload_response(response);
-                    }),
+                    .map(|response| self.payload_response(response)),
                 RequestLeg::Client(request) => self.dispatch_request_to_client(request).map(|_| ()),
                 RequestLeg::ClientFeed { request, missing } => {
                     self.client_feed_missing.insert(request_id, missing);
@@ -1325,15 +1183,12 @@ impl DataEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error if `leg` is not a trades leg of a pipeline, it names unavailable days
-    /// (whose trades its sessions would not drop; only a join names them, and a join carrying
-    /// `quotes` is refused), or a session cannot be opened or its first chunk read. The leg then
-    /// fails, and the sessions opened are dropped.
+    /// Returns an error if `leg` is not a trades leg of a pipeline, or a session cannot be opened
+    /// or its first chunk read. The leg then fails, and the sessions opened are dropped.
     fn open_catalog_leg_sessions(
         &mut self,
         leg: &RequestCommand,
         catalog_name: Ustr,
-        unavailable: &[(UnixNanos, UnixNanos)],
     ) -> anyhow::Result<()> {
         let RequestCommand::Trades(cmd) = leg else {
             anyhow::bail!("open_catalog_leg_sessions called with a non-trades leg {leg:?}");
@@ -1342,11 +1197,6 @@ impl DataEngine {
             .request_pipeline_parent_request_id
             .get(&cmd.request_id)
             .context("a catalog leg is registered with its pipeline before it is sent")?;
-        anyhow::ensure!(
-            unavailable.is_empty(),
-            "{QUOTES_REFUSED}: its catalog leg names unavailable days, whose trades its \
-             sessions would not drop"
-        );
 
         let start_ns = request_start(leg)
             .map(datetime_to_unix_nanos_or_zero)
@@ -1778,9 +1628,6 @@ enum RequestLeg {
     Catalog {
         request: RequestCommand,
         catalog: Ustr,
-        /// Half-open `[open, next open)` spans of the days whose rows the leg may not use,
-        /// ascending; empty outside a join.
-        unavailable: Vec<(UnixNanos, UnixNanos)>,
     },
     Client(RequestCommand),
     /// A client leg of a `quotes` request for one feed, over an interval where the catalog lacks
@@ -1810,40 +1657,6 @@ impl RequestLeg {
             Self::Terminal { request_id, .. } => *request_id,
         }
     }
-}
-
-/// The legs of an admitted join and the past trading days it does not serve (by their opens).
-struct JoinPlan {
-    legs: Vec<RequestLeg>,
-    missing_sessions: Vec<UnixNanos>,
-}
-
-/// Returns why the plan of a joined `quotes` request cannot carry the instrument's quotes, or
-/// `None` when it has a catalog leg and no replay tail: a plan with no catalog leg, or with the
-/// join's replay tail of the current session (trades only), is not served.
-fn quotes_plan_refusal(plan: &[RequestLeg]) -> Option<String> {
-    let mut reasons = Vec::new();
-    if !plan
-        .iter()
-        .any(|leg| matches!(leg, RequestLeg::Catalog { .. }))
-    {
-        reasons.push("its plan has no catalog leg".to_owned());
-    }
-
-    for leg in plan {
-        let RequestLeg::Client(request) = leg else {
-            continue;
-        };
-        if request_params(request).is_some_and(|params| params.contains_key(PARAM_REPLAY_START)) {
-            let start = request_start(request)
-                .map_or_else(UnixNanos::default, datetime_to_unix_nanos_or_zero);
-            reasons.push(format!(
-                "its leg from {start} is its client's replay tail, which carries no quotes"
-            ));
-        }
-    }
-
-    (!reasons.is_empty()).then(|| reasons.join("; "))
 }
 
 /// Returns `left` and `right`, two lists of inclusive intervals each in order, as one list in
@@ -1942,42 +1755,6 @@ fn keep_rows_in_intervals(response: &mut DataResponse, intervals: &[(u64, u64)])
                 .into();
         }
         _ => {}
-    }
-}
-
-/// Drops the trades whose `ts_init` falls in one of the `unavailable` spans.
-fn drop_rows_of_unavailable_days(
-    response: &mut DataResponse,
-    unavailable: &[(UnixNanos, UnixNanos)],
-) {
-    if unavailable.is_empty() {
-        return;
-    }
-    let DataResponse::Trades(response) = response else {
-        return;
-    };
-    let is_unavailable = |ts_init: UnixNanos| {
-        let after = unavailable.partition_point(|(open, _)| *open <= ts_init);
-        after > 0 && ts_init < unavailable[after - 1].1
-    };
-    response.data = response
-        .data
-        .iter()
-        .filter(|trade| !is_unavailable(trade.ts_init))
-        .copied()
-        .collect::<Vec<_>>()
-        .into();
-}
-
-/// Sets the trades request's `replay_start` parameter: the client serves it by its replay.
-fn set_replay_start(request: &mut RequestCommand, replay_start: UnixNanos) {
-    if let RequestCommand::Trades(cmd) = request {
-        let mut params = cmd.params.as_deref().cloned().unwrap_or_default();
-        params.insert(
-            PARAM_REPLAY_START.to_owned(),
-            Value::from(replay_start.as_u64()),
-        );
-        cmd.params = Some(Params::new(params));
     }
 }
 

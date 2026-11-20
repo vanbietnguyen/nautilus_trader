@@ -33,7 +33,6 @@ pub mod book;
 pub mod config;
 
 mod commands;
-mod deadline;
 mod dispatch;
 mod futures;
 mod handlers;
@@ -76,7 +75,6 @@ use book::{
 };
 pub(crate) use commands::{DeferredCommand, DeferredCommandQueue};
 use config::DataEngineConfig;
-use deadline::JoinDeadlineTimer;
 use dispatch::{log_error_on_cache_insert, process_engine_bar};
 use futures::{ContinuousFutureRoller, ContinuousFutureSubscriptionState, datetime_to_unix_nanos};
 use handlers::{
@@ -141,16 +139,16 @@ use option_chain::{
 #[cfg(not(feature = "streaming"))]
 use requests::QUOTES_REFUSED;
 use requests::{
-    AdmittedJoin, ContinuousFutureRequest, ContinuousFutureRequestState, ContinuousFutureSegment,
-    ContinuousFutureSource, RequestBarAggregation, admit_cut_warmup, carries_quotes,
+    ContinuousFutureRequest, ContinuousFutureRequestState, ContinuousFutureSegment,
+    ContinuousFutureSource, RequestBarAggregation, carries_quotes,
     continuous_future_request_from_bars, continuous_future_subscription_from_bars,
     has_continuous_future_params, request_bar_aggregation_from_params, request_params,
-    response_params, sets_cut_warmup, sets_quotes,
+    response_params, sets_quotes,
 };
 use responses::{
-    PlacedSource, append_failure, keep_open_end, leg_sources, log_if_empty_response,
-    parent_request_window, quote_and_trade_runs, rebind_response_correlation,
-    rebuild_pipeline_response, same_instrument, take_merge_rows,
+    PlacedSource, append_failure, leg_sources, log_if_empty_response, parent_request_window,
+    quote_and_trade_runs, rebind_response_correlation, rebuild_pipeline_response, same_instrument,
+    take_merge_rows,
 };
 use serde_json::Value;
 use spread_quote::SpreadQuoteState;
@@ -249,14 +247,6 @@ pub struct DataEngine {
     /// be handed over together once its last member naming one is prepared (see
     /// [`DataEngine::adopt_kept_builders`]); `None` outside such a command.
     pending_adoptions: Option<Vec<BarType>>,
-    /// Each joined request's deadline, from its dispatch until its completion or its expiry
-    /// claims it.
-    request_deadlines: AHashMap<UUID4, UnixNanos>,
-    /// The unfinished legs of expired joined requests, each until its own terminal arrives.
-    suppressed_legs: AHashSet<UUID4>,
-    /// Envelopes of suppressed legs dropped after their request's expiry.
-    late_envelopes: u64,
-    join_deadline_timer: Option<Rc<JoinDeadlineTimer>>,
     option_chain_bootstrapper: Option<Rc<OptionChainBootstrapper>>,
     pending_option_chain_requests: IndexMap<UUID4, PendingOptionChainRequest>,
     option_chain_greeks_bootstraps: AHashMap<(OptionSeriesId, UUID4), OptionChainGreeksBootstrap>,
@@ -354,10 +344,6 @@ impl DataEngine {
             kept_replays: Vec::new(),
             pending_releases: AHashMap::new(),
             pending_adoptions: None,
-            request_deadlines: AHashMap::new(),
-            suppressed_legs: AHashSet::new(),
-            late_envelopes: 0,
-            join_deadline_timer: None,
             option_chain_bootstrapper: None,
             pending_option_chain_requests: IndexMap::new(),
             option_chain_greeks_bootstraps: AHashMap::new(),
@@ -419,7 +405,6 @@ impl DataEngine {
             Some(Rc::new(ContinuousFutureRoller::new(engine)));
         engine.borrow_mut().option_chain_bootstrapper =
             Some(Rc::new(OptionChainBootstrapper::new(engine)));
-        engine.borrow_mut().join_deadline_timer = Some(Rc::new(JoinDeadlineTimer::new(engine)));
 
         let weak1 = weak.clone();
         msgbus::register_data_command_endpoint(
@@ -645,7 +630,6 @@ impl DataEngine {
         self.data_count = 0;
         self.request_count = 0;
         self.response_count = 0;
-        self.late_envelopes = 0;
     }
 
     fn clear_request_state(&mut self) {
@@ -657,8 +641,6 @@ impl DataEngine {
         self.bar_aggregators_pending_stop.clear();
         self.request_book_events.clear();
         self.inflight_requests.clear();
-        self.request_deadlines.clear();
-        self.suppressed_legs.clear();
         self.request_pipeline_parent_request.clear();
         self.request_pipeline_n_components.clear();
         self.request_pipeline_parent_request_id.clear();
@@ -1731,8 +1713,6 @@ impl DataEngine {
 
     fn execute_request_inner(&mut self, req: RequestCommand) -> anyhow::Result<()> {
         Self::validate_request(&req)?;
-        // Refused on the command, before any request aggregator exists
-        let join = admit_cut_warmup(&req, || self.clock.borrow().timestamp_ns())?;
         #[cfg(feature = "streaming")]
         self.validate_catalog_update(&req)?;
         // An `interleave` request is admitted on its whole route before any of it runs
@@ -1743,7 +1723,7 @@ impl DataEngine {
         // A `quotes` request is admitted on its whole route and plan before any of it runs
         if carries_quotes(&req) {
             #[cfg(feature = "streaming")]
-            return self.execute_quotes_request(req, join.as_ref());
+            return self.execute_quotes_request(req);
             #[cfg(not(feature = "streaming"))]
             anyhow::bail!(
                 "{QUOTES_REFUSED}: this build has no catalogs (no `streaming` feature), so its \
@@ -1772,15 +1752,6 @@ impl DataEngine {
         let request_id = *req.request_id();
         self.prepare_request_bar_aggregators(&req)?;
 
-        // The join's dispatcher: before the schema bypass of the catalog path, catalog or not
-        if let Some(join) = join {
-            let result = self.dispatch_joined_request(req, &join);
-            if result.is_err() {
-                self.cleanup_request_bar_aggregators(&request_id);
-            }
-            return result;
-        }
-
         if has_time_range_pipeline_params(request_params(&req))
             && is_time_range_pipeline_variant(&req)
         {
@@ -1807,52 +1778,6 @@ impl DataEngine {
         }
 
         result.map(|_| ())
-    }
-
-    /// Dispatches an admitted `cut_warmup` request (the history/live join).
-    ///
-    /// Runs after the request's aggregators were prepared and before any input reached them; on
-    /// an error the caller cleans them up. The join's plan (`plan_join` over
-    /// `join.session_opens`) is dispatched through the request pipeline: past sessions from the
-    /// catalog, the current one from the client's replay. The engine arms `join.deadline` here,
-    /// refusing the request when the timer cannot be registered.
-    #[cfg_attr(
-        not(feature = "streaming"),
-        expect(
-            clippy::needless_pass_by_value,
-            reason = "only the streaming build plans the join"
-        )
-    )]
-    fn dispatch_joined_request(
-        &mut self,
-        req: RequestCommand,
-        join: &AdmittedJoin,
-    ) -> anyhow::Result<()> {
-        let request_id = *req.request_id();
-        log::debug!(
-            "Dispatching the `cut_warmup` request {request_id} for {} ({} session opens, deadline \
-             {})",
-            join.instrument_id,
-            join.session_opens.len(),
-            join.deadline,
-        );
-
-        self.arm_join_deadline(request_id, join.deadline)?;
-
-        #[cfg(feature = "streaming")]
-        let result = self.dispatch_join_plan(req, &join.session_opens);
-
-        #[cfg(not(feature = "streaming"))]
-        let result = Err(anyhow::anyhow!(
-            "Cannot handle the `cut_warmup` request {request_id} for {}: the join's plan needs \
-             the `streaming` feature",
-            join.instrument_id,
-        ));
-
-        if result.is_err() {
-            self.claim_join_deadline(&request_id);
-        }
-        result
     }
 
     fn validate_request(req: &RequestCommand) -> anyhow::Result<()> {
@@ -2169,12 +2094,6 @@ impl DataEngine {
     }
 
     fn process_response_envelope(&mut self, mut envelope: DataResponseEnvelope) {
-        // A joined request's deadline is checked before any payload effect
-        self.expire_overdue_joins();
-        if self.drop_late_envelope(&envelope) {
-            return;
-        }
-
         let accepted = match envelope.response() {
             Some(DataResponse::Instrument(response)) => self.cache_instrument(&response.data),
             Some(DataResponse::Instruments(response)) => {
@@ -2274,8 +2193,7 @@ impl DataEngine {
         if failure.is_none() {
             self.end_replay_coverage(request_id);
         }
-        let release =
-            self.release_request_bar_aggregators(&request_id, None, None, failure.is_none());
+        let release = self.release_request_bar_aggregators(&request_id, None, failure.is_none());
 
         match failure {
             Some(reason) if envelope.failure_reason().is_none() => {
@@ -2488,22 +2406,18 @@ impl DataEngine {
         let slots = self.request_pipeline_responses.remove(&parent_id)?;
         self.request_pipeline_n_components.remove(&parent_id);
         let parent = self.request_pipeline_parent_request.remove(&parent_id);
-        // Completion claims a joined request's deadline (an expiry would have taken the slots)
-        self.claim_join_deadline(&parent_id);
-        Some(self.finish_request_pipeline(parent_id, parent.as_ref(), slots, None))
+        Some(self.finish_request_pipeline(parent_id, parent.as_ref(), slots))
     }
 
     /// Rebuilds a pipeline's answer from the envelopes its legs' slots hold, into one completed
-    /// envelope; shared by the pipeline's completion and a joined request's expiry. Its reason
-    /// is `first_reason`, if any, followed by the reasons the legs carry. A `quotes` request's
-    /// client legs' write-backs that waited for its catalog leg's sessions run once the answer
-    /// is built, before its terminal is sent, and a failed one fails the terminal.
+    /// envelope, whose reason is the reasons the legs carry. A `quotes` request's client legs'
+    /// write-backs that waited for its catalog leg's sessions run once the answer is built,
+    /// before its terminal is sent, and a failed one fails the terminal.
     fn finish_request_pipeline(
         &mut self,
         parent_id: UUID4,
         parent: Option<&RequestCommand>,
         slots: Vec<Option<Vec<DataResponseEnvelope>>>,
-        first_reason: Option<&str>,
     ) -> DataResponseEnvelope {
         // A `quotes` request's catalog leg's open sessions leave the engine first, before
         // anything is sent; any return that does not merge them drops them
@@ -2518,8 +2432,7 @@ impl DataEngine {
         #[cfg(not(feature = "streaming"))]
         let catalog_leg = None;
 
-        let answer =
-            self.answer_request_pipeline(parent_id, parent, slots, first_reason, catalog_leg);
+        let answer = self.answer_request_pipeline(parent_id, parent, slots, catalog_leg);
 
         // The sessions have been read or dropped by now
         #[cfg(feature = "streaming")]
@@ -2533,17 +2446,14 @@ impl DataEngine {
         parent_id: UUID4,
         parent: Option<&RequestCommand>,
         slots: Vec<Option<Vec<DataResponseEnvelope>>>,
-        first_reason: Option<&str>,
         catalog_leg: Option<(PlacedSource, PlacedSource)>,
     ) -> DataResponseEnvelope {
-        let mut failures = first_reason.into_iter().collect::<Vec<_>>();
-        failures.extend(
-            slots
-                .iter()
-                .flatten()
-                .flatten()
-                .filter_map(|value| value.failure_reason()),
-        );
+        let failures = slots
+            .iter()
+            .flatten()
+            .flatten()
+            .filter_map(|value| value.failure_reason())
+            .collect::<Vec<_>>();
         let failure_reason = (!failures.is_empty()).then(|| failures.join("; "));
         let legs = slots
             .into_iter()
@@ -2595,10 +2505,6 @@ impl DataEngine {
         {
             let terminal = DataResponseEnvelope::terminal(parent_id, failure_reason);
             return append_failure(terminal, e.to_string());
-        }
-
-        if parent.is_some_and(sets_cut_warmup) {
-            keep_open_end(&mut rebuilt);
         }
 
         // Client definitions can have a newer ts_init than the requested history

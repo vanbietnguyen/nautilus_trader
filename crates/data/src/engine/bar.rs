@@ -42,7 +42,7 @@ use super::{
     UnsubscribeCommand, UnsubscribeQuotes, UnsubscribeTrades, ValueBarAggregator,
     ValueImbalanceBarAggregator, ValueRunsBarAggregator, VolumeBarAggregator,
     VolumeImbalanceBarAggregator, VolumeRunsBarAggregator,
-    handlers::{JoinedRelease, JoinedSlot, JoinedTradeHandler, WarmupBuffer},
+    handlers::WarmupBuffer,
     has_continuous_future_params, has_time_range_pipeline_params, log_error_on_cache_insert,
     process_engine_bar, request_bar_aggregation_from_params, request_params,
     requests::{
@@ -199,8 +199,6 @@ pub(super) struct ClosingPart<'a> {
     /// Its trades after its last delivered bar.
     pending: Vec<TradeTick>,
     sub_correlation_id: Option<UUID4>,
-    /// The cut and the floor of a joined request's answer.
-    joined: Option<JoinedRelease>,
 }
 
 impl DataEngine {
@@ -210,10 +208,10 @@ impl DataEngine {
     /// Live order is guaranteed only for bars built directly from the request's own trades, so
     /// the one admitted shape is a trades request for one instrument whose every bar type its
     /// trades feed (see [`why_not_fed_by_trades`], the same test that routes a trade to the
-    /// request's aggregators), answered by its client, by a date-range plan or by a join
-    /// (`cut_warmup`): each answer reaches [`Self::respond_interleaved_trades`]. It sees the
-    /// request's route in the engine's routing order: its kind, its client, the pipeline it is
-    /// a leg of, the pipelines its params nest it in, its instruments, then its bar types.
+    /// request's aggregators), answered by its client or by a date-range plan: each answer
+    /// reaches [`Self::respond_interleaved_trades`]. It sees the request's route in the engine's
+    /// routing order: its kind, its client, the pipeline it is a leg of, the pipelines its params
+    /// nest it in, its instruments, then its bar types.
     /// Without `interleave`, or with it `false`, the request is admitted at once, unread; so is
     /// a request that aggregates no bars (no `bar_types`, or an empty list), whatever its kind,
     /// route or `interleave` value, which nothing else reads then.
@@ -450,13 +448,13 @@ impl DataEngine {
     }
 
     /// Admits a request that sets `update_subscriptions` on any route, or refuses it with a
-    /// reason naming the case, before any of it runs: no replay is claimed, no join deadline
-    /// armed and no route dispatched, a merged (`quotes`) request's, an external client's and a
-    /// continuous future's included. It runs after the join's own parameter refusals and the
-    /// `interleave` admission, and before [`Self::admit_kept_request`], which admits the builders
-    /// the request keeps. A request that does not set it to `true`, or that aggregates no bars
-    /// (and is not a continuous future, whose bar types its params give otherwise), is admitted
-    /// at once; so is one whose `bar_types` cannot be read, which its route refuses as before.
+    /// reason naming the case, before any of it runs: no replay is claimed and no route
+    /// dispatched, a merged (`quotes`) request's, an external client's and a continuous
+    /// future's included. It runs after the `interleave` admission, and before
+    /// [`Self::admit_kept_request`], which admits the builders the request keeps. A request that
+    /// does not set it to `true`, or that aggregates no bars (and is not a continuous future, whose
+    /// bar types its params give otherwise), is admitted at once; so is one whose `bar_types`
+    /// cannot be read, which its route refuses as before.
     ///
     /// # Errors
     ///
@@ -908,18 +906,12 @@ impl DataEngine {
     /// with no failure reason: `min(end, dispatched)` (`dispatched` without an end), so every
     /// close the answer covered fires and nothing later, and records it as the replay's
     /// coverage. An answer that may not hold every record of the window (see
-    /// [`RequestReplay::partial`]) does not drive it, nor does a joined request's
-    /// (`cut_warmup`), whose held live trades drive it on (see
-    /// [`Self::release_kept_builders`]).
+    /// [`RequestReplay::partial`]) does not drive it.
     pub(super) fn end_replay_coverage(&mut self, request_id: UUID4) {
-        let joined = self
-            .request_bar_aggregations
-            .get(&request_id)
-            .is_some_and(|state| state.cut_warmup);
         let Some(replay) = self
             .request_replays
             .get_mut(&request_id)
-            .filter(|replay| !replay.partial && !joined)
+            .filter(|replay| !replay.partial)
         else {
             return;
         };
@@ -1060,7 +1052,7 @@ impl DataEngine {
     /// [`Self::finish_release`]).
     pub(super) fn cleanup_request_bar_aggregators(&mut self, request_id: &UUID4) -> bool {
         let aggregates = self.request_bar_aggregations.contains_key(request_id);
-        if let Some(release) = self.release_request_bar_aggregators(request_id, None, None, false) {
+        if let Some(release) = self.release_request_bar_aggregators(request_id, None, false) {
             self.pending_releases.insert(*request_id, release);
         }
         aggregates
@@ -1107,12 +1099,10 @@ impl DataEngine {
     /// [`Self::finish_release`]). With `interleaved`, the entry of an interleaving request
     /// holding its undelivered bars, the bars its held live trades complete go there; the entry
     /// still held here goes with the builders, undelivered: only [`Self::finish_interleaved`],
-    /// which takes the entry first, delivers its bars. A joined builder releases its held live
-    /// trades through its own copy of `joined`.
+    /// which takes the entry first, delivers its bars.
     pub(super) fn release_request_bar_aggregators(
         &mut self,
         request_id: &UUID4,
-        joined: Option<JoinedRelease>,
         interleaved: Option<&InterleavedRequest>,
         succeeded: bool,
     ) -> Option<Release> {
@@ -1125,7 +1115,7 @@ impl DataEngine {
             let answer = interleaved.map(|interleaved| Rc::clone(&interleaved.bars));
             return match replay {
                 Some(replay) if succeeded && !replay.partial => self
-                    .release_kept_builders(&state, replay, joined, answer.as_deref())
+                    .release_kept_builders(&state, replay, answer.as_deref())
                     .map(Release::HandOver),
                 replay => self
                     .remove_kept_builders(&state, replay.as_ref())
@@ -1157,13 +1147,11 @@ impl DataEngine {
     /// undelivered bars, their held live trades are fed now (see [`Self::feed_held_records`]),
     /// and the bars they complete go to the answer; otherwise every held record is fed at the
     /// hand-over, and the bars it completes are published. A held record stamped at or before
-    /// the replay's coverage is not fed: the answer held every record of its window up to then
-    /// (a joined request's answer certifies no coverage; its cut and floor decide instead).
+    /// the replay's coverage is not fed: the answer held every record of its window up to then.
     fn release_kept_builders(
         &mut self,
         state: &RequestBarAggregation,
         mut replay: RequestReplay,
-        joined: Option<JoinedRelease>,
         answer: Option<&RefCell<Vec<Bar>>>,
     ) -> Option<HandOver> {
         let held_back: Vec<BarType> = sources_before_dependents(&state.bar_types)
@@ -1178,7 +1166,7 @@ impl DataEngine {
             None
         } else {
             let clock = self.hand_over_clock(&replay.clock, &held_back);
-            let mut held = self.take_held_records(&held_back, joined, replay.covered);
+            let mut held = self.take_held_records(&held_back, replay.covered);
             if let Some(answer) = answer {
                 self.feed_held_records(std::mem::take(&mut held), &clock, Some(answer));
             }
@@ -1234,7 +1222,7 @@ impl DataEngine {
         state: &RequestBarAggregation,
         replay: Option<&RequestReplay>,
     ) -> Option<Restart> {
-        let held_trades = self.take_held_trades(&state.bar_types, None);
+        let held_trades = self.take_held_trades(&state.bar_types);
         let mut restarted = Vec::new();
 
         for bar_type in sources_before_dependents(&state.bar_types) {
@@ -1431,14 +1419,13 @@ impl DataEngine {
 
     /// Takes the live records held for the kept builders of `bar_types` (see
     /// [`BarAggregatorWarmup`]) as one list in arrival order (see [`WarmupBuffer`]), across
-    /// builders and kinds: each held trade once, with every builder's copy of it through its own
-    /// copy of `joined` (see [`Self::take_held_trades`]), in the order live gave them the copies;
+    /// builders and kinds: each held trade once, with every builder's copy of it (see
+    /// [`Self::take_held_trades`]), in the order live gave them the copies;
     /// each held quote and bar. A copy stamped at or before `covered`, the coverage of the
     /// answer the builders leave, is dropped: the answer held it.
     fn take_held_records(
         &mut self,
         bar_types: &[BarType],
-        joined: Option<JoinedRelease>,
         covered: Option<UnixNanos>,
     ) -> Vec<HeldRecord> {
         let owned = |ts_init: UnixNanos| covered.is_some_and(|covered| ts_init <= covered);
@@ -1458,7 +1445,7 @@ impl DataEngine {
         };
 
         // A builder subscribed later holds the last of the trades the first one holds
-        let held_trades = self.take_held_trades(bar_types, joined);
+        let held_trades = self.take_held_trades(bar_types);
         let longest = held_trades
             .iter()
             .map(|(_, copies)| copies.len())
@@ -1507,8 +1494,7 @@ impl DataEngine {
                         .filter(|(_, bar)| !owned(bar.ts_init))
                         .map(|(arrival, bar)| HeldRecord::Bar(arrival, *bar_type, bar)),
                 ),
-                BarAggregatorWarmup::Trade(buffer)
-                | BarAggregatorWarmup::JoinedTrade(buffer, _) => records.extend(
+                BarAggregatorWarmup::Trade(buffer) => records.extend(
                     buffer
                         .release_with_arrivals()
                         .into_iter()
@@ -1610,16 +1596,7 @@ impl DataEngine {
                 self.end_replay_coverage(correlation_id);
             }
 
-            let joined = match resp {
-                DataResponse::Trades(r) => joined_release(&state, &r.data),
-                _ => None,
-            };
-            return self.release_request_bar_aggregators(
-                &correlation_id,
-                joined,
-                None,
-                failure.is_none(),
-            );
+            return self.release_request_bar_aggregators(&correlation_id, None, failure.is_none());
         }
 
         None
@@ -1660,8 +1637,7 @@ impl DataEngine {
     /// Takes the trade warm-ups of the subscribed builders of `bar_types` (kept by request), in
     /// that order (the request's; for an interleaving request live's, see
     /// [`live_delivery_order`]): each builder's bar type and its copy of each held trade, in
-    /// arrival order, through its own copy of `joined`, as when it releases alone (`None` where
-    /// the cut drops one). Any other warm-up stays.
+    /// arrival order, as when it releases alone. Any other warm-up stays.
     ///
     /// Admission leaves a request that holds trades for several builders one instrument, so
     /// every builder holds the trades of one topic from its subscription to this release: a
@@ -1669,7 +1645,6 @@ impl DataEngine {
     fn take_held_trades(
         &mut self,
         bar_types: &[BarType],
-        joined: Option<JoinedRelease>,
     ) -> Vec<(BarType, Vec<Option<TradeTick>>)> {
         let mut builders = Vec::new();
 
@@ -1682,7 +1657,7 @@ impl DataEngine {
             let Some(copies) = self
                 .bar_aggregator_warmups
                 .get(&key)
-                .and_then(|warmup| warmup.release_trades(joined, key.0))
+                .and_then(BarAggregatorWarmup::release_trades)
             else {
                 continue;
             };
@@ -1758,7 +1733,6 @@ impl DataEngine {
                 resp,
                 pending,
                 sub_correlation_id: envelope.sub_correlation_id(),
-                joined: joined_release(state, &resp.data),
             };
             let failure = envelope.failure_reason().map(str::to_owned);
             self.finish_interleaved(request_id, failure, Some(closing));
@@ -1837,8 +1811,7 @@ impl DataEngine {
     ///
     /// At a completed answer with no failure reason, first drives the request's replay through
     /// the end of its coverage (see [`Self::end_replay_coverage`]). Then takes the request's
-    /// entry, cleans up its aggregators (a joined request's builders releasing through the
-    /// answer's cut and floor), and delivers the bars that end and that clean-up completed, each
+    /// entry, cleans up its aggregators, and delivers the bars that end and that clean-up completed, each
     /// a part of its own in the order they were produced, entering the cache just before its
     /// part is sent: with the answer's identity, after the answer's trades; or, when there is
     /// no answer and a client was resolved, with the dispatched client's identity and the
@@ -1867,20 +1840,14 @@ impl DataEngine {
             .interleaved_requests
             .remove(&request_id)
             .unwrap_or_default();
-        let joined = closing.as_ref().and_then(|closing| closing.joined);
-        let release = self.release_request_bar_aggregators(
-            &request_id,
-            joined,
-            Some(&interleaved),
-            succeeded,
-        );
+        let release =
+            self.release_request_bar_aggregators(&request_id, Some(&interleaved), succeeded);
         let remaining = std::mem::take(&mut *interleaved.bars.borrow_mut());
 
         let terminal = if let Some(ClosingPart {
             resp,
             mut pending,
             sub_correlation_id,
-            ..
         }) = closing
         {
             send_interleaved_bars(&self.cache, resp, &mut pending, remaining);
@@ -2473,19 +2440,6 @@ impl DataEngine {
         Ok(())
     }
 
-    /// Returns whether the live aggregator under `key` is warming up for a joined request
-    /// (`cut_warmup`): asked once when its deferred subscription is set up, never per trade.
-    fn is_joined_warmup(&self, key: &BarAggregatorKey) -> bool {
-        self.request_bar_aggregations.values().any(|state| {
-            state.cut_warmup
-                && state.update_subscriptions
-                && state
-                    .bar_types
-                    .iter()
-                    .any(|bar_type| bar_aggregator_key(*bar_type, None) == *key)
-        })
-    }
-
     fn subscribe_bar_aggregator_handlers(
         &mut self,
         key: BarAggregatorKey,
@@ -2512,30 +2466,13 @@ impl DataEngine {
             subscriptions.push(BarAggregatorSubscription::Bar { topic, handler });
         } else if bar_type.spec().price_type == PriceType::Last {
             let topic = switchboard::get_trades_topic(bar_type.instrument_id());
-            // Chosen once here: only a joined warm-up's builder takes trades through a slot
-            let handler = if defer && self.is_joined_warmup(&key) {
-                let buffer = WarmupBuffer::new();
-                let joined = JoinedSlot::default();
-                warmup = Some(BarAggregatorWarmup::JoinedTrade(
-                    buffer.clone(),
-                    joined.clone(),
-                ));
-                TypedHandler::new(JoinedTradeHandler::new(
-                    aggregator,
-                    bar_type_std,
-                    buffer,
-                    joined,
-                ))
-            } else {
-                let buffer = defer.then(WarmupBuffer::new);
+            let buffer = defer.then(WarmupBuffer::new);
 
-                let handler = TypedHandler::new(
-                    BarTradeHandler::new(aggregator, bar_type_std).with_warmup(buffer.clone()),
-                );
+            let handler = TypedHandler::new(
+                BarTradeHandler::new(aggregator, bar_type_std).with_warmup(buffer.clone()),
+            );
 
-                warmup = buffer.map(BarAggregatorWarmup::Trade);
-                handler
-            };
+            warmup = buffer.map(BarAggregatorWarmup::Trade);
             msgbus::subscribe_trades(topic.into(), handler.clone(), Some(BAR_AGGREGATOR_PRIORITY));
             subscriptions.push(BarAggregatorSubscription::Trade { topic, handler });
         } else {
@@ -2946,9 +2883,7 @@ fn why_not_fed_by_own_records(req: &RequestCommand, bar_type: &BarType) -> Optio
 /// from a trade: the replay fires every close before the trade, in close order, ties in timer
 /// name order (`RANGE_BAR_<bar type>` before `TIME_BAR_<bar type>`), so the key orders only
 /// the other bar types. The trades topic's router calls those aggregators at one priority in
-/// handler ID order, `BarTradeHandler|<bar type>`: the bar type's string order (a builder
-/// subscribed during a joined warm-up has
-/// `JoinedTradeHandler|<bar type>`, so the order holds among builders subscribed alike). A
+/// handler ID order, `BarTradeHandler|<bar type>`: the bar type's string order. A
 /// `RANGE_INCLUSIVE` bar is published after the trade, its aggregator having been called in
 /// that same order.
 fn live_delivery_order(bar_type: &BarType) -> (bool, String) {
@@ -3097,9 +3032,6 @@ pub(super) enum BarAggregatorWarmup {
     Bar(WarmupBuffer<Bar>),
     Trade(WarmupBuffer<TradeTick>),
     Quote(WarmupBuffer<QuoteTick>),
-    /// A joined warm-up's held trades, and the slot through which its handler takes later trades
-    /// once the warm-up is released.
-    JoinedTrade(WarmupBuffer<TradeTick>, JoinedSlot),
 }
 
 impl BarAggregatorWarmup {
@@ -3118,10 +3050,6 @@ impl BarAggregatorWarmup {
                 .release()
                 .into_iter()
                 .for_each(|quote| aggregator.handle_quote(quote)),
-            Self::JoinedTrade(buffer, _) => buffer
-                .release()
-                .into_iter()
-                .for_each(|trade| aggregator.handle_trade(trade)),
         }
     }
 
@@ -3129,7 +3057,7 @@ impl BarAggregatorWarmup {
     pub(super) fn arrivals(&self) -> Vec<u64> {
         match self {
             Self::Bar(buffer) => buffer.arrivals(),
-            Self::Trade(buffer) | Self::JoinedTrade(buffer, _) => buffer.arrivals(),
+            Self::Trade(buffer) => buffer.arrivals(),
             Self::Quote(buffer) => buffer.arrivals(),
         }
     }
@@ -3138,38 +3066,20 @@ impl BarAggregatorWarmup {
     pub(super) fn discard(&self) {
         match self {
             Self::Bar(buffer) => drop(buffer.release()),
-            Self::Trade(buffer) | Self::JoinedTrade(buffer, _) => drop(buffer.release()),
+            Self::Trade(buffer) => drop(buffer.release()),
             Self::Quote(buffer) => drop(buffer.release()),
         }
     }
 
     /// Ends a trade warm-up and returns the builder's copy of each held trade in arrival order,
-    /// through `joined`'s cut and floor (see [`JoinedRelease`]) or as [`Self::release`] would
-    /// feed them, `None` where the cut drops one; `None` for a warm-up of bars or quotes, which
-    /// stays held.
-    pub(super) fn release_trades(
-        &self,
-        joined: Option<JoinedRelease>,
-        bar_type: BarType,
-    ) -> Option<Vec<Option<TradeTick>>> {
-        match (self, joined) {
-            (Self::JoinedTrade(buffer, slot), Some(release)) => {
-                Some(buffer.release_joined_copies(slot, release, bar_type))
-            }
-            (Self::Trade(buffer) | Self::JoinedTrade(buffer, _), _) => {
-                Some(buffer.release().into_iter().map(Some).collect())
-            }
-            (Self::Bar(_) | Self::Quote(_), _) => None,
+    /// as [`Self::release`] would feed them; `None` for a warm-up of bars or quotes, which stays
+    /// held.
+    pub(super) fn release_trades(&self) -> Option<Vec<Option<TradeTick>>> {
+        match self {
+            Self::Trade(buffer) => Some(buffer.release().into_iter().map(Some).collect()),
+            Self::Bar(_) | Self::Quote(_) => None,
         }
     }
-}
-
-/// Returns the cut and the floor that release the held live trades of a joined request's
-/// builders, from its complete `answered` trades; `None` for every other request.
-fn joined_release(state: &RequestBarAggregation, answered: &[TradeTick]) -> Option<JoinedRelease> {
-    state
-        .cut_warmup
-        .then(|| JoinedRelease::from_answer(answered))
 }
 
 /// Typed subscription for bar aggregator handlers.
@@ -3653,7 +3563,6 @@ mod tests {
     #[rstest]
     #[case::plain_live(None, "BarTradeHandler", None)]
     #[case::ordinary_warmup(Some(false), "BarTradeHandler", Some("Trade"))]
-    #[case::joined_warmup(Some(true), "JoinedTradeHandler", Some("JoinedTrade"))]
     fn test_only_a_joined_warmup_subscribes_the_joined_trade_handler(
         #[case] cut_warmup: Option<bool>,
         #[case] handler_name: &str,
@@ -3710,7 +3619,6 @@ mod tests {
             .get(&key)
             .map(|warmup| match warmup {
                 BarAggregatorWarmup::Trade(_) => "Trade",
-                BarAggregatorWarmup::JoinedTrade(..) => "JoinedTrade",
                 other => panic!("not a trade warm-up: {other:?}"),
             });
         assert_eq!(warmup_kind, warmup);

@@ -3159,9 +3159,9 @@ pub trait DataActor {
     ///
     /// The engine refuses such a request before dispatching anything, with one terminal
     /// envelope naming the reason, when: `quotes` is not a boolean; the client is external; the
-    /// request is a leg of a `RequestJoin`; it sets continuous-future, time-range, `cut_warmup`,
-    /// `schema` or `skip_catalog_data` params; no catalog is registered, or the engine is built
-    /// without `streaming`; or it names more than one instrument.
+    /// request is a leg of a `RequestJoin`; it sets continuous-future, time-range, `schema` or
+    /// `skip_catalog_data` params; no catalog is registered, or the engine is built without
+    /// `streaming`; or it names more than one instrument.
     ///
     /// Coverage is the catalog's file intervals, not the rows they hold. Each part of the window
     /// the catalog's trade files or its quote files do not cover is asked of the request's
@@ -3222,11 +3222,10 @@ pub trait DataActor {
     /// (one at that very nanosecond fires after the records stamped then) and a calendar grid pass
     /// from one request to the next, and every bar goes to the continuing request's answer. Any
     /// other such request is refused before dispatch, with one terminal envelope naming the
-    /// case, and changes nothing. A joined request (`cut_warmup`, below), whose answer fires no
-    /// close after its last record, leaves aggregators no request can continue. A request that
-    /// fails or expires, or that is answered by a bare response (above), removes its
-    /// aggregators; one answered bare ends with a failure reason naming it, so its requester holds
-    /// none of them. Between requests nothing drives them and no bar goes anywhere.
+    /// case, and changes nothing. A request that fails or expires, or that is answered by a bare
+    /// response (above), removes its aggregators; one answered bare ends with a failure reason
+    /// naming it, so its requester holds none of them. Between requests nothing drives them and
+    /// no bar goes anywhere.
     ///
     /// A subscription to a kept bar type takes its aggregator over. Made after the answer, the
     /// closes due before the engine clock's time are published to it, stamped at their own
@@ -3245,9 +3244,7 @@ pub trait DataActor {
     /// answer's last bars and its terminal, so their bars come in close order after them. When
     /// the request fails, expires or is answered by a bare response instead, the subscription
     /// gets a new aggregator, started then and fed the held trades after the answer's terminal,
-    /// so their bars come after it. A joined request
-    /// (`cut_warmup`) closes nothing after its last trade: its held live trades, through the
-    /// join's cut and floor, move its clock on before the takeover.
+    /// so their bars come after it.
     ///
     /// A kept aggregator is claimed by the request that started or last continued it, not by an
     /// actor. The actor records the ID of every such request it sends, by bar type, and keeps it
@@ -3321,18 +3318,15 @@ pub trait DataActor {
     /// terminal envelope for the join naming the request; the request is not joined and is
     /// answered as described here. Only `RequestJoin` is checked: the engine's low-level
     /// pipeline registration (`new_request_pipeline`, `register_request_pipeline_leg`) must not
-    /// be given the ID of a request that set `interleave`. A client's direct answer, a catalog's
-    /// answer with any client gaps, and the history/live join (`cut_warmup`) are served; with
-    /// `quotes`, the quotes parts go out in the merged order between the trades and bars parts.
+    /// be given the ID of a request that set `interleave`. A client's direct answer and a
+    /// catalog's answer with any client gaps are served; with `quotes`, the quotes parts go out in
+    /// the merged order between the trades and bars parts.
     ///
-    /// Limits: live, the order of a timer and a trade at the same instant is not defined. A live
-    /// builder subscribed during a
-    /// `cut_warmup` warm-up has the handler ID `JoinedTradeHandler|<bar type>`, so live calls
-    /// it after every builder subscribed otherwise; the order above holds among builders
-    /// subscribed alike. Bars never delivered do not reach the cache. A failure with no answer
-    /// delivers no bar: its clean-up completes none (a subscription held back on a kept
-    /// aggregator gets its held trades' bars from a new one, above). With `quotes` and
-    /// `update_subscriptions` the same split of a run of quotes applies.
+    /// Limits: live, the order of a timer and a trade at the same instant is not defined. Bars
+    /// never delivered do not reach the cache. A failure with no answer delivers no bar: its
+    /// clean-up completes none (a subscription held back on a kept aggregator gets its held
+    /// trades' bars from a new one, above). With `quotes` and `update_subscriptions` the same
+    /// split of a run of quotes applies.
     ///
     /// # Errors
     ///
