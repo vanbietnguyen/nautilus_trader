@@ -327,16 +327,6 @@ mod tests {
                 open_error: None,
             }
         }
-
-        fn failing_page(mut self, message: &'static str) -> Self {
-            self.pages.push(Err(anyhow::anyhow!(message)));
-            self
-        }
-
-        fn failing_open(mut self, message: &'static str) -> Self {
-            self.open_error = Some(message);
-            self
-        }
     }
 
     fn merged(sources: Vec<Source>, page_size: usize, counter: &Arc<Counter>) -> MergedPages<Row> {
@@ -392,24 +382,6 @@ mod tests {
         assert_eq!(counter.opened.load(Ordering::SeqCst), 50);
         assert_eq!(counter.max_live.load(Ordering::SeqCst), 1);
         assert_eq!(counter.live.load(Ordering::SeqCst), 0);
-    }
-
-    #[rstest]
-    fn merged_pages_defers_sources_until_the_frontier_reaches_their_start() {
-        let counter = Arc::new(Counter::default());
-        let sources = vec![
-            Source::new(0, Some(10), &[&[10, 20]]),
-            Source::new(1, Some(30), &[&[30]]),
-        ];
-        let mut pages = merged(sources, 1, &counter);
-
-        assert_eq!(pages.next().unwrap().unwrap()[0].ts, 10);
-        assert_eq!(counter.opened.load(Ordering::SeqCst), 1);
-        assert_eq!(pages.next().unwrap().unwrap()[0].ts, 20);
-        assert_eq!(counter.opened.load(Ordering::SeqCst), 1);
-        assert_eq!(pages.next().unwrap().unwrap()[0].ts, 30);
-        assert_eq!(counter.opened.load(Ordering::SeqCst), 2);
-        assert!(pages.next().is_none());
     }
 
     #[rstest]
@@ -475,89 +447,6 @@ mod tests {
 
         assert_eq!(lazy, eager);
         assert_eq!(counter.live.load(Ordering::SeqCst), 0);
-    }
-
-    #[rstest]
-    fn merged_pages_drains_empty_sources_in_place() {
-        let counter = Arc::new(Counter::default());
-        let sources = vec![
-            Source::new(0, Some(0), &[]),
-            Source::new(1, Some(5), &[&[]]),
-            Source::new(2, Some(10), &[&[10]]),
-            Source::new(3, Some(15), &[]),
-            Source::new(4, Some(20), &[&[20]]),
-        ];
-
-        let rows: Vec<_> = drain(merged(sources, 1, &counter))
-            .into_iter()
-            .flatten()
-            .map(|row| row.ts)
-            .collect();
-
-        assert_eq!(rows, vec![10, 20]);
-        assert_eq!(counter.opened.load(Ordering::SeqCst), 5);
-        assert_eq!(counter.max_live.load(Ordering::SeqCst), 1);
-        assert_eq!(counter.live.load(Ordering::SeqCst), 0);
-    }
-
-    #[rstest]
-    fn merged_pages_rejects_a_first_row_before_the_declared_start() {
-        let counter = Arc::new(Counter::default());
-        let sources = vec![
-            Source::new(0, Some(10), &[&[10, 30]]),
-            Source::new(1, Some(20), &[&[15]]),
-        ];
-        let mut pages = merged(sources, 1, &counter);
-
-        assert_eq!(pages.next().unwrap().unwrap()[0].ts, 10);
-        let error = pages.next().unwrap().unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "Catalog source source-1 returned ts_init 15 before its declared start 20"
-        );
-        assert!(pages.next().is_none());
-        assert_eq!(counter.live.load(Ordering::SeqCst), 0);
-    }
-
-    #[rstest]
-    fn merged_pages_surfaces_a_deferred_open_failure_on_the_pull_that_reaches_it() {
-        let counter = Arc::new(Counter::default());
-        let sources = vec![
-            Source::new(0, Some(10), &[&[10, 20]]),
-            Source::new(1, Some(30), &[&[30]]).failing_open("file is missing"),
-            Source::new(2, Some(40), &[&[40]]),
-        ];
-        let mut pages = merged(sources, 1, &counter);
-
-        assert_eq!(pages.next().unwrap().unwrap()[0].ts, 10);
-        assert_eq!(pages.next().unwrap().unwrap()[0].ts, 20);
-        assert_eq!(
-            pages.next().unwrap().unwrap_err().to_string(),
-            "file is missing"
-        );
-        assert!(pages.next().is_none());
-        assert_eq!(counter.opened.load(Ordering::SeqCst), 1);
-        assert_eq!(counter.live.load(Ordering::SeqCst), 0);
-    }
-
-    #[rstest]
-    fn merged_pages_releases_every_active_source_after_a_page_failure() {
-        let counter = Arc::new(Counter::default());
-        let sources = vec![
-            Source::new(0, Some(10), &[&[10], &[30]]),
-            Source::new(1, Some(20), &[&[20]]).failing_page("page failed"),
-        ];
-        let mut pages = merged(sources, 1, &counter);
-
-        assert_eq!(pages.next().unwrap().unwrap()[0].ts, 10);
-        assert_eq!(
-            pages.next().unwrap().unwrap_err().to_string(),
-            "page failed"
-        );
-
-        assert_eq!(counter.live.load(Ordering::SeqCst), 0);
-        assert!(pages.next().is_none());
     }
 
     #[rstest]

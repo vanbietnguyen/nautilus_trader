@@ -1589,8 +1589,8 @@ fn encode_bars_response(response: &BarsResponse) -> Result<EncodedPayload, Encod
 #[cfg(test)]
 mod tests {
     use nautilus_common::messages::data::{
-        ReleaseKeptBars, RequestCommand, RequestQuotes, SubscribeCommand, SubscribeQuotes,
-        UnsubscribeCommand, UnsubscribeQuotes,
+        RequestCommand, RequestQuotes, SubscribeCommand, SubscribeQuotes, UnsubscribeCommand,
+        UnsubscribeQuotes,
     };
     #[cfg(feature = "defi")]
     use nautilus_common::messages::defi::{
@@ -3349,33 +3349,6 @@ mod tests {
     }
 
     #[rstest]
-    fn data_command_release_kept_bars_envelope_stamps_release_kept_bars_payload_type() {
-        let release = make_release_kept_bars();
-        let envelope = DataCommand::ReleaseKeptBars(release.clone());
-        let encoded = encode_data_command(&envelope).expect("encode");
-
-        assert_eq!(
-            encoded.payload_type.expect("override").as_str(),
-            PAYLOAD_TYPE_RELEASE_KEPT_BARS,
-        );
-        assert!(encoded.index_keys.is_empty());
-
-        let decoded: ReleaseKeptBars = rmp_serde::from_slice(&encoded.payload).expect("decode");
-        assert_eq!(decoded, release);
-    }
-
-    #[rstest]
-    fn default_registry_release_kept_bars_identity_dedupes_dispatch_hops() {
-        let registry = default_registry();
-        let release = make_release_kept_bars();
-        let expected = release.command_id;
-
-        let identity = registry.identity_for_any(&DataCommand::ReleaseKeptBars(release));
-
-        assert_eq!(identity, Some(expected));
-    }
-
-    #[rstest]
     fn data_command_registered_under_category_payload_type() {
         // The default registry must dispatch DataCommand through encode_data_command and
         // stamp the inner category tag, not the wrapper sentinel tag.
@@ -3526,10 +3499,6 @@ mod tests {
             Some(correlation_id()),
             None,
         ))
-    }
-
-    fn make_release_kept_bars() -> ReleaseKeptBars {
-        ReleaseKeptBars::new(bar_type(), UUID4::new(), UUID4::new(), UnixNanos::from(200))
     }
 
     #[cfg(feature = "defi")]

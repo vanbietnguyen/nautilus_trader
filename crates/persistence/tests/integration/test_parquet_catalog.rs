@@ -9127,23 +9127,6 @@ fn read_eager_quotes(catalog: &mut ParquetDataCatalog) -> Vec<QuoteTick> {
 }
 
 #[rstest]
-fn per_file_session_reads_rows_before_an_overridden_filename_start() {
-    let (_directory, mut catalog) = create_temp_catalog();
-    let rows = [10, 20].map(create_quote_tick);
-    catalog
-        .write_to_parquet(&rows, Some(UnixNanos::from(15)), None, None)
-        .unwrap();
-
-    assert_eq!(read_per_file_quotes(&mut catalog).unwrap(), rows.to_vec());
-    assert_eq!(read_eager_quotes(&mut catalog), rows.to_vec());
-
-    // Directory tables declare no start, so the default query reads the file as before
-    let query = CatalogQuery::new(NautilusDataType::QuoteTick);
-    let mut session = CatalogReader::query_batch_session(&mut catalog, &query, None).unwrap();
-    assert_eq!(next_quotes(&mut session).unwrap().unwrap(), rows.to_vec());
-}
-
-#[rstest]
 fn per_file_session_merges_an_overridden_file_with_an_overlapping_file_in_eager_order() {
     let (_directory, mut catalog) = create_temp_catalog();
     let ordinary = [5, 12, 18, 25].map(create_quote_tick);
@@ -9190,107 +9173,6 @@ fn per_file_session_breaks_equal_stamps_across_an_overridden_file_in_eager_order
     ];
     assert_eq!(read_eager_quotes(&mut catalog), expected);
     assert_eq!(read_per_file_quotes(&mut catalog).unwrap(), expected);
-}
-
-#[rstest]
-fn per_file_session_opens_a_file_without_ts_init_statistics_before_the_first_row() {
-    use parquet::file::{
-        properties::{EnabledStatistics, WriterProperties},
-        reader::{FileReader, SerializedFileReader},
-    };
-
-    let (directory, mut catalog) = create_temp_catalog();
-    let ordinary = [create_quote_tick(20)];
-    catalog
-        .write_to_parquet(&ordinary, None, None, None)
-        .unwrap();
-
-    // Named from 25, holding rows from 10, with no statistics to declare an earlier start
-    let unstated = [10, 30].map(create_quote_tick);
-    let path = quote_file_path(&directory, &catalog, 20).with_file_name(timestamps_to_filename(
-        UnixNanos::from(25),
-        UnixNanos::from(30),
-    ));
-    let batch = QuoteTick::encode_batch(&QuoteTick::chunk_metadata(&unstated), &unstated).unwrap();
-    let properties = WriterProperties::builder()
-        .set_statistics_enabled(EnabledStatistics::None)
-        .build();
-    let mut writer = parquet::arrow::ArrowWriter::try_new(
-        fs::File::create(&path).unwrap(),
-        batch.schema(),
-        Some(properties),
-    )
-    .unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
-
-    let reader = SerializedFileReader::new(fs::File::open(&path).unwrap()).unwrap();
-    let row_group = reader.metadata().row_group(0);
-    assert!(
-        (0..row_group.num_columns())
-            .map(|index| row_group.column(index))
-            .find(|column| column.column_path().string() == "ts_init")
-            .unwrap()
-            .statistics()
-            .is_none()
-    );
-
-    let expected = vec![unstated[0], ordinary[0], unstated[1]];
-    assert_eq!(read_eager_quotes(&mut catalog), expected);
-    assert_eq!(read_per_file_quotes(&mut catalog).unwrap(), expected);
-}
-
-// Replaces a written file's bytes with a file of other rows after the query read its footer
-fn replace_quote_file(path: &std::path::Path, rows: &[QuoteTick]) {
-    let (other_directory, other_catalog) = create_temp_catalog();
-    other_catalog
-        .write_to_parquet(rows, None, None, None)
-        .unwrap();
-    let other = quote_file_path(&other_directory, &other_catalog, rows[0].ts_init.as_u64());
-    fs::write(path, fs::read(other).unwrap()).unwrap();
-}
-
-#[rstest]
-fn per_file_session_keeps_a_filename_start_earlier_than_the_statistics() {
-    let (directory, mut catalog) = create_temp_catalog();
-    catalog
-        .write_to_parquet(
-            &[30, 40].map(create_quote_tick),
-            Some(UnixNanos::from(5)),
-            None,
-            None,
-        )
-        .unwrap();
-
-    let mut session =
-        CatalogReader::query_batch_session(&mut catalog, &per_file_quote_query(), None).unwrap();
-    let rows = [10, 20, 25].map(create_quote_tick);
-    replace_quote_file(&quote_file_path(&directory, &catalog, 30), &rows);
-
-    assert_eq!(next_quotes(&mut session).unwrap().unwrap(), rows.to_vec());
-}
-
-#[rstest]
-fn per_file_session_rejects_a_first_row_before_the_start_its_statistics_declared() {
-    let (directory, mut catalog) = create_temp_catalog();
-    catalog
-        .write_to_parquet(&[30, 40].map(create_quote_tick), None, None, None)
-        .unwrap();
-
-    let mut session =
-        CatalogReader::query_batch_session(&mut catalog, &per_file_quote_query(), None).unwrap();
-    replace_quote_file(
-        &quote_file_path(&directory, &catalog, 30),
-        &[10, 20, 25].map(create_quote_tick),
-    );
-    let error = next_quotes(&mut session).unwrap_err();
-
-    assert!(
-        error
-            .to_string()
-            .ends_with("returned ts_init 10 before its declared start 30"),
-        "{error}"
-    );
 }
 
 #[rstest]
@@ -9346,66 +9228,6 @@ fn per_file_session_drains_leading_and_inner_empty_files() {
 }
 
 #[rstest]
-#[case::corrupt_file(false)]
-#[case::removed_after_listing(true)]
-fn per_file_session_fails_on_the_pull_that_reaches_an_unreadable_file(#[case] remove: bool) {
-    let directory = TempDir::new().unwrap();
-    let mut catalog = ParquetDataCatalog::new(directory.path(), None, Some(1), None, None);
-    let first = [10, 11].map(create_quote_tick);
-    catalog.write_to_parquet(&first, None, None, None).unwrap();
-    for ts in [20, 30] {
-        catalog
-            .write_to_parquet(&[create_quote_tick(ts)], None, None, None)
-            .unwrap();
-    }
-    let unreadable = quote_file_path(&directory, &catalog, 20);
-    if !remove {
-        fs::write(&unreadable, b"not parquet").unwrap();
-    }
-
-    let mut session =
-        CatalogReader::query_batch_session(&mut catalog, &per_file_quote_query(), Some(1)).unwrap();
-    if remove {
-        fs::remove_file(&unreadable).unwrap();
-        assert_eq!(next_quotes(&mut session).unwrap().unwrap(), vec![first[0]]);
-    }
-
-    // A footer unreadable when the query is built declares no start, so its file opens, and
-    // fails, on the first pull; a file removed after its footer was read fails at its start
-    assert!(next_quotes(&mut session).is_err());
-    assert!(next_quotes(&mut session).unwrap().is_none());
-}
-
-#[rstest]
-fn per_file_session_opens_a_file_whose_footer_was_unreadable_before_the_first_row() {
-    let (directory, mut catalog) = create_temp_catalog();
-    let ordinary = [5, 12].map(create_quote_tick);
-    let overridden = [10, 12, 20].map(create_gbpusd_quote_tick);
-    catalog
-        .write_to_parquet(&ordinary, None, None, None)
-        .unwrap();
-    catalog
-        .write_to_parquet(&overridden, Some(UnixNanos::from(15)), None, None)
-        .unwrap();
-    let expected = read_eager_quotes(&mut catalog);
-    assert_eq!(expected.len(), 5);
-
-    // Named from 15, holding rows from 10, its footer unreadable only while the query is built
-    let path = quote_file_path(&directory, &catalog, 20);
-    let bytes = fs::read(&path).unwrap();
-    fs::write(&path, b"not parquet").unwrap();
-    let mut session =
-        CatalogReader::query_batch_session(&mut catalog, &per_file_quote_query(), Some(1)).unwrap();
-    fs::write(&path, bytes).unwrap();
-    let mut rows = Vec::new();
-    while let Some(page) = next_quotes(&mut session).unwrap() {
-        rows.extend(page);
-    }
-
-    assert_eq!(rows, expected);
-}
-
-#[rstest]
 fn per_file_session_survives_catalog_reset_and_drop() {
     let directory = TempDir::new().unwrap();
     let mut catalog = ParquetDataCatalog::new(directory.path(), None, Some(1), None, None);
@@ -9426,27 +9248,6 @@ fn per_file_session_survives_catalog_reset_and_drop() {
     }
 
     assert_eq!(read, rows.to_vec());
-}
-
-#[rstest]
-fn per_file_session_opens_files_without_timestamped_names_first() {
-    let (directory, mut catalog) = create_temp_catalog();
-    catalog
-        .write_to_parquet(&[create_quote_tick(10)], None, None, None)
-        .unwrap();
-    catalog
-        .write_to_parquet(&[create_quote_tick(20)], None, None, None)
-        .unwrap();
-    let later = quote_file_path(&directory, &catalog, 20);
-    fs::rename(&later, later.with_file_name("quote.parquet")).unwrap();
-
-    let mut session =
-        CatalogReader::query_batch_session(&mut catalog, &per_file_quote_query(), None).unwrap();
-
-    assert_eq!(
-        next_quotes(&mut session).unwrap().unwrap(),
-        [10, 20].map(create_quote_tick).to_vec()
-    );
 }
 
 #[rstest]

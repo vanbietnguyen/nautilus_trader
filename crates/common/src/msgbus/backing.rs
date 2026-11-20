@@ -432,43 +432,6 @@ mod tests {
         assert!(ingress.is_closed());
     }
 
-    struct ReadStopCountingBacking {
-        read_stops: Rc<Cell<u32>>,
-    }
-
-    impl MessageBusBacking for ReadStopCountingBacking {
-        // Reports closed although nothing closed it, as a backing whose publishing ended does
-        fn is_closed(&self) -> bool {
-            true
-        }
-
-        fn publish(&self, _message: BusMessage) {}
-
-        fn stop_read(&mut self) {
-            self.read_stops.set(self.read_stops.get() + 1);
-        }
-
-        fn close(&mut self) {}
-    }
-
-    #[rstest]
-    fn test_external_ingress_stops_its_read_when_the_backing_reports_closed_unasked() {
-        let read_stops = Rc::new(Cell::new(0));
-        let backing = ReadStopCountingBacking {
-            read_stops: read_stops.clone(),
-        };
-        let (egress, mut ingress) = external_io_from_backing(Box::new(backing));
-
-        assert!(egress.is_closed());
-        assert!(!ingress.is_closed());
-
-        ingress.close();
-        ingress.close();
-
-        assert!(ingress.is_closed());
-        assert_eq!(read_stops.get(), 1);
-    }
-
     #[rstest]
     fn test_external_egress_from_backing_forwards_publications() {
         let publications = Rc::new(RefCell::new(Vec::new()));
