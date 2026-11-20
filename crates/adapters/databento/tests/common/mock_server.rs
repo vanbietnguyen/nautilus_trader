@@ -25,7 +25,7 @@ use std::{
 
 use databento::dbn::{MetadataBuilder, SType, encode::dbn::AsyncMetadataEncoder, record::HasRType};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
 };
 
@@ -33,7 +33,6 @@ pub(crate) enum MockEvent {
     Authenticate,
     AuthenticateReject(String),
     ExpectSubscription,
-    AcceptUntilClosed(tokio::sync::oneshot::Sender<()>),
     Start,
     SendRecord(Box<dyn AsRef<[u8]> + Send>),
     #[allow(dead_code, reason = "used by the clients benchmark target")]
@@ -48,7 +47,6 @@ impl Debug for MockEvent {
             Self::Authenticate => write!(f, "Authenticate"),
             Self::AuthenticateReject(msg) => write!(f, "AuthenticateReject({msg:?})"),
             Self::ExpectSubscription => write!(f, "ExpectSubscription"),
-            Self::AcceptUntilClosed(_) => write!(f, "AcceptUntilClosed"),
             Self::Start => write!(f, "Start"),
             Self::SendRecord(_) => write!(f, "SendRecord"),
             Self::SendBytes(_) => write!(f, "SendBytes"),
@@ -100,18 +98,6 @@ impl MockGateway {
         self.send_text("cram=test-challenge\n").await;
         let _auth_line = self.read_line().await;
         self.send_text(&format!("success=0|error={error}\n")).await;
-    }
-
-    /// Accepts a connection, sends nothing, and returns when the client closes it.
-    async fn accept_until_closed(&mut self) {
-        self.accept().await;
-        let mut buf = [0u8; 256];
-        while let Ok(n) = self.stream().read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-        }
-        self.stream = None;
     }
 
     async fn expect_subscription(&mut self) {
@@ -197,10 +183,6 @@ impl MockLsgServer {
                         gateway.authenticate_reject(&error).await;
                     }
                     Some(MockEvent::ExpectSubscription) => gateway.expect_subscription().await,
-                    Some(MockEvent::AcceptUntilClosed(closed)) => {
-                        gateway.accept_until_closed().await;
-                        let _ = closed.send(());
-                    }
                     Some(MockEvent::Start) => gateway.start().await,
                     Some(MockEvent::SendRecord(record)) => gateway.send_record(record).await,
                     Some(MockEvent::SendBytes(bytes)) => gateway.send_bytes(bytes).await,
@@ -234,16 +216,6 @@ impl MockLsgServer {
 
     pub(crate) fn expect_subscription(&self) {
         self.tx.send(MockEvent::ExpectSubscription).unwrap();
-    }
-
-    /// Accepts a connection without authenticating it; the receiver resolves when the client
-    /// closes the connection.
-    pub(crate) fn accept_until_closed(&self) -> tokio::sync::oneshot::Receiver<()> {
-        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(MockEvent::AcceptUntilClosed(closed_tx))
-            .unwrap();
-        closed_rx
     }
 
     /// Returns the subscription lines the gateway has read, oldest first.

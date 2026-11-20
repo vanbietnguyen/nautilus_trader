@@ -58,9 +58,7 @@ use nautilus_live::{
     SocketControl, SocketControlFactory, SocketReconnectRequestOutcome, task::TaskGroup,
 };
 use nautilus_model::{
-    data::{
-        BarSpecification, BarType, CustomData, Data, DataType, TradeTick, custom::CustomDataTrait,
-    },
+    data::{BarSpecification, BarType, CustomData, Data, DataType, custom::CustomDataTrait},
     enums::{BarAggregation, PriceType},
     identifiers::{ClientId, InstrumentId, Symbol, Venue, futures::FuturesYearDigits},
     instruments::{Instrument, InstrumentAny},
@@ -70,12 +68,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     common::{Credential, DATABENTO_VENUE, ohlcv_schema_from_aggregation},
-    decode::DatabentoDecodeConfig,
     historical::{DatabentoHistoricalClient, RangeQueryParams},
-    live::{
-        DatabentoFeedHandler, DatabentoMessage, HandlerCommand, LiveSessionSpec, ReplayEnd,
-        ReplaySummary, replay_trades,
-    },
+    live::{DatabentoFeedHandler, DatabentoMessage, HandlerCommand},
     loader::DatabentoDataLoader,
     symbology::{
         check_consistent_symbology, infer_symbology_type, instrument_id_to_symbol_string,
@@ -85,25 +79,7 @@ use crate::{
 };
 
 const PRICE_PRECISION_PARAM: &str = "price_precision";
-const REPLAY_START_PARAM: &str = "replay_start";
 const SCHEMA_PARAM: &str = "schema";
-
-/// How far before `replay_start` a trades replay begins, so the gateway still sends every trade
-/// received from `replay_start` on (the lag bound).
-///
-/// It assumes no trade received at or after `replay_start` has an exchange time more than this
-/// before it. The assumption is unverified: the only measurement is one Sunday open, whose
-/// largest receive-minus-exchange time was 88.7 ms, and which clock the gateway filters the
-/// replay's start by is not known. If it filters by exchange time, a trade past the bound is
-/// never sent and the replay still completes, so exact completeness is not claimed until that
-/// filter is known.
-pub(crate) const REPLAY_LAG_BOUND: DurationNanos = DurationNanos::from_secs(1);
-
-/// How long a trades replay waits for a data record before it ends as complete (the idle time).
-const REPLAY_IDLE: Duration = Duration::from_millis(5000);
-
-/// The wall-clock bound over a whole trades replay when `replay_bound_secs` is not configured.
-const DEFAULT_REPLAY_BOUND_SECS: u64 = 120;
 const MBP10_DEPTH: usize = 10;
 const QUOTE_SCHEMAS: &[dbn::Schema] = &[
     dbn::Schema::Mbp1,
@@ -152,26 +128,6 @@ pub struct DatabentoDataClientConfig {
     pub reconnect_timeout_mins: Option<u64>,
     /// Year digits in futures IDs: 2 by default, or 1 for existing catalogs and caches.
     pub futures_year_digits: FuturesYearDigits,
-    /// Wall-clock bound in seconds over a whole `replay_start` trades replay, from the
-    /// connection attempt to the end of draining (None for the default of 120). On expiry the
-    /// private gateway session is dropped and the request fails with a reason naming the
-    /// bound; the caller has then seen any partial responses already sent, followed by the
-    /// failure, and trades decoded but not yet sent are lost.
-    ///
-    /// A replay starts one second before `replay_start`, assuming no trade received at or after
-    /// `replay_start` has an exchange time more than one second before it. That is unverified
-    /// (one Sunday open measured at most 88.7 ms between receive and exchange time, and which
-    /// clock the gateway filters the start by is not known), so a completed replay is not
-    /// claimed to hold every such trade until the gateway's start filter is known.
-    pub replay_bound_secs: Option<u64>,
-    /// Decode configuration for `replay_start` trades replays (None decodes as the default
-    /// configuration does, `ts_event` from `ts_recv`). With [`TsEventSource::Exchange`] a
-    /// replayed trade's `ts_event` is the record header `ts_event` (exchange time), or `ts_recv`
-    /// when that is undefined, and its `ts_init` stays `ts_recv`. The live feed session does not
-    /// read this field: it always decodes with the default configuration.
-    ///
-    /// [`TsEventSource::Exchange`]: crate::decode::TsEventSource::Exchange
-    pub decode_config: Option<DatabentoDecodeConfig>,
     /// Whether to spell a share class with a space in instrument IDs (`BRK.B` -> `BRK B`).
     pub share_class_space: bool,
 }
@@ -207,8 +163,6 @@ impl DatabentoDataClientConfig {
             reconnect_timeout_mins: Some(10), // Default: 10 minutes
             historical_base_url: None,
             live_gateway_addr: None,
-            replay_bound_secs: None,
-            decode_config: None,
         }
     }
 
@@ -467,137 +421,6 @@ impl DatabentoDataClient {
         if let Err(e) = self.task_handles.spawn(future) {
             log::debug!("Skipping Databento task after shutdown began: {e}");
         }
-    }
-
-    /// Serves an open-ended trades request carrying `replay_start` by a live gateway replay.
-    ///
-    /// The replay runs on a private gateway session from `replay_start` less
-    /// [`REPLAY_LAG_BOUND`] and keeps the trades received at or after `replay_start`. Each batch
-    /// is sent as a partial response. The replay ends on the gateway's `ReplayCompleted`, after
-    /// [`REPLAY_IDLE`] without a data record, or at the first record whose event time reaches
-    /// the clock's time when the request arrives (discarded); one empty response then
-    /// completes the request. The whole replay is bounded by `replay_bound_secs`; on expiry,
-    /// or when the replay fails, the request fails after any partial responses already sent.
-    /// One `info` line with the replay's counts and timings is logged at every end. The
-    /// historical client is never called.
-    fn request_trades_replay(
-        &self,
-        request: RequestTrades,
-        replay_start: UnixNanos,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            request.end.is_none(),
-            "A `{REPLAY_START_PARAM}` trades request must be open-ended (no end)"
-        );
-        let schema = schema_from_params(request.params.as_ref(), dbn::Schema::Tbbo, TRADE_SCHEMAS)?;
-        anyhow::ensure!(
-            schema == dbn::Schema::Tbbo,
-            "A `{REPLAY_START_PARAM}` trades request is served only from the `tbbo` schema"
-        );
-        let [instrument_id] = request.instrument_ids[..] else {
-            anyhow::bail!(
-                "A `{REPLAY_START_PARAM}` trades request must name exactly one instrument"
-            );
-        };
-        anyhow::ensure!(
-            request.limit.is_none(),
-            "A record limit is unsupported for `{REPLAY_START_PARAM}` trades requests"
-        );
-        let symbol = instrument_id.symbol.to_string();
-        anyhow::ensure!(
-            infer_symbology_type(&symbol) == dbn::SType::RawSymbol,
-            "Unsupported symbol {symbol} for a Databento replay, only raw symbols are available \
-             (not continuous or parent symbols)",
-        );
-
-        let session = LiveSessionSpec {
-            credential: self.config.credential.clone(),
-            dataset: self.get_dataset_for_venue(instrument_id.venue)?,
-            gateway_addr: self.config.live_gateway_addr.clone(),
-            instrument_id,
-            publisher_venue_map: self.publisher_venue_map.clone(),
-            futures_year_digits: self.config.futures_year_digits,
-            share_class_space: self.config.share_class_space,
-            price_precision: price_precision_from_params(request.params.as_ref())?,
-        };
-        let data_sender = self.data_sender.clone();
-        let client_id = request.client_id.unwrap_or(self.client_id);
-        let request_id = request.request_id;
-        let start = datetime_to_unix_nanos(request.start);
-        let params = request.params;
-        let replay_from = replay_start.saturating_sub(REPLAY_LAG_BOUND);
-        let until = get_atomic_clock_realtime().get_time_ns();
-        let replay_bound = Duration::from_secs(
-            self.config
-                .replay_bound_secs
-                .unwrap_or(DEFAULT_REPLAY_BOUND_SECS),
-        );
-        let decode_config = self.config.decode_config.clone();
-
-        self.spawn_task(async move {
-            let response = |trades: Vec<TradeTick>| {
-                DataResponse::Trades(TradesResponse::new(
-                    request_id,
-                    client_id,
-                    instrument_id,
-                    trades,
-                    start,
-                    None,
-                    get_atomic_clock_realtime().get_time_ns(),
-                    params.clone(),
-                ))
-            };
-            let send = |trades: Vec<TradeTick>, completed: bool| {
-                let envelope = DataResponseEnvelope::new(response(trades), completed, None);
-                data_sender
-                    .send(DataEvent::ResponseEnvelope(envelope))
-                    .map_err(|e| anyhow::anyhow!("Failed to send replay response: {e}"))
-            };
-            let mut batch = Vec::new();
-            let mut summary = ReplaySummary::new();
-            let result = tokio::time::timeout(
-                replay_bound,
-                replay_trades(
-                    session,
-                    replay_from,
-                    replay_start,
-                    until,
-                    REPLAY_IDLE,
-                    decode_config.as_ref(),
-                    &mut batch,
-                    &mut summary,
-                    |trades| send(trades, false),
-                ),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                summary.end(ReplayEnd::ReplayBound);
-                Err(anyhow::anyhow!(
-                    "exceeded the replay bound of {} s (`replay_bound_secs`)",
-                    replay_bound.as_secs()
-                ))
-            });
-
-            match result {
-                Ok(_) => {
-                    if let Err(e) = send(Vec::new(), true) {
-                        log::error!("{e}");
-                    }
-                }
-                Err(e) => {
-                    summary.end(ReplayEnd::Error);
-                    send_request_result(
-                        &data_sender,
-                        request_id,
-                        None,
-                        &[format!("Replay of {instrument_id}: {e}")],
-                    );
-                }
-            }
-            log::info!("Replay of {instrument_id} ended: {summary}");
-        });
-
-        Ok(())
     }
 
     /// Initializes the live feed handler for streaming data.
@@ -1254,10 +1077,6 @@ impl DataClient for DatabentoDataClient {
     }
 
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
-        if let Some(replay_start) = replay_start_from_params(request.params.as_ref())? {
-            return self.request_trades_replay(request, replay_start);
-        }
-
         anyhow::ensure!(
             request.instrument_ids.len() == 1 || request.limit.is_none(),
             "A record limit is unsupported for multi-instrument requests"
@@ -1834,20 +1653,6 @@ fn requested_instrument(
         .cloned()
 }
 
-/// Reads `replay_start`: `None` when absent, an error when present but not an unsigned
-/// nanosecond count (a string, a negative, a null), so a malformed opt-in is refused rather
-/// than served by the historical client.
-fn replay_start_from_params(params: Option<&Params>) -> anyhow::Result<Option<UnixNanos>> {
-    params
-        .and_then(|params| params.get(REPLAY_START_PARAM))
-        .map(|value| {
-            value.as_u64().map(UnixNanos::from).ok_or_else(|| {
-                anyhow::anyhow!("`{REPLAY_START_PARAM}` must be an unsigned count of nanoseconds")
-            })
-        })
-        .transpose()
-}
-
 fn price_precision_from_params(params: Option<&Params>) -> anyhow::Result<Option<u8>> {
     let Some(price_precision) = params.and_then(|params| params.get_u64(PRICE_PRECISION_PARAM))
     else {
@@ -2015,7 +1820,7 @@ mod tests {
         types::{Currency, Price, Quantity},
     };
     use rstest::rstest;
-    use serde_json::{Value, json};
+    use serde_json::json;
     use time::macros::date;
     use tokio::{
         io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -3002,168 +2807,6 @@ mod tests {
         assert_eq!(response.client_id(), &client_id);
         assert_eq!(response.params(), Some(&params));
         assert_eq!(response.record_count(), Some(0));
-    }
-
-    #[rstest]
-    #[tokio::test]
-    async fn test_request_trades_without_replay_start_opens_no_gateway_session() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("test_data")
-            .join("test_data.tbbo.dbn.zst");
-        let decoder = Decoder::from_zstd_file(path).unwrap();
-        let mut metadata = decoder.metadata().clone();
-        metadata.dataset = "GLBX.MDP3".to_owned();
-        let mut body = Vec::new();
-        {
-            let mut encoder = dbn::encode::dbn::Encoder::with_zstd(&mut body, &metadata).unwrap();
-            encoder.flush().unwrap();
-        }
-
-        let historical = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base_url = format!("http://{}/", historical.local_addr().unwrap());
-        let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server = tokio::spawn(serve_historical_response(historical, body));
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        replace_data_event_sender(sender);
-
-        let mut config = DatabentoDataClientConfig::new(
-            "32-character-with-lots-of-filler",
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("publishers.json"),
-            false,
-            true,
-        );
-        config.historical_base_url = Some(base_url);
-        config.live_gateway_addr = Some(gateway.local_addr().unwrap().to_string());
-        let client_id = ClientId::from("DATABENTO-NO-REPLAY");
-        let client =
-            DatabentoDataClient::new(client_id, config, get_atomic_clock_realtime()).unwrap();
-        let start = UnixNanos::from(1_717_423_200_000_000_000);
-        let params = Params::new(
-            [
-                (PRICE_PRECISION_PARAM.to_owned(), json!(2)),
-                (SCHEMA_PARAM.to_owned(), json!("tbbo")),
-            ]
-            .into(),
-        );
-
-        client
-            .request_trades(RequestTrades::new(
-                InstrumentId::from("ESM4.GLBX"),
-                Some(start.to_datetime_utc()),
-                None,
-                None,
-                Some(client_id),
-                UUID4::new(),
-                UnixNanos::from(37),
-                Some(params),
-            ))
-            .unwrap();
-
-        let event = tokio::select! {
-            event = receiver.recv() => event.unwrap(),
-            result = gateway.accept() => panic!("Unexpected gateway connection: {result:?}"),
-            () = tokio::time::sleep(Duration::from_secs(5)) => panic!("Request did not finish"),
-        };
-
-        let DataEvent::ResponseEnvelope(envelope) = event else {
-            panic!("expected completed response, received {event:?}");
-        };
-        assert!(envelope.completed());
-        let request = server.await.unwrap();
-        assert!(request.split('&').any(|field| field == "schema=tbbo"));
-    }
-
-    #[rstest]
-    #[case::with_end(
-        Some(1_717_423_260_000_000_000),
-        None,
-        "A `replay_start` trades request must be open-ended (no end)"
-    )]
-    #[case::trades_schema(
-        None,
-        Some("trades"),
-        "A `replay_start` trades request is served only from the `tbbo` schema"
-    )]
-    fn test_request_trades_refuses_replay_start_request(
-        #[case] end: Option<u64>,
-        #[case] schema: Option<&str>,
-        #[case] expected: &str,
-    ) {
-        let client = test_data_client();
-        let replay_start = UnixNanos::from(1_717_423_200_000_000_000);
-        let mut params = IndexMap::new();
-        params.insert(REPLAY_START_PARAM.to_owned(), json!(replay_start.as_u64()));
-        if let Some(schema) = schema {
-            params.insert(SCHEMA_PARAM.to_owned(), json!(schema));
-        }
-
-        let error = client
-            .request_trades(RequestTrades::new(
-                InstrumentId::from("ESM4.GLBX"),
-                Some(replay_start.to_datetime_utc()),
-                end.map(|end| UnixNanos::from(end).to_datetime_utc()),
-                None,
-                None,
-                UUID4::new(),
-                UnixNanos::from(37),
-                Some(Params::new(params)),
-            ))
-            .unwrap_err();
-
-        assert_eq!(error.to_string(), expected);
-    }
-
-    #[rstest]
-    #[case::string(json!("1717423200000000000"))]
-    #[case::negative(json!(-1_717_423_200_000_000_000_i64))]
-    #[case::null(json!(null))]
-    fn test_request_trades_refuses_a_present_but_invalid_replay_start(#[case] value: Value) {
-        let client = test_data_client();
-        let start = UnixNanos::from(1_717_423_200_000_000_000);
-        let params = Params::new(
-            [
-                (REPLAY_START_PARAM.to_owned(), value),
-                (SCHEMA_PARAM.to_owned(), json!("tbbo")),
-            ]
-            .into(),
-        );
-
-        let error = client
-            .request_trades(RequestTrades::new(
-                InstrumentId::from("ESM4.GLBX"),
-                Some(start.to_datetime_utc()),
-                None,
-                None,
-                None,
-                UUID4::new(),
-                UnixNanos::from(37),
-                Some(params),
-            ))
-            .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "`replay_start` must be an unsigned count of nanoseconds"
-        );
-    }
-
-    #[rstest]
-    #[case::absent(None, None)]
-    #[case::valid(Some(json!(1_717_423_200_000_000_000_u64)), Some(1_717_423_200_000_000_000))]
-    fn test_replay_start_from_params_reads_absent_and_valid(
-        #[case] value: Option<Value>,
-        #[case] expected: Option<u64>,
-    ) {
-        let params = Params::new(
-            value
-                .map(|value| (REPLAY_START_PARAM.to_owned(), value))
-                .into_iter()
-                .collect(),
-        );
-
-        let replay_start = replay_start_from_params(Some(&params)).unwrap();
-
-        assert_eq!(replay_start, expected.map(UnixNanos::from));
     }
 
     #[rstest]

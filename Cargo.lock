@@ -6122,7 +6122,6 @@ dependencies = [
  "anyhow",
  "arrow",
  "async-trait",
- "clap",
  "codspeed-criterion-compat",
  "databento",
  "dotenvy",
