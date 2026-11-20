@@ -130,6 +130,13 @@ pub trait BarAggregator: Any + Debug {
     /// `RangeBarAggregator` override.
     fn continue_on_clock(&mut self, _clock: Rc<RefCell<dyn Clock>>) {}
 
+    /// Fires, without an update, the closes due through `ts` of an aggregator building
+    /// historical data: a time bar's interval closes, a range bar's daily boundary. Nothing
+    /// fires before the first update has started the aggregator, nor for a `ts` it has reached.
+    /// Default implementation does nothing, `TimeBarAggregator` and
+    /// `RangeBarAggregator` override.
+    fn advance_historical(&mut self, _ts: UnixNanos) {}
+
     /// Sets the weak reference to the aggregator wrapper (for historical mode).
     /// Default implementation does nothing, `TimeBarAggregator` overrides.
     fn set_aggregator_weak(&mut self, _weak: BarAggregatorWeak) {}
@@ -1925,6 +1932,12 @@ impl TimeBarAggregator {
         test_clock.set_time(ts_init);
     }
 
+    /// Returns whether the aggregator builds historical data on a clock its first update has
+    /// already started.
+    pub(crate) fn has_started_historical_clock(&self) -> bool {
+        self.historical_mode && self.clock.borrow().timestamp_ns() != UnixNanos::default()
+    }
+
     /// Flushes the deferred historical close, if any.
     ///
     /// Call once no more updates can arrive at its timestamp.
@@ -2056,6 +2069,12 @@ impl BarAggregator for TimeBarAggregator {
                     Some(false),
                 )
                 .expect(FAILED);
+        }
+    }
+
+    fn advance_historical(&mut self, ts: UnixNanos) {
+        if self.has_started_historical_clock() && ts > self.clock.borrow().timestamp_ns() {
+            self.preprocess_historical_events(ts, false);
         }
     }
 

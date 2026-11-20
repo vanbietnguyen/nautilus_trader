@@ -13,7 +13,10 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::fmt::Debug;
+use std::{
+    fmt::Debug,
+    sync::{LazyLock, Once},
+};
 
 use anyhow::Context;
 use jiff::tz::TimeZone;
@@ -357,6 +360,10 @@ impl DataEngine {
             );
         }
 
+        if is_upstream_kept(state) {
+            return self.prepare_upstream_kept_bar_aggregators(request_id, state);
+        }
+
         let aggregator_request_id = state.aggregator_request_id(request_id);
         let keys: Vec<BarAggregatorKey> = state
             .bar_types
@@ -419,6 +426,7 @@ impl DataEngine {
         let Some(mut state) = request_bar_aggregation_from_params(request_params(req))? else {
             return Ok(());
         };
+        state.end = parent_request_window(Some(req)).1;
         self.admit_kept_request(req, &state)?;
 
         // The entry exists before the aggregators that deliver into it
@@ -474,7 +482,7 @@ impl DataEngine {
         let Some(params) = request_params(req) else {
             return Ok(());
         };
-        if params.get_bool(UPDATE_SUBSCRIPTIONS) != Some(true) {
+        if params.get_bool(UPDATE_SUBSCRIPTIONS) != Some(true) || upstream_kept_experiment() {
             return Ok(());
         }
 
@@ -552,7 +560,7 @@ impl DataEngine {
         req: &RequestCommand,
         state: &RequestBarAggregation,
     ) -> anyhow::Result<()> {
-        if !state.update_subscriptions {
+        if !state.update_subscriptions || is_upstream_kept(state) {
             return Ok(());
         }
 
@@ -934,6 +942,174 @@ impl DataEngine {
         }
     }
 
+    /// EXPERIMENT (see [`upstream_kept_experiment`]): prepares the builders of a request that
+    /// keeps them (`update_subscriptions`) on upstream's historical path, with no replay: each is
+    /// made or reused under its bar type, set up in historical mode (see
+    /// [`Self::setup_historical_bar_aggregator`]) and running, its bars going to the request's
+    /// answer (see [`Self::set_request_bar_aggregator_chain_handlers`]).
+    fn prepare_upstream_kept_bar_aggregators(
+        &mut self,
+        request_id: UUID4,
+        state: &RequestBarAggregation,
+    ) -> anyhow::Result<()> {
+        static ANNOUNCED: Once = Once::new();
+        ANNOUNCED.call_once(|| log::info!("experiment: upstream kept builders"));
+
+        self.request_bar_aggregations
+            .insert(request_id, state.clone());
+
+        for bar_type in &state.bar_types {
+            let result = self
+                .create_bar_aggregator_for_key(
+                    *bar_type,
+                    None,
+                    state.skip_first_non_full_bar,
+                    state.time_zone.clone(),
+                )
+                .and_then(|()| self.setup_historical_bar_aggregator(*bar_type));
+            if let Err(e) = result {
+                self.cleanup_request_bar_aggregators(&request_id);
+                return Err(e);
+            }
+
+            if let Some(aggregator) = self
+                .bar_aggregators
+                .get(&bar_aggregator_key(*bar_type, None))
+            {
+                if state.disable_build_with_no_updates {
+                    aggregator.borrow_mut().set_build_with_no_updates(false);
+                }
+                aggregator.borrow_mut().set_is_running(true);
+            }
+        }
+
+        self.set_request_bar_aggregator_chain_handlers(request_id, state, true);
+
+        Ok(())
+    }
+
+    /// Sets up the kept builder of `bar_type` for historical data, as upstream's
+    /// `setup_bar_aggregator` does with `historical`: a time bar gets a clock of its own, whose
+    /// timer its first update starts. A time bar already historical on a started clock keeps
+    /// that clock (U1, the carry-over): a request continuing it closes the interval the previous
+    /// request left forming, on the same grid.
+    fn setup_historical_bar_aggregator(&self, bar_type: BarType) -> anyhow::Result<()> {
+        let aggregator = self
+            .bar_aggregators
+            .get(&bar_aggregator_key(bar_type, None))
+            .ok_or_else(|| {
+                anyhow::anyhow!("Cannot setup bar aggregator: no aggregator found for {bar_type}")
+            })?;
+
+        let continued = aggregator
+            .borrow()
+            .as_any()
+            .downcast_ref::<TimeBarAggregator>()
+            .is_some_and(TimeBarAggregator::has_started_historical_clock);
+
+        if bar_type.spec().is_time_aggregated() && !continued {
+            let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+            aggregator.borrow_mut().set_clock(clock);
+            aggregator
+                .borrow_mut()
+                .set_aggregator_weak(Rc::downgrade(aggregator));
+        }
+
+        Ok(())
+    }
+
+    /// EXPERIMENT (see [`upstream_kept_experiment`]): ends the builders of a request that kept
+    /// them on upstream's historical path, as upstream's `cleanup_request_bar_aggregators` does,
+    /// sources first. After a success each first fires the closes due up to the request's end,
+    /// the engine clock's time when that is earlier (U2, the drain). A builder whose subscription
+    /// was held back is fed the live records held for it, then handed over: set up as a
+    /// subscription's on the engine clock (see [`Self::setup_bar_aggregator`]). Any other is kept
+    /// idle, historical, until a later request continues it or a subscription takes it.
+    fn finish_upstream_kept_bar_aggregators(
+        &mut self,
+        state: &RequestBarAggregation,
+        succeeded: bool,
+    ) {
+        let now = self.clock.borrow().timestamp_ns();
+        let drain_through = succeeded.then(|| state.end.map_or(now, |end| end.min(now)));
+
+        for bar_type in sources_before_dependents(&state.bar_types) {
+            let key = bar_aggregator_key(bar_type, None);
+            let has_live_handlers = self.bar_aggregator_handlers.contains_key(&key);
+
+            self.finish_historical_bar_aggregator(&key, has_live_handlers, drain_through);
+
+            let keep_running = has_live_handlers
+                && match self.setup_bar_aggregator(bar_type, None) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::error!(
+                            "Error starting live request bar aggregator for {bar_type}: {e}"
+                        );
+                        false
+                    }
+                };
+
+            if let Some(aggregator) = self.bar_aggregators.get(&key) {
+                aggregator.borrow_mut().set_is_running(keep_running);
+            }
+
+            let stop_after_request = self.bar_aggregators_pending_stop.contains(&key)
+                && !self.has_pending_shared_bar_aggregation(bar_type);
+
+            if stop_after_request && let Err(e) = self.stop_bar_aggregator(bar_type, None) {
+                log::error!("Error stopping request bar aggregator for {bar_type}: {e}");
+            }
+        }
+    }
+
+    /// Ends the historical data of the builder under `key`, as upstream's
+    /// `finish_historical_bar_aggregator` does, after firing the closes due through
+    /// `drain_through` (U2): the live records held for its subscription are fed, then a close
+    /// deferred at the last record's instant fires.
+    fn finish_historical_bar_aggregator(
+        &mut self,
+        key: &BarAggregatorKey,
+        has_live_handlers: bool,
+        drain_through: Option<UnixNanos>,
+    ) {
+        if let Some(through) = drain_through
+            && let Some(aggregator) = self.bar_aggregators.get(key)
+        {
+            aggregator.borrow_mut().advance_historical(through);
+        }
+
+        if has_live_handlers
+            && let Some(warmup) = self.bar_aggregator_warmups.remove(key)
+            && let Some(aggregator) = self.bar_aggregators.get(key)
+        {
+            warmup.release(aggregator.borrow_mut().as_mut());
+        }
+
+        if let Some(aggregator) = self.bar_aggregators.get(key)
+            && let Some(aggregator) = aggregator
+                .borrow_mut()
+                .as_any_mut()
+                .downcast_mut::<TimeBarAggregator>()
+        {
+            aggregator.flush_pending_historical_bar();
+        }
+    }
+
+    /// EXPERIMENT (see [`upstream_kept_experiment`]): fires the closes of the builders of a
+    /// request kept on upstream's historical path due strictly before a record stamped `ts` of
+    /// its interleaved answer (U3): each builder, in the request's order, advances through `ts`
+    /// minus 1 ns (see [`BarAggregator::advance_historical`]).
+    fn advance_historical_bar_aggregators(&self, state: &RequestBarAggregation, ts: UnixNanos) {
+        let through = ts.saturating_sub(DurationNanos::new(1));
+
+        for bar_type in &state.bar_types {
+            self.update_request_bar_aggregator(*bar_type, None, |aggregator| {
+                aggregator.advance_historical(through);
+            });
+        }
+    }
+
     fn can_start_request_bar_aggregators(
         &self,
         request_id: UUID4,
@@ -990,7 +1166,7 @@ impl DataEngine {
             aggregator.borrow_mut().set_is_running(true);
         }
 
-        self.set_request_bar_aggregator_chain_handlers(request_id, state);
+        self.set_request_bar_aggregator_chain_handlers(request_id, state, false);
 
         Ok(())
     }
@@ -999,6 +1175,7 @@ impl DataEngine {
         &self,
         request_id: UUID4,
         state: &RequestBarAggregation,
+        historical: bool,
     ) {
         let aggregator_request_id = state.aggregator_request_id(request_id);
 
@@ -1041,8 +1218,11 @@ impl DataEngine {
                 }
             });
 
-            // A replay's builder computes as a subscription's, not in historical mode
-            aggregator.borrow_mut().set_historical_mode(false, handler);
+            // A replay's builder computes as a subscription's, not in historical mode; a
+            // builder on upstream's historical path (the experiment) computes historically
+            aggregator
+                .borrow_mut()
+                .set_historical_mode(historical, handler);
         }
     }
 
@@ -1109,6 +1289,11 @@ impl DataEngine {
         let replay = self.request_replays.remove(request_id);
 
         let state = self.request_bar_aggregations.remove(request_id)?;
+
+        if is_upstream_kept(&state) {
+            self.finish_upstream_kept_bar_aggregators(&state, succeeded);
+            return None;
+        }
 
         if state.update_subscriptions {
             let answer = interleaved.map(|interleaved| Rc::clone(&interleaved.bars));
@@ -1711,7 +1896,11 @@ impl DataEngine {
 
         for trade in resp.data.iter() {
             // The closes of the request's replay due before the trade, each bar before it
-            self.replay_until(request_id, trade.ts_init);
+            if is_upstream_kept(state) {
+                self.advance_historical_bar_aggregators(state, trade.ts_init);
+            } else {
+                self.replay_until(request_id, trade.ts_init);
+            }
             let fired = std::mem::take(&mut *bars.borrow_mut());
             send_interleaved_bars(&self.cache, resp, &mut pending, fired);
 
@@ -1770,10 +1959,15 @@ impl DataEngine {
         quotes: QuotesResponse,
     ) {
         let request_id = quotes.correlation_id;
+        let upstream_kept = self
+            .request_bar_aggregations
+            .get(&request_id)
+            .filter(|state| is_upstream_kept(state))
+            .cloned();
         let bars = self
             .interleaved_requests
             .get(&request_id)
-            .filter(|_| self.request_replays.contains_key(&request_id))
+            .filter(|_| self.request_replays.contains_key(&request_id) || upstream_kept.is_some())
             .map(|interleaved| Rc::clone(&interleaved.bars));
 
         let Some(bars) = bars else {
@@ -1786,7 +1980,10 @@ impl DataEngine {
 
         for quote in quotes.data.iter() {
             // The closes of the request's replay due before the quote, each bar before it
-            self.replay_until(request_id, quote.ts_init);
+            match &upstream_kept {
+                Some(state) => self.advance_historical_bar_aggregators(state, quote.ts_init),
+                None => self.replay_until(request_id, quote.ts_init),
+            }
             let fired = std::mem::take(&mut *bars.borrow_mut());
 
             if !fired.is_empty() {
@@ -2904,6 +3101,24 @@ fn names_a_limit(req: &RequestCommand) -> bool {
         RequestCommand::Bars(cmd) => cmd.limit.is_some(),
         _ => false,
     }
+}
+
+/// EXPERIMENT SCAFFOLDING, not for merging: whether requests that keep their builders
+/// (`update_subscriptions`) take upstream's historical path (made in historical mode on clocks
+/// of their own, finished and handed over at the request's end, plus U1-U3) instead of our
+/// replay, its admissions and its release. Read once from the process environment:
+/// `NAUTILUS_EXPERIMENT_UPSTREAM_KEPT=1`. Off by default, which leaves our path as it is.
+fn upstream_kept_experiment() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("NAUTILUS_EXPERIMENT_UPSTREAM_KEPT").is_ok_and(|value| value == "1")
+    });
+    *ON
+}
+
+/// Whether `state` keeps its builders on upstream's historical path (see
+/// [`upstream_kept_experiment`]).
+fn is_upstream_kept(state: &RequestBarAggregation) -> bool {
+    state.update_subscriptions && upstream_kept_experiment()
 }
 
 /// Returns whether `bar_type`'s builder runs on a clock: a time bar closes, and a `RANGE` bar

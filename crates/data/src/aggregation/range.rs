@@ -334,6 +334,14 @@ impl BarAggregator for RangeBarAggregator {
         self.arm_boundary_alert(boundary);
     }
 
+    /// Without a clock, completes the forming bar at a boundary `ts` has reached; the first
+    /// update schedules the first boundary.
+    fn advance_historical(&mut self, ts: UnixNanos) {
+        if self.clock.is_none() && self.next_boundary_ns.is_some() {
+            self.roll_boundary(ts);
+        }
+    }
+
     fn set_aggregator_weak(&mut self, weak: Weak<RefCell<Box<dyn BarAggregator>>>) {
         self.aggregator_weak = Some(weak);
     }

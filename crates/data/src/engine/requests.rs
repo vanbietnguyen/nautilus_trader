@@ -63,6 +63,9 @@ pub(super) struct RequestBarAggregation {
     /// `DataEngine::admit_interleave`; what callers get is documented on
     /// `DataActor::request_trades`, `nautilus_common::actor`).
     pub(super) interleave: bool,
+    /// The request's `end`, set when its aggregators are prepared: its builders kept by request
+    /// (`update_subscriptions`) fire the closes due up to it when it succeeds.
+    pub(super) end: Option<UnixNanos>,
 }
 
 impl RequestBarAggregation {
@@ -331,6 +334,7 @@ pub(super) fn request_bar_aggregation_from_params(
         skip_first_non_full_bar,
         time_zone: time_zone_from_params(Some(params))?,
         interleave,
+        end: None,
     }))
 }
 
@@ -503,6 +507,7 @@ fn parse_continuous_future(
             skip_first_non_full_bar: None,
             time_zone: time_zone_from_params(Some(params))?,
             interleave: false,
+            end: None,
         },
         transitions,
         adjustment_mode,
