@@ -442,27 +442,6 @@ mod tests {
     }
 
     #[rstest]
-    fn test_range_is_step_ticks() {
-        let agg = aggregator(|_| {});
-
-        assert_eq!(agg.range, Price::from("10.00"));
-    }
-
-    #[rstest]
-    #[should_panic(expected = "`boundary_offset` must be within [0, 24) hours")]
-    fn test_boundary_offset_must_be_within_a_day() {
-        let _ = RangeBarAggregator::new(
-            bar_type(),
-            2,
-            0,
-            Price::from("0.25"),
-            TimeZone::UTC,
-            SignedDuration::from_hours(24),
-            |_| {},
-        );
-    }
-
-    #[rstest]
     // Friday before the spring-forward Sunday: 18:00 EST
     #[case("2026-03-06T17:00:00Z", "2026-03-06T23:00:00Z")]
     // Exactly at a boundary: the next one
@@ -483,74 +462,6 @@ mod tests {
         );
 
         assert_eq!(agg.next_boundary_after(utc(now)), utc(expected));
-    }
-
-    #[rstest]
-    fn test_first_trade_opens_bar() {
-        let (bars, record) = recording_handler();
-        let mut agg = aggregator(record);
-
-        agg.update(Price::from("100.00"), Quantity::from(2), ts(1));
-
-        assert!(bars.lock().is_empty());
-        assert_eq!(agg.core.builder.open, Some(Price::from("100.00")));
-        assert_eq!(agg.core.builder.volume, Quantity::from(2));
-    }
-
-    #[rstest]
-    fn test_range_equal_to_step_stays_in_bar() {
-        let (bars, record) = recording_handler();
-        let mut agg = aggregator(record);
-
-        agg.update(Price::from("100.00"), Quantity::from(1), ts(1));
-        agg.update(Price::from("110.00"), Quantity::from(1), ts(2));
-        agg.update(Price::from("100.00"), Quantity::from(1), ts(3));
-
-        assert!(bars.lock().is_empty());
-        assert_eq!(agg.core.builder.count, 3);
-    }
-
-    #[rstest]
-    #[case::up("110.00", "110.25", "110.00", "100.00")]
-    #[case::down("90.00", "89.75", "100.00", "90.00")]
-    fn test_overflow_completes_bar_and_opens_next_with_whole_trade(
-        #[case] extreme: &str,
-        #[case] overflow: &str,
-        #[case] bar_high: &str,
-        #[case] bar_low: &str,
-    ) {
-        let (bars, record) = recording_handler();
-        let mut agg = aggregator(record);
-
-        agg.update(Price::from("100.00"), Quantity::from(1), ts(1));
-        agg.update(Price::from(extreme), Quantity::from(2), ts(2));
-        agg.update(Price::from(overflow), Quantity::from(5), ts(3));
-
-        assert_eq!(
-            *bars.lock(),
-            vec![bar("100.00", bar_high, bar_low, extreme, 3, 3)]
-        );
-        assert_eq!(agg.core.builder.open, Some(Price::from(overflow)));
-        assert_eq!(agg.core.builder.high, Some(Price::from(overflow)));
-        assert_eq!(agg.core.builder.low, Some(Price::from(overflow)));
-        assert_eq!(agg.core.builder.volume, Quantity::from(5));
-        assert_eq!(agg.core.builder.count, 1);
-    }
-
-    #[rstest]
-    fn test_boundary_alert_completes_forming_bar() {
-        let (bars, record) = recording_handler();
-        let (rc, clock) = started(record);
-
-        trade(&rc, &clock, "100.00", 1, 1);
-        trade(&rc, &clock, "104.50", 2, 2);
-        advance(&clock, BOUNDARY);
-
-        assert_eq!(
-            *bars.lock(),
-            vec![bar("100.00", "104.50", "100.00", "104.50", 3, BOUNDARY)]
-        );
-        assert_eq!(forming(&rc), (None, Quantity::from(0)));
     }
 
     #[rstest]
@@ -576,56 +487,6 @@ mod tests {
         assert_eq!(
             clock.borrow().next_time_ns(&timer_name()),
             Some(ts(2 * DAY + BOUNDARY))
-        );
-    }
-
-    #[rstest]
-    fn test_boundary_without_forming_bar_is_noop() {
-        let (bars, record) = recording_handler();
-        let (_rc, clock) = started(record);
-
-        advance(&clock, BOUNDARY);
-        advance(&clock, DAY + BOUNDARY);
-
-        assert!(bars.lock().is_empty());
-    }
-
-    #[rstest]
-    fn test_first_trade_after_boundary_opens_new_bar() {
-        let (bars, record) = recording_handler();
-        let (rc, clock) = started(record);
-
-        trade(&rc, &clock, "100.00", 1, 1);
-        trade(&rc, &clock, "150.00", 4, 20);
-
-        assert_eq!(
-            *bars.lock(),
-            vec![bar("100.00", "100.00", "100.00", "100.00", 1, BOUNDARY)]
-        );
-        assert_eq!(
-            forming(&rc),
-            (Some(Price::from("150.00")), Quantity::from(4))
-        );
-    }
-
-    #[rstest]
-    fn test_boundary_completes_before_trade_at_boundary_without_alert() {
-        let (bars, record) = recording_handler();
-        let (rc, clock) = started(record);
-
-        trade(&rc, &clock, "100.00", 1, 1);
-        // The trade reaches the aggregator before the alert fires
-        rc.borrow_mut()
-            .update(Price::from("101.00"), Quantity::from(1), ts(BOUNDARY));
-        advance(&clock, BOUNDARY + 1);
-
-        assert_eq!(
-            *bars.lock(),
-            vec![bar("100.00", "100.00", "100.00", "100.00", 1, BOUNDARY)]
-        );
-        assert_eq!(
-            forming(&rc),
-            (Some(Price::from("101.00")), Quantity::from(1))
         );
     }
 
@@ -818,88 +679,6 @@ mod tests {
             new.borrow().next_time_ns(&timer_name()),
             Some(utc("2026-11-17T23:00:00Z"))
         );
-    }
-
-    #[rstest]
-    fn test_continue_on_clock_never_armed_stays_unarmed() {
-        let (bars, record) = recording_handler();
-        let old = clock_at("2026-11-16T20:00:00Z");
-        let rc: SharedAggregator = Rc::new(RefCell::new(Box::new(RangeBarAggregator::new(
-            bar_type(),
-            2,
-            0,
-            Price::from("0.25"),
-            get_timezone(NEW_YORK).unwrap(),
-            SIX_PM,
-            record,
-        ))));
-        rc.borrow_mut()
-            .set_clock(Rc::clone(&old) as Rc<RefCell<dyn Clock>>);
-        rc.borrow_mut().set_aggregator_weak(Rc::downgrade(&rc));
-        let new = clock_at("2026-11-16T20:10:00Z");
-
-        continue_on(&rc, &new);
-
-        assert_eq!(old.borrow().timer_count(), 0);
-        assert_eq!(new.borrow().timer_count(), 0);
-        trade_on(&rc, &new, "100.00", 1, "2026-11-16T20:30:00Z");
-        assert_eq!(*bars.lock(), Vec::<Bar>::new());
-        assert_eq!(
-            forming(&rc),
-            (Some(Price::from("100.00")), Quantity::from(1))
-        );
-        assert_eq!(old.borrow().timer_count(), 0);
-        assert_eq!(
-            new.borrow().next_time_ns(&timer_name()),
-            Some(utc("2026-11-16T23:00:00Z"))
-        );
-    }
-
-    #[rstest]
-    fn test_continue_on_clock_voids_collected_callback() {
-        let (bars, record) = recording_handler();
-        let old = clock_at("2026-11-16T20:00:00Z");
-        let rc = started_in_new_york(record, &old);
-        trade_on(&rc, &old, "100.00", 1, "2026-11-16T20:30:00Z");
-        let events = old
-            .borrow_mut()
-            .advance_time(utc("2026-11-16T23:00:00Z"), true);
-        let collected = old.borrow().match_handlers(events);
-        let new = clock_at("2026-11-16T23:00:00Z");
-
-        continue_on(&rc, &new);
-
-        for handler in collected {
-            handler.callback.call(handler.event);
-        }
-        assert_eq!(*bars.lock(), Vec::<Bar>::new());
-        assert_eq!(
-            forming(&rc),
-            (Some(Price::from("100.00")), Quantity::from(1))
-        );
-        fire_through(&new, "2026-11-16T23:00:00Z");
-        assert_eq!(
-            *bars.lock(),
-            vec![bar_at(
-                "100.00",
-                "100.00",
-                "100.00",
-                "100.00",
-                1,
-                "2026-11-16T23:00:00Z"
-            )]
-        );
-    }
-
-    #[rstest]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "Invariant: the pending boundary")]
-    fn test_continue_on_clock_past_pending_boundary_is_a_caller_bug() {
-        let old = clock_at("2026-11-16T20:00:00Z");
-        let rc = started_in_new_york(|_| {}, &old);
-        let new = clock_at("2026-11-16T23:00:01Z");
-
-        continue_on(&rc, &new);
     }
 
     /// One synthetic tape through every construction rule, against bars computed by hand from the

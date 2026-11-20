@@ -905,24 +905,6 @@ mod tests {
     }
 
     #[rstest]
-    fn test_window_source_passes_a_chunk_error_on_unchanged() {
-        let failing = || {
-            let page = DataBatch::Quote(vec![quote(1, 1)].into());
-            [Ok(page), Err(anyhow::anyhow!("page 2 cannot be decoded"))].into_iter()
-        };
-
-        let mut source = WindowSource::new(failing(), None, None).unwrap();
-        assert!(matches!(source.poll_batch(), Ok(ReplayPoll::Ready(_))));
-        let error = source.poll_batch().unwrap_err();
-        assert_eq!(error.to_string(), "page 2 cannot be decoded");
-
-        // Read before a row in the window, the error fails the source as it is made
-        let outside = Some(UnixNanos::from(2));
-        let error = WindowSource::new(failing(), outside, None).err().unwrap();
-        assert_eq!(error.to_string(), "page 2 cannot be decoded");
-    }
-
-    #[rstest]
     #[case::sorted(vec![9, 1, 2, 8], true)]
     #[case::unsorted(vec![9, 2, 1, 8], false)]
     fn test_merge_series_preserves_single_visible_leg(

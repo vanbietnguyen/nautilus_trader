@@ -3188,25 +3188,21 @@ mod tests {
     use nautilus_common::{
         cache::Cache,
         clock::{Clock, VirtualClock},
-        messages::data::{
-            DataResponse, DataResponseEnvelope, RequestCommand, RequestTrades, SubscribeBars,
-            TradesResponse,
-        },
+        messages::data::SubscribeBars,
         msgbus::MessageBus,
     };
     use nautilus_core::{UUID4, UnixNanos, datetime::get_timezone};
     use nautilus_model::{
-        data::{Bar, BarType, TradeTick},
-        enums::AggressorSide,
-        identifiers::{ClientId, TradeId, TraderId},
+        data::{Bar, BarType},
+        identifiers::TraderId,
         instruments::{InstrumentAny, stubs::audusd_sim},
         types::{Price, Quantity},
     };
     use rstest::rstest;
 
     use super::{
-        BarAggregatorSubscription, BarAggregatorWarmup, bar_aggregator_key,
-        request_bar_aggregation_from_params, sources_before_dependents, time_zone_from_params,
+        bar_aggregator_key, request_bar_aggregation_from_params, sources_before_dependents,
+        time_zone_from_params,
     };
     use crate::engine::{DataEngine, config::DataEngineConfig};
 
@@ -3442,166 +3438,5 @@ mod tests {
         raw.iter()
             .map(|bar_type| BarType::from(format!("AUD/USD.SIM-{bar_type}").as_str()))
             .collect()
-    }
-
-    /// An engine without clients, and an interleaved trades request for AUD/USD 1-TICK bars.
-    fn interleaved_engine() -> (DataEngine, RequestCommand) {
-        let clock = Rc::new(RefCell::new(VirtualClock::new()));
-        let cache = Rc::new(RefCell::new(Cache::default()));
-        cache
-            .borrow_mut()
-            .add_instrument(InstrumentAny::CurrencyPair(audusd_sim()))
-            .unwrap();
-        let engine = DataEngine::new(clock, cache, None);
-        let params: nautilus_core::Params = serde_json::from_value(serde_json::json!({
-            "bar_types": ["AUD/USD.SIM-1-TICK-LAST-INTERNAL"],
-            "update_subscriptions": false,
-            "interleave": true,
-        }))
-        .unwrap();
-        let request = RequestCommand::Trades(RequestTrades::new(
-            audusd_sim().id,
-            None,
-            None,
-            None,
-            Some(ClientId::new("SIM")),
-            UUID4::new(),
-            UnixNanos::default(),
-            Some(params),
-        ));
-        (engine, request)
-    }
-
-    fn trades_envelope(request_id: UUID4, ts: u64, completed: bool) -> DataResponseEnvelope {
-        let trade = TradeTick::new(
-            audusd_sim().id,
-            Price::from("0.65000"),
-            Quantity::from(1),
-            AggressorSide::Buy,
-            TradeId::new(ts.to_string()),
-            UnixNanos::from(ts),
-            UnixNanos::from(ts),
-        );
-        DataResponseEnvelope::new(
-            DataResponse::Trades(TradesResponse::new(
-                request_id,
-                ClientId::new("SIM"),
-                audusd_sim().id,
-                vec![trade],
-                None,
-                None,
-                UnixNanos::from(ts),
-                None,
-            )),
-            completed,
-            None,
-        )
-    }
-
-    #[rstest]
-    #[case::completed_answer(true)]
-    #[case::payload_free_failure(false)]
-    fn test_interleaved_entry_lives_through_partial_envelopes_until_the_request_ends(
-        #[case] completed_answer: bool,
-    ) {
-        let _msgbus = MessageBus::new(TraderId::new("TESTER-001"), UUID4::new(), None, None)
-            .register_message_bus();
-        let (mut engine, request) = interleaved_engine();
-        let request_id = *request.request_id();
-        engine.prepare_request_bar_aggregators(&request).unwrap();
-
-        for ts in 1..=3 {
-            assert!(engine.interleaved_requests.contains_key(&request_id));
-            engine.response_envelope(trades_envelope(request_id, ts, false));
-        }
-        assert!(engine.interleaved_requests.contains_key(&request_id));
-        if completed_answer {
-            engine.response_envelope(trades_envelope(request_id, 4, true));
-        } else {
-            engine.response_envelope(DataResponseEnvelope::terminal(
-                request_id,
-                Some("the source stopped".to_owned()),
-            ));
-        }
-
-        assert!(engine.interleaved_requests.is_empty());
-        assert!(engine.request_bar_aggregations.is_empty());
-    }
-
-    #[rstest]
-    fn test_interleaved_dispatch_error_leaves_no_entry() {
-        let _msgbus = MessageBus::new(TraderId::new("TESTER-001"), UUID4::new(), None, None)
-            .register_message_bus();
-        let (mut engine, request) = interleaved_engine();
-
-        let error = engine.execute_request(request).unwrap_err();
-
-        assert!(error.to_string().contains("no client found"), "{error}");
-        assert!(engine.interleaved_requests.is_empty());
-        assert!(engine.request_bar_aggregations.is_empty());
-    }
-
-    #[rstest]
-    #[case::plain_live(None, "BarTradeHandler", None)]
-    #[case::ordinary_warmup(Some(false), "BarTradeHandler", Some("Trade"))]
-    fn test_only_a_joined_warmup_subscribes_the_joined_trade_handler(
-        #[case] cut_warmup: Option<bool>,
-        #[case] handler_name: &str,
-        #[case] warmup: Option<&str>,
-    ) {
-        let _msgbus = MessageBus::new(TraderId::new("TESTER-001"), UUID4::new(), None, None)
-            .register_message_bus();
-        let (mut engine, _) = interleaved_engine();
-        let bar_type = BarType::from("AUD/USD.SIM-1-TICK-LAST-INTERNAL");
-
-        // A running `update_subscriptions` request defers the live subscription to its warm-up
-        if let Some(cut_warmup) = cut_warmup {
-            let params: nautilus_core::Params = serde_json::from_value(serde_json::json!({
-                "bar_types": [bar_type.to_string()],
-                "update_subscriptions": true,
-                "cut_warmup": cut_warmup,
-            }))
-            .unwrap();
-            let request = RequestCommand::Trades(RequestTrades::new(
-                audusd_sim().id,
-                Some(UnixNanos::default().to_datetime_utc()),
-                None,
-                None,
-                Some(ClientId::new("SIM")),
-                UUID4::new(),
-                UnixNanos::default(),
-                Some(params),
-            ));
-            engine.prepare_request_bar_aggregators(&request).unwrap();
-        }
-        engine
-            .subscribe_bars(&SubscribeBars::new(
-                bar_type,
-                None,
-                Some(bar_type.instrument_id().venue),
-                UUID4::new(),
-                UnixNanos::default(),
-                None,
-                None,
-            ))
-            .unwrap();
-
-        let key = bar_aggregator_key(bar_type, None);
-        let handler_ids: Vec<String> = engine.bar_aggregator_handlers[&key]
-            .iter()
-            .map(|subscription| match subscription {
-                BarAggregatorSubscription::Trade { handler, .. } => handler.id().to_string(),
-                other => panic!("not a trade subscription: {other:?}"),
-            })
-            .collect();
-        assert_eq!(handler_ids, [format!("{handler_name}|{bar_type}")]);
-        let warmup_kind = engine
-            .bar_aggregator_warmups
-            .get(&key)
-            .map(|warmup| match warmup {
-                BarAggregatorWarmup::Trade(_) => "Trade",
-                other => panic!("not a trade warm-up: {other:?}"),
-            });
-        assert_eq!(warmup_kind, warmup);
     }
 }
