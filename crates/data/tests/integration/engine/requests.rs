@@ -5939,6 +5939,102 @@ fn test_merged_answer_sends_a_bar_before_the_first_quote_after_its_close(
 
 #[cfg(feature = "streaming")]
 #[rstest]
+fn test_merged_answer_quote_at_a_close_comes_before_the_closing_bar(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let minute = bar_type_of(fixture.instrument_id, "1-MINUTE");
+    let t = |time: &str| utc_ns(&format!("2024-01-08T{time}Z"));
+    let window = (t("09:59:00"), t("10:00:30"));
+
+    let delivered = run_merged(
+        &fixture,
+        "merged-quote-at-a-close",
+        &[minute],
+        window,
+        &[merged_run(
+            window,
+            &[quote_at(t("10:00:00")), quote_at(t("10:00:02"))],
+            &[(t("09:59:30"), "t1"), (t("10:00:06"), "t2")],
+        )],
+    );
+
+    // The close at the quote's own stamp stays armed: the quote, then the bar, before the next
+    // later record (the 10:00:02 quote), so the run of quotes is split there
+    assert_eq!(
+        delivered,
+        vec![
+            merged_trades(&["t1"], &[0, 0]),
+            merged_quotes(&[t("10:00:00")], &[0, 1]),
+            merged_bar(minute, t("10:00:00"), 1, &[1, 1]),
+            merged_quotes(&[t("10:00:02")], &[1, 2]),
+            merged_trades(&["t2"], &[1, 2]),
+            Merged::End(None),
+        ]
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_merged_answer_quote_at_the_range_boundary_comes_before_the_range_then_the_time_bar(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let fixture = join_fixture_with_config(
+        audusd_sim,
+        client_id,
+        venue,
+        NY_2026_11_12_2000,
+        Some(with_new_york_session(DataEngineConfig::default())),
+    );
+    let id = fixture.instrument_id;
+    let (five, range) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "10-RANGE"));
+    let t = |time: &str| new_york(&format!("2024-01-08T{time}"));
+    let window = (t("17:50:00"), t("18:02:00"));
+
+    let delivered = run_merged(
+        &fixture,
+        "merged-quote-at-the-boundary",
+        &[five, range],
+        window,
+        &[merged_run(
+            window,
+            &[quote_at(t("18:00:00")), quote_at(t("18:01:00"))],
+            &[
+                (t("17:52:00"), "a"),
+                (t("17:56:00"), "b"),
+                (t("18:01:30"), "c"),
+            ],
+        )],
+    );
+
+    // No trade at 18:00: the quote stamped there, then the range bar its boundary completes, then
+    // the 5-minute bar closing at the same instant (timer name order), then the next quote
+    assert_eq!(
+        delivered,
+        vec![
+            merged_trades(&["a"], &[0, 0, 0]),
+            merged_bar(five, t("17:55:00"), 1, &[1, 0, 0]),
+            merged_trades(&["b"], &[1, 0, 0]),
+            merged_quotes(&[t("18:00:00")], &[1, 0, 1]),
+            merged_bar(range, t("18:00:00"), 2, &[1, 1, 1]),
+            merged_bar(five, t("18:00:00"), 1, &[2, 1, 1]),
+            merged_quotes(&[t("18:01:00")], &[2, 1, 2]),
+            merged_trades(&["c"], &[2, 1, 2]),
+            Merged::End(None),
+        ]
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
 fn test_merged_answer_splits_a_run_of_quotes_at_each_close_of_two_time_bar_types(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
@@ -7871,6 +7967,49 @@ fn test_held_back_subscription_drops_a_held_trade_the_answer_already_holds(
             published(five, monday("17:05:00"), 4, &[2]),
         ]
     );
+}
+
+/// A kept bar type released by its request while that request is in flight: the request runs to
+/// its end, its answer whole, then its replay is removed, not kept, so the first window can be
+/// asked again; no subscription is released at the client.
+#[rstest]
+fn test_releasing_a_kept_bar_type_while_its_request_runs_removes_the_replay_at_its_end(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
+    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
+    let request = fixture
+        .request(&[five], kept_window(monday("10:00:00"), monday("10:08:00")))
+        .unwrap();
+    let sent = fixture.client_commands(0).len();
+    fixture.release(five, request);
+    fixture.answer(
+        request,
+        &[(monday("10:01:00"), 1, "a1"), (monday("10:06:00"), 2, "a2")],
+        None,
+    );
+
+    // The first window again: admitted only because no builder of it is left
+    let started = fixture
+        .request(&[five], kept_window(monday("10:00:00"), monday("10:15:00")))
+        .unwrap();
+    fixture.answer(started, &[(monday("10:12:00"), 4, "c1")], None);
+
+    assert!(
+        !fixture
+            .client_commands(sent)
+            .iter()
+            .any(|command| matches!(command, DataCommand::Unsubscribe(_))),
+        "{:?}",
+        fixture.client_commands(sent)
+    );
+    let mut expected = first_kept_answer(five);
+    expected.extend([kept_trade(1, "c1", &[1]), Kept::End(1, None)]);
+    assert_eq!(fixture.delivered(), expected);
 }
 
 /// A kept request for 3-MINUTE and 5-MINUTE bars from 10:00, answered through 10:05 at 10:08,
