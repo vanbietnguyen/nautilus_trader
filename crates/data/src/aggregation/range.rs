@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! `DeepCharts`-style range bar aggregation.
+//! Range bar aggregation in which the completing update opens the next bar.
 
 use std::{
     cell::{Cell, RefCell},
@@ -38,12 +38,6 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 
 use super::{BarAggregator, BarAggregatorCore};
-
-/// The default time zone of the daily range bar boundary.
-pub const RANGE_BAR_DEFAULT_TIME_ZONE: &str = "America/New_York";
-
-/// The default daily range bar boundary, as an offset from local midnight (18:00).
-pub const RANGE_BAR_DEFAULT_BOUNDARY: SignedDuration = SignedDuration::from_hours(18);
 
 /// Returns the first daily boundary strictly after `ts`, where the boundary is `offset` from local
 /// midnight in `time_zone`.
@@ -72,7 +66,7 @@ pub(super) fn next_daily_boundary_after(
     }
 }
 
-/// Provides a means of building range bars, following the `DeepCharts` convention.
+/// Provides a means of building range bars that exclude their completing update.
 ///
 /// The range is the bar specification step multiplied by the instrument price increment. An
 /// update that would make the forming bar's high minus low exceed the range completes the forming
@@ -89,7 +83,7 @@ pub(super) fn next_daily_boundary_after(
 ///
 /// Completed bars carry the completion time as both `ts_event` and `ts_init`: the completing
 /// update's `ts_init`, or the boundary.
-pub struct DeepChartsRangeBarAggregator {
+pub struct RangeBarAggregator {
     core: BarAggregatorCore,
     range: Price,
     time_zone: TimeZone,
@@ -101,9 +95,9 @@ pub struct DeepChartsRangeBarAggregator {
     next_boundary_ns: Option<UnixNanos>,
 }
 
-impl Debug for DeepChartsRangeBarAggregator {
+impl Debug for RangeBarAggregator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(stringify!(DeepChartsRangeBarAggregator))
+        f.debug_struct(stringify!(RangeBarAggregator))
             .field("core", &self.core)
             .field("range", &self.range)
             .field("time_zone", &self.time_zone)
@@ -115,8 +109,8 @@ impl Debug for DeepChartsRangeBarAggregator {
     }
 }
 
-impl DeepChartsRangeBarAggregator {
-    /// Creates a new [`DeepChartsRangeBarAggregator`] instance.
+impl RangeBarAggregator {
+    /// Creates a new [`RangeBarAggregator`] instance.
     ///
     /// `boundary_offset` is the daily boundary as an offset from local midnight in `time_zone`.
     ///
@@ -225,7 +219,7 @@ impl DeepChartsRangeBarAggregator {
     }
 }
 
-impl BarAggregator for DeepChartsRangeBarAggregator {
+impl BarAggregator for RangeBarAggregator {
     fn bar_type(&self) -> BarType {
         self.core.builder.bar_type
     }
@@ -364,6 +358,9 @@ mod tests {
     const DAY: u64 = 86_400;
     // Boundaries fall at 10 seconds past each UTC midnight
     const BOUNDARY: u64 = 10;
+    // A session boundary at 18:00 New York
+    const NEW_YORK: &str = "America/New_York";
+    const SIX_PM: SignedDuration = SignedDuration::from_hours(18);
 
     fn bar_type() -> BarType {
         BarType::from("MNQZ5.XCME-40-RANGE-LAST-INTERNAL")
@@ -390,8 +387,8 @@ mod tests {
         )
     }
 
-    fn aggregator<H: FnMut(Bar) + 'static>(handler: H) -> DeepChartsRangeBarAggregator {
-        DeepChartsRangeBarAggregator::new(
+    fn aggregator<H: FnMut(Bar) + 'static>(handler: H) -> RangeBarAggregator {
+        RangeBarAggregator::new(
             bar_type(),
             2,
             0,
@@ -415,10 +412,7 @@ mod tests {
 
     fn forming(rc: &SharedAggregator) -> (Option<Price>, Quantity) {
         let agg = rc.borrow();
-        let agg = agg
-            .as_any()
-            .downcast_ref::<DeepChartsRangeBarAggregator>()
-            .unwrap();
+        let agg = agg.as_any().downcast_ref::<RangeBarAggregator>().unwrap();
         (agg.core.builder.open, agg.core.builder.volume)
     }
 
@@ -457,7 +451,7 @@ mod tests {
     #[rstest]
     #[should_panic(expected = "`boundary_offset` must be within [0, 24) hours")]
     fn test_boundary_offset_must_be_within_a_day() {
-        let _ = DeepChartsRangeBarAggregator::new(
+        let _ = RangeBarAggregator::new(
             bar_type(),
             2,
             0,
@@ -477,14 +471,14 @@ mod tests {
     #[case("2026-03-09T17:00:00Z", "2026-03-09T22:00:00Z")]
     // After the boundary, before UTC midnight
     #[case("2026-08-21T22:30:00Z", "2026-08-22T22:00:00Z")]
-    fn test_default_boundary_follows_new_york_clock(#[case] now: &str, #[case] expected: &str) {
-        let agg = DeepChartsRangeBarAggregator::new(
+    fn test_boundary_follows_new_york_clock(#[case] now: &str, #[case] expected: &str) {
+        let agg = RangeBarAggregator::new(
             bar_type(),
             2,
             0,
             Price::from("0.25"),
-            get_timezone(RANGE_BAR_DEFAULT_TIME_ZONE).unwrap(),
-            RANGE_BAR_DEFAULT_BOUNDARY,
+            get_timezone(NEW_YORK).unwrap(),
+            SIX_PM,
             |_| {},
         );
 
@@ -691,21 +685,20 @@ mod tests {
         clock
     }
 
-    /// Starts an aggregator with the default boundary, 18:00 in New York, on `clock`.
+    /// Starts an aggregator with its boundary at 18:00 in New York, on `clock`.
     fn started_in_new_york<H: FnMut(Bar) + 'static>(
         handler: H,
         clock: &Rc<RefCell<VirtualClock>>,
     ) -> SharedAggregator {
-        let rc: SharedAggregator =
-            Rc::new(RefCell::new(Box::new(DeepChartsRangeBarAggregator::new(
-                bar_type(),
-                2,
-                0,
-                Price::from("0.25"),
-                get_timezone(RANGE_BAR_DEFAULT_TIME_ZONE).unwrap(),
-                RANGE_BAR_DEFAULT_BOUNDARY,
-                handler,
-            ))));
+        let rc: SharedAggregator = Rc::new(RefCell::new(Box::new(RangeBarAggregator::new(
+            bar_type(),
+            2,
+            0,
+            Price::from("0.25"),
+            get_timezone(NEW_YORK).unwrap(),
+            SIX_PM,
+            handler,
+        ))));
         rc.borrow_mut()
             .set_clock(Rc::clone(clock) as Rc<RefCell<dyn Clock>>);
         rc.borrow_mut().start_timer(Some(Rc::clone(&rc)));
@@ -831,16 +824,15 @@ mod tests {
     fn test_continue_on_clock_never_armed_stays_unarmed() {
         let (bars, record) = recording_handler();
         let old = clock_at("2026-11-16T20:00:00Z");
-        let rc: SharedAggregator =
-            Rc::new(RefCell::new(Box::new(DeepChartsRangeBarAggregator::new(
-                bar_type(),
-                2,
-                0,
-                Price::from("0.25"),
-                get_timezone(RANGE_BAR_DEFAULT_TIME_ZONE).unwrap(),
-                RANGE_BAR_DEFAULT_BOUNDARY,
-                record,
-            ))));
+        let rc: SharedAggregator = Rc::new(RefCell::new(Box::new(RangeBarAggregator::new(
+            bar_type(),
+            2,
+            0,
+            Price::from("0.25"),
+            get_timezone(NEW_YORK).unwrap(),
+            SIX_PM,
+            record,
+        ))));
         rc.borrow_mut()
             .set_clock(Rc::clone(&old) as Rc<RefCell<dyn Clock>>);
         rc.borrow_mut().set_aggregator_weak(Rc::downgrade(&rc));
@@ -911,7 +903,7 @@ mod tests {
     }
 
     /// One synthetic tape through every construction rule, against bars computed by hand from the
-    /// `DeepCharts` convention: overflow completes the prior bar and the whole trade opens the
+    /// aggregator's rules: overflow completes the prior bar and the whole trade opens the
     /// next; equality stays; the daily boundary completes the forming bar; a boundary with nothing
     /// forming is a no-op; the first trade after a boundary opens a fresh bar; a trade at the
     /// boundary arrives after the boundary's completion; a forming bar at the end of the tape is

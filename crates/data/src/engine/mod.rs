@@ -166,8 +166,7 @@ use crate::defi::engine as _;
 use crate::engine::pool::PoolUpdater;
 use crate::{
     aggregation::{
-        BarAggregator, DeepChartsRangeBarAggregator, RANGE_BAR_DEFAULT_BOUNDARY,
-        RANGE_BAR_DEFAULT_TIME_ZONE, RangeInclusiveBarAggregator, RenkoBarAggregator,
+        BarAggregator, RangeBarAggregator, RangeInclusiveBarAggregator, RenkoBarAggregator,
         SpreadQuoteAggregator, TickBarAggregator, TickImbalanceBarAggregator,
         TickRunsBarAggregator, TimeBarAggregator, ValueBarAggregator, ValueImbalanceBarAggregator,
         ValueRunsBarAggregator, VolumeBarAggregator, VolumeImbalanceBarAggregator,

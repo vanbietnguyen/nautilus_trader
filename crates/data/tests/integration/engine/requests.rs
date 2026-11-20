@@ -3833,6 +3833,17 @@ fn join_fixture(
     venue: Venue,
     now_ns: u64,
 ) -> JoinFixture {
+    join_fixture_with_config(audusd_sim, client_id, venue, now_ns, None)
+}
+
+/// An engine with `config` whose clock reads `now_ns`, with a recording mock client.
+fn join_fixture_with_config(
+    audusd_sim: CurrencyPair,
+    client_id: ClientId,
+    venue: Venue,
+    now_ns: u64,
+    config: Option<DataEngineConfig>,
+) -> JoinFixture {
     let mut virtual_clock = VirtualClock::new();
     let _ = virtual_clock.advance_time(UnixNanos::from(now_ns), true);
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(virtual_clock));
@@ -3847,7 +3858,7 @@ fn join_fixture(
     let engine = Rc::new(RefCell::new(DataEngine::new(
         clock,
         Rc::clone(&cache),
-        None,
+        config,
     )));
     DataEngine::register_msgbus_handlers(&engine);
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
@@ -6540,7 +6551,7 @@ fn test_replayed_request_delivers_the_closes_after_its_last_trade_through_its_en
         audusd_sim,
         client_id,
         venue,
-        without_flat_bars(),
+        with_new_york_session(without_flat_bars()),
         &[five, range],
         spec,
     );
@@ -6590,7 +6601,7 @@ fn test_replayed_trade_at_a_close_is_in_the_closing_bar_and_at_the_boundary_comp
         audusd_sim,
         client_id,
         venue,
-        without_flat_bars(),
+        with_new_york_session(without_flat_bars()),
         &[five, range],
         spec,
     );
@@ -6693,7 +6704,7 @@ fn test_replayed_range_boundary_and_time_close_at_one_instant_come_range_then_ti
         audusd_sim,
         client_id,
         venue,
-        without_flat_bars(),
+        with_new_york_session(without_flat_bars()),
         &[five, range],
         spec,
     );
@@ -6779,10 +6790,10 @@ fn test_replayed_weekend_completes_the_range_bar_once_at_friday_18_00(
     let _ = stub_msgbus;
     let id = audusd_sim.id;
     let (hour, range) = (bar_type_of(id, "1-HOUR"), bar_type_of(id, "10-RANGE"));
-    let config = DataEngineConfig {
+    let config = with_new_york_session(DataEngineConfig {
         time_bars_build_with_no_updates: build_with_no_updates,
         ..DataEngineConfig::default()
-    };
+    });
     let spec = ReplaySpec {
         dispatched: new_york("2024-01-15T09:00:00"),
         start: Some(new_york("2024-01-12T16:00:00")),
@@ -7297,7 +7308,7 @@ fn test_plain_request_delivers_the_closes_after_its_last_trade_through_its_end(
         vec![InstrumentAny::CurrencyPair(audusd_sim)],
         client_id,
         venue,
-        without_flat_bars(),
+        with_new_york_session(without_flat_bars()),
         new_york("2024-01-08T20:00:00"),
         &[five, range],
     );
@@ -8149,7 +8160,13 @@ fn test_merged_answer_quote_at_the_range_boundary_comes_before_the_range_then_th
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let fixture = join_fixture(audusd_sim, client_id, venue, NY_2026_11_12_2000);
+    let fixture = join_fixture_with_config(
+        audusd_sim,
+        client_id,
+        venue,
+        NY_2026_11_12_2000,
+        Some(with_new_york_session(DataEngineConfig::default())),
+    );
     let id = fixture.instrument_id;
     let (five, range) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "10-RANGE"));
     let t = |time: &str| new_york(&format!("2024-01-08T{time}"));
@@ -10242,6 +10259,24 @@ impl KeptFixture {
         now: u64,
         watched: &[BarType],
     ) -> Self {
+        Self::with_config(
+            audusd_sim,
+            client_id,
+            venue,
+            without_flat_bars(),
+            now,
+            watched,
+        )
+    }
+
+    fn with_config(
+        audusd_sim: CurrencyPair,
+        client_id: ClientId,
+        venue: Venue,
+        config: DataEngineConfig,
+        now: u64,
+        watched: &[BarType],
+    ) -> Self {
         let instrument_id = audusd_sim.id;
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let _ = clock.borrow_mut().advance_time(UnixNanos::from(now), true);
@@ -10253,7 +10288,7 @@ impl KeptFixture {
         let mut engine = DataEngine::new(
             Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
             Rc::clone(&cache),
-            Some(without_flat_bars()),
+            Some(config),
         );
         let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
         register_mock_client(
@@ -11110,10 +11145,11 @@ fn test_subscription_after_a_kept_answer_publishes_the_range_bar_at_the_boundary
     let _ = stub_msgbus;
     let id = audusd_sim.id;
     let (five, range) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "10-RANGE"));
-    let mut fixture = KeptFixture::new(
+    let mut fixture = KeptFixture::with_config(
         audusd_sim,
         client_id,
         venue,
+        with_new_york_session(without_flat_bars()),
         monday("17:00:00"),
         &[five, range],
     );
@@ -11161,7 +11197,14 @@ fn test_subscription_at_the_range_boundary_builds_nothing_inside_the_call(
 ) {
     let _ = stub_msgbus;
     let range = bar_type_of(audusd_sim.id, "10-RANGE");
-    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("18:00:00"), &[range]);
+    let mut fixture = KeptFixture::with_config(
+        audusd_sim,
+        client_id,
+        venue,
+        with_new_york_session(without_flat_bars()),
+        monday("18:00:00"),
+        &[range],
+    );
     let request = fixture
         .request(
             &[range],
@@ -12430,10 +12473,11 @@ fn test_kept_builders_handed_over_before_their_pending_closes_publish_each_once_
     let _ = stub_msgbus;
     let id = audusd_sim.id;
     let (five, range) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "10-RANGE"));
-    let mut fixture = KeptFixture::new(
+    let mut fixture = KeptFixture::with_config(
         audusd_sim,
         client_id,
         venue,
+        with_new_york_session(without_flat_bars()),
         monday("16:59:59"),
         &[five, range],
     );
@@ -12482,10 +12526,11 @@ fn test_kept_request_ended_by_a_terminal_without_a_reason_fires_its_end_and_keep
     let _ = stub_msgbus;
     let id = audusd_sim.id;
     let (five, range) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "10-RANGE"));
-    let mut fixture = KeptFixture::new(
+    let mut fixture = KeptFixture::with_config(
         audusd_sim,
         client_id,
         venue,
+        with_new_york_session(without_flat_bars()),
         monday("18:10:00"),
         &[five, range],
     );

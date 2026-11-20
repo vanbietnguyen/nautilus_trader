@@ -3271,7 +3271,7 @@ pub trait DataActor {
     /// a subscription's do, on a clock of their own that the engine drives as a backtest drives
     /// its clock. It starts at the request's `start` (at its first trade without one), so a
     /// calendar grid such as a 2-DAY bar's is anchored there. Before each trade, every time bar
-    /// close and every `RANGE` daily boundary (18:00 `America/New_York` by default) due strictly
+    /// close and every `RANGE` daily boundary (at its configured origin offset) due strictly
     /// before it fires, in time order, two at one instant in timer name order (`RANGE` before
     /// time bars, time bars in bar type order), and its bar comes before the trade; a close at
     /// a trade's own instant fires after every trade of that instant, so that trade is in the

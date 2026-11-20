@@ -13,9 +13,12 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::collections::HashMap;
+
 #[cfg(feature = "streaming")]
 use indexmap::IndexMap;
 use nautilus_common::messages::data::IntoInstrumentIds;
+use nautilus_model::enums::BarAggregation;
 
 use super::*;
 
@@ -84,6 +87,20 @@ pub(super) fn dispatch_data(data_engine: &mut DataEngine, data: Data, borrowed: 
     }
 
     assert_eq!(data_engine.data_count(), count + 1);
+}
+
+/// Returns `config` with range and range-inclusive bars ending their session at 18:00
+/// `America/New_York`.
+pub(super) fn with_new_york_session(config: DataEngineConfig) -> DataEngineConfig {
+    let six_pm = Duration::from_secs(18 * 3_600);
+    DataEngineConfig {
+        time_bars_time_zone: Some("America/New_York".to_owned()),
+        time_bars_origin_offset: HashMap::from([
+            (BarAggregation::Range, six_pm),
+            (BarAggregation::RangeInclusive, six_pm),
+        ]),
+        ..config
+    }
 }
 
 // Registers a mock data client for tests

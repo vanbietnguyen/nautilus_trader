@@ -180,14 +180,15 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::aggregation::{
-        RANGE_BAR_DEFAULT_BOUNDARY, RANGE_BAR_DEFAULT_TIME_ZONE, tests::recording_handler,
-    };
+    use crate::aggregation::tests::recording_handler;
 
     const SEC: u64 = 1_000_000_000;
     const DAY: u64 = 86_400;
     // Boundaries fall at 10 seconds past each UTC midnight
     const BOUNDARY: u64 = 10;
+    // A session boundary at 18:00 New York
+    const NEW_YORK: &str = "America/New_York";
+    const SIX_PM: SignedDuration = SignedDuration::from_hours(18);
 
     fn bar_type() -> BarType {
         BarType::from("MNQZ5.XCME-40-RANGE_INCLUSIVE-LAST-INTERNAL")
@@ -491,18 +492,15 @@ mod tests {
     #[case("2026-03-06T17:00:00Z", "2026-03-06T23:00:00Z")]
     // Monday after: 18:00 EDT
     #[case("2026-03-09T17:00:00Z", "2026-03-09T22:00:00Z")]
-    fn test_default_boundary_discards_at_new_york_clock(
-        #[case] open: &str,
-        #[case] boundary: &str,
-    ) {
+    fn test_boundary_discards_at_new_york_clock(#[case] open: &str, #[case] boundary: &str) {
         let (bars, record) = recording_handler();
         let mut agg = RangeInclusiveBarAggregator::new(
             bar_type(),
             2,
             0,
             Price::from("0.25"),
-            get_timezone(RANGE_BAR_DEFAULT_TIME_ZONE).unwrap(),
-            RANGE_BAR_DEFAULT_BOUNDARY,
+            get_timezone(NEW_YORK).unwrap(),
+            SIX_PM,
             record,
         );
         let boundary = utc(boundary);

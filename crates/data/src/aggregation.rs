@@ -59,9 +59,7 @@ use rust_decimal::{Decimal, prelude::ToPrimitive};
 mod range;
 mod range_inclusive;
 
-pub use range::{
-    DeepChartsRangeBarAggregator, RANGE_BAR_DEFAULT_BOUNDARY, RANGE_BAR_DEFAULT_TIME_ZONE,
-};
+pub use range::RangeBarAggregator;
 pub use range_inclusive::RangeInclusiveBarAggregator;
 
 /// Type alias for bar handler to reduce type complexity.
@@ -129,7 +127,7 @@ pub trait BarAggregator: Any + Debug {
     /// The caller first drives the current clock so that no deadline of this aggregator lies
     /// before the time of `clock`.
     /// Default implementation does nothing, `TimeBarAggregator` and
-    /// `DeepChartsRangeBarAggregator` override.
+    /// `RangeBarAggregator` override.
     fn continue_on_clock(&mut self, _clock: Rc<RefCell<dyn Clock>>) {}
 
     /// Sets the weak reference to the aggregator wrapper (for historical mode).

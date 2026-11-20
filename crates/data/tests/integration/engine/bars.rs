@@ -1542,7 +1542,7 @@ fn test_subscribe_range_bars_aggregates_trades(
 }
 
 #[rstest]
-fn test_subscribe_range_bars_completes_forming_bar_at_default_boundary(
+fn test_subscribe_range_bars_completes_forming_bar_at_session_boundary(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
@@ -1561,7 +1561,7 @@ fn test_subscribe_range_bars_completes_forming_bar_at_default_boundary(
     let mut data_engine = DataEngine::new(
         Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
         Rc::clone(&cache),
-        None,
+        Some(with_new_york_session(DataEngineConfig::default())),
     );
     let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1701,7 +1701,7 @@ fn test_subscribe_range_inclusive_bars_aggregates_trades(
 }
 
 #[rstest]
-fn test_subscribe_range_inclusive_bars_discards_forming_bar_at_default_boundary(
+fn test_subscribe_range_inclusive_bars_discards_forming_bar_at_session_boundary(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
@@ -1717,7 +1717,11 @@ fn test_subscribe_range_inclusive_bars_discards_forming_bar_at_default_boundary(
         .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
         .unwrap();
 
-    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
+    let mut data_engine = DataEngine::new(
+        clock,
+        Rc::clone(&cache),
+        Some(with_new_york_session(DataEngineConfig::default())),
+    );
     let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
@@ -1836,7 +1840,11 @@ fn range_bar_engine(
         .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
         .unwrap();
 
-    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
+    let mut data_engine = DataEngine::new(
+        clock,
+        Rc::clone(&cache),
+        Some(with_new_york_session(DataEngineConfig::default())),
+    );
     let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(

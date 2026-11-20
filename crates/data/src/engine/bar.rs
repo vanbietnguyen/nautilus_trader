@@ -34,12 +34,11 @@ use nautilus_model::{
 
 use super::{
     AggregationSource, BAR_AGGREGATOR_PRIORITY, BarAggregation, BarAggregator, BarBarHandler,
-    BarQuoteHandler, BarTradeHandler, DataCommand, DataEngine, DataResponse,
-    DeepChartsRangeBarAggregator, Instrument, InstrumentAny, PriceType, RANGE_BAR_DEFAULT_BOUNDARY,
-    RANGE_BAR_DEFAULT_TIME_ZONE, RangeInclusiveBarAggregator, Rc, RefCell, RenkoBarAggregator,
-    RequestBarAggregation, RequestCommand, SubscribeQuotes, SubscribeTrades, TickBarAggregator,
-    TickImbalanceBarAggregator, TickRunsBarAggregator, TimeBarAggregator, UnsubscribeBars,
-    UnsubscribeCommand, UnsubscribeQuotes, UnsubscribeTrades, ValueBarAggregator,
+    BarQuoteHandler, BarTradeHandler, DataCommand, DataEngine, DataResponse, Instrument,
+    InstrumentAny, PriceType, RangeBarAggregator, RangeInclusiveBarAggregator, Rc, RefCell,
+    RenkoBarAggregator, RequestBarAggregation, RequestCommand, SubscribeQuotes, SubscribeTrades,
+    TickBarAggregator, TickImbalanceBarAggregator, TickRunsBarAggregator, TimeBarAggregator,
+    UnsubscribeBars, UnsubscribeCommand, UnsubscribeQuotes, UnsubscribeTrades, ValueBarAggregator,
     ValueImbalanceBarAggregator, ValueRunsBarAggregator, VolumeBarAggregator,
     VolumeImbalanceBarAggregator, VolumeRunsBarAggregator,
     handlers::WarmupBuffer,
@@ -621,7 +620,7 @@ impl DataEngine {
         }
 
         for key in &existing {
-            let time_zone = self.bar_aggregator_time_zone(key.0, state.time_zone.clone())?;
+            let time_zone = self.bar_aggregator_time_zone(state.time_zone.clone())?;
             anyhow::ensure!(
                 self.bar_aggregator_reusable(key, &time_zone),
                 "{KEPT_REFUSED}: its time zone is not the time zone of the kept builder of {}",
@@ -2203,7 +2202,7 @@ impl DataEngine {
                     instrument.price_increment(),
                     handler,
                 )) as Box<dyn BarAggregator>,
-                BarAggregation::Range => Box::new(DeepChartsRangeBarAggregator::new(
+                BarAggregation::Range => Box::new(RangeBarAggregator::new(
                     bar_type,
                     price_precision,
                     size_precision,
@@ -2212,7 +2211,7 @@ impl DataEngine {
                     config
                         .time_bars_origin_offset
                         .get(&BarAggregation::Range)
-                        .map_or(RANGE_BAR_DEFAULT_BOUNDARY, |duration| {
+                        .map_or(jiff::SignedDuration::ZERO, |duration| {
                             jiff::SignedDuration::try_from(*duration).unwrap_or_default()
                         }),
                     handler,
@@ -2226,7 +2225,7 @@ impl DataEngine {
                     config
                         .time_bars_origin_offset
                         .get(&BarAggregation::RangeInclusive)
-                        .map_or(RANGE_BAR_DEFAULT_BOUNDARY, |duration| {
+                        .map_or(jiff::SignedDuration::ZERO, |duration| {
                             jiff::SignedDuration::try_from(*duration).unwrap_or_default()
                         }),
                     handler,
@@ -2246,7 +2245,7 @@ impl DataEngine {
         time_zone: Option<TimeZone>,
     ) -> anyhow::Result<()> {
         let key = bar_aggregator_key(bar_type, request_id);
-        let time_zone = self.bar_aggregator_time_zone(bar_type, time_zone)?;
+        let time_zone = self.bar_aggregator_time_zone(time_zone)?;
 
         if self.bar_aggregators.contains_key(&key) {
             anyhow::ensure!(
@@ -2283,36 +2282,18 @@ impl DataEngine {
         Ok(())
     }
 
-    /// Returns the time zone a builder of `bar_type` is made with: `time_zone`, else the
-    /// configured `time_bars_time_zone`, else its aggregation's default.
+    /// Returns the time zone a builder is made with: `time_zone`, else the configured
+    /// `time_bars_time_zone`, else UTC.
     ///
     /// # Errors
     ///
     /// Returns an error if the configured `time_bars_time_zone` is invalid.
-    fn bar_aggregator_time_zone(
-        &self,
-        bar_type: BarType,
-        time_zone: Option<TimeZone>,
-    ) -> anyhow::Result<TimeZone> {
-        if let Some(zone) = time_zone {
-            return Ok(zone);
+    fn bar_aggregator_time_zone(&self, time_zone: Option<TimeZone>) -> anyhow::Result<TimeZone> {
+        match time_zone {
+            Some(zone) => Ok(zone),
+            None => get_timezone(self.config.time_bars_time_zone.as_deref().unwrap_or("UTC"))
+                .context("invalid `time_bars_time_zone` configuration"),
         }
-
-        let default_zone = if matches!(
-            bar_type.spec().aggregation,
-            BarAggregation::Range | BarAggregation::RangeInclusive
-        ) {
-            RANGE_BAR_DEFAULT_TIME_ZONE
-        } else {
-            "UTC"
-        };
-        get_timezone(
-            self.config
-                .time_bars_time_zone
-                .as_deref()
-                .unwrap_or(default_zone),
-        )
-        .context("invalid `time_bars_time_zone` configuration")
     }
 
     /// Returns whether the builder under `key` can be used with `time_zone`: a time bar's builder
