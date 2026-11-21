@@ -71,11 +71,11 @@ use crate::{
             BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
             DataCommand, DataResponse, DataResponseEnvelope, FundingRatesResponse,
             InstrumentResponse, InstrumentsResponse, IntoBarTypes, IntoInstrumentIds,
-            QuotesResponse, ReleaseKeptBars, RequestBars, RequestBookDeltas, RequestBookDepth,
-            RequestBookSnapshot, RequestCommand, RequestCustomData, RequestFundingRates,
-            RequestInstrument, RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars,
-            SubscribeBookDeltas, SubscribeBookDepth, SubscribeBookSnapshots, SubscribeCommand,
-            SubscribeCustomData, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
+            QuotesResponse, RequestBars, RequestBookDeltas, RequestBookDepth, RequestBookSnapshot,
+            RequestCommand, RequestCustomData, RequestFundingRates, RequestInstrument,
+            RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars, SubscribeBookDeltas,
+            SubscribeBookDepth, SubscribeBookSnapshots, SubscribeCommand, SubscribeCustomData,
+            SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
             SubscribeInstrumentClose, SubscribeInstrumentStatus, SubscribeInstruments,
             SubscribeMarkPrices, SubscribeOptionChain, SubscribeOptionGreeks, SubscribeQuotes,
             SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
@@ -3177,7 +3177,7 @@ pub trait DataActor {
     ///
     /// With `params["bar_types"]`, and without `interleave`, the engine also builds those bars
     /// and adds them to the cache; the requester is given the trades as before. The request's
-    /// aggregators (its own, or kept with `update_subscriptions`: below) compute as a
+    /// own aggregators (for those kept with `update_subscriptions`, see below) compute as a
     /// subscription's do, on a clock of their own that the engine drives as a backtest drives
     /// its clock, from
     /// the request's `start` (its first trade without one). Before each trade, every time bar
@@ -3202,62 +3202,25 @@ pub trait DataActor {
     /// time-range pipeline's `point_data` (whose children ask single instants), or that its
     /// client answers with a bare response (`DataEngine::response`, which certifies no coverage;
     /// for a time-range pipeline, to any of its child requests), closes nothing after its last
-    /// record; it completes with no failure reason, except a kept request answered bare (below).
+    /// record; it completes with no failure reason.
     ///
     /// With `params["update_subscriptions"] = true` the request's aggregators are kept under
-    /// their bar types and outlive it, so a later request can continue them and a subscription
-    /// to their bar types takes them over. They compute as above, on a clock of their own; such
-    /// a request must give a `start`, name one instrument, no `limit`, no filter expression, no
-    /// `point_data`, no bar type built from another bar and no bar type its own records do not
-    /// feed (`LAST` bars of its instrument on a trades request, `BID`, `ASK` and `MID` bars on a
-    /// quotes request; no other kind of request keeps builders), and not be a continuous-future
-    /// request, on an engine
-    /// whose clock is a `VirtualClock` (a backtest's); any other is refused before dispatch, with
-    /// one terminal envelope naming the case. A request none of whose aggregators exists starts
-    /// them, their clock at its `start`. A request whose aggregators are exactly those one earlier kept request left, none
-    /// subscribed and none in use by a request in flight, in the time zone they were made in,
-    /// continues them on their clock when its `start` is the next nanosecond after that
-    /// request's coverage (`min(end, the engine clock's time when it was dispatched)`, which
-    /// its completed answer with no failure reason closed through): an open bar, a pending close
-    /// (one at that very nanosecond fires after the records stamped then) and a calendar grid pass
-    /// from one request to the next, and every bar goes to the continuing request's answer. Any
-    /// other such request is refused before dispatch, with one terminal envelope naming the
-    /// case, and changes nothing. A request that fails or expires, or that is answered by a bare
-    /// response (above), removes its aggregators; one answered bare ends with a failure reason
-    /// naming it, so its requester holds none of them. Between requests nothing drives them and
-    /// no bar goes anywhere.
-    ///
-    /// A subscription to a kept bar type takes its aggregator over. Made after the answer, the
-    /// closes due before the engine clock's time are published to it, stamped at their own
-    /// close, then the aggregator continues on the engine clock with its pending close or
-    /// `RANGE` boundary as armed (one at the engine clock's time fires there once, after the
-    /// records stamped then); nothing is flushed. The aggregators one subscribe command takes
-    /// over catch up together, in close order, before its other bar types are prepared, so a
-    /// composite built from one of them is not given their catch-up bars; those a later command
-    /// takes over catch up alone.
-    /// Made while the answer is in flight, a subscription is held back: its
-    /// live records are held and, when the request succeeds, the ones stamped after its coverage
-    /// (the answer holds every record up to it) are fed to the aggregators as the answer's are
-    /// (the closes due before each fire first), in the order they arrived, across bar types
-    /// and kinds; with `interleave` the held trades' bars are still the answer's, otherwise they
-    /// are published. The aggregators held back are taken over together, as above, after the
-    /// answer's last bars and its terminal, so their bars come in close order after them. When
-    /// the request fails, expires or is answered by a bare response instead, the subscription
-    /// gets a new aggregator, started then and fed the held trades after the answer's terminal,
-    /// so their bars come after it.
-    ///
-    /// A kept aggregator is claimed by the request that started or last continued it, not by an
-    /// actor. The actor records the ID of every such request it sends, by bar type, and keeps it
-    /// until it releases it, as its own command ([`ReleaseKeptBars`]), at
-    /// [`Self::unsubscribe_bars`] of the bar type, when it stops (whatever its stop handler
-    /// returns), and at its reset and disposal; subscribing forgets none of them. The engine acts
-    /// only on the claiming request's ID: an idle aggregator of the released bar type is removed
-    /// (the replay goes with its last one); one that request still runs is removed at its end,
-    /// after its answer, unless a subscription held back on it takes it over then; any other ID
-    /// is ignored. A refused request claims nothing. An unsubscribe never removes a kept
-    /// aggregator: a held-back subscription's releases only that subscription. An aggregator a
-    /// subscription took over, no release touches: the IDs the actor still holds for it are
-    /// ignored.
+    /// their bar types and outlive it. Such a request is refused while one of them runs, for a
+    /// subscription or for a request in flight; an existing one is reused, only its time zone
+    /// checked. They build in historical mode, each on a clock of its own whose timer its first
+    /// record starts, on a grid from that record: a close fires when a later record reaches the
+    /// aggregator, so a close at a record's own instant waits for a later record, and their bars
+    /// go to the cache (with `interleave`, to the answer: below). A time bar a later request
+    /// reuses keeps its clock, so the interval the previous request left forming closes in the
+    /// next answer, on the same grid. When the answer completes with no failure reason, each
+    /// aggregator fires the closes due through `min(end, the engine clock's time)` (that time
+    /// without an `end`) before the request ends; then a close at its last record's instant
+    /// fires. An aggregator stays idle in historical mode until a subscription to its bar type
+    /// takes it over: set up as a live subscription's, on the engine clock, its grid from the
+    /// engine clock's time. A subscription made while the answer is in flight is held back: its
+    /// live records are held and, at the request's end, fed to the aggregator still in
+    /// historical mode (their bars go to the cache), before it is taken over. An unsubscribe of
+    /// the bar type removes an idle kept aggregator.
     ///
     /// With `params["interleave"] = true` and `params["bar_types"]`, the engine answers the
     /// trades together with the bars it builds from them, in the order a subscriber running
@@ -3267,9 +3230,9 @@ pub trait DataActor {
     /// trade, except a `RANGE_INCLUSIVE` bar, which contains its completing trade and comes
     /// after it.
     ///
-    /// The request's aggregators (its own, or kept with `update_subscriptions`: above) compute as
-    /// a subscription's do, on a clock of their own that the engine drives as a backtest drives
-    /// its clock. It starts at the request's `start` (at its first trade without one), so a
+    /// The request's own aggregators compute as a subscription's do, on a clock of their own that
+    /// the engine drives as a backtest drives its clock (aggregators kept with
+    /// `update_subscriptions`: at the end of this paragraph). It starts at the request's `start` (at its first trade without one), so a
     /// calendar grid such as a 2-DAY bar's is anchored there. Before each trade, every time bar
     /// close and every `RANGE` daily boundary (at its configured origin offset) due strictly
     /// before it fires, in time order, two at one instant in timer name order (`RANGE` before
@@ -3287,7 +3250,10 @@ pub trait DataActor {
     /// a part of the window that no source covers fails the request, its existing trades and
     /// the bars before its last trade still delivered, the last trades part carrying the
     /// reason; and a request with a filter expression, or answered by a bare response,
-    /// completes but closes nothing after its last record.
+    /// completes but closes nothing after its last record. Aggregators kept with
+    /// `update_subscriptions` (above) fire, before each trade (with `quotes`, each quote), the
+    /// closes due strictly before it, one aggregator after the other in the order below, and
+    /// their bars come before it, as above; a close at its own instant fires after it.
     ///
     /// Bars of different types that one trade completes come in the order live publishes them,
     /// whatever the order of `bar_types`: in the string order of their bar types (the trades
@@ -3324,9 +3290,8 @@ pub trait DataActor {
     ///
     /// Limits: live, the order of a timer and a trade at the same instant is not defined. Bars
     /// never delivered do not reach the cache. A failure with no answer delivers no bar: its
-    /// clean-up completes none (a subscription held back on a kept aggregator gets its held
-    /// trades' bars from a new one, above). With `quotes` and `update_subscriptions` the same
-    /// split of a run of quotes applies.
+    /// clean-up completes none. With `quotes` and `update_subscriptions` the same split of a run
+    /// of quotes applies.
     ///
     /// # Errors
     ///
@@ -3570,10 +3535,7 @@ where
     }
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
-        let result = DataActor::on_stop(self);
-        // A stopping actor holds no builder kept by request, whatever its stop handler returns
-        self.core().release_kept_requests();
-        result
+        DataActor::on_stop(self)
     }
 
     fn on_resume(&mut self) -> anyhow::Result<()> {
@@ -3625,11 +3587,6 @@ pub struct DataActorCore {
     indicators: Indicators,
     warning_events: AHashSet<String>, // TODO: TBD
     requests: RefCell<RequestLifecycle>,
-    /// The ID of every request keeping bar builders by request (`update_subscriptions`) this
-    /// actor sent, by bar type, since it last released them (a subscription forgets none): each is
-    /// released at [`Self::unsubscribe_bars`] of its bar type, and all at
-    /// [`Self::unsubscribe_all`] and when the actor stops (see [`ReleaseKeptBars`]).
-    kept_requests: RefCell<IndexMap<BarType, Vec<UUID4>>>,
     signal_classes: AHashMap<String, String>,
     #[cfg(feature = "defi")]
     block_handlers: AHashMap<MStr<Topic>, Subscription<TypedHandler<Block>>>,
@@ -4373,9 +4330,7 @@ impl DataActorCore {
     /// Removes every message bus handler and releases each retained venue subscription.
     ///
     /// Called on disposal so retirement leaves no handler which would resolve an actor that
-    /// deregistration has already removed. The ID of every request keeping bar builders by request
-    /// (`update_subscriptions`) the actor sent since it last released them is released too, a
-    /// request still in flight included (see [`ReleaseKeptBars`]).
+    /// deregistration has already removed.
     pub(crate) fn unsubscribe_all(&mut self) {
         let mut commands = Vec::new();
 
@@ -4469,8 +4424,6 @@ impl DataActorCore {
                 self.send_data_cmd(command);
             }
         }
-
-        self.release_kept_requests();
         #[cfg(feature = "python")]
         self.message_bus.clear();
     }
@@ -4552,7 +4505,6 @@ impl DataActorCore {
             indicators: Indicators::default(),
             warning_events: AHashSet::new(),
             requests: RefCell::new(RequestLifecycle::default()),
-            kept_requests: RefCell::default(),
             signal_classes: AHashMap::new(),
             #[cfg(feature = "defi")]
             block_handlers: AHashMap::new(),
@@ -6329,12 +6281,6 @@ impl DataActorCore {
 
     /// Unsubscribes the actor from bars using each type's retained route.
     ///
-    /// The ID of every request keeping bar builders by request (`update_subscriptions`) the actor
-    /// sent for the bar type since it last released them is released too, each
-    /// as its own command (see [`ReleaseKeptBars`]): the engine removes the kept builder only for
-    /// the request that started or last continued its replay (one still in flight at its end),
-    /// and ignores any other. The unsubscribe itself never removes a kept builder.
-    ///
     /// # Errors
     ///
     /// Returns an error if the list is empty or spans venues without an explicit client.
@@ -6347,18 +6293,10 @@ impl DataActorCore {
         self.check_registered();
         let bar_types = bar_types.into_bar_types()?;
         ensure_routable_bar_types(&bar_types, client_id.is_some())?;
-        let mut retained = Vec::new();
-        for bar_type in bar_types {
-            if let Some(command) = self.remove_bar_subscription(bar_type) {
-                retained.push(command);
-            }
-
-            let bar_type = bar_type.standard();
-            let request_ids = self.kept_requests.borrow_mut().shift_remove(&bar_type);
-            for request_id in request_ids.into_iter().flatten() {
-                self.send_data_cmd(release_kept_bars(bar_type, request_id, self.timestamp_ns()));
-            }
-        }
+        let retained = bar_types
+            .into_iter()
+            .filter_map(|bar_type| self.remove_bar_subscription(bar_type))
+            .collect();
         self.release_subscriptions(retained);
         Ok(())
     }
@@ -6828,7 +6766,6 @@ impl DataActorCore {
         check_timestamps(now, start, end)?;
 
         let request_id = UUID4::new();
-        let kept = kept_bar_types(params.as_ref());
         let command = RequestCommand::Quotes(RequestQuotes {
             instrument_ids,
             start,
@@ -6841,7 +6778,6 @@ impl DataActorCore {
         });
 
         self.register_request_handler(command.request_id(), handler)?;
-        self.record_kept_request(request_id, kept);
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -6877,7 +6813,6 @@ impl DataActorCore {
         check_timestamps(now, start, end)?;
 
         let request_id = UUID4::new();
-        let kept = kept_bar_types(params.as_ref());
         let command = RequestCommand::Trades(RequestTrades {
             instrument_ids,
             start,
@@ -6890,7 +6825,6 @@ impl DataActorCore {
         });
 
         self.register_request_handler(command.request_id(), handler)?;
-        self.record_kept_request(request_id, kept);
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -6930,7 +6864,6 @@ impl DataActorCore {
         check_timestamps(now, start, end)?;
 
         let request_id = UUID4::new();
-        let kept = kept_bar_types(params.as_ref());
         let command = RequestCommand::Bars(RequestBars {
             bar_types,
             start,
@@ -6943,7 +6876,6 @@ impl DataActorCore {
         });
 
         self.register_request_handler(command.request_id(), handler)?;
-        self.record_kept_request(request_id, kept);
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -7003,28 +6935,6 @@ impl DataActorCore {
             .register_response_handler(request_id, handler)?;
         self.requests.borrow_mut().register(*request_id);
         Ok(())
-    }
-
-    /// Records `request_id` as a request this actor sent that keeps the builders of `bar_types` by
-    /// request (`update_subscriptions`), to release it later (see [`Self::kept_requests`]). It is
-    /// recorded whatever becomes of the request: the engine alone knows which request claims a
-    /// kept builder, and ignores a release naming any other.
-    fn record_kept_request(&self, request_id: UUID4, bar_types: Vec<BarType>) {
-        let mut kept_requests = self.kept_requests.borrow_mut();
-        for bar_type in bar_types {
-            kept_requests.entry(bar_type).or_default().push(request_id);
-        }
-    }
-
-    /// Releases the ID of every request keeping bar builders by request this actor recorded (see
-    /// [`Self::kept_requests`]), each as its own command (see [`ReleaseKeptBars`]).
-    fn release_kept_requests(&self) {
-        let kept_requests = std::mem::take(&mut *self.kept_requests.borrow_mut());
-        for (bar_type, request_ids) in kept_requests {
-            for request_id in request_ids {
-                self.send_data_cmd(release_kept_bars(bar_type, request_id, self.timestamp_ns()));
-            }
-        }
     }
 
     /// Returns whether this actor is awaiting completion of a request.
@@ -7179,37 +7089,6 @@ impl DataActorNative for DataActorCore {
     fn core_mut(&mut self) -> &mut DataActorCore {
         self
     }
-}
-
-/// Returns the command that releases the claim of the request `request_id` on the builder of
-/// `bar_type` kept by request.
-fn release_kept_bars(bar_type: BarType, request_id: UUID4, ts_init: UnixNanos) -> DataCommand {
-    DataCommand::ReleaseKeptBars(ReleaseKeptBars::new(
-        bar_type,
-        request_id,
-        UUID4::new(),
-        ts_init,
-    ))
-}
-
-/// Returns the bar types, standard, whose builders a request with `params` keeps: its
-/// `bar_types` when it sets `update_subscriptions`; none otherwise, or for one that does not
-/// parse (the data engine refuses that request).
-fn kept_bar_types(params: Option<&Params>) -> Vec<BarType> {
-    let Some(params) =
-        params.filter(|params| params.get_bool("update_subscriptions") == Some(true))
-    else {
-        return Vec::new();
-    };
-
-    params
-        .get("bar_types")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|value| value.as_str()?.parse::<BarType>().ok())
-        .map(|bar_type| bar_type.standard())
-        .collect()
 }
 
 fn check_timestamps(

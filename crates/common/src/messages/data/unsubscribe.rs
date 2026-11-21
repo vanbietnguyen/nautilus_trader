@@ -706,36 +706,6 @@ impl UnsubscribeBars {
     }
 }
 
-/// Releases the claim of the request `request_id` on the builder of `bar_type` that the data
-/// engine keeps for it by request (`update_subscriptions`). The engine acts only when that request
-/// is the one that started or last continued the builder's replay; any other release is ignored.
-/// It never releases a subscription.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReleaseKeptBars {
-    pub bar_type: BarType,
-    pub request_id: UUID4,
-    pub command_id: UUID4,
-    pub ts_init: UnixNanos,
-}
-
-impl ReleaseKeptBars {
-    /// Creates a new [`ReleaseKeptBars`] instance.
-    #[must_use]
-    pub const fn new(
-        bar_type: BarType,
-        request_id: UUID4,
-        command_id: UUID4,
-        ts_init: UnixNanos,
-    ) -> Self {
-        Self {
-            bar_type,
-            request_id,
-            command_id,
-            ts_init,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",

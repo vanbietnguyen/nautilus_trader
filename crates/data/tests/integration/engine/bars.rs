@@ -1331,15 +1331,16 @@ fn test_request_time_bar_boundary_finalizes_sources_before_dependents(
 }
 
 #[rstest]
-#[case::right_open(BarIntervalType::RightOpen, (10_000_000_000, 11_000_000_000))]
-#[case::left_open(BarIntervalType::LeftOpen, (11_000_000_000, 12_000_000_000))]
+#[case::right_open(BarIntervalType::RightOpen, ("100.00000", 1, 10_000_000_000), ("101.00000", 3, 11_000_000_000))]
+#[case::left_open(BarIntervalType::LeftOpen, ("102.00000", 3, 11_000_000_000), ("103.00000", 1, 12_000_000_000))]
 fn test_request_time_bar_boundary_replays_warmup_before_final_close(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
     venue: Venue,
     #[case] interval: BarIntervalType,
-    #[case] ts_events: (u64, u64),
+    #[case] historical_fields: (&str, u64, u64),
+    #[case] live_fields: (&str, u64, u64),
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
@@ -1380,8 +1381,8 @@ fn test_request_time_bar_boundary_replays_warmup_before_final_close(
 
     let request = RequestTrades::new(
         instrument_id,
-        Some(UnixNanos::from(10_000_000_000).to_datetime_utc()),
-        Some(UnixNanos::from(10_999_999_999).to_datetime_utc()),
+        None,
+        None,
         None,
         Some(client_id),
         request_id,
@@ -1409,22 +1410,32 @@ fn test_request_time_bar_boundary_replays_warmup_before_final_close(
     let warmup = make_trade(instrument_id, "102.00000", 1, "warmup", 11_000_000_000);
     engine.process_data(Data::Trade(warmup));
     let first = make_trade(instrument_id, "100.00000", 1, "first", 10_500_000_000);
-    // A completed envelope certifies its window through 10.999999999 s: the held warm-up trade
-    // at 11 s is after it, so it is fed at the hand-over, before the 11 s close fires
-    engine.response_envelope(DataResponseEnvelope::new(
-        DataResponse::Trades(TradesResponse::new(
-            request_id,
-            client_id,
-            instrument_id,
-            vec![first],
-            None,
-            None,
-            UnixNanos::from(11_500_000_000),
-            None,
-        )),
-        true,
+    let boundary = make_trade(instrument_id, "101.00000", 1, "boundary", 11_000_000_000);
+    engine.response(DataResponse::Trades(TradesResponse::new(
+        request_id,
+        client_id,
+        instrument_id,
+        vec![first, boundary],
         None,
-    ));
+        None,
+        UnixNanos::from(11_500_000_000),
+        None,
+    )));
+
+    let (historical_close, historical_volume, historical_ts) = historical_fields;
+
+    let historical = Bar::new(
+        bar_type,
+        Price::from("100.00000"),
+        Price::from(historical_close),
+        Price::from("100.00000"),
+        Price::from(historical_close),
+        Quantity::from(historical_volume),
+        UnixNanos::from(historical_ts),
+        UnixNanos::from(11_000_000_000),
+    );
+    assert_eq!(cache.borrow().bar(&bar_type), Some(&historical));
+    assert_eq!(saver.get_messages(), Vec::<Bar>::new());
 
     let live = make_trade(instrument_id, "103.00000", 1, "live", 11_750_000_000);
     engine.process_data(Data::Trade(live));
@@ -1436,32 +1447,21 @@ fn test_request_time_bar_boundary_replays_warmup_before_final_close(
         handler.callback.call(handler.event);
     }
 
-    let (warmup_ts, live_ts) = ts_events;
-    let warmup_bar = Bar::new(
+    let (live_open, live_volume, live_ts) = live_fields;
+
+    let expected = Bar::new(
         bar_type,
-        Price::from("100.00000"),
-        Price::from("102.00000"),
-        Price::from("100.00000"),
-        Price::from("102.00000"),
-        Quantity::from(2),
-        UnixNanos::from(warmup_ts),
-        UnixNanos::from(11_000_000_000),
-    );
-    let live_bar = Bar::new(
-        bar_type,
+        Price::from(live_open),
         Price::from("103.00000"),
+        Price::from(live_open),
         Price::from("103.00000"),
-        Price::from("103.00000"),
-        Price::from("103.00000"),
-        Quantity::from(1),
+        Quantity::from(live_volume),
         UnixNanos::from(live_ts),
         UnixNanos::from(12_000_000_000),
     );
-    // The held warm-up trade is in the bar before its close, with the answer's trade; the
-    // handed-over builder then closes the live trade's bar on the engine clock
     let bars: Vec<_> = cache.borrow().bars(&bar_type).unwrap();
-    assert_eq!(bars, vec![live_bar, warmup_bar]);
-    assert_eq!(saver.get_messages(), vec![warmup_bar, live_bar]);
+    assert_eq!(bars, vec![expected, historical]);
+    assert_eq!(saver.get_messages(), vec![expected]);
 }
 
 #[rstest]

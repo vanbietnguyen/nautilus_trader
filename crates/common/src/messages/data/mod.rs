@@ -66,11 +66,11 @@ pub use subscribe::{
     SubscriptionError,
 };
 pub use unsubscribe::{
-    ReleaseKeptBars, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth,
-    UnsubscribeBookSnapshots, UnsubscribeCustomData, UnsubscribeFundingRates,
-    UnsubscribeIndexPrices, UnsubscribeInstrument, UnsubscribeInstrumentClose,
-    UnsubscribeInstrumentStatus, UnsubscribeInstruments, UnsubscribeMarkPrices,
-    UnsubscribeOptionChain, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
+    UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth, UnsubscribeBookSnapshots,
+    UnsubscribeCustomData, UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrument,
+    UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus, UnsubscribeInstruments,
+    UnsubscribeMarkPrices, UnsubscribeOptionChain, UnsubscribeOptionGreeks, UnsubscribeQuotes,
+    UnsubscribeTrades,
 };
 
 #[cfg(feature = "defi")]
@@ -82,8 +82,6 @@ pub enum DataCommand {
     Request(RequestCommand),
     Subscribe(SubscribeCommand),
     Unsubscribe(UnsubscribeCommand),
-    /// Releases a request's claim on a bar builder kept by request (see [`ReleaseKeptBars`]).
-    ReleaseKeptBars(ReleaseKeptBars),
     #[cfg(feature = "defi")]
     DefiRequest(DefiRequestCommand),
     #[cfg(feature = "defi")]

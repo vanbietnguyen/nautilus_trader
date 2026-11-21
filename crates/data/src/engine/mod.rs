@@ -66,7 +66,7 @@ use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 pub use bar::BarAggregatorSubscription;
 use bar::{
-    BarAggregationSubscription, BarAggregatorKey, BarAggregatorWarmup, InterleavedRequest, Release,
+    BarAggregationSubscription, BarAggregatorKey, BarAggregatorWarmup, InterleavedRequest,
     RequestReplay, bar_aggregator_key,
 };
 use book::{
@@ -235,17 +235,6 @@ pub struct DataEngine {
     /// The replay of each request (for a pipeline, its parent) whose aggregators are its own,
     /// until they are cleaned up.
     request_replays: AHashMap<UUID4, RequestReplay>,
-    /// The replays of builders kept by request (`update_subscriptions`) between their requests,
-    /// each idle until a request continues it, a subscription adopts its builders or the request
-    /// claiming it releases them (see [`Self::release_kept_bars`]).
-    kept_replays: Vec<RequestReplay>,
-    /// What the clean-up of a request whose builders are kept by request left to do for their
-    /// subscriptions (see [`Release`]), until its terminal is out.
-    pending_releases: AHashMap<UUID4, Release>,
-    /// The idle kept builders the subscriptions of the subscribe command being prepared adopt, to
-    /// be handed over together once its last member naming one is prepared (see
-    /// [`DataEngine::adopt_kept_builders`]); `None` outside such a command.
-    pending_adoptions: Option<Vec<BarType>>,
     option_chain_bootstrapper: Option<Rc<OptionChainBootstrapper>>,
     pending_option_chain_requests: IndexMap<UUID4, PendingOptionChainRequest>,
     option_chain_greeks_bootstraps: AHashMap<(OptionSeriesId, UUID4), OptionChainGreeksBootstrap>,
@@ -340,9 +329,6 @@ impl DataEngine {
             deferred_bars: Rc::new(RefCell::new(VecDeque::new())),
             interleaved_requests: AHashMap::new(),
             request_replays: AHashMap::new(),
-            kept_replays: Vec::new(),
-            pending_releases: AHashMap::new(),
-            pending_adoptions: None,
             option_chain_bootstrapper: None,
             pending_option_chain_requests: IndexMap::new(),
             option_chain_greeks_bootstraps: AHashMap::new(),
@@ -521,8 +507,7 @@ impl DataEngine {
         self.pending_join_requests.len()
     }
 
-    /// Starts all registered data clients and re-arms bar aggregator timers, except those of
-    /// builders a replay drives (a request's own, or kept by request), whose timers stay armed.
+    /// Starts all registered data clients and re-arms bar aggregator timers.
     pub fn start(&mut self) {
         self.is_stopped = false;
 
@@ -533,11 +518,13 @@ impl DataEngine {
             }
         }
 
-        for (key, aggregator) in &self.bar_aggregators {
-            // A replay drives its builders' clock, kept or in flight: their timers stay as armed
+        for ((_, request_id), aggregator) in &self.bar_aggregators {
+            // Request-scoped or historical aggregators run on private clocks;
+            // re-arming them here would perturb an in-flight request's timer state
+            let is_subscription = request_id.is_none() && !aggregator.borrow().is_historical();
             let spec = aggregator.borrow().bar_type().spec();
             let has_timer = spec.is_time_aggregated() || spec.aggregation == BarAggregation::Range;
-            if !self.is_replay_driven(key) && has_timer {
+            if is_subscription && has_timer {
                 aggregator
                     .borrow_mut()
                     .start_timer(Some(Rc::clone(aggregator)));
@@ -553,7 +540,7 @@ impl DataEngine {
     }
 
     /// Stops all registered data clients and bar aggregator timers, except those of builders a
-    /// replay drives (a request's own, or kept by request), whose timers stay armed.
+    /// request's replay drives, whose timers stay armed.
     ///
     /// Blocks new physical subscriptions until [`Self::start`] or [`Self::reset`].
     /// Data processing, subscription ownership, and unsubscribes remain enabled.
@@ -635,8 +622,6 @@ impl DataEngine {
         self.request_bar_aggregations.clear();
         self.interleaved_requests.clear();
         self.request_replays.clear();
-        self.kept_replays.clear();
-        self.pending_releases.clear();
         self.bar_aggregators_pending_stop.clear();
         self.request_book_events.clear();
         self.inflight_requests.clear();
@@ -827,13 +812,7 @@ impl DataEngine {
         subscribed.extend(
             self.bar_aggregators
                 .keys()
-                // A builder a replay drives with no subscription is a kept request's, not one
-                .filter(|key| {
-                    key.1.is_none()
-                        && !self.bar_aggregators_pending_stop.contains(*key)
-                        && (self.bar_aggregator_handlers.contains_key(*key)
-                            || !self.is_replay_driven(key))
-                })
+                .filter(|key| key.1.is_none() && !self.bar_aggregators_pending_stop.contains(*key))
                 .map(|(bar_type, _)| *bar_type),
         );
         subscribed
@@ -879,9 +858,7 @@ impl DataEngine {
     /// Errors during execution are logged.
     pub fn execute(&mut self, cmd: DataCommand) {
         match &cmd {
-            DataCommand::Subscribe(_)
-            | DataCommand::Unsubscribe(_)
-            | DataCommand::ReleaseKeptBars(_) => self.command_count += 1,
+            DataCommand::Subscribe(_) | DataCommand::Unsubscribe(_) => self.command_count += 1,
             DataCommand::Request(_) => self.request_count += 1,
             #[cfg(feature = "defi")]
             DataCommand::DefiRequest(_) => self.request_count += 1,
@@ -911,7 +888,6 @@ impl DataEngine {
                 c.venue().copied(),
                 Some(*c.request_id()),
             ),
-            DataCommand::ReleaseKeptBars(c) => ("ReleaseKeptBars", None, None, Some(c.command_id)),
             #[cfg(feature = "defi")]
             DataCommand::DefiRequest(c) => (
                 "DefiRequest",
@@ -940,10 +916,6 @@ impl DataEngine {
             DataCommand::Subscribe(c) => self.execute_subscribe(c),
             DataCommand::Unsubscribe(c) => self.execute_unsubscribe(&c),
             DataCommand::Request(c) => self.execute_request(c),
-            DataCommand::ReleaseKeptBars(c) => {
-                self.release_kept_bars(&c);
-                Ok(())
-            }
             #[cfg(feature = "defi")]
             DataCommand::DefiRequest(c) => self.execute_defi_request(c),
             #[cfg(feature = "defi")]
@@ -1030,43 +1002,8 @@ impl DataEngine {
         let mut groups: IndexMap<Option<Value>, Vec<SubscribeCommand>> = IndexMap::new();
         let mut result = Ok(());
 
-        // The members naming an idle kept builder are prepared first, and the builders they adopt
-        // handed over together and caught up once the last of them is prepared (see
-        // `adopt_kept_builders`); the other members are prepared after, so none of them, such as
-        // a composite built from an adopted builder, takes those builders' catch-up bars
-        let adopting: Vec<bool> = members
-            .iter()
-            .map(|member| {
-                self.pending_adoptions.is_none()
-                    && member.bar_types().is_some_and(|bar_types| {
-                        bar_types
-                            .iter()
-                            .any(|bar_type| self.is_idle_kept_builder(*bar_type))
-                    })
-            })
-            .collect();
-        let last_adopting = adopting.iter().rposition(|adopts| *adopts);
-        if last_adopting.is_some() {
-            self.pending_adoptions = Some(Vec::new());
-        }
-
-        let mut prepared_members: Vec<Option<anyhow::Result<Option<SubscribeCommand>>>> =
-            members.iter().map(|_| None).collect();
-        let adopting_first = (0..members.len())
-            .filter(|index| adopting[*index])
-            .chain((0..members.len()).filter(|index| !adopting[*index]));
-        for index in adopting_first {
-            prepared_members[index] = Some(self.prepare_subscribe_member(&members[index]));
-            if Some(index) == last_adopting
-                && let Some(adopted) = self.pending_adoptions.take()
-            {
-                self.adopt_kept_builders(&adopted);
-            }
-        }
-
-        // Grouped in the command's member order
-        for (member, prepared) in members.into_iter().zip(prepared_members) {
-            let prepared = match prepared.expect("every member is prepared") {
+        for member in members {
+            let prepared = match self.prepare_subscribe_member(&member) {
                 Ok(Some(prepared)) => prepared,
                 Ok(None) => continue,
                 Err(e) => {
@@ -1716,8 +1653,6 @@ impl DataEngine {
         self.validate_catalog_update(&req)?;
         // An `interleave` request is admitted on its whole route before any of it runs
         self.admit_interleave(&req)?;
-        // A request keeping its builders is admitted on its route before any of it runs
-        self.admit_kept_route(&req)?;
 
         // A `quotes` request is admitted on its whole route and plan before any of it runs
         if carries_quotes(&req) {
@@ -2031,10 +1966,8 @@ impl DataEngine {
     /// [`Self::response_envelope`] to report explicit source completion. Nor do they certify
     /// that they hold every record of the window: a request that builds bars on a replay of its
     /// own, or a time-range or continuous-future pipeline one of whose children is answered this
-    /// way, closes nothing after its last record, and its builders kept by request
-    /// (`update_subscriptions`) are removed as on a failure, its terminal carrying a failure
-    /// reason naming it. A leg of a request's plan answered this way is a source as any other
-    /// answer.
+    /// way, closes nothing after its last record. A leg of a request's plan answered this way is
+    /// a source as any other answer.
     pub fn response(&mut self, resp: DataResponse) {
         self.mark_bare_response(*resp.correlation_id());
         self.payload_response(resp);
@@ -2185,24 +2118,13 @@ impl DataEngine {
         }
 
         // A payload-free terminal with no failure reason is a successful answer with no records
-        let failure = envelope
-            .failure_reason()
-            .map(str::to_owned)
-            .or_else(|| self.kept_bare_answer_failure(request_id));
-        if failure.is_none() {
+        let succeeded = envelope.failure_reason().is_none();
+        if succeeded {
             self.end_replay_coverage(request_id);
         }
-        let release = self.release_request_bar_aggregators(&request_id, None, failure.is_none());
+        self.release_request_bar_aggregators(&request_id, succeeded);
 
-        match failure {
-            Some(reason) if envelope.failure_reason().is_none() => {
-                self.deliver_response_envelope(&envelope.clone().with_failure(reason));
-            }
-            _ => self.deliver_response_envelope(envelope),
-        }
-
-        // What its kept builders' subscriptions are given comes after its terminal
-        self.finish_release(request_id, release);
+        self.deliver_response_envelope(envelope);
     }
 
     fn route_response_payload(&mut self, resp: DataResponse, mut envelope: DataResponseEnvelope) {
@@ -2247,17 +2169,7 @@ impl DataEngine {
             return;
         }
 
-        // A kept request answered bare ends with the reason its builders are not kept
-        let bare_failure = envelope
-            .completed()
-            .then(|| self.kept_bare_answer_failure(*resp.correlation_id()))
-            .flatten()
-            .filter(|_| envelope.failure_reason().is_none());
-        if let Some(reason) = bare_failure {
-            envelope = envelope.with_failure(reason);
-        }
-
-        let release = self.process_request_bar_aggregation_response(
+        self.process_request_bar_aggregation_response(
             &resp,
             envelope.completed(),
             envelope.failure_reason(),
@@ -2265,9 +2177,6 @@ impl DataEngine {
         if self.handle_book_deltas_envelope(&mut envelope) {
             self.deliver_response_envelope(&envelope);
         }
-
-        // What its kept builders' subscriptions are given comes after its terminal
-        self.finish_release(*resp.correlation_id(), release);
     }
 
     // Completes the request's book events before its final envelope reaches the requester
@@ -2323,8 +2232,7 @@ impl DataEngine {
                 }
             }
             DataResponse::OptionChainReferencePrice(r) => {
-                let release = self.process_request_bar_aggregation_response(resp, true, None);
-                self.finish_release(correlation_id, release);
+                self.process_request_bar_aggregation_response(resp, true, None);
                 self.handle_option_chain_reference_price_response(&correlation_id, r);
                 return false;
             }

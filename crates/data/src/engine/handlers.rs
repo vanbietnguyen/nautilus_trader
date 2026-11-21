@@ -13,10 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-};
+use std::{cell::RefCell, rc::Rc};
 
 use nautilus_common::msgbus::Handler;
 use nautilus_core::WeakCell;
@@ -31,22 +28,12 @@ use crate::aggregation::{BarAggregator, SpreadQuoteAggregator};
 // Between built-in handlers (10) and default user handlers (0)
 pub(super) const BAR_AGGREGATOR_PRIORITY: u32 = 5;
 
-thread_local! {
-    /// The number of records the warm-up buffers of this thread have held: an engine runs on one
-    /// thread, so it orders the records several of its buffers held as they arrived.
-    static ARRIVALS: Cell<u64> = const { Cell::new(0) };
-}
-
 /// Holds live data back from a bar aggregator that is still replaying a historical request.
 ///
 /// The buffer collects while it is `Some` and is emptied by [`WarmupBuffer::release`], after which
-/// the handlers holding it pass data straight through again. Each record is held with its
-/// arrival: its place among the records every buffer of the thread held.
+/// the handlers holding it pass data straight through again.
 #[derive(Debug)]
-pub(super) struct WarmupBuffer<T>(Rc<RefCell<Option<Vec<Arrived<T>>>>>);
-
-/// A held record with its arrival (see [`WarmupBuffer`]).
-type Arrived<T> = (u64, T);
+pub(super) struct WarmupBuffer<T>(Rc<RefCell<Option<Vec<T>>>>);
 
 impl<T> Clone for WarmupBuffer<T> {
     fn clone(&self) -> Self {
@@ -60,15 +47,10 @@ impl<T: Copy> WarmupBuffer<T> {
     }
 
     /// Holds `item` and returns `true` while warming up, otherwise returns `false`.
-    pub(super) fn hold(&self, item: &T) -> bool {
+    fn hold(&self, item: &T) -> bool {
         match self.0.borrow_mut().as_mut() {
             Some(held) => {
-                let arrival = ARRIVALS.with(|arrivals| {
-                    let arrival = arrivals.get();
-                    arrivals.set(arrival + 1);
-                    arrival
-                });
-                held.push((arrival, *item));
+                held.push(*item);
                 true
             }
             None => false,
@@ -77,25 +59,7 @@ impl<T: Copy> WarmupBuffer<T> {
 
     /// Ends the warm-up and returns the data held in arrival order.
     pub(super) fn release(&self) -> Vec<T> {
-        self.release_with_arrivals()
-            .into_iter()
-            .map(|(_, item)| item)
-            .collect()
-    }
-
-    /// Ends the warm-up and returns the data held in arrival order, each with its arrival.
-    pub(super) fn release_with_arrivals(&self) -> Vec<Arrived<T>> {
         self.0.borrow_mut().take().unwrap_or_default()
-    }
-
-    /// Returns the arrival of each record held, in arrival order, and keeps holding.
-    pub(super) fn arrivals(&self) -> Vec<u64> {
-        self.0
-            .borrow()
-            .iter()
-            .flatten()
-            .map(|(arrival, _)| *arrival)
-            .collect()
     }
 }
 

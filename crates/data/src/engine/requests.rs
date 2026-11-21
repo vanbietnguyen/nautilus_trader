@@ -40,17 +40,9 @@ const BAR_TYPES: &str = "bar_types";
 pub(super) const INTERLEAVE: &str = "interleave";
 /// The request parameter naming a filter expression, which leaves rows of the window out.
 pub(super) const FILTER_EXPR: &str = "filter_expr";
-pub(super) const UPDATE_SUBSCRIPTIONS: &str = "update_subscriptions";
 const QUOTES: &str = "quotes";
 pub(super) const QUOTES_REFUSED: &str = "Cannot answer the quotes of a `quotes` request";
 pub(super) const INTERLEAVE_REFUSED: &str = "Cannot answer an `interleave` request in live order";
-pub(super) const KEPT_REFUSED: &str =
-    "Cannot keep the bar builders of an `update_subscriptions` request";
-/// Why a kept request's answer that came as a bare response ends as a failure: it certifies no
-/// coverage, so the request's kept builders are removed, not kept.
-pub(super) const KEPT_ANSWERED_BARE: &str = "A kept request answered without a plan: its answer \
-     came as a bare response, which does not certify that it holds every record of its window, \
-     so its builders are not kept";
 
 #[derive(Debug, Clone)]
 pub(super) struct RequestBarAggregation {
@@ -63,8 +55,9 @@ pub(super) struct RequestBarAggregation {
     /// `DataEngine::admit_interleave`; what callers get is documented on
     /// `DataActor::request_trades`, `nautilus_common::actor`).
     pub(super) interleave: bool,
-    /// The request's `end`, set when its aggregators are prepared: its builders kept by request
-    /// (`update_subscriptions`) fire the closes due up to it when it succeeds.
+    /// The request's `end`, set when its aggregators are prepared: when it succeeds, its builders
+    /// kept by request (`update_subscriptions`) fire the closes due through it, or through the
+    /// engine clock's time when that is earlier.
     pub(super) end: Option<UnixNanos>,
 }
 
@@ -323,7 +316,7 @@ pub(super) fn request_bar_aggregation_from_params(
         }
     }
 
-    let update_subscriptions = params.get_bool(UPDATE_SUBSCRIPTIONS).unwrap_or(false);
+    let update_subscriptions = params.get_bool("update_subscriptions").unwrap_or(false);
     let skip_first_non_full_bar = params.get_bool("skip_first_non_full_bar");
     let interleave = params.get_bool(INTERLEAVE).unwrap_or(false);
 

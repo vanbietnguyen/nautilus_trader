@@ -13,14 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_common::{
-    actor::{DataActor, DataActorCore, data_actor::DataActorConfig},
-    component::Component,
-    messages::data::ReleaseKeptBars,
-    nautilus_actor,
-};
-use nautilus_model::instruments::stubs::equity_aapl;
-use nautilus_model::{enums::BarIntervalType, identifiers::ActorId};
+use nautilus_model::{enums::BarIntervalType, instruments::stubs::equity_aapl};
 
 use super::*;
 
@@ -636,7 +629,7 @@ fn test_update_subscriptions_request_aggregator_can_be_started_live_after_respon
 
     let request = RequestTrades::new(
         instrument_id,
-        Some(UnixNanos::default().to_datetime_utc()),
+        None,
         None,
         None,
         Some(client_id),
@@ -737,7 +730,7 @@ fn test_update_subscriptions_request_aggregator_can_subscribe_before_response(
 
     let request = RequestTrades::new(
         instrument_id,
-        Some(UnixNanos::default().to_datetime_utc()),
+        None,
         None,
         None,
         Some(client_id),
@@ -799,46 +792,18 @@ fn test_update_subscriptions_request_aggregator_can_subscribe_before_response(
     assert_eq!(messages[0].ts_event, UnixNanos::from(2_000));
 }
 
-/// Executes `request`, a kept request naming `composite`, and asserts it is refused by name
-/// before dispatch: nothing reaches the client and its one terminal carries the refusal.
-fn assert_kept_composite_refused(
-    data_engine: &mut DataEngine,
-    recorder: &Rc<RefCell<Vec<DataCommand>>>,
-    request: RequestCommand,
-    composite: BarType,
-) {
-    let request_id = *request.request_id();
-    let (handler, saver) = get_typed_message_saving_handler::<DataResponseEnvelope>(None);
-    msgbus::register_response_handler(&request_id, handler);
-
-    let error = data_engine
-        .execute_request(request)
-        .unwrap_err()
-        .to_string();
-
-    assert!(
-        error.starts_with("Cannot keep the bar builders of an `update_subscriptions` request"),
-        "{error}"
-    );
-    assert!(
-        error.contains(&format!("{composite} is built from another bar")),
-        "{error}"
-    );
-    assert!(recorder.borrow().is_empty(), "{:?}", recorder.borrow());
-    let responses = saver.get_messages();
-    assert_eq!(responses.len(), 1);
-    assert!(responses[0].completed());
-    assert_eq!(responses[0].failure_reason(), Some(error.as_str()));
-}
-
-/// UPSTREAM's kept composite request is not carried: it names a composite and is refused by name
-/// before dispatch (see `test_kept_five_minute_bars_after_unsubscribe_build_from_trades`).
 #[rstest]
+#[case::live_subscription_retained(false)]
+#[case::live_subscription_released(true)]
 fn test_request_bar_aggregation_after_unsubscribe(
+    #[case] unsubscribe_before_response: bool,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
 ) {
-    let _ = stub_msgbus;
+    const SECOND: u64 = 1_000_000_000;
+
+    // Zero timer starts mean now, so use a nonzero five-minute boundary
+    let open_ns = 1_700_000_100 * SECOND;
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache = Rc::new(RefCell::new(Cache::default()));
     let instrument = equity_aapl();
@@ -861,23 +826,147 @@ fn test_request_bar_aggregation_after_unsubscribe(
 
     let source_type = BarType::from("AAPL.XNAS-1-MINUTE-LAST-EXTERNAL");
     let composite = BarType::from("AAPL.XNAS-5-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL");
+    let request_id = UUID4::new();
     let params: Params = serde_json::from_value(json!({
         "bar_types": [composite.to_string()],
         "update_subscriptions": true,
     }))
     .unwrap();
-    let request = RequestCommand::Bars(RequestBars::new(
-        source_type,
-        Some(UnixNanos::default().to_datetime_utc()),
-        None,
-        None,
+    let (response_handler, response_saver) =
+        get_typed_message_saving_handler::<DataResponseEnvelope>(None);
+    msgbus::register_response_handler(&request_id, response_handler);
+    data_engine
+        .execute_request(RequestCommand::Bars(RequestBars::new(
+            source_type,
+            None,
+            None,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::default(),
+            Some(params.clone()),
+        )))
+        .unwrap();
+
+    let (handler, live_saver) = get_typed_message_saving_handler::<Bar>(None);
+    let topic = switchboard::get_bars_topic(composite.standard());
+    msgbus::subscribe_bars(topic.into(), handler.clone(), None);
+    data_engine
+        .execute_subscribe(SubscribeCommand::Bars(SubscribeBars::new(
+            composite,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        )))
+        .unwrap();
+
+    let unsubscribe = UnsubscribeCommand::Bars(UnsubscribeBars::new(
+        composite,
         Some(client_id),
+        Some(venue),
         UUID4::new(),
         UnixNanos::default(),
-        Some(params),
+        None,
+        None,
     ));
 
-    assert_kept_composite_refused(&mut data_engine, &recorder, request, composite);
+    if unsubscribe_before_response {
+        // Release the exact-topic handler before the command, as DataActorCore does
+        msgbus::unsubscribe_bars(topic.into(), &handler);
+        data_engine.execute_unsubscribe(&unsubscribe).unwrap();
+    }
+
+    let subscriptions_before_response = data_engine.subscribed_bars();
+    let source_unsubscribed = recorder.borrow().iter().any(|command| {
+        matches!(
+            command,
+            DataCommand::Unsubscribe(UnsubscribeCommand::Bars(cmd))
+                if cmd.single_bar_type().ok() == Some(source_type)
+        )
+    });
+    let source: Vec<_> = (0..5)
+        .map(|minute| {
+            let close_time = UnixNanos::from(open_ns + (minute + 1) * 60 * SECOND);
+            Bar::new(
+                source_type,
+                Price::from(format!("{}.00", 100 + minute).as_str()),
+                Price::from(format!("{}.00", 102 + minute).as_str()),
+                Price::from(format!("{}.00", 99 + minute).as_str()),
+                Price::from(format!("{}.00", 101 + minute).as_str()),
+                Quantity::from("10"),
+                close_time,
+                close_time,
+            )
+        })
+        .collect();
+    data_engine.response(DataResponse::Bars(BarsResponse::new(
+        request_id,
+        client_id,
+        source_type,
+        source.clone(),
+        None,
+        None,
+        UnixNanos::from(open_ns + 300 * SECOND),
+        Some(params),
+    )));
+
+    // Capture the results before normal teardown can affect their observability
+    let cached_source = cache.borrow().bars(&source_type).unwrap_or_default();
+    let aggregated = cache
+        .borrow()
+        .bars(&composite.standard())
+        .unwrap_or_default();
+    let responses = response_saver.get_messages();
+    let handler_consumed = stub_msgbus
+        .borrow()
+        .get_response_handler(&request_id)
+        .is_none();
+    let subscriptions_after_response = data_engine.subscribed_bars();
+
+    if !unsubscribe_before_response {
+        msgbus::unsubscribe_bars(topic.into(), &handler);
+        data_engine.execute_unsubscribe(&unsubscribe).unwrap();
+    }
+    data_engine.stop();
+    data_engine.dispose();
+
+    assert_eq!(source_unsubscribed, unsubscribe_before_response);
+    assert_eq!(cached_source.len(), source.len());
+    assert!(source.iter().all(|bar| cached_source.contains(bar)));
+    assert_eq!(responses.len(), 1);
+    assert!(responses[0].completed());
+    assert!(responses[0].failure_reason().is_none());
+    let Some(DataResponse::Bars(response)) = responses[0].response() else {
+        panic!("Expected the original historical bars response");
+    };
+    assert_eq!(response.data.as_ref(), source.as_slice());
+    assert!(handler_consumed);
+    assert!(live_saver.get_messages().is_empty());
+
+    if unsubscribe_before_response {
+        assert!(subscriptions_before_response.is_empty());
+        assert!(subscriptions_after_response.is_empty());
+    } else {
+        assert!(subscriptions_before_response.contains(&composite.standard()));
+        assert!(subscriptions_after_response.contains(&composite.standard()));
+    }
+
+    assert_eq!(
+        aggregated,
+        vec![Bar::new(
+            composite.standard(),
+            Price::from("100.00"),
+            Price::from("106.00"),
+            Price::from("99.00"),
+            Price::from("105.00"),
+            Quantity::from("50"),
+            UnixNanos::from(1_700_000_400_000_000_000),
+            UnixNanos::from(1_700_000_400_000_000_000),
+        )],
+    );
 }
 
 /// The fork's twin of `test_request_bar_aggregation_after_unsubscribe`: a kept request builds
@@ -1096,7 +1185,7 @@ fn test_request_bar_aggregation_after_resubscribe(
     data_engine
         .execute_request(RequestCommand::Trades(RequestTrades::new(
             instrument_id,
-            Some(UnixNanos::default().to_datetime_utc()),
+            None,
             None,
             None,
             Some(client_id),
@@ -1140,18 +1229,6 @@ fn test_request_bar_aggregation_after_resubscribe(
     };
     let (handler, saver) = get_typed_message_saving_handler::<Bar>(None);
     let topic = switchboard::get_bars_topic(bar_type);
-    // The number of bars published when the request's terminal reaches its requester
-    let published_at_terminal = Rc::new(RefCell::new(None));
-    let terminal_saver = saver.clone();
-    let terminal_seen = Rc::clone(&published_at_terminal);
-    msgbus::register_response_handler(
-        &request_id,
-        TypedHandler::from(move |envelope: &DataResponseEnvelope| {
-            if envelope.completed() {
-                *terminal_seen.borrow_mut() = Some(terminal_saver.get_messages().len());
-            }
-        }),
-    );
     msgbus::subscribe_bars(topic.into(), handler.clone(), None);
     data_engine.execute_subscribe(subscribe()).unwrap();
 
@@ -1165,21 +1242,16 @@ fn test_request_bar_aggregation_after_resubscribe(
     data_engine.execute_subscribe(subscribe()).unwrap();
     let resubscribed = data_engine.subscribed_bars();
     data_engine.process_data(Data::Trade(make_trade(2_500, "new-buffered-live")));
-    // A completed envelope certifies that the answer holds every record of its window
-    data_engine.response_envelope(DataResponseEnvelope::new(
-        DataResponse::Trades(TradesResponse::new(
-            request_id,
-            client_id,
-            instrument_id,
-            vec![make_trade(1_000, "historical")],
-            None,
-            None,
-            UnixNanos::from(1_000),
-            Some(params),
-        )),
-        true,
+    data_engine.response(DataResponse::Trades(TradesResponse::new(
+        request_id,
+        client_id,
+        instrument_id,
+        vec![make_trade(1_000, "historical")],
         None,
-    ));
+        None,
+        UnixNanos::from(1_000),
+        Some(params),
+    )));
     let historical_bars = cache.borrow().bars(&bar_type).unwrap_or_default();
     let historical_messages = saver.get_messages();
     let active_after_response = data_engine.subscribed_bars();
@@ -1201,27 +1273,24 @@ fn test_request_bar_aggregation_after_resubscribe(
         UnixNanos::from(1_000),
         UnixNanos::from(1_000),
     );
-    let bar_at = |ts: u64| Bar {
-        ts_event: UnixNanos::from(ts),
-        ts_init: UnixNanos::from(ts),
-        ..historical_bar
-    };
     assert!(released_subscriptions.is_empty());
     assert!(resubscribed.contains(&bar_type));
     assert!(active_after_response.contains(&bar_type));
     assert_eq!(historical_bars.len(), 2);
     assert!(historical_bars.contains(&historical_bar));
-    assert!(historical_bars.contains(&bar_at(2_500)));
-    // An intentional divergence from UPSTREAM's history-only warm-up: the trade held for the
-    // resubscription is fed at the hand-over and its bar published, after the request's terminal
-    assert_eq!(historical_messages, vec![bar_at(2_500)]);
-    assert_eq!(live_messages, vec![bar_at(2_500), bar_at(3_000)]);
-    assert_eq!(*published_at_terminal.borrow(), Some(0));
-    assert!(
-        historical_bars
-            .iter()
-            .chain(&live_messages)
-            .all(|bar| bar.ts_event != UnixNanos::from(2_000))
+    assert!(historical_bars.contains(&Bar {
+        ts_event: UnixNanos::from(2_500),
+        ts_init: UnixNanos::from(2_500),
+        ..historical_bar
+    }));
+    assert!(historical_messages.is_empty());
+    assert_eq!(
+        live_messages,
+        vec![Bar {
+            ts_event: UnixNanos::from(3_000),
+            ts_init: UnixNanos::from(3_000),
+            ..historical_bar
+        }]
     );
 }
 
@@ -1261,7 +1330,7 @@ fn test_request_bar_aggregation_failure_after_unsubscribe(
     let request = |request_id| {
         RequestCommand::Trades(RequestTrades::new(
             instrument_id,
-            Some(UnixNanos::default().to_datetime_utc()),
+            None,
             None,
             None,
             Some(client_id),
@@ -1324,21 +1393,16 @@ fn test_request_bar_aggregation_failure_after_unsubscribe(
         UnixNanos::from(1_000),
         UnixNanos::from(1_000),
     );
-    // A completed envelope certifies that the answer holds every record of its window
-    data_engine.response_envelope(DataResponseEnvelope::new(
-        DataResponse::Trades(TradesResponse::new(
-            next_id,
-            client_id,
-            instrument_id,
-            vec![trade],
-            None,
-            None,
-            UnixNanos::from(1_000),
-            Some(params),
-        )),
-        true,
+    data_engine.response(DataResponse::Trades(TradesResponse::new(
+        next_id,
+        client_id,
+        instrument_id,
+        vec![trade],
         None,
-    ));
+        None,
+        UnixNanos::from(1_000),
+        Some(params),
+    )));
     let responses = response_saver.get_messages();
     let bars = cache.borrow().bars(&bar_type).unwrap_or_default();
     data_engine.stop();
@@ -1374,15 +1438,16 @@ fn test_request_bar_aggregation_failure_after_unsubscribe(
     );
 }
 
-/// UPSTREAM's kept chain of composites is not carried: its kept request names composites and is
-/// refused by name before dispatch (see
-/// `test_kept_source_whose_composite_subscription_ended_first_builds_no_composite_bar`).
 #[rstest]
 fn test_request_bar_aggregation_chain_after_unsubscribe(
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
 ) {
+    const SECOND: u64 = 1_000_000_000;
     let _ = stub_msgbus;
+
+    // Both historical intervals start at the same nonzero ten-minute boundary
+    let open_ns = 1_700_000_400 * SECOND;
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache = Rc::new(RefCell::new(Cache::default()));
     let instrument = equity_aapl();
@@ -1406,39 +1471,166 @@ fn test_request_bar_aggregation_chain_after_unsubscribe(
     let source_type = BarType::from("AAPL.XNAS-1-MINUTE-LAST-EXTERNAL");
     let five_minute = BarType::from("AAPL.XNAS-5-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL");
     let ten_minute = BarType::from("AAPL.XNAS-10-MINUTE-LAST-INTERNAL@5-MINUTE-INTERNAL");
+    let request_id = UUID4::new();
     let params: Params = serde_json::from_value(json!({
         "bar_types": [five_minute.to_string(), ten_minute.to_string()],
         "update_subscriptions": true,
     }))
     .unwrap();
-    let request = RequestCommand::Bars(RequestBars::new(
-        source_type,
-        Some(UnixNanos::default().to_datetime_utc()),
-        None,
-        None,
-        Some(client_id),
-        UUID4::new(),
-        UnixNanos::default(),
-        Some(params),
-    ));
+    let (response_handler, response_saver) =
+        get_typed_message_saving_handler::<DataResponseEnvelope>(None);
+    msgbus::register_response_handler(&request_id, response_handler);
+    data_engine
+        .execute_request(RequestCommand::Bars(RequestBars::new(
+            source_type,
+            None,
+            None,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::default(),
+            Some(params.clone()),
+        )))
+        .unwrap();
+    let (handler, live_saver) = get_typed_message_saving_handler::<Bar>(None);
+    let topic = switchboard::get_bars_topic(ten_minute.standard());
+    msgbus::subscribe_bars(topic.into(), handler.clone(), None);
 
-    assert_kept_composite_refused(&mut data_engine, &recorder, request, five_minute);
+    for bar_type in [five_minute, ten_minute] {
+        data_engine
+            .execute_subscribe(SubscribeCommand::Bars(SubscribeBars::new(
+                bar_type,
+                Some(client_id),
+                Some(venue),
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            )))
+            .unwrap();
+    }
+
+    // Releasing the only public consumer also releases its internal live source
+    msgbus::unsubscribe_bars(topic.into(), &handler);
+    data_engine
+        .execute_unsubscribe(&UnsubscribeCommand::Bars(UnsubscribeBars::new(
+            ten_minute,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        )))
+        .unwrap();
+    let subscriptions_before_response = data_engine.subscribed_bars();
+    let source_unsubscribed = recorder.borrow().iter().any(|command| {
+        matches!(
+            command,
+            DataCommand::Unsubscribe(UnsubscribeCommand::Bars(cmd))
+                if cmd.single_bar_type().ok() == Some(source_type)
+        )
+    });
+    let source: Vec<_> = (0..10)
+        .map(|minute| {
+            let close_time = UnixNanos::from(open_ns + (minute + 1) * 60 * SECOND);
+            Bar::new(
+                source_type,
+                Price::from(format!("{}.00", 100 + minute).as_str()),
+                Price::from(format!("{}.00", 102 + minute).as_str()),
+                Price::from(format!("{}.00", 99 + minute).as_str()),
+                Price::from(format!("{}.00", 101 + minute).as_str()),
+                Quantity::from("10"),
+                close_time,
+                close_time,
+            )
+        })
+        .collect();
+    data_engine.response(DataResponse::Bars(BarsResponse::new(
+        request_id,
+        client_id,
+        source_type,
+        source.clone(),
+        None,
+        None,
+        UnixNanos::from(open_ns + 600 * SECOND),
+        Some(params),
+    )));
+    let cached_source = cache.borrow().bars(&source_type).unwrap_or_default();
+    let five_minute_bars = cache
+        .borrow()
+        .bars(&five_minute.standard())
+        .unwrap_or_default();
+    let ten_minute_bars = cache
+        .borrow()
+        .bars(&ten_minute.standard())
+        .unwrap_or_default();
+    let subscriptions_after_response = data_engine.subscribed_bars();
+    let responses = response_saver.get_messages();
+    data_engine.stop();
+    data_engine.dispose();
+
+    let expected_bar = |bar_type, prices: [&str; 4], volume: &str, timestamp: u64| {
+        Bar::new(
+            bar_type,
+            Price::from(prices[0]),
+            Price::from(prices[1]),
+            Price::from(prices[2]),
+            Price::from(prices[3]),
+            Quantity::from(volume),
+            UnixNanos::from(timestamp),
+            UnixNanos::from(timestamp),
+        )
+    };
+    assert!(subscriptions_before_response.is_empty());
+    assert!(subscriptions_after_response.is_empty());
+    assert!(source_unsubscribed);
+    assert_eq!(cached_source.len(), 10);
+    assert!(source.iter().all(|bar| cached_source.contains(bar)));
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].correlation_id(), &request_id);
+    assert!(responses[0].completed());
+    assert!(responses[0].failure_reason().is_none());
+    let Some(DataResponse::Bars(response)) = responses[0].response() else {
+        panic!("Expected the original historical bars response");
+    };
+    assert_eq!(response.data.as_ref(), source.as_slice());
+    assert!(live_saver.get_messages().is_empty());
+    assert_eq!(five_minute_bars.len(), 2);
+    assert!(five_minute_bars.contains(&expected_bar(
+        five_minute.standard(),
+        ["100.00", "106.00", "99.00", "105.00"],
+        "50",
+        1_700_000_700_000_000_000,
+    )));
+    assert!(five_minute_bars.contains(&expected_bar(
+        five_minute.standard(),
+        ["105.00", "111.00", "104.00", "110.00"],
+        "50",
+        1_700_001_000_000_000_000,
+    )));
+    assert_eq!(
+        ten_minute_bars,
+        vec![expected_bar(
+            ten_minute.standard(),
+            ["100.00", "111.00", "99.00", "110.00"],
+            "100",
+            1_700_001_000_000_000_000,
+        )]
+    );
 }
 
-/// UPSTREAM's kept composite over a batch subscription is not carried: its kept request names the
-/// composite and is refused by name before dispatch (see
-/// `test_kept_source_in_a_batch_subscription_keeps_the_shared_feed` for its source kept alone).
 #[rstest]
 #[case::trades(PriceType::Last)]
 #[case::quotes(PriceType::Bid)]
 fn test_request_bar_aggregation_after_batch_unsubscribe(
     #[case] price_type: PriceType,
+    #[values(false, true)] resubscribe_before_response: bool,
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
     venue: Venue,
 ) {
-    let _ = stub_msgbus;
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache = Rc::new(RefCell::new(Cache::default()));
     let instrument_id = audusd_sim.id;
@@ -1462,37 +1654,327 @@ fn test_request_bar_aggregation_after_batch_unsubscribe(
     let composite = BarType::from(
         format!("{instrument_id}-2-TICK-{price_type}-INTERNAL@1-TICK-INTERNAL").as_str(),
     );
+    let request_id = UUID4::new();
     let params: Params = serde_json::from_value(json!({
         "bar_types": [source.to_string(), composite.to_string()],
         "update_subscriptions": true,
     }))
     .unwrap();
-    let start = Some(UnixNanos::default().to_datetime_utc());
+    let (response_handler, response_saver) =
+        get_typed_message_saving_handler::<DataResponseEnvelope>(None);
+    msgbus::register_response_handler(&request_id, response_handler);
     let request = if price_type == PriceType::Last {
         RequestCommand::Trades(RequestTrades::new(
             instrument_id,
-            start,
+            None,
             None,
             None,
             Some(client_id),
-            UUID4::new(),
+            request_id,
             UnixNanos::default(),
-            Some(params),
+            Some(params.clone()),
         ))
     } else {
         RequestCommand::Quotes(RequestQuotes::new(
             instrument_id,
-            start,
+            None,
             None,
             None,
             Some(client_id),
+            request_id,
+            UnixNanos::default(),
+            Some(params.clone()),
+        ))
+    };
+    data_engine.execute_request(request).unwrap();
+
+    let (bar_handler, bar_saver) = get_typed_message_saving_handler::<Bar>(None);
+
+    for bar_type in [source, composite] {
+        let topic = switchboard::get_bars_topic(bar_type.standard());
+        msgbus::subscribe_bars(topic.into(), bar_handler.clone(), None);
+    }
+    let subscribe_bars = || {
+        SubscribeCommand::Bars(SubscribeBars::new(
+            vec![source, composite],
+            Some(client_id),
+            Some(venue),
             UUID4::new(),
             UnixNanos::default(),
+            None,
+            None,
+        ))
+    };
+    data_engine.execute_subscribe(subscribe_bars()).unwrap();
+
+    let (trade_handler, trade_saver) =
+        get_typed_message_saving_handler::<TradeTick>(Some(Ustr::from("remaining-consumer")));
+    let (quote_handler, quote_saver) =
+        get_typed_message_saving_handler::<QuoteTick>(Some(Ustr::from("remaining-consumer")));
+    let subscribe = if price_type == PriceType::Last {
+        let topic = switchboard::get_trades_topic(instrument_id);
+        msgbus::subscribe_trades(topic.into(), trade_handler.clone(), None);
+        SubscribeCommand::Trades(SubscribeTrades::new(
+            instrument_id,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+    } else {
+        let topic = switchboard::get_quotes_topic(instrument_id);
+        msgbus::subscribe_quotes(topic.into(), quote_handler.clone(), None);
+        SubscribeCommand::Quotes(SubscribeQuotes::new(
+            instrument_id,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+    };
+    data_engine.execute_subscribe(subscribe).unwrap();
+    let subscribe_count = recorder
+        .borrow()
+        .iter()
+        .filter(|command| {
+            matches!(
+                command,
+                DataCommand::Subscribe(SubscribeCommand::Trades(_) | SubscribeCommand::Quotes(_))
+            )
+        })
+        .count();
+    let unsubscribe_count = || {
+        recorder
+            .borrow()
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    DataCommand::Unsubscribe(
+                        UnsubscribeCommand::Trades(_) | UnsubscribeCommand::Quotes(_)
+                    )
+                )
+            })
+            .count()
+    };
+
+    // The actor releases both bar handlers before its composite-first batch command
+    for bar_type in [composite, source] {
+        let topic = switchboard::get_bars_topic(bar_type.standard());
+        msgbus::unsubscribe_bars(topic.into(), &bar_handler);
+    }
+    let unsubscribe_bars = || {
+        UnsubscribeCommand::Bars(UnsubscribeBars::new(
+            vec![composite, source],
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+    };
+    data_engine
+        .execute_unsubscribe(&unsubscribe_bars())
+        .unwrap();
+
+    if resubscribe_before_response {
+        for bar_type in [source, composite] {
+            let topic = switchboard::get_bars_topic(bar_type.standard());
+            msgbus::subscribe_bars(topic.into(), bar_handler.clone(), None);
+        }
+        data_engine.execute_subscribe(subscribe_bars()).unwrap();
+
+        for bar_type in [composite, source] {
+            let topic = switchboard::get_bars_topic(bar_type.standard());
+            msgbus::unsubscribe_bars(topic.into(), &bar_handler);
+        }
+        data_engine
+            .execute_unsubscribe(&unsubscribe_bars())
+            .unwrap();
+    }
+
+    let releases_before_response = unsubscribe_count();
+    let feed_before_response = if price_type == PriceType::Last {
+        data_engine.subscribed_trades()
+    } else {
+        data_engine.subscribed_quotes()
+    };
+    let bars_before_response = data_engine.subscribed_bars();
+    let make_trade = |ts: u64, trade_id: &str| {
+        TradeTick::new(
+            instrument_id,
+            Price::from("0.65000"),
+            Quantity::from("1000"),
+            AggressorSide::Buy,
+            TradeId::new(trade_id),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        )
+    };
+    let make_quote = |ts: u64| {
+        QuoteTick::new(
+            instrument_id,
+            Price::from("0.65000"),
+            Price::from("0.65020"),
+            Quantity::from("1000"),
+            Quantity::from("1000"),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        )
+    };
+    let historical_trades = vec![
+        make_trade(1_000, "history-1"),
+        make_trade(2_000, "history-2"),
+    ];
+    let historical_quotes = vec![make_quote(1_000), make_quote(2_000)];
+    let live_trade = make_trade(3_000, "remaining-live");
+    let live_quote = make_quote(3_000);
+    let response = if price_type == PriceType::Last {
+        data_engine.process_data(Data::Trade(live_trade));
+        DataResponse::Trades(TradesResponse::new(
+            request_id,
+            client_id,
+            instrument_id,
+            historical_trades.clone(),
+            None,
+            None,
+            UnixNanos::from(2_000),
+            Some(params),
+        ))
+    } else {
+        data_engine.process_data(Data::Quote(live_quote));
+        DataResponse::Quotes(QuotesResponse::new(
+            request_id,
+            client_id,
+            instrument_id,
+            historical_quotes.clone(),
+            None,
+            None,
+            UnixNanos::from(2_000),
             Some(params),
         ))
     };
+    data_engine.response(response);
+    let source_bars = cache.borrow().bars(&source).unwrap_or_default();
+    let composite_bars = cache
+        .borrow()
+        .bars(&composite.standard())
+        .unwrap_or_default();
+    let responses = response_saver.get_messages();
+    let handler_consumed = stub_msgbus
+        .borrow()
+        .get_response_handler(&request_id)
+        .is_none();
+    let feed_after_response = if price_type == PriceType::Last {
+        data_engine.subscribed_trades()
+    } else {
+        data_engine.subscribed_quotes()
+    };
+    let bars_after_response = data_engine.subscribed_bars();
+    let releases_after_response = unsubscribe_count();
+    let trades_received = trade_saver.get_messages();
+    let quotes_received = quote_saver.get_messages();
 
-    assert_kept_composite_refused(&mut data_engine, &recorder, request, composite);
+    let unsubscribe = if price_type == PriceType::Last {
+        let topic = switchboard::get_trades_topic(instrument_id);
+        msgbus::unsubscribe_trades(topic.into(), &trade_handler);
+        UnsubscribeCommand::Trades(UnsubscribeTrades::new(
+            instrument_id,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+    } else {
+        let topic = switchboard::get_quotes_topic(instrument_id);
+        msgbus::unsubscribe_quotes(topic.into(), &quote_handler);
+        UnsubscribeCommand::Quotes(UnsubscribeQuotes::new(
+            instrument_id,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+    };
+    data_engine.execute_unsubscribe(&unsubscribe).unwrap();
+    let final_release_count = unsubscribe_count();
+    let final_feed = if price_type == PriceType::Last {
+        data_engine.subscribed_trades()
+    } else {
+        data_engine.subscribed_quotes()
+    };
+    data_engine.stop();
+    data_engine.dispose();
+
+    assert_eq!(subscribe_count, 1);
+    assert_eq!(releases_before_response, 0);
+    assert_eq!(releases_after_response, 0);
+    assert_eq!(feed_before_response, vec![instrument_id]);
+    assert_eq!(feed_after_response, vec![instrument_id]);
+    assert!(bars_before_response.is_empty());
+    assert!(bars_after_response.is_empty());
+
+    if price_type == PriceType::Last {
+        assert_eq!(trades_received, vec![live_trade]);
+        assert!(quotes_received.is_empty());
+    } else {
+        assert_eq!(quotes_received, vec![live_quote]);
+        assert!(trades_received.is_empty());
+    }
+    assert!(bar_saver.get_messages().is_empty());
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].correlation_id(), &request_id);
+    assert!(responses[0].completed());
+    assert!(responses[0].failure_reason().is_none());
+    assert!(handler_consumed);
+
+    match responses[0].response() {
+        Some(DataResponse::Trades(response)) if price_type == PriceType::Last => {
+            assert_eq!(response.data.as_ref(), historical_trades.as_slice());
+        }
+        Some(DataResponse::Quotes(response)) if price_type == PriceType::Bid => {
+            assert_eq!(response.data.as_ref(), historical_quotes.as_slice());
+        }
+        _ => panic!("Expected the original historical tick response"),
+    }
+    let historical_bar = Bar::new(
+        source,
+        Price::from("0.65000"),
+        Price::from("0.65000"),
+        Price::from("0.65000"),
+        Price::from("0.65000"),
+        Quantity::from("1000"),
+        UnixNanos::from(1_000),
+        UnixNanos::from(1_000),
+    );
+    assert_eq!(source_bars.len(), 2);
+    assert!(source_bars.contains(&historical_bar));
+    assert!(source_bars.contains(&Bar {
+        ts_event: UnixNanos::from(2_000),
+        ts_init: UnixNanos::from(2_000),
+        ..historical_bar
+    }));
+    assert_eq!(
+        composite_bars,
+        vec![Bar {
+            bar_type: composite.standard(),
+            volume: Quantity::from("2000"),
+            ts_event: UnixNanos::from(2_000),
+            ts_init: UnixNanos::from(2_000),
+            ..historical_bar
+        }]
+    );
+    assert_eq!(final_release_count, 1);
+    assert!(final_feed.is_empty());
 }
 
 #[rstest]
@@ -1543,8 +2025,8 @@ fn test_update_subscriptions_request_aggregator_replays_live_quotes_after_respon
     data_engine.execute(DataCommand::Request(RequestCommand::Quotes(
         RequestQuotes::new(
             instrument_id,
-            Some(UnixNanos::from(t0 - 300 * SEC).to_datetime_utc()),
-            Some(UnixNanos::from(t0 - 1).to_datetime_utc()),
+            None,
+            None,
             None,
             Some(client_id),
             request_id,
@@ -1584,20 +2066,16 @@ fn test_update_subscriptions_request_aggregator_replays_live_quotes_after_respon
     let history: Vec<QuoteTick> = (1..=30)
         .map(|i| make_quote(t0 - 300 * SEC + i * 10 * SEC - 1, "0.65000", "0.65010"))
         .collect();
-    data_engine.response_envelope(DataResponseEnvelope::new(
-        DataResponse::Quotes(QuotesResponse::new(
-            request_id,
-            client_id,
-            instrument_id,
-            history,
-            None,
-            None,
-            UnixNanos::from(t0 + 30 * SEC),
-            Some(params),
-        )),
-        true,
+    data_engine.response(DataResponse::Quotes(QuotesResponse::new(
+        request_id,
+        client_id,
+        instrument_id,
+        history,
         None,
-    ));
+        None,
+        UnixNanos::from(t0 + 30 * SEC),
+        Some(params),
+    )));
 
     // The held quote closes the last historical bar and the stale quote is not applied
     let cache_ref = cache.borrow();
@@ -1653,7 +2131,7 @@ fn test_update_subscriptions_request_aggregator_replays_live_trades_after_respon
     data_engine.execute(DataCommand::Request(RequestCommand::Trades(
         RequestTrades::new(
             instrument_id,
-            Some(UnixNanos::default().to_datetime_utc()),
+            None,
             None,
             None,
             Some(client_id),
@@ -1724,6 +2202,127 @@ fn test_update_subscriptions_request_aggregator_replays_live_trades_after_respon
     assert_eq!(messages[0].open, Price::from("0.67000"));
     assert_eq!(messages[0].close, Price::from("0.67010"));
     assert_eq!(messages[0].ts_event, UnixNanos::from(6_000));
+}
+
+#[rstest]
+#[case::composite_first(true)]
+#[case::source_first(false)]
+fn test_update_subscriptions_request_chain_replays_live_quotes_before_dependents_go_live(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] composite_first: bool,
+) {
+    const SEC: u64 = 1_000_000_000;
+    // Aligned to a 5-minute boundary
+    let boundary = 1_700_000_100 * SEC;
+
+    let _ = stub_msgbus;
+    let virtual_clock = Rc::new(RefCell::new(VirtualClock::new()));
+    virtual_clock
+        .borrow_mut()
+        .set_time(UnixNanos::from(boundary + 10 * SEC));
+    let clock: Rc<RefCell<dyn Clock>> = virtual_clock;
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+
+    let instrument_id = audusd_sim.id;
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        test_clock,
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+
+    let source = BarType::from(format!("{instrument_id}-1-MINUTE-MID-INTERNAL").as_str());
+    let composite =
+        BarType::from(format!("{instrument_id}-5-MINUTE-MID-INTERNAL@1-MINUTE-INTERNAL").as_str());
+    let bar_types = if composite_first {
+        vec![composite, source]
+    } else {
+        vec![source, composite]
+    };
+
+    let request_id = UUID4::new();
+    let params: Params = serde_json::from_value(json!({
+        "bar_types": bar_types.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "update_subscriptions": true,
+    }))
+    .unwrap();
+
+    data_engine.execute(DataCommand::Request(RequestCommand::Quotes(
+        RequestQuotes::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::from(boundary + 10 * SEC),
+            Some(params.clone()),
+        ),
+    )));
+
+    for bar_type in bar_types {
+        data_engine.execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+            SubscribeBars::new(
+                bar_type,
+                Some(client_id),
+                Some(venue),
+                UUID4::new(),
+                UnixNanos::from(boundary + 10 * SEC),
+                None,
+                None,
+            ),
+        )));
+    }
+
+    let make_quote = |ts: u64| {
+        QuoteTick::new(
+            instrument_id,
+            Price::from("0.65000"),
+            Price::from("0.65010"),
+            Quantity::from("1000"),
+            Quantity::from("1000"),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        )
+    };
+
+    // Two live quotes straddling the 5-minute boundary arrive while the response is in flight
+    data_engine.process_data(Data::Quote(make_quote(boundary - 30 * SEC)));
+    data_engine.process_data(Data::Quote(make_quote(boundary + 5 * SEC)));
+    assert!(cache.borrow().bar(&composite.standard()).is_none());
+
+    data_engine.response(DataResponse::Quotes(QuotesResponse::new(
+        request_id,
+        client_id,
+        instrument_id,
+        Vec::new(),
+        None,
+        None,
+        UnixNanos::from(boundary + 10 * SEC),
+        Some(params),
+    )));
+
+    // The held quotes replay through the source before the composite goes live
+    let cache_ref = cache.borrow();
+    let source_bar = cache_ref.bar(&source.standard()).unwrap();
+    assert_eq!(source_bar.ts_event, UnixNanos::from(boundary));
+    let composite_bar = cache_ref.bar(&composite.standard()).unwrap();
+    assert_eq!(composite_bar.ts_event, UnixNanos::from(boundary));
+    assert_eq!(composite_bar.close, Price::from("0.65005"));
 }
 
 #[rstest]
@@ -3288,16 +3887,6 @@ fn trades_request(
     ))
 }
 
-/// `request`, a trades request, with `start` (UNIX nanoseconds): one whose builders are kept by
-/// request (`update_subscriptions`) needs one.
-fn starting_at(request: RequestCommand, start: u64) -> RequestCommand {
-    let RequestCommand::Trades(mut cmd) = request else {
-        panic!("a trades request: {request:?}");
-    };
-    cmd.start = Some(UnixNanos::from(start).to_datetime_utc());
-    RequestCommand::Trades(cmd)
-}
-
 // More made-up trading-day opens and times for the join's plan
 const NY_2026_11_12_2000: u64 = 1_794_531_600_000_000_000;
 
@@ -3401,20 +3990,13 @@ fn execute_interleaved(
     fixture: &JoinFixture,
     instrument_id: InstrumentId,
     bar_types: &[BarType],
-    update_subscriptions: bool,
 ) -> UUID4 {
     let params = json!({
         "bar_types": bar_types.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "update_subscriptions": update_subscriptions,
+        "update_subscriptions": false,
         "interleave": true,
     });
     let request = trades_request(vec![instrument_id], None, fixture.client_id, params);
-    // Kept builders need a `start`; the trades are a few nanoseconds after the epoch
-    let request = if update_subscriptions {
-        starting_at(request, 0)
-    } else {
-        request
-    };
     let request_id = *request.request_id();
     fixture
         .engine
@@ -3493,7 +4075,7 @@ fn test_interleaved_answer_keeps_its_failure_reason_on_its_one_terminal(
     let tick = fixture.bar_type;
     let tap = TappedResponses::install();
 
-    let request_id = execute_interleaved(&fixture, id, &[tick], false);
+    let request_id = execute_interleaved(&fixture, id, &[tick]);
     let failed = answer_trades(&fixture, request_id, id, &[(1, "t1"), (2, "t2")], true)
         .with_failure("the source stopped".to_owned());
     fixture.engine.borrow_mut().response_envelope(failed);
@@ -3630,7 +4212,7 @@ fn test_two_interleaved_requests_at_the_same_time_for_different_instruments_each
     let (aud_seconds, gbp_seconds) = (second_bars(aud), second_bars(gbp));
     let tap = TappedResponses::install();
 
-    let first = execute_interleaved(&fixture, aud, &[aud_seconds], false);
+    let first = execute_interleaved(&fixture, aud, &[aud_seconds]);
     let second = execute_interleaved_until(&fixture, gbp, &[gbp_seconds], 3 * SECOND_NS);
     let (a1, a2) = (SECOND_NS / 5, SECOND_NS + SECOND_NS / 5);
     let (b1, b2, b3) = (
@@ -4295,235 +4877,6 @@ fn test_interleaved_bars_of_two_types_one_trade_completes_come_in_live_order_wha
             interleaved_deliveries(audusd_sim.clone(), client_id, venue, &bar_types, answer);
         assert_eq!(history, live, "{answer:?}");
     }
-}
-
-fn order_bar_types(instrument_id: InstrumentId, specs: &[&str]) -> Vec<BarType> {
-    specs
-        .iter()
-        .map(|spec| BarType::from(format!("{instrument_id}-{spec}-LAST-INTERNAL").as_str()))
-        .collect()
-}
-
-fn subscribe_order_bars(engine: &mut DataEngine, bar_types: &[BarType], client_id: ClientId) {
-    for bar_type in bar_types {
-        engine.execute(DataCommand::Subscribe(SubscribeCommand::Bars(
-            SubscribeBars::new(
-                *bar_type,
-                Some(client_id),
-                Some(bar_type.instrument_id().venue),
-                UUID4::new(),
-                UnixNanos::default(),
-                None,
-                None,
-            ),
-        )));
-    }
-}
-
-/// Subscribes `bar_types` live and processes `trades` live, the last bar type subscribed only
-/// before the trade at `late` (with the others when `late` is zero), and returns the bars a
-/// subscriber to every bar type is given, in order.
-fn live_bars(
-    audusd_sim: CurrencyPair,
-    client_id: ClientId,
-    venue: Venue,
-    bar_types: &[BarType],
-    late: usize,
-) -> Vec<OrderedDelivery> {
-    // A bus of its own: another engine's trade handlers would hold the same IDs
-    let _msgbus = stub_msgbus();
-    let instrument_id = audusd_sim.id;
-    let (mut data_engine, cache) = order_engine(audusd_sim, client_id, venue);
-    let delivered = Rc::new(RefCell::new(Vec::new()));
-    for bar_type in bar_types {
-        let recorded = Rc::clone(&delivered);
-        let cache = Rc::clone(&cache);
-        let watched = bar_types.to_vec();
-        let handler = TypedHandler::from(move |bar: &Bar| {
-            let cached = cached_bars(&cache, &watched);
-            recorded
-                .borrow_mut()
-                .push(OrderedDelivery::Bar(bar.bar_type, bar.ts_event, cached));
-        });
-        msgbus::subscribe_bars(
-            switchboard::get_bars_topic(bar_type.standard()).into(),
-            handler,
-            None,
-        );
-    }
-
-    let (first, last) = bar_types.split_at(bar_types.len() - usize::from(late > 0));
-    subscribe_order_bars(&mut data_engine, first, client_id);
-    for (index, trade) in order_tape(instrument_id).into_iter().enumerate() {
-        if index == late {
-            subscribe_order_bars(&mut data_engine, last, client_id);
-        }
-        data_engine.process_data(Data::Trade(trade));
-    }
-
-    delivered.take()
-}
-
-/// How an interleaving request ends after its builders held live trades.
-#[derive(Clone, Copy, Debug)]
-enum HeldEnd {
-    /// A payload-free failure.
-    Failure,
-    /// A completed answer holding this many of the order tape's first trades.
-    Answer(usize),
-}
-
-/// Executes an interleaving `update_subscriptions` request for `bar_types`, subscribes them live
-/// while its answer is in flight, the last only before the held trade at `late` (with the others
-/// when `late` is zero), processes the order tape after the answered trades live (its builders
-/// hold them), then ends the request as `end` says; returns the bars its requester is given,
-/// and those published to the subscriptions (after a failure, the new builders' that took over
-/// the held trades), in the order they were given.
-fn released_bars(
-    audusd_sim: CurrencyPair,
-    client_id: ClientId,
-    venue: Venue,
-    bar_types: &[BarType],
-    late: usize,
-    end: HeldEnd,
-) -> Vec<OrderedDelivery> {
-    // A bus of its own: another engine's trade handlers would hold the same IDs
-    let _msgbus = stub_msgbus();
-    let instrument_id = audusd_sim.id;
-    let (mut data_engine, cache) = order_engine(audusd_sim, client_id, venue);
-    let params = json!({
-        "bar_types": bar_types.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "update_subscriptions": true,
-        "interleave": true,
-    });
-    let request = starting_at(
-        trades_request(vec![instrument_id], None, client_id, params.clone()),
-        0,
-    );
-    let request_id = *request.request_id();
-    data_engine.execute_request(request).unwrap();
-    let delivered = Rc::new(RefCell::new(Vec::new()));
-    let recorded = Rc::clone(&delivered);
-    let watched = bar_types.to_vec();
-    let answer_cache = Rc::clone(&cache);
-    msgbus::register_response_handler(
-        &request_id,
-        TypedHandler::from(move |envelope: &DataResponseEnvelope| {
-            if let Some(DataResponse::Bars(resp)) = envelope.response() {
-                for bar in resp.data.iter() {
-                    let cached = cached_bars(&answer_cache, &watched);
-                    recorded.borrow_mut().push(OrderedDelivery::Bar(
-                        bar.bar_type,
-                        bar.ts_event,
-                        cached,
-                    ));
-                }
-            }
-        }),
-    );
-    for bar_type in bar_types {
-        let recorded = Rc::clone(&delivered);
-        let cache = Rc::clone(&cache);
-        let watched = bar_types.to_vec();
-        let handler = TypedHandler::from(move |bar: &Bar| {
-            let cached = cached_bars(&cache, &watched);
-            recorded
-                .borrow_mut()
-                .push(OrderedDelivery::Bar(bar.bar_type, bar.ts_event, cached));
-        });
-        msgbus::subscribe_bars(
-            switchboard::get_bars_topic(bar_type.standard()).into(),
-            handler,
-            None,
-        );
-    }
-
-    let tape = order_tape(instrument_id);
-    let answered = match end {
-        HeldEnd::Failure => 0,
-        HeldEnd::Answer(answered) => answered,
-    };
-    let (first, last) = bar_types.split_at(bar_types.len() - usize::from(late > 0));
-    subscribe_order_bars(&mut data_engine, first, client_id);
-    for (index, trade) in tape[answered..].iter().enumerate() {
-        if index == late {
-            subscribe_order_bars(&mut data_engine, last, client_id);
-        }
-        data_engine.process_data(Data::Trade(*trade));
-    }
-
-    let envelope = match end {
-        HeldEnd::Failure => {
-            DataResponseEnvelope::terminal(request_id, Some("the source stopped".to_owned()))
-        }
-        HeldEnd::Answer(answered) => DataResponseEnvelope::new(
-            DataResponse::Trades(TradesResponse::new(
-                request_id,
-                client_id,
-                instrument_id,
-                tape[..answered].to_vec(),
-                None,
-                None,
-                tape[answered - 1].ts_init,
-                Some(serde_json::from_value(params).unwrap()),
-            )),
-            true,
-            None,
-        ),
-    };
-    data_engine.response_envelope(envelope);
-
-    delivered.take()
-}
-
-#[rstest]
-#[case::two_ticks(&["1-TICK", "2-TICK"])]
-#[case::range_and_range_inclusive(&["10-RANGE", "10-RANGE_INCLUSIVE"])]
-fn test_interleaved_completion_releases_held_trades_to_two_bar_types_trade_by_trade_as_live(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-    #[case] specs: &[&str],
-) {
-    let _ = stub_msgbus;
-    let bar_types = order_bar_types(audusd_sim.id, specs);
-
-    let live = live_bars(audusd_sim.clone(), client_id, venue, &bar_types, 0);
-    let released = released_bars(
-        audusd_sim,
-        client_id,
-        venue,
-        &bar_types,
-        0,
-        HeldEnd::Answer(2),
-    );
-
-    assert_eq!(released, live);
-}
-
-#[rstest]
-fn test_interleaved_release_feeds_a_bar_type_subscribed_later_only_the_trades_it_held(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-) {
-    let _ = stub_msgbus;
-    let bar_types = order_bar_types(audusd_sim.id, &["1-TICK", "2-TICK"]);
-
-    // 2-TICK is subscribed after t2: it holds t3 to t6, 1-TICK all six
-    let live = live_bars(audusd_sim.clone(), client_id, venue, &bar_types, 2);
-    let released = released_bars(
-        audusd_sim,
-        client_id,
-        venue,
-        &bar_types,
-        2,
-        HeldEnd::Failure,
-    );
-
-    assert_eq!(released, live);
 }
 
 /// What the requester of an interleaving request with its own replay (no `update_subscriptions`)
@@ -7097,7 +7450,6 @@ fn kept_window(start: u64, next: u64) -> KeptSpec {
 struct KeptFixture {
     engine: DataEngine,
     clock: Rc<RefCell<VirtualClock>>,
-    recorder: Rc<RefCell<Vec<DataCommand>>>,
     instrument_id: InstrumentId,
     client_id: ClientId,
     venue: Venue,
@@ -7194,7 +7546,6 @@ impl KeptFixture {
         Self {
             engine,
             clock,
-            recorder,
             instrument_id,
             client_id,
             venue,
@@ -7311,33 +7662,6 @@ impl KeptFixture {
         self.engine.response_envelope(envelope);
     }
 
-    /// Sends the `request`th request a part of its answer: trades (`ts`, size, trade ID) at one
-    /// price in an envelope that does not complete it.
-    fn answer_part(&mut self, request: usize, trades: &[(u64, u64, &str)]) {
-        let resp = self.trades_response(request, trades);
-        let envelope = DataResponseEnvelope::new(DataResponse::Trades(resp), false, None);
-        self.engine.response_envelope(envelope);
-    }
-
-    /// Releases the claim of the `request`th request on the builder of `bar_type`, as an actor
-    /// does (see `ReleaseKeptBars`).
-    fn release(&mut self, bar_type: BarType, request: usize) {
-        let now = self.clock.borrow().timestamp_ns();
-        self.engine
-            .execute(DataCommand::ReleaseKeptBars(ReleaseKeptBars::new(
-                bar_type,
-                self.requests[request],
-                UUID4::new(),
-                now,
-            )));
-    }
-
-    /// Ends the `request`th request with a payload-free terminal carrying no failure reason.
-    fn end(&mut self, request: usize) {
-        let terminal = DataResponseEnvelope::terminal(self.requests[request], None);
-        self.engine.response_envelope(terminal);
-    }
-
     fn trades_response(&self, request: usize, trades: &[(u64, u64, &str)]) -> TradesResponse {
         let trades: Vec<TradeTick> = trades
             .iter()
@@ -7372,23 +7696,6 @@ impl KeptFixture {
                     now,
                     None,
                     params,
-                ),
-            )));
-    }
-
-    /// Subscribes `bar_types` in one command, as an actor subscribing several bar types at once.
-    fn subscribe_all(&mut self, bar_types: &[BarType]) {
-        let now = self.clock.borrow().timestamp_ns();
-        self.engine
-            .execute(DataCommand::Subscribe(SubscribeCommand::Bars(
-                SubscribeBars::new(
-                    bar_types.to_vec(),
-                    Some(self.client_id),
-                    Some(self.venue),
-                    UUID4::new(),
-                    now,
-                    None,
-                    None,
                 ),
             )));
     }
@@ -7430,39 +7737,11 @@ impl KeptFixture {
     fn delivered(&self) -> Vec<Kept> {
         self.delivered.borrow().clone()
     }
-
-    /// The commands the client received after the first `skip`.
-    fn client_commands(&self, skip: usize) -> Vec<DataCommand> {
-        self.recorder.borrow()[skip..].to_vec()
-    }
 }
 
 /// 2024-01-08, a Monday: New York civil `time` that day.
 fn monday(time: &str) -> u64 {
     new_york(&format!("2024-01-08T{time}"))
-}
-
-/// A kept 5-MINUTE request from 10:00 to 10:08 minus 1 ns, answered with a1 at 10:01 and a2 at
-/// 10:06: the 10:05 bar closes before a2; a2's bar, closing at 10:10, stays open.
-fn first_kept_request(fixture: &mut KeptFixture, five: BarType) -> usize {
-    let request = fixture
-        .request(&[five], kept_window(monday("10:00:00"), monday("10:08:00")))
-        .unwrap();
-    fixture.answer(
-        request,
-        &[(monday("10:01:00"), 1, "a1"), (monday("10:06:00"), 2, "a2")],
-        None,
-    );
-    request
-}
-
-fn first_kept_answer(five: BarType) -> Vec<Kept> {
-    vec![
-        kept_trade(0, "a1", &[0]),
-        kept_bar(0, five, monday("10:05:00"), 1, &[1]),
-        kept_trade(0, "a2", &[1]),
-        Kept::End(0, None),
-    ]
 }
 
 #[rstest]
@@ -7522,87 +7801,6 @@ fn test_kept_request_continues_its_replay_with_every_handler_on_the_new_answer(
             Kept::End(1, None),
         ]
     );
-}
-
-#[derive(Clone, Copy, Debug)]
-enum Refusal {
-    Gap,
-    Overlap,
-    Earlier,
-    NoStart,
-    Limit,
-    SomeExist,
-}
-
-#[rstest]
-#[case::gap(Refusal::Gap, "leaves a gap after the coverage through")]
-#[case::overlap(Refusal::Overlap, "overlaps the coverage through")]
-#[case::earlier(Refusal::Earlier, "is before the start of the replay that keeps")]
-#[case::no_start(Refusal::NoStart, "it gives no `start`")]
-#[case::limit(Refusal::Limit, "it names a `limit`")]
-#[case::some_exist(Refusal::SomeExist, "has a kept builder and")]
-fn test_kept_request_refused_by_name_leaves_its_replay_as_it_was(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-    #[case] refusal: Refusal,
-    #[case] reason: &str,
-) {
-    let _ = stub_msgbus;
-    let id = audusd_sim.id;
-    let (five, tick) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "3-TICK"));
-    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
-    first_kept_request(&mut fixture, five);
-    let next = kept_window(monday("10:08:00"), monday("10:15:00"));
-    let (bar_types, spec) = match refusal {
-        Refusal::Gap => (
-            vec![five],
-            kept_window(monday("10:08:00") + 1, monday("10:15:00")),
-        ),
-        Refusal::Overlap => (
-            vec![five],
-            kept_window(monday("10:07:00"), monday("10:15:00")),
-        ),
-        Refusal::Earlier => (
-            vec![five],
-            kept_window(monday("09:59:00"), monday("10:15:00")),
-        ),
-        Refusal::NoStart => (
-            vec![five],
-            KeptSpec {
-                start: None,
-                ..next
-            },
-        ),
-        Refusal::Limit => (
-            vec![five],
-            KeptSpec {
-                limit: Some(10),
-                ..next
-            },
-        ),
-        Refusal::SomeExist => (vec![five, tick], next),
-    };
-
-    let error = fixture.request(&bar_types, spec).unwrap_err();
-    let continued = fixture.request(&[five], next).unwrap();
-    fixture.answer(continued, &[(monday("10:12:00"), 4, "b1")], None);
-
-    assert!(
-        error.starts_with("Cannot keep the bar builders of an `update_subscriptions` request"),
-        "{error}"
-    );
-    assert!(error.contains(reason), "{error}");
-    // The refused request changed nothing: the next one continues a2's open bar
-    let mut expected = first_kept_answer(five);
-    expected.extend([
-        Kept::End(1, Some(error)),
-        kept_bar(2, five, monday("10:10:00"), 2, &[2]),
-        kept_trade(2, "b1", &[2]),
-        Kept::End(2, None),
-    ]);
-    assert_eq!(fixture.delivered(), expected);
 }
 
 /// Runs kept requests for a 3-TICK and a 2-DAY New York bar from Monday 00:00 over `windows`
@@ -7697,84 +7895,6 @@ fn test_kept_requests_across_two_windows_build_the_tick_and_two_day_bars_of_one_
 }
 
 #[rstest]
-fn test_failed_kept_request_removes_its_replay_and_the_next_starts_a_new_one(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-) {
-    let _ = stub_msgbus;
-    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
-    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
-    let window = kept_window(monday("10:00:00"), monday("10:08:00"));
-    let failed = fixture.request(&[five], window).unwrap();
-    fixture.answer(
-        failed,
-        &[(monday("10:01:00"), 1, "a1"), (monday("10:06:00"), 2, "a2")],
-        Some("the source stopped"),
-    );
-
-    // The same window again: admitted only because no builder of it is left
-    let started = fixture
-        .request(&[five], kept_window(monday("10:00:00"), monday("10:15:00")))
-        .unwrap();
-    fixture.answer(
-        started,
-        &[(monday("10:07:00"), 4, "c1"), (monday("10:12:00"), 8, "c2")],
-        None,
-    );
-
-    // A new builder: the 10:10 bar holds c1 alone, not the failed request's a2
-    assert_eq!(
-        fixture.delivered(),
-        vec![
-            kept_trade(0, "a1", &[0]),
-            kept_bar(0, five, monday("10:05:00"), 1, &[1]),
-            kept_trade(0, "a2", &[1]),
-            Kept::End(0, Some("the source stopped".to_owned())),
-            kept_trade(1, "c1", &[1]),
-            kept_bar(1, five, monday("10:10:00"), 4, &[2]),
-            kept_trade(1, "c2", &[2]),
-            Kept::End(1, None),
-        ]
-    );
-}
-
-#[rstest]
-fn test_releasing_a_kept_bar_type_never_subscribed_by_its_request_removes_its_builder_and_replay(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-) {
-    let _ = stub_msgbus;
-    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
-    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
-    let request = first_kept_request(&mut fixture, five);
-    let sent = fixture.client_commands(0).len();
-
-    fixture.release(five, request);
-    // The first window again: admitted only because no builder of it is left
-    let started = fixture
-        .request(&[five], kept_window(monday("10:00:00"), monday("10:15:00")))
-        .unwrap();
-    fixture.answer(started, &[(monday("10:12:00"), 4, "c1")], None);
-
-    // No subscription of it was released at the client
-    assert!(
-        !fixture
-            .client_commands(sent)
-            .iter()
-            .any(|command| matches!(command, DataCommand::Unsubscribe(_))),
-        "{:?}",
-        fixture.client_commands(sent)
-    );
-    let mut expected = first_kept_answer(five);
-    expected.extend([kept_trade(1, "c1", &[1]), Kept::End(1, None)]);
-    assert_eq!(fixture.delivered(), expected);
-}
-
-#[rstest]
 fn test_subscription_after_a_kept_answer_publishes_the_range_bar_at_the_boundary_before_the_next_trade(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
@@ -7827,371 +7947,6 @@ fn test_subscription_after_a_kept_answer_publishes_the_range_bar_at_the_boundary
     );
 }
 
-#[rstest]
-fn test_subscription_at_the_range_boundary_builds_nothing_inside_the_call(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-) {
-    let _ = stub_msgbus;
-    let range = bar_type_of(audusd_sim.id, "10-RANGE");
-    let mut fixture = KeptFixture::with_config(
-        audusd_sim,
-        client_id,
-        venue,
-        with_new_york_session(without_flat_bars()),
-        monday("18:00:00"),
-        &[range],
-    );
-    let request = fixture
-        .request(
-            &[range],
-            kept_window(monday("17:50:00"), monday("18:00:00")),
-        )
-        .unwrap();
-    fixture.answer(request, &[(monday("17:59:40"), 1, "t1")], None);
-
-    fixture.subscribe(range, None);
-    let at_the_call = fixture.delivered();
-    fixture.advance(monday("18:00:00"));
-    fixture.live(monday("18:00:05"), 2, "t2");
-
-    assert_eq!(
-        at_the_call,
-        vec![kept_trade(0, "t1", &[0]), Kept::End(0, None)]
-    );
-    assert_eq!(
-        fixture.delivered()[at_the_call.len()..],
-        [
-            published(range, monday("18:00:00"), 1, &[1]),
-            live_trade("t2", &[1]),
-        ]
-    );
-}
-
-#[rstest]
-fn test_subscription_held_back_during_a_kept_request_gets_its_held_trades_bars_in_live_order(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-) {
-    let _ = stub_msgbus;
-    let id = audusd_sim.id;
-    let (three, five) = (bar_type_of(id, "3-MINUTE"), bar_type_of(id, "5-MINUTE"));
-    let mut fixture = KeptFixture::new(
-        audusd_sim,
-        client_id,
-        venue,
-        monday("10:08:00"),
-        &[three, five],
-    );
-    let request = fixture
-        .request(
-            &[three, five],
-            kept_window(monday("10:00:00"), monday("10:02:00")),
-        )
-        .unwrap();
-    fixture.subscribe(three, None);
-    fixture.subscribe(five, None);
-    for (ts, size, trade_id) in [
-        ("10:02:00", 2, "h1"),
-        ("10:04:00", 4, "h2"),
-        ("10:07:00", 8, "h3"),
-    ] {
-        fixture.live(monday(ts), size, trade_id);
-    }
-    fixture.answer(request, &[(monday("10:00:30"), 1, "a1")], None);
-    fixture.advance(monday("10:09:30"));
-    fixture.live(monday("10:09:30"), 16, "h4");
-    fixture.advance(monday("10:10:00"));
-
-    // The held trades drive the clock as the answer's trades: 10:03 (a1, h1), 10:05 (a1, h1,
-    // h2) and 10:06 (h2) close between them, into the answer; then the subscriptions go live
-    assert_eq!(
-        fixture.delivered(),
-        vec![
-            live_trade("h1", &[0, 0]),
-            live_trade("h2", &[0, 0]),
-            live_trade("h3", &[0, 0]),
-            kept_trade(0, "a1", &[0, 0]),
-            kept_bar(0, three, monday("10:03:00"), 3, &[1, 0]),
-            kept_bar(0, five, monday("10:05:00"), 7, &[1, 1]),
-            kept_bar(0, three, monday("10:06:00"), 4, &[2, 1]),
-            Kept::End(0, None),
-            published(three, monday("10:09:00"), 8, &[3, 1]),
-            live_trade("h4", &[3, 1]),
-            published(five, monday("10:10:00"), 24, &[3, 2]),
-        ]
-    );
-}
-
-/// A kept request ending at 17:00:00.011, the engine clock's time, whose answer holds a trade
-/// stamped exactly then: the same trade, held live for a subscription made while the answer was
-/// in flight, is not fed again at the release, so the 17:05 bar counts it once.
-#[rstest]
-fn test_held_back_subscription_drops_a_held_trade_the_answer_already_holds(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-) {
-    let _ = stub_msgbus;
-    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
-    let now = monday("17:00:00.011");
-    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, now, &[five]);
-    let spec = KeptSpec {
-        start: Some(monday("16:55:00")),
-        end: Some(now),
-        ..KeptSpec::default()
-    };
-    let request = fixture.request(&[five], spec).unwrap();
-    fixture.subscribe(five, None);
-    fixture.live(now, 4, "x");
-    fixture.answer(
-        request,
-        &[(monday("16:58:00"), 1, "a1"), (now, 4, "x")],
-        None,
-    );
-    fixture.advance(monday("17:05:00"));
-
-    assert_eq!(
-        fixture.delivered(),
-        vec![
-            live_trade("x", &[0]),
-            kept_trade(0, "a1", &[0]),
-            kept_bar(0, five, monday("17:00:00"), 1, &[1]),
-            kept_trade(0, "x", &[1]),
-            Kept::End(0, None),
-            published(five, monday("17:05:00"), 4, &[2]),
-        ]
-    );
-}
-
-/// A kept bar type released by its request while that request is in flight: the request runs to
-/// its end, its answer whole, then its replay is removed, not kept, so the first window can be
-/// asked again; no subscription is released at the client.
-#[rstest]
-fn test_releasing_a_kept_bar_type_while_its_request_runs_removes_the_replay_at_its_end(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-) {
-    let _ = stub_msgbus;
-    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
-    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
-    let request = fixture
-        .request(&[five], kept_window(monday("10:00:00"), monday("10:08:00")))
-        .unwrap();
-    let sent = fixture.client_commands(0).len();
-    fixture.release(five, request);
-    fixture.answer(
-        request,
-        &[(monday("10:01:00"), 1, "a1"), (monday("10:06:00"), 2, "a2")],
-        None,
-    );
-
-    // The first window again: admitted only because no builder of it is left
-    let started = fixture
-        .request(&[five], kept_window(monday("10:00:00"), monday("10:15:00")))
-        .unwrap();
-    fixture.answer(started, &[(monday("10:12:00"), 4, "c1")], None);
-
-    assert!(
-        !fixture
-            .client_commands(sent)
-            .iter()
-            .any(|command| matches!(command, DataCommand::Unsubscribe(_))),
-        "{:?}",
-        fixture.client_commands(sent)
-    );
-    let mut expected = first_kept_answer(five);
-    expected.extend([kept_trade(1, "c1", &[1]), Kept::End(1, None)]);
-    assert_eq!(fixture.delivered(), expected);
-}
-
-/// A kept request for 3-MINUTE and 5-MINUTE bars from 10:00, answered through 10:05 at 10:08,
-/// both subscriptions held back while it ran: its last bar, 10:05, and its terminal go out
-/// first; then the 10:06 bar its hand-over catches up is published.
-#[rstest]
-fn test_kept_request_sends_its_last_bars_and_its_end_before_its_hand_over_publishes(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-) {
-    let _ = stub_msgbus;
-    let id = audusd_sim.id;
-    let (three, five) = (bar_type_of(id, "3-MINUTE"), bar_type_of(id, "5-MINUTE"));
-    let mut fixture = KeptFixture::new(
-        audusd_sim,
-        client_id,
-        venue,
-        monday("10:08:00"),
-        &[three, five],
-    );
-    let spec = KeptSpec {
-        start: Some(monday("10:00:00")),
-        end: Some(monday("10:05:00")),
-        ..KeptSpec::default()
-    };
-    let request = fixture.request(&[three, five], spec).unwrap();
-    fixture.subscribe(three, None);
-    fixture.subscribe(five, None);
-    fixture.answer(
-        request,
-        &[(monday("10:01:00"), 1, "a1"), (monday("10:04:00"), 1, "a2")],
-        None,
-    );
-
-    assert_eq!(
-        fixture.delivered(),
-        vec![
-            kept_trade(0, "a1", &[0, 0]),
-            kept_bar(0, three, monday("10:03:00"), 1, &[1, 0]),
-            kept_trade(0, "a2", &[1, 0]),
-            kept_bar(0, five, monday("10:05:00"), 2, &[1, 1]),
-            Kept::End(0, None),
-            published(three, monday("10:06:00"), 1, &[2, 1]),
-        ]
-    );
-}
-
-/// The same release on a kept request that does not interleave, answered at 10:10: its terminal
-/// goes out first; then the bars of the live trades held for its subscriptions and the bars due
-/// by 10:10 are published to them, in deadline order, not only cached.
-#[rstest]
-fn test_plain_kept_request_publishes_its_held_trades_bars_after_its_end(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-) {
-    let _ = stub_msgbus;
-    let id = audusd_sim.id;
-    let (three, five) = (bar_type_of(id, "3-MINUTE"), bar_type_of(id, "5-MINUTE"));
-    let mut fixture = KeptFixture::new(
-        audusd_sim,
-        client_id,
-        venue,
-        monday("10:10:00"),
-        &[three, five],
-    );
-    let spec = KeptSpec {
-        plain: true,
-        ..kept_window(monday("10:00:00"), monday("10:02:00"))
-    };
-    let request = fixture.request(&[three, five], spec).unwrap();
-    fixture.subscribe(three, None);
-    fixture.subscribe(five, None);
-    for (ts, size, trade_id) in [
-        ("10:02:00", 2, "h1"),
-        ("10:04:00", 4, "h2"),
-        ("10:07:00", 8, "h3"),
-    ] {
-        fixture.live(monday(ts), size, trade_id);
-    }
-    fixture.answer(request, &[(monday("10:00:30"), 1, "a1")], None);
-    fixture.advance(monday("10:10:00"));
-
-    assert_eq!(
-        fixture.delivered(),
-        vec![
-            live_trade("h1", &[0, 0]),
-            live_trade("h2", &[0, 0]),
-            live_trade("h3", &[0, 0]),
-            kept_trade(0, "a1", &[0, 0]),
-            Kept::End(0, None),
-            published(three, monday("10:03:00"), 3, &[1, 0]),
-            published(five, monday("10:05:00"), 7, &[1, 1]),
-            published(three, monday("10:06:00"), 4, &[2, 1]),
-            published(three, monday("10:09:00"), 8, &[3, 1]),
-            published(five, monday("10:10:00"), 8, &[3, 2]),
-        ]
-    );
-}
-
-/// Populated 2-MINUTE and 3-MINUTE builders kept through 10:01, handed over together at 10:07
-/// (both subscriptions held back while their plain request ran, which names 3-MINUTE first):
-/// they catch up together, in deadline order, not in the order the request named them in.
-#[rstest]
-fn test_kept_builders_handed_over_in_one_turn_catch_up_together_in_deadline_order(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-) {
-    let _ = stub_msgbus;
-    let id = audusd_sim.id;
-    let (two, three) = (bar_type_of(id, "2-MINUTE"), bar_type_of(id, "3-MINUTE"));
-    let mut fixture = KeptFixture::new(
-        audusd_sim,
-        client_id,
-        venue,
-        monday("10:07:00"),
-        &[two, three],
-    );
-    let request = fixture
-        .request(
-            &[three, two],
-            KeptSpec {
-                plain: true,
-                ..kept_window(monday("10:00:00"), monday("10:01:00"))
-            },
-        )
-        .unwrap();
-    fixture.subscribe(three, None);
-    fixture.subscribe(two, None);
-    fixture.answer(request, &[(monday("10:00:30"), 1, "a1")], None);
-
-    assert_eq!(
-        fixture.delivered(),
-        vec![
-            kept_trade(0, "a1", &[0, 0]),
-            Kept::End(0, None),
-            published(two, monday("10:02:00"), 1, &[1, 0]),
-            published(three, monday("10:03:00"), 1, &[1, 1]),
-        ]
-    );
-}
-
-/// Answers the `request`th request with `noon_kept_answer`'s trades.
-fn answer_noon(fixture: &mut KeptFixture, request: usize) {
-    fixture.answer(
-        request,
-        &[(monday("11:51:00"), 1, "a1"), (monday("11:56:00"), 2, "a2")],
-        None,
-    );
-}
-
-/// A kept builder nobody subscribed is not listed as subscribed while its request runs nor while
-/// it is idle; once a subscription adopts it, it is.
-#[rstest]
-fn test_kept_builder_nobody_subscribed_is_listed_only_once_a_subscription_adopts_it(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-) {
-    let _ = stub_msgbus;
-    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
-    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[]);
-    let request = fixture
-        .request(&[five], kept_window(monday("11:50:00"), monday("12:00:00")))
-        .unwrap();
-    let running = fixture.engine.subscribed_bars();
-    answer_noon(&mut fixture, request);
-    let idle = fixture.engine.subscribed_bars();
-    fixture.subscribe(five, None);
-    let adopted = fixture.engine.subscribed_bars();
-
-    assert!(running.is_empty(), "{running:?}");
-    assert!(idle.is_empty(), "{idle:?}");
-    assert_eq!(adopted, vec![five]);
-}
-
 /// The owner's example through the engine: a kept request for 5-MINUTE and 10-RANGE bars from
 /// 16:55 to 16:59:59, its last trade t1 (3) at 16:59:58, answered at 16:59:59 with both
 /// subscriptions held back. Nothing is published at the hand-over; at 17:00 the 5-minute bar
@@ -8239,334 +7994,4 @@ fn test_kept_builders_handed_over_before_their_pending_closes_publish_each_once_
             published(range, monday("18:00:00"), 3, &[1, 1]),
         ]
     );
-}
-
-/// The review's example: a kept request over 16:55 to 18:05 for 5-MINUTE and 10-RANGE bars,
-/// answered at 18:10 by a part holding t1 (3) at 16:59:58 and then a payload-free terminal with
-/// no failure reason. That terminal is a success: the end of coverage fires the 17:00 close and
-/// the 18:00 boundary, and the builders are kept, so a request over the same window is refused
-/// and the next window continues them.
-#[rstest]
-#[case::interleaved(false)]
-#[case::plain(true)]
-fn test_kept_request_ended_by_a_terminal_without_a_reason_fires_its_end_and_keeps_its_builders(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-    #[case] plain: bool,
-) {
-    let _ = stub_msgbus;
-    let id = audusd_sim.id;
-    let (five, range) = (bar_type_of(id, "5-MINUTE"), bar_type_of(id, "10-RANGE"));
-    let mut fixture = KeptFixture::with_config(
-        audusd_sim,
-        client_id,
-        venue,
-        with_new_york_session(without_flat_bars()),
-        monday("18:10:00"),
-        &[five, range],
-    );
-    let window = KeptSpec {
-        plain,
-        ..kept_window(monday("16:55:00"), monday("18:05:00"))
-    };
-    let request = fixture.request(&[five, range], window).unwrap();
-    fixture.answer_part(request, &[(monday("16:59:58"), 3, "t1")]);
-    fixture.end(request);
-
-    let again = fixture.request(&[five, range], window).unwrap_err();
-    let next = KeptSpec {
-        plain,
-        ..kept_window(monday("18:05:00"), monday("18:10:00"))
-    };
-    assert!(fixture.request(&[five, range], next).is_ok());
-
-    assert!(again.contains("overlaps the coverage through"), "{again}");
-    let mut expected = vec![kept_trade(0, "t1", &[0, 0])];
-    if !plain {
-        expected.extend([
-            kept_bar(0, five, monday("17:00:00"), 3, &[1, 0]),
-            kept_bar(0, range, monday("18:00:00"), 3, &[1, 1]),
-        ]);
-    }
-    expected.extend([Kept::End(0, None), Kept::End(1, Some(again))]);
-    assert_eq!(fixture.delivered(), expected);
-    assert_eq!(cached_bars(&fixture.cache, &[five, range]), vec![1, 1]);
-}
-
-/// A size-1 trade at 10:00:30 kept by a plain request for 3-MINUTE and 2-MINUTE bars through
-/// 10:01, both idle at 10:07, when ONE subscribe command names them in that order: they are
-/// adopted together and catch up in deadline order, the 10:02 bar before the 10:03 bar.
-#[rstest]
-fn test_one_subscribe_command_adopts_its_idle_kept_builders_together_in_deadline_order(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-) {
-    let _ = stub_msgbus;
-    let id = audusd_sim.id;
-    let (two, three) = (bar_type_of(id, "2-MINUTE"), bar_type_of(id, "3-MINUTE"));
-    let mut fixture = KeptFixture::new(
-        audusd_sim,
-        client_id,
-        venue,
-        monday("10:07:00"),
-        &[two, three],
-    );
-    let request = fixture
-        .request(
-            &[three, two],
-            KeptSpec {
-                plain: true,
-                ..kept_window(monday("10:00:00"), monday("10:01:00"))
-            },
-        )
-        .unwrap();
-    fixture.answer(request, &[(monday("10:00:30"), 1, "a1")], None);
-    fixture.subscribe_all(&[three, two]);
-
-    assert_eq!(
-        fixture.delivered(),
-        vec![
-            kept_trade(0, "a1", &[0, 0]),
-            Kept::End(0, None),
-            published(two, monday("10:02:00"), 1, &[1, 0]),
-            published(three, monday("10:03:00"), 1, &[1, 1]),
-        ]
-    );
-}
-
-/// An actor driven against the engine: it requests 5-MINUTE bars kept by request over 10:00 to
-/// 10:08, answered with no failure reason, so it holds that builder. Disposed, it releases it:
-/// the engine then admits a new kept request over the same window, which a kept builder would
-/// refuse as overlapping its coverage.
-#[rstest]
-fn test_disposed_actor_releases_the_bar_types_it_kept_by_request(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-) {
-    let _ = stub_msgbus;
-    let id = audusd_sim.id;
-    let five = bar_type_of(id, "5-MINUTE");
-    let clock = Rc::new(RefCell::new(VirtualClock::new()));
-    let _ = clock
-        .borrow_mut()
-        .advance_time(UnixNanos::from(monday("12:00:00")), true);
-    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
-    cache
-        .borrow_mut()
-        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
-        .unwrap();
-    let engine = Rc::new(RefCell::new(DataEngine::new(
-        Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
-        Rc::clone(&cache),
-        Some(without_flat_bars()),
-    )));
-    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
-    register_mock_client(
-        Rc::new(RefCell::new(VirtualClock::new())),
-        Rc::clone(&cache),
-        client_id,
-        venue,
-        None,
-        &recorder,
-        &mut engine.borrow_mut(),
-    );
-    let target = Rc::clone(&engine);
-    msgbus::register_data_command_endpoint(
-        MessagingSwitchboard::data_engine_queue_execute(),
-        TypedIntoHandler::from(move |command: DataCommand| target.borrow_mut().execute(command)),
-    );
-    let mut actor = KeptRequester {
-        core: DataActorCore::new(DataActorConfig {
-            actor_id: Some(ActorId::from("KEPT-REQUESTER")),
-            ..Default::default()
-        }),
-    };
-    actor
-        .register(
-            TraderId::test_default(),
-            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
-            Rc::clone(&cache),
-        )
-        .unwrap();
-    let params = || -> Params {
-        params_from_json(json!({
-            "bar_types": [five.to_string()],
-            "update_subscriptions": true,
-        }))
-    };
-    let at = |ns: u64| Some(UnixNanos::from(ns).to_datetime_utc());
-    let (start, end) = (monday("10:00:00"), monday("10:08:00") - 1);
-
-    let request_id = actor
-        .request_trades(
-            id,
-            at(start),
-            at(end),
-            None,
-            Some(client_id),
-            Some(params()),
-        )
-        .unwrap();
-    let answer = TradesResponse::new(
-        request_id,
-        client_id,
-        id,
-        vec![make_trade(id, "1.00000", 1, "a1", monday("10:01:00"))],
-        None,
-        None,
-        monday("12:00:00").into(),
-        None,
-    );
-    engine
-        .borrow_mut()
-        .response_envelope(DataResponseEnvelope::new(
-            DataResponse::Trades(answer),
-            true,
-            None,
-        ));
-    actor.dispose().unwrap();
-
-    let again = engine
-        .borrow_mut()
-        .execute_request(RequestCommand::Trades(RequestTrades::new(
-            id,
-            at(start),
-            at(end),
-            None,
-            Some(client_id),
-            UUID4::new(),
-            monday("12:00:00").into(),
-            Some(params()),
-        )));
-    assert!(again.is_ok(), "{again:?}");
-}
-
-/// An actor that only requests (see
-/// `test_disposed_actor_releases_the_bar_types_it_kept_by_request`).
-#[derive(Debug)]
-struct KeptRequester {
-    core: DataActorCore,
-}
-
-nautilus_actor!(KeptRequester);
-impl DataActor for KeptRequester {}
-
-/// After adoption a release by request does nothing to the subscribed builder: R0 keeps 5-MINUTE
-/// through 10:07:59.999999999, a2 (2) at 10:06 open; a subscription at 12:00 adopts it, its
-/// catch-up publishing a2's 10:10 bar. R0's release then touches nothing: a live trade at 12:01
-/// is published in the 12:05 bar.
-#[rstest]
-fn test_release_after_adoption_leaves_the_subscribed_builder(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-) {
-    let _ = stub_msgbus;
-    let five = bar_type_of(audusd_sim.id, "5-MINUTE");
-    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[five]);
-    let first = first_kept_request(&mut fixture, five);
-
-    fixture.subscribe(five, None);
-    fixture.release(five, first);
-    fixture.advance(monday("12:01:00"));
-    fixture.live(monday("12:01:00"), 3, "l1");
-    fixture.advance(monday("12:05:00"));
-
-    let mut expected = first_kept_answer(five);
-    expected.extend([
-        published(five, monday("10:10:00"), 2, &[2]),
-        live_trade("l1", &[2]),
-        published(five, monday("12:05:00"), 3, &[3]),
-    ]);
-    assert_eq!(fixture.delivered(), expected);
-}
-
-/// Executes at 12:00:00 a trades request (or, with `quotes`, a quotes request) for AUD/USD.SIM
-/// and GBP/USD.SIM, added to the cache, over 10:00 to 10:07:59.999999999, asking 5-MINUTE bars
-/// of both (`BID` bars on a quotes request), kept by request or not, that does not interleave.
-fn execute_batch_request(
-    fixture: &mut KeptFixture,
-    quotes: bool,
-    kept: bool,
-) -> anyhow::Result<()> {
-    let gbpusd = gbpusd_sim();
-    let (aud, gbp) = (fixture.instrument_id, gbpusd.id);
-    fixture
-        .cache
-        .borrow_mut()
-        .add_instrument(InstrumentAny::CurrencyPair(gbpusd))
-        .unwrap();
-    let price_type = if quotes { "BID" } else { "LAST" };
-    let bar_types: Vec<String> = [aud, gbp]
-        .iter()
-        .map(|id| format!("{id}-5-MINUTE-{price_type}-INTERNAL"))
-        .collect();
-    let params = Some(params_from_json(json!({
-        "bar_types": bar_types,
-        "update_subscriptions": kept,
-    })));
-    let at = |ns: u64| Some(UnixNanos::from(ns).to_datetime_utc());
-    let (start, end) = (at(monday("10:00:00")), at(monday("10:08:00") - 1));
-    let (client_id, now) = (Some(fixture.client_id), UnixNanos::from(monday("12:00:00")));
-    let request = if quotes {
-        RequestCommand::Quotes(RequestQuotes::new(
-            vec![aud, gbp],
-            start,
-            end,
-            None,
-            client_id,
-            UUID4::new(),
-            now,
-            params,
-        ))
-    } else {
-        RequestCommand::Trades(RequestTrades::new(
-            vec![aud, gbp],
-            start,
-            end,
-            None,
-            client_id,
-            UUID4::new(),
-            now,
-            params,
-        ))
-    };
-    fixture.engine.execute_request(request)
-}
-
-/// A batch request with bar types that does not keep its builders is untouched by the kept
-/// refusal: it is dispatched to its client as one request naming both instruments.
-#[rstest]
-#[case::trades(false)]
-#[case::quotes(true)]
-fn test_batch_request_not_kept_is_dispatched_naming_both_instruments(
-    audusd_sim: CurrencyPair,
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-    client_id: ClientId,
-    venue: Venue,
-    #[case] quotes: bool,
-) {
-    let _ = stub_msgbus;
-    let mut fixture = KeptFixture::new(audusd_sim, client_id, venue, monday("12:00:00"), &[]);
-    let both = vec![fixture.instrument_id, gbpusd_sim().id];
-
-    let result = execute_batch_request(&mut fixture, quotes, false);
-
-    assert!(result.is_ok(), "{result:?}");
-    match fixture.client_commands(0).as_slice() {
-        [DataCommand::Request(RequestCommand::Trades(request))] if !quotes => {
-            assert_eq!(request.instrument_ids, both);
-        }
-        [DataCommand::Request(RequestCommand::Quotes(request))] if quotes => {
-            assert_eq!(request.instrument_ids, both);
-        }
-        commands => panic!("{commands:?}"),
-    }
 }

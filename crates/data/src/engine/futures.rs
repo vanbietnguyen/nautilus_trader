@@ -43,10 +43,6 @@ impl DataEngine {
             return Ok(());
         };
 
-        self.admit_kept_request(
-            &RequestCommand::Bars(parent.clone()),
-            &continuous_request.request_bar_aggregation,
-        )?;
         self.ensure_continuous_future_target_instrument(&continuous_request);
         self.prepare_request_bar_aggregators_from_state(
             request_id,
@@ -464,15 +460,6 @@ impl DataEngine {
             return Ok(());
         }
 
-        // An idle builder kept by request stays its replay's until a subscription adopts it (see
-        // `adopt_kept_builders`): set up here, it would run and its replay could not continue
-        if self.is_idle_kept_builder(target_bar_type) {
-            log::warn!(
-                "Aggregator for {target_bar_type} is currently in use, continuous future subscription can't be started"
-            );
-            return Ok(());
-        }
-
         let aggregator_key = bar_aggregator_key(target_bar_type, None);
         if let Some(aggregator) = self.bar_aggregators.get(&aggregator_key)
             && aggregator.borrow().is_running()
@@ -483,7 +470,7 @@ impl DataEngine {
             return Ok(());
         }
 
-        self.setup_bar_aggregator(target_bar_type, None)?;
+        self.setup_bar_aggregator(target_bar_type, false, None)?;
 
         let now_ns = self.clock.borrow().timestamp_ns().as_u64();
 
