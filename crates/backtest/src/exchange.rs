@@ -62,7 +62,7 @@ use nautilus_model::{
     },
     events::{FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted, PositionEvent},
     identifiers::{AccountId, InstrumentId, Venue},
-    instruments::{Instrument, InstrumentAny, instrument_definitions_match},
+    instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
     orders::{Order, OrderAny},
     position::Position,
@@ -632,14 +632,6 @@ impl SimulatedExchange {
         instrument_id: &InstrumentId,
     ) -> Option<&OrderMatchingEngine> {
         self.matching_engines.get(instrument_id)
-    }
-
-    /// Returns a mutable reference to the matching engine for the given instrument, if available.
-    pub(crate) fn get_matching_engine_mut(
-        &mut self,
-        instrument_id: &InstrumentId,
-    ) -> Option<&mut OrderMatchingEngine> {
-        self.matching_engines.get_mut(instrument_id)
     }
 
     /// Returns a reference to all matching engines keyed by instrument ID.
@@ -2434,6 +2426,31 @@ fn liquidation_bar_types(cache: &Cache) -> AHashMap<InstrumentId, Vec<BarType>> 
     }
 
     by_instrument
+}
+
+// Compares two instruments' tradable definitions on their serialized form without event
+// timestamps, so every field (including free-form `info`) takes part, and a serialization
+// failure compares as changed so a different definition is never accepted.
+fn instrument_definitions_match(a: &InstrumentAny, b: &InstrumentAny) -> bool {
+    fn normalized(instrument: &InstrumentAny) -> Option<serde_json::Value> {
+        let mut value = serde_json::to_value(instrument).ok()?;
+
+        if let Some(definition) = value
+            .as_object_mut()
+            .and_then(|obj| obj.values_mut().next())
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            definition.remove("ts_event");
+            definition.remove("ts_init");
+        }
+
+        Some(value)
+    }
+
+    match (normalized(a), normalized(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 #[cfg(test)]

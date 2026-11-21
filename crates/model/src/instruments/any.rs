@@ -82,39 +82,9 @@ impl crate::data::HasTsInit for InstrumentAny {
     }
 }
 
-/// Returns whether `a` and `b` have the same tradable definition: equality of their serialized
-/// form without the event timestamps `ts_event` and `ts_init`.
-///
-/// Every field, including the free-form `info` metadata, takes part without being listed. A
-/// serialization failure compares as changed, so a different definition is never accepted.
-#[must_use]
-pub fn instrument_definitions_match(a: &InstrumentAny, b: &InstrumentAny) -> bool {
-    fn normalized(instrument: &InstrumentAny) -> Option<serde_json::Value> {
-        let mut value = serde_json::to_value(instrument).ok()?;
-
-        if let Some(definition) = value
-            .as_object_mut()
-            .and_then(|obj| obj.values_mut().next())
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            definition.remove("ts_event");
-            definition.remove("ts_init");
-        }
-
-        Some(value)
-    }
-
-    match (normalized(a), normalized(b)) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use nautilus_core::UnixNanos;
     use rstest::rstest;
-    use rust_decimal_macros::dec;
 
     use super::*;
     use crate::instruments::stubs::*;
@@ -199,44 +169,5 @@ mod tests {
     )]
     fn test_is_spread(#[case] instrument: InstrumentAny, #[case] expected: bool) {
         assert_eq!(instrument.is_spread(), expected);
-    }
-
-    // The cases of the backtest exchange's re-added instrument tests
-    #[rstest]
-    #[case::restamped(
-        |pair: &mut CurrencyPair| {
-            pair.ts_event = UnixNanos::from(1);
-            pair.ts_init = UnixNanos::from(1);
-        },
-        true
-    )]
-    #[case::price_increment(
-        |pair: &mut CurrencyPair| {
-            pair.price_precision = 4;
-            pair.price_increment = Price::from("0.0001");
-        },
-        false
-    )]
-    #[case::lot_size(|pair: &mut CurrencyPair| pair.lot_size = Some(Quantity::from(100)), false)]
-    #[case::margin_init(|pair: &mut CurrencyPair| pair.margin_init = dec!(0.5), false)]
-    #[case::max_quantity(
-        |pair: &mut CurrencyPair| pair.max_quantity = Some(Quantity::from(10)),
-        false
-    )]
-    fn test_instrument_definitions_match(
-        audusd_sim: CurrencyPair,
-        #[case] change: fn(&mut CurrencyPair),
-        #[case] expected: bool,
-    ) {
-        let mut changed = audusd_sim.clone();
-        change(&mut changed);
-
-        assert_eq!(
-            instrument_definitions_match(
-                &InstrumentAny::CurrencyPair(audusd_sim),
-                &InstrumentAny::CurrencyPair(changed),
-            ),
-            expected
-        );
     }
 }

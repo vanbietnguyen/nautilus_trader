@@ -32,7 +32,7 @@ use nautilus_common::{
     clients::ExecutionClient,
     clock::{Clock, VirtualClock},
     component::{Component, component_state},
-    enums::{ComponentState, Environment, LogColor},
+    enums::{ComponentState, LogColor},
     log_info,
     logging::{
         logging_clock_set_realtime_mode, logging_clock_set_static_mode,
@@ -82,7 +82,6 @@ use crate::{
 };
 
 const CALLBACK_DRAIN_BUDGET: usize = 1024;
-const EXCHANGE_DATA_REFUSED: &str = "Cannot add exchange data";
 
 /// Core backtesting engine for running event-driven strategy backtests on historical data.
 ///
@@ -125,7 +124,6 @@ pub struct BacktestEngine {
     backtest_start: Option<UnixNanos>,
     backtest_end: Option<UnixNanos>,
     funding_error: Option<String>,
-    ts_last_exchange_data: Option<UnixNanos>,
 }
 
 impl Debug for BacktestEngine {
@@ -195,7 +193,6 @@ impl BacktestEngine {
             backtest_start: None,
             backtest_end: None,
             funding_error: None,
-            ts_last_exchange_data: None,
         })
     }
 
@@ -581,204 +578,23 @@ impl BacktestEngine {
         self.add_market_data_client_if_not_exists(instr_id.venue);
     }
 
-    /// Applies market records to the matching engines of the simulated exchanges before a run,
-    /// so they hold the market state that a run started earlier would hold at this run's start.
+    /// Routes the given data to the simulated exchanges before a run, as a run routes the data
+    /// it replays, so the exchanges start from the market state that data leaves.
     ///
-    /// Each record, a trade or a quote, goes in the given order to the matching engine of its
-    /// instrument, through that engine's own tick processing, with its own timestamps. The
-    /// matching engine's rules decide what it keeps, as in a run: a record whose `ts_event` is
-    /// before the book's last update is skipped as stale. Nothing else receives a record: it is
-    /// not written to the cache, published on the message bus, or passed to the exchange's
-    /// simulation modules, and no clock moves. The exchanges hold no order then, so the tick
-    /// processing matches none.
-    ///
-    /// The whole batch is checked before any record is applied: a refused batch applies
-    /// nothing. An empty batch is a no-op: once admitted, it applies nothing and leaves the call
-    /// available. The first [`run`](Self::run) after a call is refused, before any clock is set
-    /// or the kernel is started, when it would start before the last record's `ts_init`. A
-    /// [`reset`](Self::reset) clears what was applied, as it resets every exchange, whose
-    /// matching engines reset their book, prices and last quote, and then allows a new call.
+    /// The data is not cached, published or added to the engine's data.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The kernel's environment is not `Backtest`.
-    /// - A run has begun or been resumed since the engine was created or last reset.
-    /// - The kernel has been started since the engine was created or last reset, by a run or
-    ///   through [`kernel_mut`](Self::kernel_mut), an event-store replay start included.
-    /// - Records were already applied since the engine was created or last reset.
-    /// - A record is neither a trade nor a quote.
-    /// - A record's instrument has no matching engine (see
-    ///   [`add_instrument`](Self::add_instrument)).
-    /// - A record's price or size precision differs from its instrument's.
-    /// - A record's `ts_init` is before the previous record's.
-    /// - A record's `ts_init` is at or after its instrument's expiration.
-    /// - The cache holds an order or a position at a record's venue.
-    /// - A matching engine at a record's venue holds market state: its book was updated, or it
-    ///   has a bid, ask or last price.
+    /// Returns an error if an exchange fails to process the data.
     pub fn add_exchange_data(&mut self, data: &[Data]) -> anyhow::Result<()> {
-        self.check_exchange_data(data)?;
-
-        for record in data {
-            let instrument_id = record.instrument_id();
-
-            // Checked above: the instrument has a matching engine, and the record is a trade or
-            // a quote
-            let Some(exchange) = self.venues.get(&instrument_id.venue) else {
-                continue;
-            };
-            let mut exchange = exchange.borrow_mut();
-            let Some(matching_engine) = exchange.get_matching_engine_mut(&instrument_id) else {
-                continue;
-            };
-
-            match record {
-                Data::Trade(trade) => matching_engine.process_trade_tick(trade),
-                Data::Quote(quote) => matching_engine.process_quote_tick(quote),
-                _ => {}
-            }
+        for item in data {
+            Self::route_data_to_exchange(
+                &self.venues,
+                &mut self.has_book_processed,
+                &self.kernel.clock,
+                item.into(),
+            )?;
         }
-
-        // An empty batch applies nothing and leaves the call available
-        self.ts_last_exchange_data = data.last().map(HasTsInit::ts_init);
-        Ok(())
-    }
-
-    // Refuses `data` as `add_exchange_data` documents, before any record is applied
-    fn check_exchange_data(&self, data: &[Data]) -> anyhow::Result<()> {
-        let environment = self.kernel.environment();
-        anyhow::ensure!(
-            environment == Environment::Backtest,
-            "{EXCHANGE_DATA_REFUSED}: the environment is {environment:?}, not a backtest"
-        );
-        // Set when a run begins, before the kernel starts (an event-store replay included),
-        // and kept by a streaming run resumed by the next `run`, until `reset`
-        anyhow::ensure!(
-            self.run_id.is_none(),
-            "{EXCHANGE_DATA_REFUSED}: a run has begun or been resumed; call `reset` first"
-        );
-        // Set by every start of the kernel, through `run` or `kernel_mut`, an event-store
-        // replay start included, and kept when it stops, until `reset`
-        anyhow::ensure!(
-            self.kernel.ts_started().is_none(),
-            "{EXCHANGE_DATA_REFUSED}: the kernel has been started; call `reset` first"
-        );
-        anyhow::ensure!(
-            self.ts_last_exchange_data.is_none(),
-            "{EXCHANGE_DATA_REFUSED}: records were already applied; call `reset` first"
-        );
-
-        let mut venues: Vec<Venue> = Vec::new();
-        let mut previous_ts_init = UnixNanos::default();
-
-        for (index, record) in data.iter().enumerate() {
-            let (instrument_id, ts_init, price_precisions, size_precisions) = match record {
-                Data::Trade(trade) => (
-                    trade.instrument_id,
-                    trade.ts_init,
-                    [trade.price.precision; 2],
-                    [trade.size.precision; 2],
-                ),
-                Data::Quote(quote) => (
-                    quote.instrument_id,
-                    quote.ts_init,
-                    [quote.bid_price.precision, quote.ask_price.precision],
-                    [quote.bid_size.precision, quote.ask_size.precision],
-                ),
-                _ => anyhow::bail!(
-                    "{EXCHANGE_DATA_REFUSED}: record {index} is neither a trade nor a quote"
-                ),
-            };
-
-            let instrument = self.venues.get(&instrument_id.venue).and_then(|exchange| {
-                exchange
-                    .borrow()
-                    .get_matching_engine(&instrument_id)
-                    .map(|matching_engine| {
-                        let instrument = &matching_engine.instrument;
-                        (
-                            instrument.price_precision(),
-                            instrument.size_precision(),
-                            instrument.expiration_ns(),
-                        )
-                    })
-            });
-            let Some((price_precision, size_precision, expiration_ns)) = instrument else {
-                anyhow::bail!(
-                    "{EXCHANGE_DATA_REFUSED}: record {index} is of {instrument_id}, which the \
-                     engine does not have"
-                );
-            };
-            anyhow::ensure!(
-                price_precisions == [price_precision; 2] && size_precisions == [size_precision; 2],
-                "{EXCHANGE_DATA_REFUSED}: record {index} has a price or size precision other \
-                 than {instrument_id}'s (price {price_precision}, size {size_precision})"
-            );
-            anyhow::ensure!(
-                ts_init >= previous_ts_init,
-                "{EXCHANGE_DATA_REFUSED}: record {index} has ts_init {ts_init}, before the \
-                 previous record's {previous_ts_init}"
-            );
-            previous_ts_init = ts_init;
-            // The matching engine's own rule: from its expiration on, an instrument awaits
-            // resolution (a zero expiration is none)
-            if let Some(expiration_ns) = expiration_ns
-                && expiration_ns != UnixNanos::default()
-            {
-                anyhow::ensure!(
-                    ts_init < expiration_ns,
-                    "{EXCHANGE_DATA_REFUSED}: record {index} has ts_init {ts_init}, at or after \
-                     {instrument_id}'s expiration {expiration_ns}"
-                );
-            }
-
-            if !venues.contains(&instrument_id.venue) {
-                venues.push(instrument_id.venue);
-            }
-        }
-
-        for venue in &venues {
-            self.check_exchange_is_empty(*venue)?;
-        }
-
-        Ok(())
-    }
-
-    // Refuses records for `venue` unless it holds no order, position or market state. An order
-    // reaches an exchange only through the cache (the execution engine caches each order it
-    // routes, and a run loads the cache's open orders into the exchanges), so the cache is read
-    fn check_exchange_is_empty(&self, venue: Venue) -> anyhow::Result<()> {
-        {
-            let cache = self.kernel.cache.borrow();
-            anyhow::ensure!(
-                cache
-                    .orders(Some(&venue), None, None, None, None)
-                    .is_empty(),
-                "{EXCHANGE_DATA_REFUSED}: the cache holds an order at {venue}"
-            );
-            anyhow::ensure!(
-                cache
-                    .positions(Some(&venue), None, None, None, None)
-                    .is_empty(),
-                "{EXCHANGE_DATA_REFUSED}: the cache holds a position at {venue}"
-            );
-        }
-
-        if let Some(exchange) = self.venues.get(&venue) {
-            let exchange = exchange.borrow();
-            for (instrument_id, matching_engine) in exchange.get_matching_engines() {
-                let core = matching_engine.get_core();
-                anyhow::ensure!(
-                    matching_engine.get_book().update_count == 0
-                        && core.bid.is_none()
-                        && core.ask.is_none()
-                        && core.last.is_none(),
-                    "{EXCHANGE_DATA_REFUSED}: the matching engine of {instrument_id} holds \
-                     market state"
-                );
-            }
-        }
-
         Ok(())
     }
 
@@ -979,18 +795,6 @@ impl BacktestEngine {
         let start_ns = start.unwrap_or_else(|| self.ts_first.unwrap_or_default());
         let end_ns = end.unwrap_or_else(|| self.ts_last_data.unwrap_or(start_ns));
         anyhow::ensure!(start_ns <= end_ns, "start was > end");
-
-        // A first run may not start before a record `add_exchange_data` applied: the exchange
-        // would hold a price the run cannot know yet, and the run would stream such a record again
-        if self.run_id.is_none()
-            && let Some(ts_last) = self.ts_last_exchange_data
-        {
-            anyhow::ensure!(
-                start_ns >= ts_last,
-                "Cannot run from {start_ns}: a record applied by `add_exchange_data` has ts_init \
-                 {ts_last}, after the start; call `reset` first"
-            );
-        }
         self.end_ns = end_ns;
         self.last_ns = start_ns;
         self.last_module_ns = None;
@@ -1552,9 +1356,6 @@ impl BacktestEngine {
         self.last_liquidation_ns = None;
         self.end_ns = UnixNanos::default();
         self.has_book_processed.clear();
-        self.ts_last_exchange_data = None;
-        // The kernel's own reset clears its start stamp too; `add_exchange_data` reads it
-        self.kernel.ts_started = None;
 
         self.accumulator.clear();
         self.cancel_funding_settlement_timers();
@@ -6394,117 +6195,5 @@ mod tests {
                 "No market for ETHUSDT-PERP.BINANCE"
             );
         }
-    }
-
-    #[rstest]
-    fn test_add_exchange_data_after_a_reset() {
-        let (mut engine, instrument_id) = create_exchange_data_engine();
-        let first = [exchange_trade(
-            instrument_id,
-            "1000.00",
-            AggressorSide::Buy,
-            1,
-            1,
-        )];
-        let second = [exchange_trade(
-            instrument_id,
-            "1001.00",
-            AggressorSide::Sell,
-            2,
-            2,
-        )];
-        engine.add_exchange_data(&first).unwrap();
-        engine
-            .run(Some(UnixNanos::from(1)), None, None, false)
-            .unwrap();
-
-        engine.reset().unwrap();
-
-        // The reset reset the matching engine (book, prices, last quote)
-        let reset = matching_engine_state(&engine, instrument_id);
-        assert_eq!(reset.bid, None);
-        assert_eq!(reset.update_count, 0);
-        assert_eq!(reset.core_last, None);
-        engine.add_exchange_data(&second).unwrap();
-        let applied = matching_engine_state(&engine, instrument_id);
-        let (mut fresh, _) = create_exchange_data_engine();
-        fresh.add_exchange_data(&second).unwrap();
-        assert_eq!(applied, matching_engine_state(&fresh, instrument_id));
-        assert_eq!(applied.core_last, Some(Price::from("1001.00")));
-    }
-
-    const HOUR_NS: u64 = 3_600_000_000_000;
-
-    // Start 17:00:00, a supplied trade stamped 18:00:00: the run is refused before any clock is
-    // set or the kernel is started, and a run from 18:00:00 is then admitted
-    #[rstest]
-    fn test_add_exchange_data_refuses_a_first_run_starting_before_a_record() {
-        let (mut engine, instrument_id) = create_exchange_data_engine();
-        let records = [exchange_trade(
-            instrument_id,
-            "1001.00",
-            AggressorSide::Buy,
-            18 * HOUR_NS,
-            18 * HOUR_NS,
-        )];
-        engine.add_exchange_data(&records).unwrap();
-        let applied = matching_engine_state(&engine, instrument_id);
-        let clock_before = engine.kernel.clock.borrow().timestamp_ns();
-
-        let error = engine
-            .run(
-                Some(UnixNanos::from(17 * HOUR_NS)),
-                Some(UnixNanos::from(19 * HOUR_NS)),
-                None,
-                false,
-            )
-            .unwrap_err()
-            .to_string();
-
-        assert_eq!(
-            error,
-            format!(
-                "Cannot run from {}: a record applied by `add_exchange_data` has ts_init {}, \
-                 after the start; call `reset` first",
-                17 * HOUR_NS,
-                18 * HOUR_NS
-            )
-        );
-        assert!(engine.run_id.is_none());
-        assert!(engine.kernel.ts_started().is_none());
-        assert_eq!(engine.kernel.clock.borrow().timestamp_ns(), clock_before);
-        assert_eq!(matching_engine_state(&engine, instrument_id), applied);
-
-        engine
-            .run(
-                Some(UnixNanos::from(18 * HOUR_NS)),
-                Some(UnixNanos::from(19 * HOUR_NS)),
-                None,
-                false,
-            )
-            .unwrap();
-    }
-
-    #[rstest]
-    fn test_add_exchange_data_empty_batch_leaves_the_call_available() {
-        let (mut engine, instrument_id) = create_exchange_data_engine();
-        let before = matching_engine_state(&engine, instrument_id);
-
-        engine.add_exchange_data(&[]).unwrap();
-
-        assert_eq!(matching_engine_state(&engine, instrument_id), before);
-        engine
-            .add_exchange_data(&[exchange_trade(
-                instrument_id,
-                "1000.00",
-                AggressorSide::Buy,
-                1,
-                1,
-            )])
-            .unwrap();
-        assert_eq!(
-            matching_engine_state(&engine, instrument_id).core_last,
-            Some(Price::from("1000.00"))
-        );
     }
 }

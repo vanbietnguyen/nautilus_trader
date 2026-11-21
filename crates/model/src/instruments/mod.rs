@@ -57,7 +57,7 @@ use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
 pub use crate::instruments::{
-    any::{InstrumentAny, instrument_definitions_match},
+    any::InstrumentAny,
     betting::BettingInstrument,
     binary_option::BinaryOption,
     cfd::Cfd,
