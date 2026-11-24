@@ -1533,6 +1533,56 @@ fn test_subscribe_continuous_future_bars_dispatches_child_trade_subscription(
 }
 
 #[rstest]
+fn test_continuous_future_quote_subscription_publishes_forming_bar(
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+) {
+    let _ = stub_msgbus;
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let pre_id = add_es_contract(&cache, "ESH24.GLBX", "ESH24");
+    let post_id = add_es_contract(&cache, "ESM24.GLBX", "ESM24");
+    let config = DataEngineConfig::builder()
+        .forming_bar_interval_ms(100)
+        .build();
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let venue = Venue::from("GLBX");
+    let client = MockDataClient::new(Rc::clone(&clock), Rc::clone(&cache), client_id, Some(venue));
+    let engine = Rc::new(RefCell::new(DataEngine::new(
+        clock,
+        Rc::clone(&cache),
+        Some(config),
+    )));
+    DataEngine::register_msgbus_handlers(&engine);
+    let mut engine = engine.borrow_mut();
+    engine.register_client(
+        DataClientAdapter::new(client_id, Some(venue), true, true, Box::new(client)),
+        None,
+    );
+
+    let bar_type = BarType::from("ES.GLBX-2-TICK-BID-INTERNAL");
+    let topic = switchboard::get_bars_forming_topic(bar_type);
+    let (handler, saver) = get_typed_message_saving_handler::<Bar>(None);
+    msgbus::subscribe_bars(topic.into(), handler, None);
+    let sub = SubscribeBars::new(
+        bar_type,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        Some(continuous_future_transitions_params(10, pre_id, post_id)),
+    );
+    engine.execute(DataCommand::Subscribe(SubscribeCommand::Bars(sub)));
+    engine.process_data(Data::Quote(make_quote(pre_id, "100.00", "100.25", 1)));
+
+    let bars = saver.get_messages();
+    assert_eq!(bars.len(), 1);
+    assert_eq!(bars[0].bar_type, bar_type);
+    assert_eq!(bars[0].close, Price::from("105.00"));
+    assert!(cache.borrow().bar(&bar_type).is_none());
+}
+
+#[rstest]
 fn test_subscribe_continuous_future_bars_external_uses_bar_source(
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,

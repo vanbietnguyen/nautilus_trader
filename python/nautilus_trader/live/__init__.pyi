@@ -627,6 +627,8 @@ class LiveDataEngineConfig:
     @property
     def time_bars_time_zone(self) -> str | None: ...
     @property
+    def forming_bar_interval_ms(self) -> int | None: ...
+    @property
     def time_bars_build_with_no_updates(self) -> bool: ...
     @property
     def time_bars_timestamp_on_close(self) -> bool: ...
@@ -665,6 +667,7 @@ class LiveDataEngineConfig:
         external_clients: typing.Sequence[model.ClientId] | None = None,
         debug: bool | None = None,
         time_bars_time_zone: str | None = None,
+        forming_bar_interval_ms: int | None = None,
     ) -> LiveDataEngineConfig: ...
 
 @typing.final

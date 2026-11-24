@@ -224,6 +224,8 @@ impl BarAggregator for RangeBarAggregator {
         self.core.builder.bar_type
     }
 
+    impl_forming_bar!();
+
     fn is_running(&self) -> bool {
         self.core.is_running
     }

@@ -71,6 +71,7 @@ impl DataEngineConfig {
         debug = None,
         disable_historical_cache = None,
         time_bars_time_zone = None,
+        forming_bar_interval_ms = None,
     ))]
     fn py_new(
         time_bars_build_with_no_updates: Option<bool>,
@@ -87,6 +88,7 @@ impl DataEngineConfig {
         debug: Option<bool>,
         disable_historical_cache: Option<bool>,
         time_bars_time_zone: Option<String>,
+        forming_bar_interval_ms: Option<u64>,
     ) -> PyResult<Self> {
         if let Some(name) = &time_bars_time_zone {
             get_timezone(name).map_err(to_pyvalue_err)?;
@@ -114,6 +116,7 @@ impl DataEngineConfig {
             .maybe_emit_quotes_from_book_depths(emit_quotes_from_book_depths)
             .maybe_disable_historical_cache(disable_historical_cache)
             .maybe_time_bars_time_zone(time_bars_time_zone)
+            .maybe_forming_bar_interval_ms(forming_bar_interval_ms)
             .maybe_external_clients(external_clients)
             .maybe_debug(debug)
             .build())
@@ -211,5 +214,11 @@ impl DataEngineConfig {
     #[pyo3(name = "time_bars_time_zone")]
     fn py_time_bars_time_zone(&self) -> Option<String> {
         self.time_bars_time_zone.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "forming_bar_interval_ms")]
+    const fn py_forming_bar_interval_ms(&self) -> Option<u64> {
+        self.forming_bar_interval_ms
     }
 }

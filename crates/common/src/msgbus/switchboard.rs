@@ -436,6 +436,10 @@ define_switchboard! {
     get_bars_topic(bar_type: BarType) -> bar_type,
     "data.bars.{}", bar_type;
 
+    bar_forming_topics: BarType,
+    get_bars_forming_topic(bar_type: BarType) -> bar_type,
+    "data.bars.forming.{}", bar_type;
+
     mark_price_topics: InstrumentId,
     get_mark_price_topic(instrument_id: InstrumentId) -> instrument_id,
     "data.mark_prices.{}.{}", instrument_id.venue, instrument_id.symbol;
@@ -702,6 +706,7 @@ define_wrappers! {
     get_quotes_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_trades_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_bars_topic(bar_type: BarType) -> MStr<Topic>,
+    get_bars_forming_topic(bar_type: BarType) -> MStr<Topic>,
     get_mark_price_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_index_price_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_funding_rate_topic(instrument_id: InstrumentId) -> MStr<Topic>,
@@ -965,6 +970,15 @@ mod tests {
         let result = switchboard.get_bars_topic(bar_type);
         assert_eq!(result, expected_topic);
         assert!(switchboard.bar_topics.contains_key(&bar_type));
+    }
+
+    #[rstest]
+    fn test_get_bars_forming_topic(mut switchboard: MessagingSwitchboard) {
+        let bar_type = BarType::from("ESZ24.XCME-1-MINUTE-LAST-INTERNAL");
+        let expected_topic = "data.bars.forming.ESZ24.XCME-1-MINUTE-LAST-INTERNAL".into();
+        let result = switchboard.get_bars_forming_topic(bar_type);
+        assert_eq!(result, expected_topic);
+        assert!(switchboard.bar_forming_topics.contains_key(&bar_type));
     }
 
     #[rstest]

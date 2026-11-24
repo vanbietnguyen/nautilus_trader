@@ -56,6 +56,17 @@ pub struct DataEngineConfig {
     pub time_bars_origin_offset: HashMap<BarAggregation, Duration>,
     /// The IANA time zone for day and longer bars, defaulting to UTC.
     pub time_bars_time_zone: Option<String>,
+    /// Minimum interval in milliseconds between live snapshots of the same forming bar.
+    ///
+    /// Defaults to `None` (disabled, with no snapshot work). When enabled, live bar handlers
+    /// publish on `data.bars.forming.<bar_type>` via `msgbus::publish_bar`, bypassing the cache
+    /// and indicators. The interval uses input initialization timestamps. Each newly opened
+    /// bar can publish immediately, and `Some(0)` publishes on every applied update that leaves
+    /// a forming bar.
+    ///
+    /// Wildcard `data.bars.*` subscribers such as `SandboxExecutionClient` match this topic.
+    /// Enable only on chart or display nodes without a sandbox execution client.
+    pub forming_bar_interval_ms: Option<u64>,
     /// If data objects timestamp sequencing will be validated and handled.
     #[builder(default)]
     pub validate_data_sequence: bool,

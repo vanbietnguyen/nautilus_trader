@@ -15,6 +15,7 @@
 
 use ahash::AHashSet;
 use nautilus_common::timer::TimeEventCallback;
+use nautilus_core::datetime::NANOSECONDS_IN_MILLISECOND;
 use nautilus_model::enums::BarIntervalType;
 
 use super::*;
@@ -1749,10 +1750,11 @@ fn record_deliveries(
     deliveries
 }
 
-fn range_bar_engine(
+fn bar_test_engine(
     audusd_sim: CurrencyPair,
     client_id: ClientId,
     venue: Venue,
+    config: DataEngineConfig,
 ) -> (DataEngine, Rc<RefCell<Cache>>) {
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
@@ -1764,7 +1766,7 @@ fn range_bar_engine(
     let mut data_engine = DataEngine::new(
         clock,
         Rc::clone(&cache),
-        Some(with_new_york_session(DataEngineConfig::default())),
+        Some(with_new_york_session(config)),
     );
     let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1827,7 +1829,8 @@ fn test_range_inclusive_bar_publishes_after_its_completing_trade(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let (mut data_engine, cache) = range_bar_engine(audusd_sim, client_id, venue);
+    let (mut data_engine, cache) =
+        bar_test_engine(audusd_sim, client_id, venue, DataEngineConfig::default());
     let bar_type =
         BarType::from(format!("{instrument_id}-10-RANGE_INCLUSIVE-LAST-INTERNAL").as_str());
     subscribe_bars(&mut data_engine, bar_type, client_id, venue);
@@ -1885,7 +1888,8 @@ fn test_range_bar_publishes_before_its_completing_trade(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let (mut data_engine, cache) = range_bar_engine(audusd_sim, client_id, venue);
+    let (mut data_engine, cache) =
+        bar_test_engine(audusd_sim, client_id, venue, DataEngineConfig::default());
     let bar_type = BarType::from(format!("{instrument_id}-10-RANGE-LAST-INTERNAL").as_str());
     subscribe_bars(&mut data_engine, bar_type, client_id, venue);
     let deliveries = record_deliveries(&cache, instrument_id, bar_type);
@@ -1918,4 +1922,145 @@ fn test_range_bar_publishes_before_its_completing_trade(
             delivered_trade("t3", Some(3_000)),
         ]
     );
+}
+
+#[rstest]
+#[case::disabled(None)]
+#[case::enabled(Some(150))]
+fn test_range_forming_bar_publication(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] forming_bar_interval_ms: Option<u64>,
+) {
+    let _ = stub_msgbus;
+    let instrument_id = audusd_sim.id;
+    let config = DataEngineConfig::builder()
+        .maybe_forming_bar_interval_ms(forming_bar_interval_ms)
+        .build();
+    let (mut engine, cache) = bar_test_engine(audusd_sim, client_id, venue, config);
+    let bar_type = BarType::from(format!("{instrument_id}-10-RANGE-LAST-INTERNAL").as_str());
+    subscribe_bars(&mut engine, bar_type, client_id, venue);
+
+    let closed_topic = switchboard::get_bars_topic(bar_type);
+    let forming_topic = switchboard::get_bars_forming_topic(bar_type);
+    let deliveries = Rc::new(RefCell::new(Vec::new()));
+    for topic in [closed_topic, forming_topic] {
+        let deliveries = Rc::clone(&deliveries);
+        let handler =
+            TypedHandler::from(move |bar: &Bar| deliveries.borrow_mut().push((topic, *bar)));
+        msgbus::subscribe_bars(topic.into(), handler, None);
+    }
+
+    let price = Price::from("0.65000");
+    let high = Price::from("0.65010");
+    let close = Price::from("0.65005");
+    let overshoot = Price::from("0.65011");
+    let ns = |ms: u64| (1000 + ms) * NANOSECONDS_IN_MILLISECOND;
+    let enabled = forming_bar_interval_ms.is_some();
+
+    for (ms, price, id, snapshots) in [
+        (0, price, "open", 1),
+        (0, price, "intra", 1),
+        (50, high, "throttled", 1),
+        (160, close, "due", 2),
+    ] {
+        engine.process_data(Data::Trade(audusd_trade(
+            instrument_id,
+            &price.to_string(),
+            ns(ms),
+            id,
+        )));
+        assert_eq!(
+            deliveries.borrow().len(),
+            if enabled { snapshots } else { 0 }
+        );
+        assert_eq!(cache.borrow().bar_count(&bar_type), 0);
+    }
+
+    // The next trade closes the current bar and immediately opens a new one.
+    engine.process_data(Data::Trade(audusd_trade(
+        instrument_id,
+        "0.65011",
+        ns(170),
+        "roll",
+    )));
+    // This earlier timestamp is ignored while the new bar has exactly one update.
+    engine.process_data(Data::Trade(audusd_trade(
+        instrument_id,
+        "0.65009",
+        ns(165),
+        "stale",
+    )));
+
+    let snapshot = |open, high, low, close, volume: u64, ms| {
+        let timestamp = UnixNanos::from(ns(ms));
+        Bar::new(
+            bar_type,
+            open,
+            high,
+            low,
+            close,
+            Quantity::from(volume),
+            timestamp,
+            timestamp,
+        )
+    };
+    let completed = snapshot(price, high, price, close, 4000, 170);
+    let expected = if enabled {
+        vec![
+            (forming_topic, snapshot(price, price, price, price, 1000, 0)),
+            (
+                forming_topic,
+                snapshot(price, high, price, close, 4000, 160),
+            ),
+            (closed_topic, completed),
+            (
+                forming_topic,
+                snapshot(overshoot, overshoot, overshoot, overshoot, 1000, 170),
+            ),
+        ]
+    } else {
+        vec![(closed_topic, completed)]
+    };
+    assert_eq!(*deliveries.borrow(), expected);
+    assert_eq!(cache.borrow().bar_count(&bar_type), 1);
+    assert_eq!(cache.borrow().bar(&bar_type), Some(&completed));
+}
+
+#[rstest]
+fn test_volume_forming_bar_reopens_at_same_timestamp(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let instrument_id = audusd_sim.id;
+    let config = DataEngineConfig::builder()
+        .forming_bar_interval_ms(150)
+        .build();
+    let (mut engine, cache) = bar_test_engine(audusd_sim, client_id, venue, config);
+    let bar_type = BarType::from(format!("{instrument_id}-5000-VOLUME-LAST-INTERNAL").as_str());
+    subscribe_bars(&mut engine, bar_type, client_id, venue);
+
+    let (handler, snapshots) = get_typed_message_saving_handler::<Bar>(None);
+    let topic = switchboard::get_bars_forming_topic(bar_type);
+    msgbus::subscribe_bars(topic.into(), handler, None);
+
+    let ts = NANOSECONDS_IN_MILLISECOND;
+    let first = audusd_trade(instrument_id, "0.65000", ts, "first");
+    engine.process_data(Data::Trade(first));
+    assert_eq!(snapshots.get_messages().len(), 1);
+
+    // The next trade completes the bar and leaves the same OHLCV and timestamp in the new one.
+    let mut rollover = audusd_trade(instrument_id, "0.65000", ts, "rollover");
+    rollover.size = Quantity::from(5000);
+    engine.process_data(Data::Trade(rollover));
+
+    let snapshots = snapshots.get_messages();
+    assert_eq!(snapshots.len(), 2);
+    assert_eq!(snapshots[0], snapshots[1]);
+    assert_eq!(cache.borrow().bar_count(&bar_type), 1);
 }

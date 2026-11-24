@@ -39,6 +39,8 @@ class DataEngineConfig:
     def debug(self) -> bool: ...
     @property
     def time_bars_time_zone(self) -> str | None: ...
+    @property
+    def forming_bar_interval_ms(self) -> int | None: ...
     def __new__(
         cls,
         time_bars_build_with_no_updates: bool | None = None,
@@ -55,4 +57,5 @@ class DataEngineConfig:
         debug: bool | None = None,
         disable_historical_cache: bool | None = None,
         time_bars_time_zone: str | None = None,
+        forming_bar_interval_ms: int | None = None,
     ) -> DataEngineConfig: ...

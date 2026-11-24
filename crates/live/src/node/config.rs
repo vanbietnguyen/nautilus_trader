@@ -112,6 +112,11 @@ pub struct LiveDataEngineConfig {
     pub time_bars_origin_offset: HashMap<String, u64>,
     /// The IANA time zone for day and longer bars, defaulting to UTC.
     pub time_bars_time_zone: Option<String>,
+    /// Minimum interval in milliseconds for live forming-bar snapshots, disabled by default.
+    ///
+    /// See [`DataEngineConfig::forming_bar_interval_ms`] for topic and subscriber details.
+    #[serde(default)]
+    pub forming_bar_interval_ms: Option<u64>,
     /// If data timestamp sequencing should be validated and handled.
     #[builder(default)]
     pub validate_data_sequence: bool,
@@ -165,6 +170,7 @@ impl From<LiveDataEngineConfig> for DataEngineConfig {
             time_bars_build_delay: config.time_bars_build_delay,
             time_bars_origin_offset,
             time_bars_time_zone: config.time_bars_time_zone,
+            forming_bar_interval_ms: config.forming_bar_interval_ms,
             validate_data_sequence: config.validate_data_sequence,
             buffer_deltas: config.buffer_deltas,
             emit_quotes_from_book: config.emit_quotes_from_book,
@@ -1499,6 +1505,20 @@ mean_dispatch_ns_clear = 700
             Some(vec![ClientId::from("EXTERNAL")]),
         );
         assert!(converted.debug);
+    }
+
+    #[rstest]
+    fn test_live_data_engine_config_forming_bar_interval() {
+        let default: LiveDataEngineConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(default.forming_bar_interval_ms, None);
+
+        let configured = LiveDataEngineConfig::builder()
+            .forming_bar_interval_ms(150)
+            .build();
+        let serialized = serde_json::to_string(&configured).unwrap();
+        let decoded: LiveDataEngineConfig = serde_json::from_str(&serialized).unwrap();
+        let converted: DataEngineConfig = decoded.into();
+        assert_eq!(converted.forming_bar_interval_ms, Some(150));
     }
 
     #[rstest]

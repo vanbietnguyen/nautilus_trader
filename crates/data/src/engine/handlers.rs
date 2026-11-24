@@ -13,10 +13,13 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
-use nautilus_common::msgbus::Handler;
-use nautilus_core::WeakCell;
+use nautilus_common::msgbus::{self, Handler, switchboard};
+use nautilus_core::{UnixNanos, WeakCell};
 use nautilus_model::{
     data::{Bar, BarType, QuoteTick, TradeTick},
     identifiers::InstrumentId,
@@ -63,6 +66,70 @@ impl<T: Copy> WarmupBuffer<T> {
     }
 }
 
+#[derive(Debug)]
+struct FormingBarPublisher {
+    interval_ns: u64,
+    last_published_ns: Cell<Option<u64>>,
+}
+
+impl FormingBarPublisher {
+    const fn new(interval_ns: u64) -> Self {
+        Self {
+            interval_ns,
+            last_published_ns: Cell::new(None),
+        }
+    }
+
+    fn handle_update(
+        forming: Option<&Self>,
+        aggregator: &WeakCell<Box<dyn BarAggregator>>,
+        bar_type: BarType,
+        ts_init: UnixNanos,
+        update: impl FnOnce(&mut dyn BarAggregator),
+    ) {
+        let Some(aggregator) = aggregator.upgrade() else {
+            return;
+        };
+        let Some(forming) = forming else {
+            update(aggregator.borrow_mut().as_mut());
+            return;
+        };
+
+        let now = ts_init.as_u64();
+        let bar = {
+            let mut agg = aggregator.borrow_mut();
+            let updates = agg.forming_bar_updates();
+            let generation = agg.forming_bar_generation();
+
+            update(agg.as_mut());
+
+            let current_updates = agg.forming_bar_updates();
+            let current_generation = agg.forming_bar_generation();
+
+            // A reset can open another one-update bar even at the same timestamp.
+            if current_updates == updates && current_generation == generation {
+                return;
+            }
+
+            let due = forming
+                .last_published_ns
+                .get()
+                .is_none_or(|last| now.saturating_sub(last) >= forming.interval_ns);
+
+            if current_updates != 1 && !due {
+                return;
+            }
+
+            agg.forming_bar()
+        };
+
+        if let Some(bar) = bar {
+            forming.last_published_ns.set(Some(now));
+            msgbus::publish_bar(switchboard::get_bars_forming_topic(bar_type), &bar);
+        }
+    }
+}
+
 /// Message handler for processing quote ticks through bar aggregators.
 ///
 /// This handler receives quote tick messages and forwards them to the underlying
@@ -73,6 +140,7 @@ pub(super) struct BarQuoteHandler {
     aggregator: WeakCell<Box<dyn BarAggregator>>,
     bar_type: BarType,
     warmup: Option<WarmupBuffer<QuoteTick>>,
+    forming: Option<FormingBarPublisher>,
 }
 
 impl BarQuoteHandler {
@@ -81,7 +149,13 @@ impl BarQuoteHandler {
             aggregator: WeakCell::from(Rc::downgrade(aggregator)),
             bar_type,
             warmup: None,
+            forming: None,
         }
+    }
+
+    pub(super) fn with_forming(mut self, interval_ns: Option<u64>) -> Self {
+        self.forming = interval_ns.map(FormingBarPublisher::new);
+        self
     }
 
     /// Holds incoming data in `warmup` until the buffer is released.
@@ -105,9 +179,13 @@ impl Handler<QuoteTick> for BarQuoteHandler {
             return;
         }
 
-        if let Some(agg) = self.aggregator.upgrade() {
-            agg.borrow_mut().handle_quote(*quote);
-        }
+        FormingBarPublisher::handle_update(
+            self.forming.as_ref(),
+            &self.aggregator,
+            self.bar_type,
+            quote.ts_init,
+            |agg| agg.handle_quote(*quote),
+        );
     }
 }
 
@@ -121,6 +199,7 @@ pub(super) struct BarTradeHandler {
     aggregator: WeakCell<Box<dyn BarAggregator>>,
     bar_type: BarType,
     warmup: Option<WarmupBuffer<TradeTick>>,
+    forming: Option<FormingBarPublisher>,
 }
 
 impl BarTradeHandler {
@@ -129,7 +208,13 @@ impl BarTradeHandler {
             aggregator: WeakCell::from(Rc::downgrade(aggregator)),
             bar_type,
             warmup: None,
+            forming: None,
         }
+    }
+
+    pub(super) fn with_forming(mut self, interval_ns: Option<u64>) -> Self {
+        self.forming = interval_ns.map(FormingBarPublisher::new);
+        self
     }
 
     /// Holds incoming data in `warmup` until the buffer is released.
@@ -153,9 +238,13 @@ impl Handler<TradeTick> for BarTradeHandler {
             return;
         }
 
-        if let Some(agg) = self.aggregator.upgrade() {
-            agg.borrow_mut().handle_trade(*trade);
-        }
+        FormingBarPublisher::handle_update(
+            self.forming.as_ref(),
+            &self.aggregator,
+            self.bar_type,
+            trade.ts_init,
+            |agg| agg.handle_trade(*trade),
+        );
     }
 }
 
@@ -170,6 +259,7 @@ pub(super) struct BarBarHandler {
     aggregator: WeakCell<Box<dyn BarAggregator>>,
     bar_type: BarType,
     warmup: Option<WarmupBuffer<Bar>>,
+    forming: Option<FormingBarPublisher>,
 }
 
 impl BarBarHandler {
@@ -178,7 +268,13 @@ impl BarBarHandler {
             aggregator: WeakCell::from(Rc::downgrade(aggregator)),
             bar_type,
             warmup: None,
+            forming: None,
         }
+    }
+
+    pub(super) fn with_forming(mut self, interval_ns: Option<u64>) -> Self {
+        self.forming = interval_ns.map(FormingBarPublisher::new);
+        self
     }
 
     /// Holds incoming data in `warmup` until the buffer is released.
@@ -198,9 +294,13 @@ impl Handler<Bar> for BarBarHandler {
             return;
         }
 
-        if let Some(agg) = self.aggregator.upgrade() {
-            agg.borrow_mut().handle_bar(*bar);
-        }
+        FormingBarPublisher::handle_update(
+            self.forming.as_ref(),
+            &self.aggregator,
+            self.bar_type,
+            bar.ts_init,
+            |agg| agg.handle_bar(*bar),
+        );
     }
 }
 

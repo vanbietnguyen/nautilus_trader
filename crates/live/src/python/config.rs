@@ -187,7 +187,7 @@ impl LiveDataEngineConfig {
         clippy::needless_pass_by_value,
         reason = "PyO3 #[new] requires owned params"
     )]
-    #[pyo3(signature = (time_bars_build_with_no_updates=None, time_bars_timestamp_on_close=None, time_bars_skip_first_non_full_bar=None, time_bars_interval_type=None, time_bars_build_delay=None, time_bars_origin_offset=None, validate_data_sequence=None, buffer_deltas=None, emit_quotes_from_book=None, emit_quotes_from_book_depths=None, external_clients=None, debug=None, time_bars_time_zone=None))]
+    #[pyo3(signature = (time_bars_build_with_no_updates=None, time_bars_timestamp_on_close=None, time_bars_skip_first_non_full_bar=None, time_bars_interval_type=None, time_bars_build_delay=None, time_bars_origin_offset=None, validate_data_sequence=None, buffer_deltas=None, emit_quotes_from_book=None, emit_quotes_from_book_depths=None, external_clients=None, debug=None, time_bars_time_zone=None, forming_bar_interval_ms=None))]
     fn py_new(
         time_bars_build_with_no_updates: Option<bool>,
         time_bars_timestamp_on_close: Option<bool>,
@@ -202,6 +202,7 @@ impl LiveDataEngineConfig {
         external_clients: Option<Vec<ClientId>>,
         debug: Option<bool>,
         time_bars_time_zone: Option<String>,
+        forming_bar_interval_ms: Option<u64>,
     ) -> PyResult<Self> {
         if let Some(name) = &time_bars_time_zone {
             get_timezone(name).map_err(to_pyvalue_err)?;
@@ -225,6 +226,7 @@ impl LiveDataEngineConfig {
             time_bars_build_delay: time_bars_build_delay.unwrap_or(default.time_bars_build_delay),
             time_bars_origin_offset: time_bars_origin_offset.unwrap_or_default(),
             time_bars_time_zone,
+            forming_bar_interval_ms,
             validate_data_sequence: validate_data_sequence
                 .unwrap_or(default.validate_data_sequence),
             buffer_deltas: buffer_deltas.unwrap_or(default.buffer_deltas),
@@ -241,6 +243,12 @@ impl LiveDataEngineConfig {
     #[pyo3(name = "time_bars_time_zone")]
     fn py_time_bars_time_zone(&self) -> Option<String> {
         self.time_bars_time_zone.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "forming_bar_interval_ms")]
+    const fn py_forming_bar_interval_ms(&self) -> Option<u64> {
+        self.forming_bar_interval_ms
     }
 
     #[getter]

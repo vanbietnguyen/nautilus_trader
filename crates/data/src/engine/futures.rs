@@ -14,6 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 use indexmap::IndexMap;
+use nautilus_core::datetime::NANOSECONDS_IN_MILLISECOND;
 
 use super::{
     BAR_AGGREGATOR_PRIORITY, BarAggregatorSubscription, BarBarHandler, BarQuoteHandler,
@@ -734,21 +735,28 @@ impl DataEngine {
             .cloned()
             .expect("aggregator was created before subscribe_continuous_future_source");
 
+        let bar_type_std = target_bar_type.standard();
+        let forming_interval_ns = self
+            .config
+            .forming_bar_interval_ms
+            .map(|ms| ms.saturating_mul(NANOSECONDS_IN_MILLISECOND));
+
         let subscription = match source {
             ContinuousFutureSource::Bars(source_bar_type) => {
                 let topic = switchboard::get_bars_topic(source_bar_type);
-                let handler =
-                    TypedHandler::new(BarBarHandler::new(&aggregator, target_bar_type.standard()));
+                let handler = TypedHandler::new(
+                    BarBarHandler::new(&aggregator, bar_type_std).with_forming(forming_interval_ns),
+                );
                 msgbus::subscribe_bars(topic.into(), handler.clone(), None);
                 BarAggregatorSubscription::Bar { topic, handler }
             }
             ContinuousFutureSource::Trades => {
                 let topic = switchboard::get_trades_topic(segment_instrument_id);
 
-                let handler = TypedHandler::new(BarTradeHandler::new(
-                    &aggregator,
-                    target_bar_type.standard(),
-                ));
+                let handler = TypedHandler::new(
+                    BarTradeHandler::new(&aggregator, bar_type_std)
+                        .with_forming(forming_interval_ns),
+                );
                 msgbus::subscribe_trades(
                     topic.into(),
                     handler.clone(),
@@ -759,10 +767,10 @@ impl DataEngine {
             ContinuousFutureSource::Quotes => {
                 let topic = switchboard::get_quotes_topic(segment_instrument_id);
 
-                let handler = TypedHandler::new(BarQuoteHandler::new(
-                    &aggregator,
-                    target_bar_type.standard(),
-                ));
+                let handler = TypedHandler::new(
+                    BarQuoteHandler::new(&aggregator, bar_type_std)
+                        .with_forming(forming_interval_ns),
+                );
                 msgbus::subscribe_quotes(
                     topic.into(),
                     handler.clone(),

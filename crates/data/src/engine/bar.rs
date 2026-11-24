@@ -26,7 +26,10 @@ use nautilus_common::{
     },
     msgbus::{self, MStr, Topic, TypedHandler},
 };
-use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos, datetime::get_timezone};
+use nautilus_core::{
+    DurationNanos, Params, UUID4, UnixNanos,
+    datetime::{NANOSECONDS_IN_MILLISECOND, get_timezone},
+};
 use nautilus_model::{
     data::{Bar, BarType, QuoteTick, TradeTick},
     identifiers::{ClientId, InstrumentId},
@@ -1522,6 +1525,10 @@ impl DataEngine {
         let mut subscriptions = Vec::new();
 
         let bar_type_std = bar_type.standard();
+        let forming_interval_ns = self
+            .config
+            .forming_bar_interval_ms
+            .map(|ms| ms.saturating_mul(NANOSECONDS_IN_MILLISECOND));
         let warmup;
 
         if bar_type.is_composite() {
@@ -1529,7 +1536,9 @@ impl DataEngine {
             let buffer = defer.then(WarmupBuffer::new);
 
             let handler = TypedHandler::new(
-                BarBarHandler::new(aggregator, bar_type_std).with_warmup(buffer.clone()),
+                BarBarHandler::new(aggregator, bar_type_std)
+                    .with_warmup(buffer.clone())
+                    .with_forming(forming_interval_ns),
             );
 
             warmup = buffer.map(BarAggregatorWarmup::Bar);
@@ -1540,7 +1549,9 @@ impl DataEngine {
             let buffer = defer.then(WarmupBuffer::new);
 
             let handler = TypedHandler::new(
-                BarTradeHandler::new(aggregator, bar_type_std).with_warmup(buffer.clone()),
+                BarTradeHandler::new(aggregator, bar_type_std)
+                    .with_warmup(buffer.clone())
+                    .with_forming(forming_interval_ns),
             );
 
             warmup = buffer.map(BarAggregatorWarmup::Trade);
@@ -1568,7 +1579,9 @@ impl DataEngine {
             let buffer = defer.then(WarmupBuffer::new);
 
             let handler = TypedHandler::new(
-                BarQuoteHandler::new(aggregator, bar_type_std).with_warmup(buffer.clone()),
+                BarQuoteHandler::new(aggregator, bar_type_std)
+                    .with_warmup(buffer.clone())
+                    .with_forming(forming_interval_ns),
             );
 
             warmup = buffer.map(BarAggregatorWarmup::Quote);
