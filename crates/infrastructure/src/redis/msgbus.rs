@@ -87,6 +87,7 @@ use std::{
 };
 
 use ahash::AHashMap;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use futures::{
     future::{BoxFuture, LocalBoxFuture},
@@ -126,6 +127,8 @@ const MSGBUS_PUBLISH: &str = "msgbus-publish";
 const MSGBUS_STREAM: &str = "msgbus-stream";
 const MSGBUS_HEARTBEAT: &str = "msgbus-heartbeat";
 const HEARTBEAT_TOPIC: &str = "health:heartbeat";
+const FORMING_BAR_TOPIC_PREFIX: &str = "data.bars.forming.";
+const FORMING_BAR_CHANNEL_SUFFIX: &str = ":forming";
 const TRIM_BUFFER_SECS: u64 = 60;
 const PUBLISH_BATCH_SIZE: usize = 1_000;
 
@@ -450,8 +453,14 @@ impl MessageBusBacking for RedisMessageBusBacking {
     /// Reserves the source of the next entry written for `topic`: this backing's trader ID and
     /// instance ID, the key the entry is written on, and the next number of that key.
     ///
+    /// Ephemeral forming bar snapshots (`data.bars.forming.*`) are published via Redis Pub/Sub
+    /// rather than appended to a stream, so they reserve no stream sequence number.
+    ///
     /// The entry's age runs from this call.
     fn reserve_source(&self, topic: Ustr) -> anyhow::Result<Option<BusMessageSource>> {
+        if is_forming_bar_topic(topic.as_str()) {
+            return Ok(None);
+        }
         let source = self.sources.reserve(topic)?;
         RESERVED_AT.set(Some((source, tokio::time::Instant::now())));
         Ok(Some(source))
@@ -645,6 +654,18 @@ thread_local! {
     /// while it encodes one, so a reservation whose entry never arrives is overwritten by the next.
     static RESERVED_AT: Cell<Option<(BusMessageSource, tokio::time::Instant)>> =
         const { Cell::new(None) };
+}
+
+/// Returns whether `topic` carries an ephemeral forming bar snapshot routed over Redis Pub/Sub.
+fn is_forming_bar_topic(topic: &str) -> bool {
+    topic.starts_with(FORMING_BAR_TOPIC_PREFIX)
+}
+
+/// Returns the Redis Pub/Sub channel carrying forming bar snapshots for `stream_key`:
+/// `<stream_key>:forming` (for example `trader-<trader_id>:stream:forming`).
+#[must_use]
+pub fn forming_bar_channel(stream_key: &str) -> String {
+    format!("{stream_key}{FORMING_BAR_CHANNEL_SUFFIX}")
 }
 
 /// Returns the key an entry of `topic` is written on: `stream_key`, or with one stream per topic,
@@ -897,7 +918,14 @@ async fn publish_messages(
 
     let PublishReceiver { pending, mut wake } = rx;
     let stream_key = get_stream_key(trader_id, instance_id, &config);
-    let mut writer = StreamWriter::new(stream_key, &config, backing, pending)?;
+    let mut writer = StreamWriter::new(
+        stream_key,
+        trader_id,
+        instance_id,
+        &config,
+        backing,
+        pending,
+    )?;
 
     // Buffering
     let buffer_interval = Duration::from_millis(u64::from(config.buffer_interval_ms.unwrap_or(0)));
@@ -1054,6 +1082,8 @@ struct PendingMessage {
 #[derive(Clone)]
 struct StreamTarget {
     stream_key: String,
+    publisher_id: TraderId,
+    instance_id: UUID4,
     stream_per_topic: bool,
     autotrim_duration: Option<Duration>,
     autotrim_maxlen: Option<usize>,
@@ -1075,6 +1105,8 @@ enum PublishAttempt {
 impl StreamWriter {
     fn new(
         stream_key: String,
+        publisher_id: TraderId,
+        instance_id: UUID4,
         config: &MessageBusConfig,
         backing: RedisMessageBusConfig,
         pending: Arc<Mutex<PendingEntries>>,
@@ -1101,6 +1133,8 @@ impl StreamWriter {
             },
             target: StreamTarget {
                 stream_key,
+                publisher_id,
+                instance_id,
                 stream_per_topic: config.stream_per_topic,
                 autotrim_duration,
                 autotrim_maxlen,
@@ -1521,10 +1555,7 @@ async fn write_attempt(
     let mut trim_error = None;
     let write = write_buffer(
         &mut con,
-        &target.stream_key,
-        target.stream_per_topic,
-        target.autotrim_duration,
-        target.autotrim_maxlen,
+        &target,
         &mut last_trim_index,
         &mut trim_error,
         messages.iter(),
@@ -1538,27 +1569,76 @@ async fn write_attempt(
     }
 }
 
+#[derive(Serialize)]
+struct FormingBarPubSubMessage<'a> {
+    topic: &'a str,
+    #[serde(rename = "type")]
+    payload_type: &'a str,
+    encoding: String,
+    publisher_id: &'a str,
+    instance_id: &'a str,
+    payload: FormingBarPubSubPayload,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum FormingBarPubSubPayload {
+    Json(serde_json::Value),
+    Base64(String),
+}
+
+fn encode_forming_bar_pubsub_payload(
+    msg: &BusMessage,
+    publisher_id: TraderId,
+    instance_id: UUID4,
+) -> Vec<u8> {
+    let payload = if msg.encoding == SerializationEncoding::Json {
+        serde_json::from_slice::<serde_json::Value>(&msg.payload).map_or_else(
+            |_| FormingBarPubSubPayload::Base64(BASE64_STANDARD.encode(&msg.payload)),
+            FormingBarPubSubPayload::Json,
+        )
+    } else {
+        FormingBarPubSubPayload::Base64(BASE64_STANDARD.encode(&msg.payload))
+    };
+
+    let envelope = FormingBarPubSubMessage {
+        topic: msg.topic.as_str(),
+        payload_type: msg.payload_type.as_str(),
+        encoding: msg.encoding.to_string(),
+        publisher_id: publisher_id.as_str(),
+        instance_id: instance_id.as_str(),
+        payload,
+    };
+
+    serde_json::to_vec(&envelope).expect("FormingBarPubSubMessage serialization cannot fail")
+}
+
 // A trim error that does not fail the write is kept in `trim_error` with its key, for the caller
 // to report
-#[expect(clippy::too_many_arguments)]
 async fn write_buffer(
     conn: &mut redis::aio::ConnectionManager,
-    stream_key: &str,
-    stream_per_topic: bool,
-    autotrim_duration: Option<Duration>,
-    autotrim_maxlen: Option<usize>,
+    target: &StreamTarget,
     last_trim_index: &mut HashMap<String, usize>,
     trim_error: &mut Option<(String, redis::RedisError)>,
     messages: impl Iterator<Item = &BusMessage>,
 ) -> redis::RedisResult<()> {
     let mut pipe = redis::pipe();
     pipe.atomic();
+    let forming_channel = forming_bar_channel(&target.stream_key);
 
     for msg in messages {
-        let stream_key = stream_entry_key(stream_key, stream_per_topic, &msg.topic).into_owned();
-        add_stream_entry(&mut pipe, &stream_key, autotrim_maxlen, msg);
+        if is_forming_bar_topic(msg.topic.as_str()) {
+            let payload =
+                encode_forming_bar_pubsub_payload(msg, target.publisher_id, target.instance_id);
+            pipe.publish(&forming_channel, payload);
+            continue;
+        }
 
-        if autotrim_duration.is_none() {
+        let stream_key =
+            stream_entry_key(&target.stream_key, target.stream_per_topic, &msg.topic).into_owned();
+        add_stream_entry(&mut pipe, &stream_key, target.autotrim_maxlen, msg);
+
+        if target.autotrim_duration.is_none() {
             continue; // Nothing else to do
         }
 
@@ -1570,7 +1650,7 @@ async fn write_buffer(
         // Improve efficiency of this by batching
         if *last_trim_ms < unix_duration_now.saturating_sub(trim_buffer).as_millis() as usize {
             let min_timestamp_ms = unix_duration_now
-                .saturating_sub(autotrim_duration.unwrap())
+                .saturating_sub(target.autotrim_duration.unwrap())
                 .as_millis() as usize;
             let result: Result<(), redis::RedisError> = redis::cmd(REDIS_XTRIM)
                 .arg(stream_key.clone())
@@ -3507,6 +3587,58 @@ mod tests {
     }
 
     #[rstest]
+    #[case::single_stream(false)]
+    #[case::stream_per_topic(true)]
+    fn test_forming_bars_publish_over_pubsub_without_consuming_stream_sequence(
+        #[case] stream_per_topic: bool,
+    ) {
+        let fake = get_runtime().block_on(FakeRedis::start("unused"));
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        let instance_id = UUID4::new();
+        let config = MessageBusConfig {
+            encoding: SerializationEncoding::Json,
+            stream_per_topic,
+            ..Default::default()
+        };
+        install_way_out(&fake, instance_id, config);
+
+        let forming_topic = "data.bars.forming.MNQ.XCME-1-MINUTE-LAST-INTERNAL";
+        let bar = nautilus_model::data::Bar::default();
+        publish_quote("data.quotes.A".into(), &QuoteTick::default());
+        nautilus_common::msgbus::publish_bar(forming_topic.into(), &bar);
+        publish_quote("data.quotes.A".into(), &QuoteTick::default());
+
+        wait_until(
+            || fake.written().len() == 2 && fake.published().len() == 1,
+            Duration::from_secs(5),
+        );
+        close_way_out();
+
+        let written = fake.written();
+        assert_eq!(written.len(), 2);
+        assert_eq!(
+            written.iter().map(FakeXadd::sequence).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(
+            written
+                .iter()
+                .all(|xadd| xadd.field("topic").as_deref() == Some("data.quotes.A"))
+        );
+
+        let published = fake.published();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].channel, "trader-TESTER-007:stream:forming");
+        let envelope: serde_json::Value = serde_json::from_slice(&published[0].payload).unwrap();
+        assert_eq!(envelope["topic"], forming_topic);
+        assert_eq!(envelope["type"], "Bar");
+        assert_eq!(envelope["encoding"], "Json");
+        assert_eq!(envelope["publisher_id"], "TESTER-007");
+        assert_eq!(envelope["instance_id"], instance_id.as_str());
+        assert_eq!(envelope["payload"], serde_json::to_value(bar).unwrap());
+    }
+
+    #[rstest]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_write_stream_entries_writes_the_entries_of_the_backing_on_an_explicit_key() {
         let fake = FakeRedis::start("unused").await;
@@ -4676,6 +4808,7 @@ mod tests {
         wrong_type_key: Arc<std::sync::Mutex<Option<String>>>,
         attempted: Arc<std::sync::Mutex<Vec<FakeXadd>>>,
         written: Arc<std::sync::Mutex<Vec<FakeXadd>>>,
+        published: Arc<std::sync::Mutex<Vec<FakePublish>>>,
         commits: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
         committed_at: Arc<std::sync::Mutex<Vec<UnixNanos>>>,
         connections: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
@@ -4702,6 +4835,7 @@ mod tests {
                 wrong_type_key: Arc::new(std::sync::Mutex::new(None)),
                 attempted: Arc::new(std::sync::Mutex::new(Vec::new())),
                 written: Arc::new(std::sync::Mutex::new(Vec::new())),
+                published: Arc::new(std::sync::Mutex::new(Vec::new())),
                 commits: Arc::new(std::sync::Mutex::new(Vec::new())),
                 committed_at: Arc::new(std::sync::Mutex::new(Vec::new())),
                 connections: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -4739,7 +4873,7 @@ mod tests {
             let mut reader = tokio::io::BufReader::new(read);
             let mut queued = 0;
             let mut queue_failed = false;
-            let mut queued_xadds = Vec::new();
+            let mut queued_commands: Vec<FakeQueuedCommand> = Vec::new();
             let mut stalled = 0;
 
             while let Some(command) = read_resp_command(&mut reader).await {
@@ -4769,15 +4903,21 @@ mod tests {
                     b"MULTI" => {
                         queued = 0;
                         queue_failed = false;
-                        queued_xadds.clear();
+                        queued_commands.clear();
                         "+OK\r\n".to_string()
                     }
                     b"XADD" if self.accept_writes.load(Ordering::SeqCst) && !demoted => {
                         queued += 1;
-                        queued_xadds.push(FakeXadd::parse(&command));
+                        queued_commands.push(FakeQueuedCommand::Xadd(FakeXadd::parse(&command)));
                         "+QUEUED\r\n".to_string()
                     }
-                    b"XADD" => {
+                    b"PUBLISH" if self.accept_writes.load(Ordering::SeqCst) && !demoted => {
+                        queued += 1;
+                        queued_commands
+                            .push(FakeQueuedCommand::Publish(FakePublish::parse(&command)));
+                        "+QUEUED\r\n".to_string()
+                    }
+                    b"XADD" | b"PUBLISH" => {
                         queue_failed = true;
                         format!("-{queued_error}\r\n")
                     }
@@ -4786,36 +4926,7 @@ mod tests {
                         "-EXECABORT Transaction discarded because of previous errors.\r\n"
                             .to_string()
                     }
-                    b"EXEC" => {
-                        let wrong_type_key = self.wrong_type_key.lock().unwrap().clone();
-                        let mut replies = String::new();
-                        let mut executed_in_part = false;
-
-                        for xadd in queued_xadds.drain(..) {
-                            if Some(&xadd.key) == wrong_type_key.as_ref() {
-                                executed_in_part = true;
-                                replies.push_str(
-                                    "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                                );
-                            } else {
-                                self.written.lock().unwrap().push(xadd);
-                                replies.push_str("$3\r\n0-1\r\n");
-                            }
-                        }
-
-                        if !executed_in_part {
-                            self.committed.fetch_add(1, Ordering::SeqCst);
-                            self.commits
-                                .lock()
-                                .unwrap()
-                                .push(tokio::time::Instant::now());
-                            self.committed_at
-                                .lock()
-                                .unwrap()
-                                .push(get_atomic_clock_realtime().get_time_ns());
-                        }
-                        format!("*{queued}\r\n{replies}")
-                    }
+                    b"EXEC" => self.exec_queued(queued, &mut queued_commands),
                     b"XTRIM" => {
                         self.trims.fetch_add(1, Ordering::SeqCst);
                         match *self.trim_error.lock().unwrap() {
@@ -4835,6 +4946,49 @@ mod tests {
                 }
             }
             self.execs_held.fetch_sub(stalled, Ordering::SeqCst);
+        }
+
+        fn exec_queued(
+            &self,
+            queued: usize,
+            queued_commands: &mut Vec<FakeQueuedCommand>,
+        ) -> String {
+            let wrong_type_key = self.wrong_type_key.lock().unwrap().clone();
+            let mut replies = String::new();
+            let mut executed_in_part = false;
+
+            for queued_command in queued_commands.drain(..) {
+                match queued_command {
+                    FakeQueuedCommand::Xadd(xadd) => {
+                        if Some(&xadd.key) == wrong_type_key.as_ref() {
+                            executed_in_part = true;
+                            replies.push_str(
+                                "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                            );
+                        } else {
+                            self.written.lock().unwrap().push(xadd);
+                            replies.push_str("$3\r\n0-1\r\n");
+                        }
+                    }
+                    FakeQueuedCommand::Publish(publish) => {
+                        self.published.lock().unwrap().push(publish);
+                        replies.push_str(":1\r\n");
+                    }
+                }
+            }
+
+            if !executed_in_part {
+                self.committed.fetch_add(1, Ordering::SeqCst);
+                self.commits
+                    .lock()
+                    .unwrap()
+                    .push(tokio::time::Instant::now());
+                self.committed_at
+                    .lock()
+                    .unwrap()
+                    .push(get_atomic_clock_realtime().get_time_ns());
+            }
+            format!("*{queued}\r\n{replies}")
         }
 
         /// Holds an `EXEC` of queued `XADD`s while `stall_writes` or `execs_allowed` says so,
@@ -4878,6 +5032,10 @@ mod tests {
             self.written.lock().unwrap().clone()
         }
 
+        fn published(&self) -> Vec<FakePublish> {
+            self.published.lock().unwrap().clone()
+        }
+
         fn written_len(&self) -> usize {
             self.written.lock().unwrap().len()
         }
@@ -4918,6 +5076,28 @@ mod tests {
             }
 
             state_records(logs)
+        }
+    }
+
+    enum FakeQueuedCommand {
+        Xadd(FakeXadd),
+        Publish(FakePublish),
+    }
+
+    /// One `PUBLISH channel message` a [`FakeRedis`] received.
+    #[derive(Clone, Debug)]
+    struct FakePublish {
+        channel: String,
+        payload: Vec<u8>,
+    }
+
+    impl FakePublish {
+        fn parse(command: &[Vec<u8>]) -> Self {
+            assert_eq!(command.len(), 3);
+            Self {
+                channel: String::from_utf8(command[1].clone()).unwrap(),
+                payload: command[2].clone(),
+            }
         }
     }
 

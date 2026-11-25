@@ -191,6 +191,7 @@ pub struct BarBuilder {
     price_precision: u8,
     size_precision: u8,
     initialized: bool,
+    ts_first: Option<UnixNanos>,
     ts_last: UnixNanos,
     count: usize,
     generation: usize,
@@ -227,6 +228,7 @@ impl BarBuilder {
             price_precision,
             size_precision,
             initialized: false,
+            ts_first: None,
             ts_last: UnixNanos::default(),
             count: 0,
             generation: 0,
@@ -316,6 +318,7 @@ impl BarBuilder {
             self.open = Some(price);
             self.high = Some(price);
             self.low = Some(price);
+            self.ts_first = Some(ts_init);
             self.initialized = true;
         } else {
             if price > self.high.unwrap() {
@@ -354,6 +357,7 @@ impl BarBuilder {
             self.open = Some(bar_open);
             self.high = Some(bar_high);
             self.low = Some(bar_low);
+            self.ts_first = Some(ts_init);
             self.initialized = true;
         } else {
             if bar_high > self.high.unwrap() {
@@ -383,6 +387,7 @@ impl BarBuilder {
         self.low = None;
         self.close = None;
         self.volume = Quantity::zero(self.size_precision);
+        self.ts_first = None;
         self.count = 0;
         self.generation = self.generation.wrapping_add(1);
     }
@@ -405,6 +410,7 @@ impl BarBuilder {
             low = close;
         }
 
+        let ts_event = self.ts_first.unwrap_or(self.ts_last);
         Some(Bar::new(
             self.bar_type,
             open,
@@ -412,7 +418,7 @@ impl BarBuilder {
             low,
             close,
             self.volume,
-            self.ts_last,
+            ts_event,
             self.ts_last,
         ))
     }
@@ -3229,7 +3235,17 @@ mod tests {
 
         let second = Price::from("95.00");
         builder.update(second, Quantity::from(2), 2000.into());
-        let expected = Bar::new(
+        let expected_peek = Bar::new(
+            bar_type,
+            first,
+            first,
+            second,
+            second,
+            3.into(),
+            1000.into(),
+            2000.into(),
+        );
+        let expected_built = Bar::new(
             bar_type,
             first,
             first,
@@ -3239,13 +3255,26 @@ mod tests {
             2000.into(),
             2000.into(),
         );
-        assert_eq!(builder.peek(), Some(expected));
+        assert_eq!(builder.peek(), Some(expected_peek));
         assert_eq!(builder.count, 2);
-        assert_eq!(builder.build_now(), expected);
+        assert_eq!(builder.build_now(), expected_built);
         assert!(builder.initialized);
         assert!(builder.peek().is_none());
 
         builder.update(first, Quantity::from(1), 3000.into());
+        assert_eq!(
+            builder.peek(),
+            Some(Bar::new(
+                bar_type,
+                first,
+                first,
+                first,
+                first,
+                1.into(),
+                3000.into(),
+                3000.into(),
+            ))
+        );
         builder.reset();
         assert!(builder.peek().is_none());
         assert_eq!(builder.count, 0);
