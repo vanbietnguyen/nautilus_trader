@@ -20,7 +20,8 @@ use std::{fmt::Debug, fs, num::NonZeroU64, path::PathBuf, str::FromStr, sync::Ar
 use ahash::{AHashMap, AHashSet};
 use databento::{
     dbn::{self, decode::DbnMetadata},
-    historical::timeseries::GetRangeParams,
+    error::ApiError,
+    historical::timeseries::{AsyncDbnDecoder, GetRangeParams},
 };
 use indexmap::IndexMap;
 use nautilus_core::{AtomicMap, UnixNanos, consts::NAUTILUS_USER_AGENT, time::AtomicTime};
@@ -30,6 +31,11 @@ use nautilus_model::{
     identifiers::{InstrumentId, Symbol, Venue, futures::FuturesYearDigits},
     instruments::{Instrument, InstrumentAny},
 };
+use time::{
+    OffsetDateTime, PrimitiveDateTime,
+    format_description::well_known::{Iso8601, Rfc3339},
+};
+use tokio::io::AsyncReadExt;
 
 use crate::{
     common::{Credential, get_date_time_range, ohlcv_schema_from_aggregation},
@@ -44,6 +50,12 @@ use crate::{
     },
     types::{DatabentoImbalance, DatabentoPublisher, DatabentoStatistics, PublisherId},
 };
+
+/// Databento API error case for a range whose `start` is after the dataset's available end.
+const DATA_START_AFTER_AVAILABLE_END: &str = "data_start_after_available_end";
+
+/// Databento API error case for a range whose `end` is after the dataset's available end.
+const DATA_END_AFTER_AVAILABLE_END: &str = "data_end_after_available_end";
 
 /// Core Databento historical client for fetching historical market data.
 ///
@@ -284,6 +296,76 @@ impl DatabentoHistoricalClient {
         })
     }
 
+    /// Requests a timeseries range, clamping its end to the data the dataset has available.
+    ///
+    /// Databento Historical lags real time, so a request ending at the current time can be
+    /// rejected with `data_end_after_available_end`. Such a request is retried once with its
+    /// end clamped to the available end, taken from the error payload or, when the payload
+    /// lacks it, from the dataset range. Returns `None` when the dataset has no data yet
+    /// within the requested range.
+    async fn get_range_clamped(
+        &self,
+        mut range_params: GetRangeParams,
+    ) -> anyhow::Result<Option<AsyncDbnDecoder<impl AsyncReadExt + Unpin>>> {
+        let mut client = (*self.inner).clone();
+        let api_err = match client.timeseries().get_range(&range_params).await {
+            Ok(decoder) => return Ok(Some(decoder)),
+            Err(databento::Error::Api(api_err)) => api_err,
+            Err(e) => anyhow::bail!("Failed to get range: {e}"),
+        };
+
+        match api_err.case.as_deref() {
+            Some(DATA_START_AFTER_AVAILABLE_END) => {
+                log::info!(
+                    "No {} {} data available yet from {}: {}",
+                    range_params.dataset,
+                    range_params.schema,
+                    range_params.date_time_range.start,
+                    api_err.message,
+                );
+                return Ok(None);
+            }
+            Some(DATA_END_AFTER_AVAILABLE_END) => {}
+            _ => anyhow::bail!("Failed to get range: {}", databento::Error::Api(api_err)),
+        }
+
+        let Some(available_end) = available_end(&mut client, &range_params, &api_err).await else {
+            anyhow::bail!("Failed to get range: {}", databento::Error::Api(api_err));
+        };
+        let requested = &range_params.date_time_range;
+
+        if available_end <= requested.start {
+            log::info!(
+                "No {} {} data available yet from {}: available end is {available_end}",
+                range_params.dataset,
+                range_params.schema,
+                requested.start,
+            );
+            return Ok(None);
+        }
+
+        if available_end >= requested.end {
+            anyhow::bail!("Failed to get range: {}", databento::Error::Api(api_err));
+        }
+
+        log::info!(
+            "Clamping {} {} request end from {} to available end {available_end}",
+            range_params.dataset,
+            range_params.schema,
+            requested.end,
+        );
+        range_params.date_time_range.end = available_end;
+
+        client
+            .timeseries()
+            .get_range(&range_params)
+            .await
+            .map(Some)
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to get range after clamping end to {available_end}: {e}")
+            })
+    }
+
     /// Fetches instrument definitions for the given parameters.
     ///
     /// # Errors
@@ -314,12 +396,9 @@ impl DatabentoHistoricalClient {
             .maybe_limit(params.limit.and_then(NonZeroU64::new))
             .build();
 
-        let mut client = (*self.inner).clone();
-        let mut decoder = client
-            .timeseries()
-            .get_range(&range_params)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get range: {e}"))?;
+        let Some(mut decoder) = self.get_range_clamped(range_params).await? else {
+            return Ok(Vec::new());
+        };
 
         let metadata = decoder.metadata().clone();
         let mut metadata_cache = MetadataCache::new(metadata);
@@ -442,12 +521,9 @@ impl DatabentoHistoricalClient {
 
         let price_precision_arg = params.price_precision;
 
-        let mut client = (*self.inner).clone();
-        let mut decoder = client
-            .timeseries()
-            .get_range(&range_params)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get range: {e}"))?;
+        let Some(mut decoder) = self.get_range_clamped(range_params).await? else {
+            return Ok(Vec::new());
+        };
 
         let metadata = decoder.metadata().clone();
         let mut metadata_cache = MetadataCache::new(metadata);
@@ -561,12 +637,9 @@ impl DatabentoHistoricalClient {
 
         let price_precision_arg = params.price_precision;
 
-        let mut client = (*self.inner).clone();
-        let mut decoder = client
-            .timeseries()
-            .get_range(&range_params)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get range: {e}"))?;
+        let Some(mut decoder) = self.get_range_clamped(range_params).await? else {
+            return Ok(Vec::new());
+        };
 
         let metadata = decoder.metadata().clone();
         let mut metadata_cache = MetadataCache::new(metadata);
@@ -629,12 +702,9 @@ impl DatabentoHistoricalClient {
 
         let price_precision_arg = params.price_precision;
 
-        let mut client = (*self.inner).clone();
-        let mut decoder = client
-            .timeseries()
-            .get_range(&range_params)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get range: {e}"))?;
+        let Some(mut decoder) = self.get_range_clamped(range_params).await? else {
+            return Ok(Vec::new());
+        };
 
         let metadata = decoder.metadata().clone();
         let mut metadata_cache = MetadataCache::new(metadata);
@@ -721,12 +791,9 @@ impl DatabentoHistoricalClient {
 
         let price_precision_arg = params.price_precision;
 
-        let mut client = (*self.inner).clone();
-        let mut decoder = client
-            .timeseries()
-            .get_range(&range_params)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get range: {e}"))?;
+        let Some(mut decoder) = self.get_range_clamped(range_params).await? else {
+            return Ok(Vec::new());
+        };
 
         let metadata = decoder.metadata().clone();
         let mut metadata_cache = MetadataCache::new(metadata);
@@ -826,12 +893,9 @@ impl DatabentoHistoricalClient {
 
         let price_precision_arg = params.price_precision;
 
-        let mut client = (*self.inner).clone();
-        let mut decoder = client
-            .timeseries()
-            .get_range(&range_params)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get range: {e}"))?;
+        let Some(mut decoder) = self.get_range_clamped(range_params).await? else {
+            return Ok(Vec::new());
+        };
 
         let metadata = decoder.metadata().clone();
         let mut metadata_cache = MetadataCache::new(metadata);
@@ -900,12 +964,9 @@ impl DatabentoHistoricalClient {
 
         let price_precision_arg = params.price_precision;
 
-        let mut client = (*self.inner).clone();
-        let mut decoder = client
-            .timeseries()
-            .get_range(&range_params)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get range: {e}"))?;
+        let Some(mut decoder) = self.get_range_clamped(range_params).await? else {
+            return Ok(Vec::new());
+        };
 
         let metadata = decoder.metadata().clone();
         let mut metadata_cache = MetadataCache::new(metadata);
@@ -961,12 +1022,9 @@ impl DatabentoHistoricalClient {
 
         let price_precision_arg = params.price_precision;
 
-        let mut client = (*self.inner).clone();
-        let mut decoder = client
-            .timeseries()
-            .get_range(&range_params)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get range: {e}"))?;
+        let Some(mut decoder) = self.get_range_clamped(range_params).await? else {
+            return Ok(Vec::new());
+        };
 
         let metadata = decoder.metadata().clone();
         let mut metadata_cache = MetadataCache::new(metadata);
@@ -1029,12 +1087,9 @@ impl DatabentoHistoricalClient {
             .maybe_limit(params.limit.and_then(NonZeroU64::new))
             .build();
 
-        let mut client = (*self.inner).clone();
-        let mut decoder = client
-            .timeseries()
-            .get_range(&range_params)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get range: {e}"))?;
+        let Some(mut decoder) = self.get_range_clamped(range_params).await? else {
+            return Ok(Vec::new());
+        };
 
         let metadata = decoder.metadata().clone();
         let mut metadata_cache = MetadataCache::new(metadata);
@@ -1113,6 +1168,61 @@ impl DatabentoHistoricalClient {
     }
 }
 
+/// Resolves the available end of the dataset that rejected `range_params`.
+///
+/// Prefers the `available_end` from the error payload and falls back to the schema's end
+/// (or the dataset's end) from the dataset range.
+async fn available_end(
+    client: &mut databento::HistoricalClient,
+    range_params: &GetRangeParams,
+    api_err: &ApiError,
+) -> Option<OffsetDateTime> {
+    let payload_end = api_err
+        .payload
+        .as_deref()
+        .and_then(|payload| payload.get("available_end"))
+        .and_then(serde_json::Value::as_str);
+
+    if let Some(end) = payload_end.and_then(parse_available_end) {
+        return Some(end);
+    }
+
+    match client
+        .metadata()
+        .get_dataset_range(&range_params.dataset)
+        .await
+    {
+        Ok(dataset_range) => Some(
+            dataset_range
+                .range_by_schema
+                .get(&range_params.schema)
+                .map_or(dataset_range.end, |range| range.end),
+        ),
+        Err(e) => {
+            log::warn!(
+                "Failed to get dataset range for {}: {e}",
+                range_params.dataset
+            );
+            None
+        }
+    }
+}
+
+/// Parses an `available_end` timestamp from a Databento API error payload.
+///
+/// Accepts RFC 3339 and ISO 8601 timestamps, including Databento's space-separated form
+/// (`2026-11-25 10:00:00+00:00`). A timestamp without an offset is taken as UTC.
+fn parse_available_end(value: &str) -> Option<OffsetDateTime> {
+    let normalized = value.trim().replacen(' ', "T", 1);
+
+    OffsetDateTime::parse(&normalized, &Rfc3339)
+        .or_else(|_| OffsetDateTime::parse(&normalized, &Iso8601::DEFAULT))
+        .or_else(|_| {
+            PrimitiveDateTime::parse(&normalized, &Iso8601::DEFAULT).map(|dt| dt.assume_utc())
+        })
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::c_char;
@@ -1123,11 +1233,8 @@ mod tests {
     use nautilus_core::time::get_atomic_clock_realtime;
     use nautilus_model::types::{Price, Quantity};
     use rstest::{fixture, rstest};
-    use time::macros::date;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-    };
+    use time::macros::{date, datetime};
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
 
     use super::*;
 
@@ -1182,28 +1289,140 @@ mod tests {
         body
     }
 
+    struct MockResponse {
+        status: &'static str,
+        content_type: &'static str,
+        body: Vec<u8>,
+    }
+
+    impl MockResponse {
+        fn dbn(body: Vec<u8>) -> Self {
+            Self {
+                status: "200 OK",
+                content_type: "application/octet-stream",
+                body,
+            }
+        }
+
+        fn json(status: &'static str, body: &serde_json::Value) -> Self {
+            Self {
+                status,
+                content_type: "application/json",
+                body: body.to_string().into_bytes(),
+            }
+        }
+    }
+
     async fn serve_response(listener: TcpListener, body: Vec<u8>) {
-        let (mut stream, _) = listener.accept().await.unwrap();
+        serve_responses(listener, vec![MockResponse::dbn(body)]).await;
+    }
+
+    /// Answers one connection per scripted response, in order, then closes the listener.
+    ///
+    /// Returns each request's head and body so tests can assert what was sent.
+    async fn serve_responses(listener: TcpListener, responses: Vec<MockResponse>) -> Vec<String> {
+        let mut requests = Vec::new();
+
+        for response in responses {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            requests.push(read_request(&mut stream).await);
+
+            let headers = format!(
+                "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.status,
+                response.content_type,
+                response.body.len(),
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(&response.body).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+
+        requests
+    }
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
         let mut request = Vec::new();
         let mut buffer = [0_u8; 1024];
+        let mut expected_len = None;
+
         loop {
+            if expected_len.is_none()
+                && let Some(head_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            {
+                let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+                let body_len = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .map_or(0, |len| len.trim().parse::<usize>().unwrap());
+                expected_len = Some(head_end + 4 + body_len);
+            }
+
+            if expected_len.is_some_and(|len| request.len() >= len) {
+                break;
+            }
+
             let read = stream.read(&mut buffer).await.unwrap();
             if read == 0 {
                 break;
             }
             request.extend_from_slice(&buffer[..read]);
-            if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
-            }
         }
 
-        let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len(),
-        );
-        stream.write_all(headers.as_bytes()).await.unwrap();
-        stream.write_all(&body).await.unwrap();
-        stream.shutdown().await.unwrap();
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    fn mock_client(listener: &TcpListener) -> DatabentoHistoricalClient {
+        DatabentoHistoricalClient::new_with_base_url(
+            Credential::new(test_api_key()),
+            publishers_path(),
+            get_atomic_clock_realtime(),
+            false,
+            &format!("http://{}/", listener.local_addr().unwrap()),
+        )
+        .unwrap()
+    }
+
+    fn unix_nanos(date_time: OffsetDateTime) -> UnixNanos {
+        UnixNanos::from(u64::try_from(date_time.unix_timestamp_nanos()).unwrap())
+    }
+
+    fn intraday_deltas_params() -> RangeQueryParams {
+        RangeQueryParams {
+            dataset: "GLBX.MDP3".to_string(),
+            symbols: vec!["ESM4".to_string()],
+            start: unix_nanos(datetime!(2026-11-25 09:00:00 UTC)),
+            end: Some(unix_nanos(datetime!(2026-11-25 10:02:42.438655057 UTC))),
+            limit: None,
+            price_precision: Some(2),
+        }
+    }
+
+    fn api_error(case: &str, payload: &serde_json::Value) -> MockResponse {
+        MockResponse::json(
+            "422 Unprocessable Entity",
+            &serde_json::json!({
+                "detail": {
+                    "case": case,
+                    "message": "The dataset GLBX.MDP3 has data available up to '2026-11-25 10:00:00+00:00'.",
+                    "status_code": 422,
+                    "docs": "https://databento.com/docs/api-reference-historical/basics/datasets",
+                    "payload": payload,
+                }
+            }),
+        )
+    }
+
+    fn end_form_field(date_time: OffsetDateTime) -> String {
+        format!("end={}", date_time.unix_timestamp_nanos())
+    }
+
+    fn two_deltas_body() -> Vec<u8> {
+        encode_mbo_response(&[
+            mbo_record('C' as c_char, 0, 1),
+            mbo_record('N' as c_char, dbn::flags::LAST, 2),
+            mbo_record('C' as c_char, 0, 3),
+        ])
     }
 
     #[fixture]
@@ -1673,5 +1892,224 @@ mod tests {
                 ts.into(),
             )]
         );
+    }
+
+    #[rstest]
+    #[case("2026-11-25T10:00:00Z")]
+    #[case("2026-11-25 10:00:00+00:00")]
+    #[tokio::test]
+    async fn test_get_range_end_after_available_end_retries_once_with_payload_end(
+        #[case] available_end: &str,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = mock_client(&listener);
+        let server = tokio::spawn(serve_responses(
+            listener,
+            vec![
+                api_error(
+                    "data_end_after_available_end",
+                    &serde_json::json!({ "dataset": "GLBX.MDP3", "available_end": available_end }),
+                ),
+                MockResponse::dbn(two_deltas_body()),
+            ],
+        ));
+
+        let deltas = client
+            .get_range_order_book_deltas(intraday_deltas_params())
+            .await
+            .unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains(&end_form_field(
+            datetime!(2026-11-25 10:02:42.438655057 UTC)
+        )));
+        assert!(requests[1].starts_with("POST /v0/timeseries.get_range"));
+        assert!(requests[1].contains(&end_form_field(datetime!(2026-11-25 10:00:00 UTC))));
+    }
+
+    #[rstest]
+    #[case(true, datetime!(2026-11-25 09:58:00 UTC))]
+    #[case(false, datetime!(2026-11-25 10:00:00 UTC))]
+    #[tokio::test]
+    async fn test_get_range_end_after_available_end_falls_back_to_dataset_range(
+        #[case] schema_listed: bool,
+        #[case] expected_end: OffsetDateTime,
+    ) {
+        let schema = if schema_listed { "mbo" } else { "ohlcv-1m" };
+        let dataset_range = serde_json::json!({
+            "start": "2017-05-21T00:00:00.000000000Z",
+            "end": "2026-11-25T10:00:00.000000000Z",
+            "schema": {
+                schema: {
+                    "start": "2017-05-21T00:00:00.000000000Z",
+                    "end": "2026-11-25T09:58:00.000000000Z",
+                },
+            },
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = mock_client(&listener);
+        let server = tokio::spawn(serve_responses(
+            listener,
+            vec![
+                api_error(
+                    "data_end_after_available_end",
+                    &serde_json::json!({ "dataset": "GLBX.MDP3" }),
+                ),
+                MockResponse::json("200 OK", &dataset_range),
+                MockResponse::dbn(two_deltas_body()),
+            ],
+        ));
+
+        let deltas = client
+            .get_range_order_book_deltas(intraday_deltas_params())
+            .await
+            .unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].starts_with("GET /v0/metadata.get_dataset_range?dataset=GLBX.MDP3"));
+        assert!(requests[2].starts_with("POST /v0/timeseries.get_range"));
+        assert!(requests[2].contains(&end_form_field(expected_end)));
+    }
+
+    #[rstest]
+    #[case(api_error(
+        "data_end_after_available_end",
+        &serde_json::json!({ "available_end": "2026-11-25T09:00:00Z" }),
+    ))]
+    #[case(api_error(
+        "data_end_after_available_end",
+        &serde_json::json!({ "available_end": "2026-11-25 08:59:59+00:00" }),
+    ))]
+    #[case(api_error(
+        "data_start_after_available_end",
+        &serde_json::json!({ "available_end": "2026-11-25T08:59:59Z" }),
+    ))]
+    #[tokio::test]
+    async fn test_get_range_without_available_data_returns_empty_without_retry(
+        #[case] response: MockResponse,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = mock_client(&listener);
+        let server = tokio::spawn(serve_responses(listener, vec![response]));
+
+        let deltas = client
+            .get_range_order_book_deltas(intraday_deltas_params())
+            .await
+            .unwrap();
+        let requests = server.await.unwrap();
+
+        assert!(deltas.is_empty());
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[rstest]
+    #[case(
+        api_error("data_start_before_available_start", &serde_json::json!({})),
+        "(case: data_start_before_available_start)",
+    )]
+    #[case(
+        api_error(
+            "data_end_after_available_end",
+            &serde_json::json!({ "available_end": "2026-11-25T10:02:42.438655057Z" }),
+        ),
+        "(case: data_end_after_available_end)",
+    )]
+    #[case(
+        MockResponse::json(
+            "500 Internal Server Error",
+            &serde_json::json!({ "detail": "Internal server error" }),
+        ),
+        "500 Internal Server Error Internal server error",
+    )]
+    #[tokio::test]
+    async fn test_get_range_other_errors_propagate_without_retry(
+        #[case] response: MockResponse,
+        #[case] expected: &str,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = mock_client(&listener);
+        let server = tokio::spawn(serve_responses(listener, vec![response]));
+
+        let err = client
+            .get_range_order_book_deltas(intraday_deltas_params())
+            .await
+            .expect_err("expected the API error to propagate");
+        let requests = server.await.unwrap();
+        let err_msg = format!("{err}");
+
+        assert_eq!(requests.len(), 1);
+        assert!(
+            err_msg.starts_with("Failed to get range: API error: "),
+            "unexpected error message: {err_msg}",
+        );
+        assert!(
+            err_msg.contains(expected),
+            "unexpected error message: {err_msg}"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_get_range_clamped_retry_error_propagates() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = mock_client(&listener);
+        let server = tokio::spawn(serve_responses(
+            listener,
+            vec![
+                api_error(
+                    "data_end_after_available_end",
+                    &serde_json::json!({ "available_end": "2026-11-25T10:00:00Z" }),
+                ),
+                api_error(
+                    "data_end_after_available_end",
+                    &serde_json::json!({ "available_end": "2026-11-25T09:59:00Z" }),
+                ),
+            ],
+        ));
+
+        let err = client
+            .get_range_order_book_deltas(intraday_deltas_params())
+            .await
+            .expect_err("expected the retry error to propagate");
+        let requests = server.await.unwrap();
+        let err_msg = format!("{err}");
+
+        assert_eq!(requests.len(), 2);
+        assert!(
+            err_msg.starts_with(
+                "Failed to get range after clamping end to 2026-11-25 10:00:00.0 +00:00:00: "
+            ),
+            "unexpected error message: {err_msg}",
+        );
+        assert!(
+            err_msg.contains("(case: data_end_after_available_end)"),
+            "unexpected error message: {err_msg}",
+        );
+    }
+
+    #[rstest]
+    #[case("2026-11-25T10:00:00Z", Some(datetime!(2026-11-25 10:00:00 UTC)))]
+    #[case("2026-11-25T10:00:00+00:00", Some(datetime!(2026-11-25 10:00:00 UTC)))]
+    #[case("2026-11-25 10:00:00+00:00", Some(datetime!(2026-11-25 10:00:00 UTC)))]
+    #[case(
+        "2026-11-25 10:00:00.123456789+00:00",
+        Some(datetime!(2026-11-25 10:00:00.123456789 UTC))
+    )]
+    #[case(
+        "2026-11-25T10:00:00.000000000Z",
+        Some(datetime!(2026-11-25 10:00:00 UTC))
+    )]
+    #[case(
+        "2026-11-25T05:00:00.5-05:00",
+        Some(datetime!(2026-11-25 10:00:00.5 UTC))
+    )]
+    #[case("2026-11-25 10:00:00", Some(datetime!(2026-11-25 10:00:00 UTC)))]
+    #[case("not a timestamp", None)]
+    fn test_parse_available_end(#[case] value: &str, #[case] expected: Option<OffsetDateTime>) {
+        assert_eq!(parse_available_end(value), expected);
     }
 }
