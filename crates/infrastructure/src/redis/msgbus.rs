@@ -127,8 +127,16 @@ const MSGBUS_PUBLISH: &str = "msgbus-publish";
 const MSGBUS_STREAM: &str = "msgbus-stream";
 const MSGBUS_HEARTBEAT: &str = "msgbus-heartbeat";
 const HEARTBEAT_TOPIC: &str = "health:heartbeat";
-const FORMING_BAR_TOPIC_PREFIX: &str = "data.bars.forming.";
 const FORMING_BAR_CHANNEL_SUFFIX: &str = ":forming";
+const DEPTH_CHANNEL_SUFFIX: &str = ":depth";
+/// The topic prefixes of ephemeral payloads published via Redis Pub/Sub, each with the suffix its
+/// channel adds to the stream key: forming bar snapshots, and order book depth snapshots on both
+/// depth topic families (live and pipeline).
+const PUBSUB_ROUTES: [(&str, &str); 3] = [
+    ("data.bars.forming.", FORMING_BAR_CHANNEL_SUFFIX),
+    ("data.book.depth.", DEPTH_CHANNEL_SUFFIX),
+    ("data.pipeline.book.depth.", DEPTH_CHANNEL_SUFFIX),
+];
 const TRIM_BUFFER_SECS: u64 = 60;
 const PUBLISH_BATCH_SIZE: usize = 1_000;
 
@@ -453,12 +461,13 @@ impl MessageBusBacking for RedisMessageBusBacking {
     /// Reserves the source of the next entry written for `topic`: this backing's trader ID and
     /// instance ID, the key the entry is written on, and the next number of that key.
     ///
-    /// Ephemeral forming bar snapshots (`data.bars.forming.*`) are published via Redis Pub/Sub
+    /// Ephemeral forming bar snapshots (`data.bars.forming.*`) and order book depth snapshots
+    /// (`data.book.depth.*`, `data.pipeline.book.depth.*`) are published via Redis Pub/Sub
     /// rather than appended to a stream, so they reserve no stream sequence number.
     ///
     /// The entry's age runs from this call.
     fn reserve_source(&self, topic: Ustr) -> anyhow::Result<Option<BusMessageSource>> {
-        if is_forming_bar_topic(topic.as_str()) {
+        if pubsub_channel_suffix(topic.as_str()).is_some() {
             return Ok(None);
         }
         let source = self.sources.reserve(topic)?;
@@ -656,9 +665,13 @@ thread_local! {
         const { Cell::new(None) };
 }
 
-/// Returns whether `topic` carries an ephemeral forming bar snapshot routed over Redis Pub/Sub.
-fn is_forming_bar_topic(topic: &str) -> bool {
-    topic.starts_with(FORMING_BAR_TOPIC_PREFIX)
+/// Returns the suffix of the Redis Pub/Sub channel an ephemeral `topic` is published on, or
+/// `None` for a topic appended to a stream.
+fn pubsub_channel_suffix(topic: &str) -> Option<&'static str> {
+    PUBSUB_ROUTES
+        .iter()
+        .find(|(prefix, _)| topic.starts_with(prefix))
+        .map(|&(_, suffix)| suffix)
 }
 
 /// Returns the Redis Pub/Sub channel carrying forming bar snapshots for `stream_key`:
@@ -1570,38 +1583,34 @@ async fn write_attempt(
 }
 
 #[derive(Serialize)]
-struct FormingBarPubSubMessage<'a> {
+struct PubSubMessage<'a> {
     topic: &'a str,
     #[serde(rename = "type")]
     payload_type: &'a str,
     encoding: String,
     publisher_id: &'a str,
     instance_id: &'a str,
-    payload: FormingBarPubSubPayload,
+    payload: PubSubPayload,
 }
 
 #[derive(Serialize)]
 #[serde(untagged)]
-enum FormingBarPubSubPayload {
+enum PubSubPayload {
     Json(serde_json::Value),
     Base64(String),
 }
 
-fn encode_forming_bar_pubsub_payload(
-    msg: &BusMessage,
-    publisher_id: TraderId,
-    instance_id: UUID4,
-) -> Vec<u8> {
+fn encode_pubsub_payload(msg: &BusMessage, publisher_id: TraderId, instance_id: UUID4) -> Vec<u8> {
     let payload = if msg.encoding == SerializationEncoding::Json {
         serde_json::from_slice::<serde_json::Value>(&msg.payload).map_or_else(
-            |_| FormingBarPubSubPayload::Base64(BASE64_STANDARD.encode(&msg.payload)),
-            FormingBarPubSubPayload::Json,
+            |_| PubSubPayload::Base64(BASE64_STANDARD.encode(&msg.payload)),
+            PubSubPayload::Json,
         )
     } else {
-        FormingBarPubSubPayload::Base64(BASE64_STANDARD.encode(&msg.payload))
+        PubSubPayload::Base64(BASE64_STANDARD.encode(&msg.payload))
     };
 
-    let envelope = FormingBarPubSubMessage {
+    let envelope = PubSubMessage {
         topic: msg.topic.as_str(),
         payload_type: msg.payload_type.as_str(),
         encoding: msg.encoding.to_string(),
@@ -1610,7 +1619,7 @@ fn encode_forming_bar_pubsub_payload(
         payload,
     };
 
-    serde_json::to_vec(&envelope).expect("FormingBarPubSubMessage serialization cannot fail")
+    serde_json::to_vec(&envelope).expect("PubSubMessage serialization cannot fail")
 }
 
 // A trim error that does not fail the write is kept in `trim_error` with its key, for the caller
@@ -1624,13 +1633,11 @@ async fn write_buffer(
 ) -> redis::RedisResult<()> {
     let mut pipe = redis::pipe();
     pipe.atomic();
-    let forming_channel = forming_bar_channel(&target.stream_key);
 
     for msg in messages {
-        if is_forming_bar_topic(msg.topic.as_str()) {
-            let payload =
-                encode_forming_bar_pubsub_payload(msg, target.publisher_id, target.instance_id);
-            pipe.publish(&forming_channel, payload);
+        if let Some(suffix) = pubsub_channel_suffix(msg.topic.as_str()) {
+            let payload = encode_pubsub_payload(msg, target.publisher_id, target.instance_id);
+            pipe.publish(format!("{}{suffix}", target.stream_key), payload);
             continue;
         }
 
@@ -2531,12 +2538,17 @@ mod tests {
     use nautilus_common::{
         msgbus::{
             MessageBus, external_egress_from_backing, external_io_from_backing, get_message_bus,
-            publish_quote, set_message_bus,
+            publish_depth, publish_quote, set_message_bus, switchboard,
         },
         testing::{wait_until, wait_until_async},
     };
     use nautilus_core::UnixNanos;
-    use nautilus_model::data::QuoteTick;
+    use nautilus_model::{
+        data::{BookOrder, OrderBookDepth, QuoteTick},
+        enums::OrderSide,
+        identifiers::InstrumentId,
+        types::{Price, Quantity},
+    };
     use redis::{ToRedisArgs, Value};
     use rstest::*;
     use serde_json::json;
@@ -3636,6 +3648,92 @@ mod tests {
         assert_eq!(envelope["publisher_id"], "TESTER-007");
         assert_eq!(envelope["instance_id"], instance_id.as_str());
         assert_eq!(envelope["payload"], serde_json::to_value(bar).unwrap());
+    }
+
+    #[rstest]
+    #[case::single_stream(false)]
+    #[case::stream_per_topic(true)]
+    fn test_depth_publishes_over_pubsub_without_consuming_stream_sequence(
+        #[case] stream_per_topic: bool,
+    ) {
+        let fake = get_runtime().block_on(FakeRedis::start("unused"));
+        fake.accept_writes.store(true, Ordering::SeqCst);
+        let instance_id = UUID4::new();
+        let config = MessageBusConfig {
+            encoding: SerializationEncoding::Json,
+            stream_per_topic,
+            ..Default::default()
+        };
+        install_way_out(&fake, instance_id, config);
+
+        let instrument_id = InstrumentId::from("MNQZ6.XCME");
+        let depth = OrderBookDepth::new(
+            instrument_id,
+            [
+                BookOrder::new(OrderSide::Buy, Price::from("100.00"), Quantity::from(3), 0),
+                BookOrder::new(OrderSide::Buy, Price::from("99.75"), Quantity::from(5), 0),
+            ],
+            [
+                BookOrder::new(OrderSide::Sell, Price::from("100.25"), Quantity::from(2), 0),
+                BookOrder::new(OrderSide::Sell, Price::from("100.50"), Quantity::from(7), 0),
+            ],
+            [1, 2],
+            [1, 3],
+            0,
+            42,
+            UnixNanos::from(1_000),
+            UnixNanos::from(2_000),
+        );
+        let depth_topic = switchboard::get_book_depth_topic(instrument_id);
+        let pipeline_depth_topic = switchboard::get_pipeline_book_depth_topic(instrument_id);
+        assert_eq!(depth_topic.as_ref(), "data.book.depth.XCME.MNQZ6");
+        assert_eq!(
+            pipeline_depth_topic.as_ref(),
+            "data.pipeline.book.depth.XCME.MNQZ6"
+        );
+        publish_quote("data.quotes.A".into(), &QuoteTick::default());
+        publish_depth(depth_topic, &depth);
+        publish_depth(pipeline_depth_topic, &depth);
+        publish_quote("data.quotes.A".into(), &QuoteTick::default());
+
+        wait_until(
+            || fake.written().len() == 2 && fake.published().len() == 2,
+            Duration::from_secs(5),
+        );
+        close_way_out();
+
+        let written = fake.written();
+        assert_eq!(written.len(), 2);
+        assert_eq!(
+            written.iter().map(FakeXadd::sequence).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(
+            written
+                .iter()
+                .all(|xadd| xadd.field("topic").as_deref() == Some("data.quotes.A"))
+        );
+
+        let published = fake.published();
+        assert_eq!(published.len(), 2);
+        assert!(
+            published
+                .iter()
+                .all(|publish| publish.channel == "trader-TESTER-007:stream:depth")
+        );
+        let envelopes: Vec<serde_json::Value> = published
+            .iter()
+            .map(|publish| serde_json::from_slice(&publish.payload).unwrap())
+            .collect();
+        assert_eq!(envelopes[0]["topic"], "data.book.depth.XCME.MNQZ6");
+        assert_eq!(envelopes[1]["topic"], "data.pipeline.book.depth.XCME.MNQZ6");
+        for envelope in &envelopes {
+            assert_eq!(envelope["type"], "OrderBookDepth");
+            assert_eq!(envelope["encoding"], "Json");
+            assert_eq!(envelope["publisher_id"], "TESTER-007");
+            assert_eq!(envelope["instance_id"], instance_id.as_str());
+            assert_eq!(envelope["payload"], serde_json::to_value(&depth).unwrap());
+        }
     }
 
     #[rstest]
