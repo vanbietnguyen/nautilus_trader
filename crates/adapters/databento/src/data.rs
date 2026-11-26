@@ -98,6 +98,8 @@ const TRADE_SCHEMAS: &[dbn::Schema] = &[
     dbn::Schema::Mbp1,
     dbn::Schema::Cmbp1,
 ];
+const RANGE_FETCH_ATTEMPTS: u32 = 3;
+const RANGE_FETCH_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 /// Configuration for the Databento data client.
 #[derive(Debug, Clone)]
@@ -1040,20 +1042,20 @@ impl DataClient for DatabentoDataClient {
                 }
 
                 let symbols = historical_client.prepare_symbols_from_instrument_ids(&ids);
-
-                let params = RangeQueryParams {
-                    dataset: dataset.clone(),
-                    symbols,
-                    start: query_start,
-                    end: query_end,
-                    limit,
-                    price_precision: precision,
+                let label = format!("Request quotes {} dataset {dataset}", request.request_id);
+                let fetch = || {
+                    let params = RangeQueryParams {
+                        dataset: dataset.clone(),
+                        symbols: symbols.clone(),
+                        start: query_start,
+                        end: query_end,
+                        limit,
+                        price_precision: precision,
+                    };
+                    historical_client.get_range_quotes(params, Some(schema.clone()))
                 };
 
-                match historical_client
-                    .get_range_quotes(params, Some(schema.clone()))
-                    .await
-                {
+                match fetch_range_with_retry(&label, fetch).await {
                     Ok(rows) => data.extend(rows),
                     Err(e) => failures.push(format!("Dataset {dataset}: {e}")),
                 }
@@ -1111,20 +1113,20 @@ impl DataClient for DatabentoDataClient {
                 }
 
                 let symbols = historical_client.prepare_symbols_from_instrument_ids(&ids);
-
-                let params = RangeQueryParams {
-                    dataset: dataset.clone(),
-                    symbols,
-                    start: query_start,
-                    end: query_end,
-                    limit,
-                    price_precision: precision,
+                let label = format!("Request trades {} dataset {dataset}", request.request_id);
+                let fetch = || {
+                    let params = RangeQueryParams {
+                        dataset: dataset.clone(),
+                        symbols: symbols.clone(),
+                        start: query_start,
+                        end: query_end,
+                        limit,
+                        price_precision: precision,
+                    };
+                    historical_client.get_range_trades(params, Some(schema.clone()))
                 };
 
-                match historical_client
-                    .get_range_trades(params, Some(schema.clone()))
-                    .await
-                {
+                match fetch_range_with_retry(&label, fetch).await {
                     Ok(rows) => data.extend(rows),
                     Err(e) => failures.push(format!("Dataset {dataset}: {e}")),
                 }
@@ -1569,6 +1571,37 @@ async fn seed_price_precision_if_needed(
 
     if let Err(e) = historical_client.get_range_instruments(query_params).await {
         log::warn!("Failed to seed price precision for {instrument_id}: {e}");
+    }
+}
+
+/// Runs a historical range fetch up to [`RANGE_FETCH_ATTEMPTS`] times, pausing
+/// [`RANGE_FETCH_RETRY_DELAY`] between attempts.
+///
+/// A range download streams for minutes and can fail mid-flight (a gateway timeout, a connection
+/// cut mid-stream). The historical client erases the error type, so every failure is retried.
+/// Each failed attempt logs a warning; the last failure is returned unchanged.
+async fn fetch_range_with_retry<T, F, Fut>(label: &str, mut fetch: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    let mut attempt = 1;
+    loop {
+        match fetch().await {
+            Ok(rows) => return Ok(rows),
+            Err(e) if attempt < RANGE_FETCH_ATTEMPTS => {
+                log::warn!(
+                    "{label}: attempt {attempt}/{RANGE_FETCH_ATTEMPTS} failed, retrying in {}s: {e}",
+                    RANGE_FETCH_RETRY_DELAY.as_secs(),
+                );
+                tokio::time::sleep(RANGE_FETCH_RETRY_DELAY).await;
+                attempt += 1;
+            }
+            Err(e) => {
+                log::warn!("{label}: attempt {attempt}/{RANGE_FETCH_ATTEMPTS} failed: {e}");
+                return Err(e);
+            }
+        }
     }
 }
 
@@ -3606,5 +3639,47 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_fetch_range_with_retry_delivers_once_after_two_failures() {
+        let calls = std::cell::Cell::new(0_u32);
+        let started = tokio::time::Instant::now();
+
+        let result = fetch_range_with_retry("Request trades test", || {
+            calls.set(calls.get() + 1);
+            let call = calls.get();
+            async move {
+                if call < 3 {
+                    anyhow::bail!("Failed to get range: 504 Gateway Timeout");
+                }
+                Ok(vec![call])
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), vec![3]);
+        assert_eq!(calls.get(), 3);
+        assert_eq!(started.elapsed(), RANGE_FETCH_RETRY_DELAY * 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_fetch_range_with_retry_returns_third_failure() {
+        let calls = std::cell::Cell::new(0_u32);
+        let started = tokio::time::Instant::now();
+
+        let result = fetch_range_with_retry("Request quotes test", || {
+            calls.set(calls.get() + 1);
+            let call = calls.get();
+            async move { Err::<Vec<u32>, _>(anyhow::anyhow!("Failed to get range: attempt {call}")) }
+        })
+        .await;
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Failed to get range: attempt 3"
+        );
+        assert_eq!(calls.get(), 3);
+        assert_eq!(started.elapsed(), RANGE_FETCH_RETRY_DELAY * 2);
     }
 }
